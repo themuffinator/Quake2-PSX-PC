@@ -201,6 +201,10 @@ struct q2_hud_tables;
 #define Q2_SBAR_ICON_ARMOUR_COMBAT 27  /* 0x80035810, offset 135 — flag 0x2000 */
 #define Q2_SBAR_ICON_ARMOUR_JACKET 28  /* 0x800358A4, offset 140 — flag 0x1000 */
 #define Q2_SBAR_ICON_POWER_SHIELD  30  /* 0x8003565C, offset 150 — flag 0x8000 */
+#define Q2_SBAR_ICON_POWERUP_QUAD  40  /* 0x80035B90 — client+0xAC              */
+#define Q2_SBAR_ICON_POWERUP_INVULN 41 /* 0x80035BEC — client+0xB0              */
+#define Q2_SBAR_ICON_POWERUP_ENVIRO 42 /* 0x80035C48 — client+0xB4              */
+#define Q2_SBAR_ICON_POWERUP_BREATHER 43 /* 0x80035CA4 — client+0xB8            */
 #define Q2_SBAR_ICON_NONE           0  /* rect 0 is the 1x1 blank             */
 
 /*
@@ -260,6 +264,10 @@ u8 q2_sbar_armour_icon(u32 inv_flags, bool show_power);
  * level clock, so exactly one second.
  */
 #define Q2_SBAR_POWER_ALTERNATE 300u
+
+/* The fifth sub-draw divides its selected powerup deadline by this, on the
+ * same 300 Hz level clock as the armour alternation. */
+#define Q2_SBAR_POWERUP_SECONDS_TICKS 300u
 
 /*
  * The one weapon whose ammo digits are blanked — the blaster, slot 1.
@@ -421,6 +429,15 @@ typedef struct q2_statusbar {
     u8 armour_icon;
 
     /*
+     * The fifth sub-draw at 0x80035B38: its own upper-right icon and two
+     * decimal fields. It reads the four expiry words rather than inventory
+     * flags, selects the first live one, and shows floor((until - ticks)/300).
+     * Zero icon is rect 0 and means no timer is present.
+     */
+    u8  powerup_icon;
+    u8  powerup_seconds;
+
+    /*
      * The pickup caption's icon — field 16, the upper-left one, filled by the
      * fourth sub-draw at `0x800359C0` from `client+84`.
      *
@@ -530,6 +547,15 @@ void q2_statusbar_anchor(q2_statusbar *b, s16 x, s16 y);
  * from the same inventory.
  */
 void q2_statusbar_armour_state(q2_statusbar *b, u32 inv_flags);
+
+/*
+ * Run 0x80035B38's powerup selector. `b->ticks` must already be the level
+ * clock. The deadline order is deliberately not an inventory-bit priority:
+ * quad, invulnerability, environment suit, then rebreather are the four
+ * client words in memory order, and the first strict unsigned `now < until`
+ * wins.
+ */
+void q2_statusbar_powerup_state(q2_statusbar *b, const q2_inventory *inv);
 
 /*
  * Emit the bar into bucket `bucket`.

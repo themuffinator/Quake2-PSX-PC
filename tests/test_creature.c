@@ -16,6 +16,7 @@
 #include "ai.h"
 #include "crebind.h"
 #include "creature.h"
+#include "spawn.h"
 
 static int g_failures;
 static int g_checks;
@@ -37,6 +38,20 @@ static void check_eq_i(s64 got, s64 want, const char *what)
                what, (long long)got, (long long)want);
         g_failures++;
     }
+}
+
+static void put_u16(u8 *p, u16 v)
+{
+    p[0] = (u8)v;
+    p[1] = (u8)(v >> 8);
+}
+
+static void put_u32(u8 *p, u32 v)
+{
+    p[0] = (u8)v;
+    p[1] = (u8)(v >> 8);
+    p[2] = (u8)(v >> 16);
+    p[3] = (u8)(v >> 24);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -150,6 +165,56 @@ static void test_bind(void)
     check(m.run == t_run, "and the run callback");
     check((m.svflags & Q2_SVF_MONSTER) != 0, "and is flagged a monster");
     check(q2_ent_inuse(&m), "and is in use");
+}
+
+/* ------------------------------------------------------------------------- */
+/* The shared population-to-entity flag hand-off, before module spawn runs. */
+static void test_population_spawn_flags(void)
+{
+    enum { SPAWN_LIST = Q2_POP_GROUP_SIZE + 4,
+           SIZE = SPAWN_LIST + Q2_POP_SPAWN_SIZE + 4 };
+    u8 bytes[SIZE];
+    q2_population pop;
+    q2_monster_set set;
+    q2_monster *m;
+
+    printf("population spawn flags\n");
+
+    memset(bytes, 0, sizeof(bytes));
+    memcpy(bytes, "Zone0", 5);
+    put_u32(bytes + 0x0C, SPAWN_LIST);
+    /* bytes + 24 is the group's four-byte terminator. */
+
+    put_u32(bytes + SPAWN_LIST, 34);  /* Insane class id: module reads flags */
+    put_u16(bytes + SPAWN_LIST + 0x12, 0xFFFEu);
+    put_u16(bytes + SPAWN_LIST + 0x14, 0x81D8u);
+    /* One zero class-id word after this record terminates its spawn list. */
+
+    memset(&pop, 0, sizeof(pop));
+    pop.data        = bytes;
+    pop.size        = sizeof(bytes);
+    pop.group_count = 1;
+
+    memset(&set, 0, sizeof(set));
+    q2_monster_set_register(&set, 34);
+    check_eq_i(q2_spawn_from_population(&set, &pop, NULL, NULL), Q2_OK,
+               "one hand-built record spawns");
+    check_eq_i(set.count, 1, "the record produced one monster");
+
+    m = set.count ? &set.monsters[0] : NULL;
+    check(m != NULL, "the spawned monster exists");
+    if (m) {
+        check_eq_i(m->target, -2,
+                   "the link halfword reaches the entity target without a sentinel rewrite");
+        check_eq_i((m->spawnflags >> Q2_POP_SPAWN_FLAGS_SHIFT) &
+                       Q2_POP_SPAWN_FLAGS_MASK,
+                   0x1D8,
+                   "only the record's low nine flag bits reach entity bits 18..26");
+        check((m->spawnflags & Q2_SVFLAG_INUSE) != 0,
+              "the shared copy preserves the independent in-use bit");
+    }
+
+    q2_monster_set_free(&set);
 }
 
 static void test_move_lookup(void)
@@ -520,6 +585,7 @@ int main(void)
     printf("Q2PSX-PC creature tests\n\n");
 
     test_bind();
+    test_population_spawn_flags();
     test_move_lookup();
     test_endfunc_resolution();
     test_frames_drive();

@@ -1010,7 +1010,7 @@ static void report_walk(const disc *d, const char *map, int zone_index)
 
             if (!any) {
                 printf("\n  standing in each environment volume:\n");
-                printf("    vol  asserts                  view  speed\n");
+                printf("    vol  asserts                  at                 view  speed\n");
                 any = true;
             }
 
@@ -1031,13 +1031,14 @@ static void report_walk(const disc *d, const char *map, int zone_index)
                 q2_sim_tick(&sim, &in, Q2_DT_NOMINAL);
 
             env = sim.player[0].ent.flags;
-            printf("    %3u  %-24s %4d  %5d\n", v,
+            printf("    %3u  %-24s %6d,%6d,%6d  %4d  %5d\n", v,
                    (env & Q2_ENV_INLOWCROUCH) ? "INLOWCROUCH" :
                    (env & Q2_ENV_INCROUCH)    ? "INCROUCH"    :
                    (env & Q2_ENV_UNDERWATER)  ? "UNDERWATER"  :
                    (env & Q2_ENV_INWATER)     ? "INWATER"     :
                    (env & Q2_ENT_JUMP_LATCH)  ? "DONTJUMP"    :
                                                 "(centre outside the hull)",
+                   at[0], at[1], at[2],
                    (s32)sim.player[0].view_height,
                    (env & Q2_ENV_INLOWCROUCH) ? Q2_SPEED_LOWCROUCH :
                    (env & (Q2_ENV_INWATER | Q2_ENV_UNDERWATER | Q2_ENV_INCROUCH))

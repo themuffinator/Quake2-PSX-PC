@@ -106,6 +106,11 @@ static void build_state(q2_sim *sim, q2_inventory *inv)
     sim->player[0].fall_time      = 7777;
     sim->player[0].foot           = 1;
     sim->player[0].look_scheme    = 6;
+    sim->player[0].wade           = 3;
+    sim->player[0].water_air      = 1234;
+    sim->player[0].water_next     = 124000;
+    sim->player[0].splash_time    = 123900;
+    sim->player[0].water_voice    = true;
     sim->player[0].ent.flags      = 0xDEADBEEFu;
     sim->player[0].ent.node       = 42;
     sim->player[0].ent.ground_normal[1] = -4096;
@@ -244,6 +249,13 @@ static void test_round_trip(void)
     check_eq_i(loaded.player.fall_time, 7777, "the fall deadline survives");
     check_eq_i(loaded.player.foot, 1, "which footstep is next survives");
     check_eq_i(loaded.player.look_scheme, 6, "the control scheme survives");
+    check_eq_i(loaded.player.wade, 3, "the shallow-water counter survives");
+    check_eq_i(loaded.player.water_air, 1234, "the accumulated breath survives");
+    check_eq_i(loaded.player.water_next, 124000,
+               "the drowning deadline survives");
+    check_eq_i(loaded.player.splash_time, 123900,
+               "the water-splash deadline survives");
+    check(loaded.player.water_voice, "the drowning voice alternation survives");
 
     /* The mover's own carried state. Losing this is what makes a restored
      * player fall through the floor they were standing on. */

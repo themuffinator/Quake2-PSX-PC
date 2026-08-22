@@ -650,14 +650,38 @@ int q2_move(q2_collision *coll, q2_move_ent *ent, const s16 delta_in[3],
 
         result = 0;
 
-        /* 0x800453AC: a second slot, keyed on |ny| instead, so a ceiling
-         * counts here and cannot count as ground above. */
+        /*
+         * 0x800453AC — a second slot, keyed on |ny| instead, so a ceiling
+         * counts here and cannot count as ground above. It keeps the SMALLEST
+         * |ny| of the frame: the most WALL-LIKE contact touched. This slot is
+         * the port's wall detector, and the comparison was the wrong way round.
+         *
+         *     800453AC  lh   v1, 2(s2)     ; v1 = the new contact's ny
+         *     800453B0  lh   v0, 20(s1)    ; v0 = last_normal[1]
+         *     800453B4/BC   bgez/subu      ; v1 = |new|
+         *     800453C0/C8   bgez/subu      ; v0 = |old|
+         *     800453CC  slt  v1, v1, v0    ; |new| < |old| ?
+         *     800453D0  beq  v1, zero, ... ; not smaller -> keep the old one
+         *
+         * Which is why the per-tick reset is (0, 4096, 0): 4096 is the LARGEST
+         * |ny| a 1.3.12 unit normal can carry, so the sentinel is chosen to lose
+         * to the frame's first real contact. Keeping the largest instead made
+         * the predicate unsatisfiable against its own sentinel — the field was
+         * frozen at (0, 4096, 0) for the entire session, and everything reading
+         * it was reading a floor that was never touched.
+         *
+         * Three things were dead because of it: the ladder flag (0x800 needs
+         * -1023 <= ny < 1024 and always saw 4096, so all 31 ladder volumes on
+         * the disc were indistinguishable from air), the velocity clip, and the
+         * water-exit jump. The sibling slot above, on the SIGNED ny into
+         * ground_normal, is a different comparison and was already right.
+         */
         if (have_normal) {
             s32 a = ent->last_normal[1] < 0 ? -(s32)ent->last_normal[1]
                                             :  (s32)ent->last_normal[1];
             s32 b = normal[1] < 0 ? -(s32)normal[1] : (s32)normal[1];
 
-            if (a < b) {
+            if (b < a) {
                 ent->last_normal[0] = normal[0];
                 ent->last_normal[1] = normal[1];
                 ent->last_normal[2] = normal[2];
@@ -794,10 +818,6 @@ bool q2_move_step(q2_collision *coll, q2_move_ent *ent, const s16 delta[3],
     grounded = (ent->flags & Q2_ENT_GROUNDED_MASK) != 0 &&
                !(ent->flags & Q2_ENT_UNDERWATER);
 
-    /* 0x80045B14: both contact flags are cleared before the frame's moves, so
-     * ground is decided fresh every frame. */
-    ent->flags &= ~(Q2_ENT_ON_GROUND | Q2_ENT_ON_ENTITY);
-
     if (!grounded) {
         /*
          * 0x80045CA4 — airborne, or swimming. One slide with the frame delta,
@@ -825,6 +845,27 @@ bool q2_move_step(q2_collision *coll, q2_move_ent *ent, const s16 delta[3],
 
         return (ent->flags & Q2_ENT_GROUNDED_MASK) != 0;
     }
+
+    /*
+     * 0x80045B14 — both contact flags are cleared before the frame's moves, so
+     * ground is decided fresh every frame. THE STEPPED ARM ONLY: the branch
+     * that picks the arm sits above the clear, and its delay slot is just a
+     * constant load, so the airborne path jumps straight past it.
+     *
+     *     80045B0C  beq   v0, zero, 0x80045CA4   ; -> the airborne arm
+     *     80045B10  addiu v0, zero, -33          ; delay slot, a constant
+     *     80045B14  and   v0, v1, v0             ; ~0x20
+     *     80045B1C  and   v0, v0, v1             ; ~0x40
+     *     80045B20  sw    v0, 152(s0)
+     *
+     * Clearing it on both arms is only reachable while UNDERWATER — that is the
+     * one state whose entity can be grounded and still take the airborne path —
+     * and it dropped the ground flag a submerged player standing on the bottom
+     * should keep. That latch is what keeps the 20-unit down probe skipped and
+     * what makes the 0x2000 buoyancy boost fire on the frames the console fires
+     * it on.
+     */
+    ent->flags &= ~(Q2_ENT_ON_GROUND | Q2_ENT_ON_ENTITY);
 
     /* Up. -Y is up. Table entry 0x800AE930 = {0, 0}, zero further attempts. */
     v[0] = 0; v[1] = (s16)(-step); v[2] = 0;

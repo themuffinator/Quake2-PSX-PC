@@ -206,10 +206,17 @@ u32 q2_creature_world_tick(q2_creature_world *w, const s32 player_origin[3]);
 /*
  * The player made a noise, and creatures may look for it.
  *
- * `weapon` true is a gunshot (the console's noise type < 2, which goes to
- * `sound_entity`); false is the player's own — a footstep, a landing — which
- * goes to `sound2_entity` and which an AMBUSH creature ignores. Without this
- * two of FindTarget's three alert arms are dead. See the note on the definition.
+ * `weapon` true is the console's noise type < 2, which goes to `sound_entity`;
+ * false is type 2 and up, which goes to `sound2_entity` and which an AMBUSH
+ * creature ignores. Without this two of FindTarget's three alert arms are dead.
+ * See the note on the definition.
+ *
+ * The names mislead slightly, so be careful choosing: type < 2 is not only
+ * gunfire. `xrefs 0x80062B80` shows the player's own body raising type 0 for
+ * the jump and for entering, leaving and breathing under water — all of them
+ * `true` here. Walking and landing raise nothing at all. An earlier note here
+ * cited "a footstep, a landing" as the `false` case; the real one is a bullet
+ * impact, PNOISE_IMPACT, type 2.
  */
 void q2_creature_world_player_noise(q2_creature_world *w, bool weapon);
 

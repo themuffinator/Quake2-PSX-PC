@@ -282,4 +282,16 @@ u16 q2_events_list_entry(const u8 *offsets, u32 index);
  */
 bool q2_events_get_call_index(const q2_event_item *item, u8 *index_out);
 
+/*
+ * The two signed halfwords carried by an FX item.  The retail handler at
+ * 0x80027840 accepts precisely an 8-byte item, then passes payload+2 as its
+ * damage argument and payload+0 as its means-of-death argument to T_Damage.
+ *
+ * `point` is deliberately absent: the original neglects to initialise its
+ * fifth T_Damage argument.  A caller that needs a reproducible result must
+ * choose its own defined point rather than treating either operand as one.
+ */
+bool q2_events_get_fx_damage(const q2_event_item *item, s16 *mod_out,
+                             s16 *damage_out);
+
 #endif /* Q2PSX_EVENTS_H */

@@ -332,6 +332,8 @@ typedef enum q2_ent_sound {
      */
     Q2_SND_WATER_IN    = 24,  /* 0x800B2938 — pla_watr_in                   */
     Q2_SND_WATER_OUT   = 25,  /* 0x800B293C — pla_watr_out                  */
+    Q2_SND_WATER_UNDER = 26,  /* 0x800B2940 — pla_watr_un                   */
+    Q2_SND_GASP         = 27, /* 0x800B28F8 — pla_gasp1                     */
 
     Q2_SND_COUNT
 } q2_ent_sound;

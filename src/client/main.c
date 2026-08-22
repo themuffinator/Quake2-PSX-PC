@@ -127,6 +127,7 @@
 #include "fxtables.h"
 #include "hudtables.h"
 #include "ident.h"
+#include "item.h"
 #include "itemtable.h"
 #include "menu.h"
 #include "menudraw.h"
@@ -966,6 +967,10 @@ typedef struct client {
     u32               give_armour_flag;
     s16               give_armour_points;
     s16               give_armour_cells;
+
+    /* `--powerup <kind>` holds one of the four thirty-second effects for a
+     * deterministic headless HUD capture. -1 leaves retail gameplay alone. */
+    int               give_powerup;
 
     /*
      * `--weapon N`: own every weapon, hold slot N, and keep it fed. The eleven
@@ -8525,6 +8530,8 @@ static const char *client_ent_sound_name(const client *c, u32 which)
     case Q2_SND_LAND_SOFT:    return "pla_land1";    /* 0x800B2904 */
     case Q2_SND_WATER_IN:     return "pla_watr_in";  /* 0x800B2938 */
     case Q2_SND_WATER_OUT:    return "pla_watr_out"; /* 0x800B293C */
+    case Q2_SND_WATER_UNDER:  return "pla_watr_un";  /* 0x800B2940 */
+    case Q2_SND_GASP:         return "pla_gasp1";    /* 0x800B28F8 */
     default: break;
     }
 
@@ -11092,6 +11099,7 @@ static void client_draw_view(void *user, q2_screen *s, int p,
         c->sbar.cells       = inv->ammo[Q2_AMMO_CELLS];
         c->sbar.ticks       = (u32)c->sim[0].level_time;
         q2_statusbar_armour_state(&c->sbar, inv->flags);
+        q2_statusbar_powerup_state(&c->sbar, inv);
 
         /*
          * WHAT WAS JUST PICKED UP, which nothing has ever drawn.
@@ -11781,6 +11789,7 @@ static void usage(void)
     printf("  --frames N    stop after N frames\n");
     printf("  --shot P.ppm  write the console's own framebuffer to P.ppm\n");
     printf("  --shot-every N  ...and one every N frames, numbered\n");
+    printf("  --powerup KIND hold quad|invuln|enviro|breather for HUD capture\n");
     printf("  --fire-event NAME [F]  queue ONE named Events entry point at\n"
            "                frame F, instead of every trigger volume on the\n"
            "                map. Level authors name the interesting ones\n"
@@ -12119,6 +12128,7 @@ int main(int argc, char **argv)
     q2_mp_mode mp_mode    = Q2_MP_DEATHMATCH;
 
     c.trace_cre = -1;
+    c.give_powerup = -1;
     /* Alive, and holding a gun, before anything has loaded: `memset` leaves
      * `linked_weapon` false, and the view weapon draw now asks for it. */
     {
@@ -12234,6 +12244,18 @@ int main(int argc, char **argv)
         /* `--weapon N`: hold weapon slot N, fed. See the field's note. */
         else if (!strcmp(argv[i], "--weapon") && i + 1 < argc)
             c.give_weapon = (int)strtol(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--powerup") && i + 1 < argc) {
+            const char *w = argv[++i];
+
+            if      (!strcmp(w, "quad"))     c.give_powerup = Q2_POWERUP_QUAD;
+            else if (!strcmp(w, "invuln"))   c.give_powerup = Q2_POWERUP_INVULN;
+            else if (!strcmp(w, "enviro"))   c.give_powerup = Q2_POWERUP_ENVIRO;
+            else if (!strcmp(w, "breather")) c.give_powerup = Q2_POWERUP_BREATHER;
+            else {
+                fprintf(stderr, "--powerup wants quad|invuln|enviro|breather\n");
+                return 2;
+            }
+        }
         /* `--armour body|combat|jacket|shield|shard`: see the field's note. */
         else if (!strcmp(argv[i], "--armour") && i + 1 < argc) {
             const char *w = argv[++i];
@@ -13020,12 +13042,12 @@ no_window:
                 case SDLK_F2: c.opts.affine_uv = !c.opts.affine_uv; break;
                 case SDLK_F3:
                     /*
-                     * Submerge. Nothing in the port yet resolves a trigger
-                     * volume's event to UNDERWATER, so this stands in for the
-                     * volume exactly as the crouch key does — it sets the flag
-                     * the dispatcher would set, and everything downstream is
-                     * the console's: the swimming physics, and the screen
-                     * effect that ramps up over about fourteen frames.
+                     * Submerge, as a testing override. Authored trigger volumes
+                     * resolve UNDERWATER themselves; this is still useful for
+                     * inspecting the same downstream console behaviour away
+                     * from a pool: swimming physics, water life support, and
+                     * the screen effect that ramps up over about fourteen
+                     * frames.
                      */
                     c.force_underwater = !c.force_underwater;
                     Q2_INFO("underwater: %s", c.force_underwater ? "on" : "off");
@@ -13567,6 +13589,22 @@ no_window:
                 inv->armour = c.give_armour_points;
             if (inv->ammo[Q2_AMMO_CELLS] < c.give_armour_cells)
                 inv->ammo[Q2_AMMO_CELLS] = c.give_armour_cells;
+        }
+        /* `--powerup`: retained solely as a reproducible renderer probe. The
+         * live pickup handlers still own the normal extend-from-later rule;
+         * this reassertion merely keeps one HUD timer present across map loads
+         * and long headless runs. */
+        if (c.give_powerup >= 0 && c.give_powerup < Q2_POWERUP_SLOT_COUNT) {
+            q2_inventory *inv = &c.sim[0].combat.inv;
+            s32 until = c.sim[0].level_time + Q2_ITEM_POWERUP_TICKS;
+
+            switch (c.give_powerup) {
+            case Q2_POWERUP_QUAD:     inv->quad_until = until; break;
+            case Q2_POWERUP_INVULN:   inv->invuln_until = until; break;
+            case Q2_POWERUP_ENVIRO:   inv->enviro_until = until; break;
+            case Q2_POWERUP_BREATHER: inv->breather_until = until; break;
+            default: break;
+            }
         }
         /* `--weapon N`: same treatment. The ammo is topped up every frame
          * rather than given once, so a long run does not quietly turn into a

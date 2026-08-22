@@ -72,6 +72,47 @@ static void place_untouchable(q2_actor *a, s32 x, s32 y, s32 z, s16 hp)
 }
 
 /* ------------------------------------------------------------------------- */
+/* The actor is a working projection of the player record. The two protection
+ * timers live in the inventory, however, so this boundary is where an active
+ * pickup either reaches T_Damage or silently becomes cosmetic. */
+static void test_player_powerup_sync(void)
+{
+    q2_actor player;
+    q2_inventory inv;
+    q2_combat_rules rules;
+    q2_damage_result hit;
+    s32 pos[3] = { 10, 20, 30 };
+
+    printf("player powerups\n");
+    q2_actor_init(&player);
+    q2_inventory_init(&inv);
+    q2_combat_rules_default(&rules);
+    inv.health = 100;
+    inv.invuln_until = 200;
+    inv.enviro_until = 300;
+
+    q2_actor_from_player(&player, &inv, pos);
+    check_eq_i(player.invuln_until, 200,
+               "invulnerability deadline reaches the damage actor");
+    check_eq_i(player.protect_until, 300,
+               "envirosuit deadline reaches the damage actor");
+
+    rules.level_time = 199;
+    hit = q2_combat_damage(NULL, &player, 40, Q2_MOD_BULLET, pos, &rules);
+    check(hit.blocked, "invulnerability blocks a hit before its deadline");
+    check_eq_i(player.health, 100, "the blocked hit changes no health");
+
+    /* The comparison in 0x80058244 is strict: the expiry tick itself hurts. */
+    inv.invuln_until = 0;
+    inv.enviro_until = 300;
+    q2_actor_from_player(&player, &inv, pos);
+    rules.level_time = 300;
+    hit = q2_combat_damage(NULL, &player, 40, Q2_MOD_LAVA, pos, &rules);
+    check(!hit.blocked, "the protection expiry tick is no longer protected");
+    check(player.health < 100, "damage resumes on the expiry tick");
+}
+
+/* ------------------------------------------------------------------------- */
 static void test_ray_distance(void)
 {
     s32 origin[3] = { 0, 0, 0 };
@@ -612,6 +653,7 @@ int main(void)
 {
     printf("combat behaviour\n\n");
 
+    test_player_powerup_sync();
     test_ray_distance();
     test_armour_absorption();
     test_power_armour();

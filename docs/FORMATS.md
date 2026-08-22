@@ -743,8 +743,15 @@ typedef struct {            /* 24 bytes */
                              * count, and name resolution yields nonsense.          */
     int32_t  x, y, z;       /* CONFIRMED                                            */
     uint16_t angle;         /* INFERRED: 0..3958; 0/1015/2041/3068 dominate         */
-    uint16_t link;          /* UNKNOWN: 0xFFFF == none in 482/673                   */
-    uint16_t flags;         /* UNKNOWN: 47 distinct values 0..12293                 */
+    uint16_t link;          /* CONFIRMED: copied verbatim to signed entity.target
+                             * (+0x16) by 0x8007E608/0x8007E614. The common
+                             * 0xFFFF sentinel therefore remains -1; readers
+                             * choose their own predicate.                    */
+    uint16_t flags;         /* CONFIRMED: low 9 bits become entity.spawnflags
+                             * bits 18..26. 0x8007E61C does
+                             * `(flags & 0xF803FFFF) | ((record.flags & 0x1FF)
+                             * << 18)` before the creature module's spawn
+                             * export runs; bit meanings are module-specific. */
     uint16_t index;         /* UNKNOWN: slot index 0..323, not strictly monotonic   */
 } q2p_spawn;
 
@@ -1006,6 +1013,15 @@ Opcodes `0x06`, `0x07`, `0x0A…0x0E`, `0x10…0x12` are dead slots. Per-opcode 
 items agrees with every hard-coded assert in the EXE. The list identity `len == 4 + 2*(count + (count & 1))`
 holds **501/501**, and **812/812** of those operands land exactly on a walked record start. `0x02` reads them
 with `lhu`, `0x14`/`0x15` with `lh`.
+
+`0x13` is a direct player damage event, despite its generic `FX` name. Its only
+accepted form is eight bytes: signed `mod` at item `+2` and signed `damage` at
+item `+4`; `0x80027840` clears the attacker and calls `T_Damage`. Seven occur
+on the PAL disc: BIGGUN carries lava/1 and WASTE3 carries none/65. The handler
+does not prepare T_Damage's fifth (`point`) argument, an actual stack-slot bug
+whose result depends on prior code. The port applies the decoded damage with a
+defined null point, retaining the retail damage and armour behaviour without
+inventing non-deterministic directional knockback.
 
 For `0x16`, `funcIndex` is a **`uint8_t`** at `+2` (`lbu` at both `0x80027730` and `0x80026F28`), not a
 `uint16_t`; byte `+3` is 0 in 3,760/3,760 on disc so a wide read happens to work *here only*. Bounds check
@@ -4153,6 +4169,14 @@ caption column and diffs it against the disc.
 One frame of the expiry is visible and is reproduced: the sub-draw clears `client+84` and then *reloads* it,
 so the tick a caption dies still draws — rect 0, the blank, and entry 0, the empty string. Only the tick
 after that takes the early-out at `0x80035A28`.
+
+**The upper-right powerup timer is a separate fifth sub-draw.** `0x80035B38` reads the four client expiry
+words at `+0xAC`, `+0xB0`, `+0xB4` and `+0xB8` — quad, invulnerability, environment suit and rebreather —
+in that exact memory order. It takes the first whose unsigned deadline is strictly after the 300 Hz level
+clock, puts rect 40, 41, 42 or 43 in upper-right field 13, and displays
+`floor((deadline - now) / 300)` in fields 14 and 15. Thus coincident timers are not ranked by remaining
+time or strength, and the deadline tick itself is blank. `q2_statusbar_powerup_state()` and the matching
+emitter reproduce it; this timer is independent of the upper-left pickup caption.
 
 `q2_icon_name_for_id()` and `q2_icon_item_name()` name a rect without a disc, so the status bar's health and
 armour icons are named constants (`Q2_SBAR_ICON_MEDIKIT`, `_ARMOUR_JACKET`) rather than caller-supplied

@@ -160,18 +160,17 @@
  * What is still owed
  * ---------------------------------------------------------------------------
  * `q2_cre_impl.spawn` is CALLED now, which for this creature is the whole
- * game: everything an Insane IS gets decided in export 0. What is left is that
- * the hook is asked about a word nobody fills.
+ * game: everything an Insane IS gets decided in export 0. Its map flags now
+ * arrive before it is called: spawn.c transcribes the engine filler at
+ * 0x8007E61C..0x8007E62C, preserving the surrounding entity bits and copying
+ * Population.spawn.flags low nine bits into spawnflags bits 18..26. The prone,
+ * stand-ground, cross and vocal variants are therefore live rather than all
+ * silently selecting the upright default.
  *
- *   - Nothing fills `m->spawnflags` from the placement record. The engine does
- *     it at 0x8007E61C..0x8007E62C, `spawnflags = (spawnflags & 0xF803FFFF) |
- *     ((rec.flags & 0x1FF) << 18)`; `spawn.c` has no equivalent. So all four
- *     variant bits read zero at runtime and every Insane is still the plain
- *     upright standing one — not because the hook does nothing now, but
- *     because its input is zero. One missing assignment in a shared file.
- *   - `self->target` (entity+0x16) is likewise never filled, so the branch it
- *     gates is never taken. What a non-zero value MEANS for this creature is
- *     not established — see insane_walk.
+ *   - `self->target` (entity+0x16) now receives Population.spawn.link as its
+ *     literal signed halfword. What a non-zero value MEANS for this creature
+ *     is not established — see insane_walk — but its observed 0xFFFF sentinel
+ *     stays -1 rather than being silently rewritten to zero.
  *   - link_entity and the walkmonster_start / flymonster_start pair have no
  *     port equivalent; both are named at the spawn hook.
  *
@@ -417,9 +416,9 @@ static void insane_stand(q2_monster *self)
  *      (0x8007E608/0x8007E614) and which `monster.h` names `target`. What a
  *      non-zero link means for a misc_insane is NOT established, and the
  *      record's documented "no link" sentinel is 0xFFFF rather than 0 — which
- *      as a signed halfword is -1 and would take this arm. Transcribed
- *      literally; nothing in this port fills the field, so the arm is dead
- *      either way and the fall-through is the safe one.
+ *      arrives as signed -1 and does take this arm. That is the retail
+ *      transport; `monster_start_go` separately treats only positive values as
+ *      path targets, so the two readers keep their own predicates.
  *   3. otherwise the coin between the two walk cycles, `random() <= 0.5`.
  */
 static void insane_walk(q2_monster *self)
@@ -784,17 +783,11 @@ static void insane_moan(q2_monster *self)
  * Insane's four variants exist nowhere else: the callbacks, the animations,
  * the knockback and the skin are all chosen down here.
  *
- * AND ITS INPUT IS STILL ZERO. Every variant test reads `spawnflags >> 18`,
- * and nothing in this port copies the placement record's nine flag bits into
- * `m->spawnflags` — the engine does it at 0x8007E61C..0x8007E62C as
- * `spawnflags = (spawnflags & 0xF803FFFF) | ((rec.flags & 0x1FF) << 18)` and
- * `spawn.c` has no equivalent. So `sf` below is zero on every placed Insane,
- * each of the three arms that reads it takes the else, and what actually
- * spawns is the plain upright standing one whatever the map asked for. The
- * hook is wired; the wire has nothing on it. That is a shared file's debt, not
- * something this file can pay, and it is written here rather than in the
- * commit message because a reader who watches an Insane stand up straight on a
- * crucified placement needs to find this paragraph.
+ * ITS INPUT ARRIVES BEFORE THIS FUNCTION. Every variant test reads
+ * `spawnflags >> 18`; spawn.c now gives those nine bits the retail source,
+ * Population.spawn.flags, using the exact 0xF803FFFF preserve mask and 0x1FF
+ * source mask. A crucified LAB placement therefore reaches the cross override
+ * below instead of standing up as the generic upright variant.
  *
  * The health IS set here, and it matters: class table row 34 carries health 0
  * and gib -50 for the Insane, and the row is applied BEFORE this runs, so

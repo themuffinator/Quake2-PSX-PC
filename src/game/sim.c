@@ -13,6 +13,29 @@
 /* Defined below, but attach_gameplay needs it. */
 static void build_volumes(q2_sim *sim);
 
+/*
+ * The FX dispatcher, 0x80027840, gets its target from the live event context:
+ * the player who entered the trigger. Its fifth T_Damage argument is never
+ * prepared by the console code (see userfuncs.h), so this port makes the
+ * necessary defined choice explicit: NULL means no fabricated impact point or
+ * knockback. The two meaningful operands themselves are exactly retail.
+ */
+bool q2_sim_apply_event_fx(q2_sim *sim, const q2_event_item *item)
+{
+    s16 mod, damage;
+
+    if (!sim || !q2_events_get_fx_damage(item, &mod, &damage))
+        return false;
+
+    q2_sim_hurt_player(sim, NULL, damage, mod, NULL);
+    return true;
+}
+
+static void event_fx(void *user, const q2_event_item *item)
+{
+    q2_sim_apply_event_fx((q2_sim *)user, item);
+}
+
 void q2_sim_init(q2_sim *sim, const q2_world_zone *zone, int tick_rate_hz)
 {
     if (!sim)
@@ -604,8 +627,11 @@ q2_result q2_sim_attach_gameplay(q2_sim *sim, const q2_common_file *common)
     }
 
     if (q2_events_parse_common(&sim->events, common) == Q2_OK) {
-        if (q2_event_rt_init(&sim->event_rt, &sim->events) == Q2_OK)
+        if (q2_event_rt_init(&sim->event_rt, &sim->events) == Q2_OK) {
             sim->events_ready = true;
+            sim->event_rt.on_fx = event_fx;
+            sim->event_rt.on_fx_user = sim;
+        }
     }
 
     /* The same volumes serve three jobs: firing scripts, answering the contents
@@ -1131,6 +1157,16 @@ void q2_sim_spawn(q2_sim *sim, const s32 pos[3], s32 yaw)
     sim->player[sim->cur_player].footstep_time = 0;
     sim->player[sim->cur_player].foot          = 0;
 
+    /* The retail player allocator clears the client-side water state with the
+     * rest of a new life.  Keeping it across q2_sim_spawn made a position
+     * override (or respawn) inherit the old air counter and deadline, so a
+     * player could take a drowning hit on the first frame in a pool. */
+    sim->player[sim->cur_player].wade          = 0;
+    sim->player[sim->cur_player].water_air     = 0;
+    sim->player[sim->cur_player].water_next    = 0;
+    sim->player[sim->cur_player].splash_time   = 0;
+    sim->player[sim->cur_player].water_voice   = false;
+
     /*
      * The view's own state. A spawn that kept these would put the player into
      * the world already flinching from a hit taken in the last life, or with
@@ -1164,6 +1200,35 @@ void q2_sim_spawn(q2_sim *sim, const s32 pos[3], s32 yaw)
      * every move.
      */
     memset(&sim->player[sim->cur_player].ent, 0, sizeof(sim->player[sim->cur_player].ent));
+
+    /*
+     * 0x8006C1B0 — the slope limit, which nothing in this port had ever
+     * written. The retail allocator memsets a fresh entity and then stores 2600
+     * into entity+0x9C, so this line is the port's equivalent of that store and
+     * belongs immediately after the memset for the same reason.
+     *
+     * Seven places read the field and every one of them was reading zero, which
+     * is not a harmless default: it is "any surface facing even slightly upward
+     * is a floor". A near-vertical wall declared ground, the jump believed it,
+     * and the velocity clip's gate — `n[1] >= max_slope_ny` — was true for
+     * every possible normal, so the clip had never once executed.
+     *
+     * The last_normal contact this same entity carries is the other half of
+     * that gate; see the note in q2_move.
+     */
+    sim->player[sim->cur_player].ent.max_slope_ny = Q2_MAX_SLOPE_NY;
+
+    /*
+     * And the contact slot starts at the flat sentinel the mover resets it to
+     * every tick, rather than at the memset's (0, 0, 0). A zero ny reads as a
+     * perfectly vertical wall, so without this a player who spawns inside a
+     * ladder volume gets one spurious tick of wall contact before the first
+     * move overwrites it.
+     */
+    sim->player[sim->cur_player].ent.last_normal[0] = 0;
+    sim->player[sim->cur_player].ent.last_normal[1] = 4096;
+    sim->player[sim->cur_player].ent.last_normal[2] = 0;
+
     sim->player[sim->cur_player].ent.pos[0] = pos[0];
     sim->player[sim->cur_player].ent.pos[1] = q2_sim_origin_y(pos[1]);
     sim->player[sim->cur_player].ent.pos[2] = pos[2];
@@ -1208,7 +1273,7 @@ static void update_contents(q2_sim *sim)
     /*
      * 0x800458B4: inside a 0x1000 volume, flag 0x800 is set when the entity's
      * last contact normal is nearly horizontal — `-1023 <= ny < 1024` on
-     * ent+0x14, which is the |ny|-maximising normal, not the velocity. So the
+     * ent+0x14, which is the |ny|-MINIMISING normal, not the velocity. So the
      * flag means "in this volume AND touching a wall rather than a floor",
      * which is a ladder-shaped condition.
      */
@@ -2092,14 +2157,20 @@ static void clip_velocity(q2_sim *sim)
     p->vel[2] = (s16)(p->vel[2] - scale_term(n[2], d));
 
     /*
-     * 0x80039BB4 — restore the fall rate.
+     * 0x80039BB4 — a guard against the clip ever ADDING upward speed.
      *
-     * If the clip slowed the descent, the whole vector is rescaled so the
-     * vertical component is what it was and the horizontal components grow to
-     * match. That is what makes a steep slope shed you sideways instead of
-     * catching you. When `keep` is zero — an entity that was rising — the scale
-     * is zero and all velocity is lost, which is exactly what hitting an
-     * overhang mid-jump does.
+     * With `keep` read the right way round this is not a fall-rate restorer.
+     * `keep` is the rise rate for a climbing entity and zero for a falling one,
+     * and the test only fires when the clip left the entity rising FASTER than
+     * it was. The vector is then rescaled so the vertical component is put back
+     * to what it was and the horizontal components grow to match — which is
+     * what makes a steep face shed you sideways instead of launching you.
+     *
+     * A falling entity has `keep == 0` and a post-clip `vel.y > 0`, so
+     * `vel.y >= keep` and the whole block is skipped. Under the inverted read it
+     * was the RISING entity that landed on `keep == 0`, and the rescale then
+     * multiplied the entire velocity by zero — brushing a doorframe on the way
+     * up would have deleted all three components and dropped you straight down.
      */
     if ((s16)p->vel[1] >= keep)
         return;
@@ -2272,11 +2343,18 @@ static void update_footsteps(q2_sim *sim)
  * what stops a dive from playing the splash twice as you pass through the
  * surface.
  *
- * NOT IMPLEMENTED, and deliberately: the arm at 0x8003D300..0x8003D448 that
- * accumulates breath into the same field, plays `pla_watr_un` and
- * `pla_u_brea~2` on a 300/750-tick cycle, gasps and then drowns you. That is a
- * life-support subsystem with its own damage path, not a movement one, and
- * half-implementing it would drown people. `water_air` is a plain latch here.
+ * The submerged arm is separate from the transition. It accumulates air in
+ * client+0x84, starts a 300-tick clock in +0x88, and periodically calls the
+ * ordinary damage path with MOD 8 — the one class that skips both armour
+ * stages. A rebreather resets the counter to one every frame before that
+ * periodic test, which is why its expiry field is tested here instead of being
+ * folded into generic invulnerability.
+ *
+ * At 3601 air units the cadence becomes 750 ticks and the retail build emits
+ * `pla_watr_un`; below it, every other 300-tick damage pass emits either the
+ * existing drowning voice or `pla_gasp1`, chosen by the game's rand() bit.
+ * The silent alternate pass is real: client+0xDF is XORed with one before the
+ * sound branch at 0x8003D388.
  */
 static void world_effects(q2_sim *sim)
 {
@@ -2295,6 +2373,49 @@ static void world_effects(q2_sim *sim)
                 q2_ent_sound_at(&sim->ent_world.events, Q2_SND_WATER_IN,
                                 p->pos);
             p->water_air = 1;
+            p->water_next = sim->level_time + 300;
+        }
+
+        /* 0x8003D300: the water clock carries the same dt as the level. */
+        p->water_air += sim->cur_dt;
+
+        /* client+0xB8. The rebreather suppresses drowning by resetting air,
+         * rather than by changing MOD 8's damage rule. */
+        if ((u32)sim->level_time < (u32)sim->combat.inv.breather_until)
+            p->water_air = 1;
+
+        /* 0x8003D344: the deadline is strict, not inclusive. */
+        if ((u32)p->water_next >= (u32)sim->level_time)
+            return;
+
+        if (p->water_air < 3601) {
+            s32 damage = p->water_air >> 10;
+
+            p->water_next = sim->level_time + 300;
+            if (damage > 7)
+                damage = 7;
+
+            /* 0x8003D380. Even a zero-point pass reaches T_Damage; doing so
+             * preserves the retail MOD state and costs no health. */
+            q2_sim_hurt_player(sim, NULL, (s16)damage, Q2_MOD_NO_ARMOUR,
+                               p->pos);
+
+            /* 0x8003D388. One pass is silent; the other selects a warning from
+             * the game's one-bit random result. */
+            p->water_voice = !p->water_voice;
+            if (p->water_voice) {
+                q2_ent_sound sound = (rand() & 1) ? Q2_SND_DROWN
+                                                   : Q2_SND_GASP;
+
+                q2_ent_sound_at(&sim->ent_world.events, sound, p->pos);
+            }
+        } else {
+            /* 0x8003D3E0 / 0x8003D434: long-submerge warning cadence. A live
+             * rebreather has already reset air above, so this is the reachable
+             * no-rebreather arm on the retail disc. */
+            p->water_next = sim->level_time + 750;
+            q2_ent_sound_at(&sim->ent_world.events, Q2_SND_WATER_UNDER,
+                            p->pos);
         }
         return;
     }

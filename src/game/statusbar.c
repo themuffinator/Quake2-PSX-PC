@@ -253,6 +253,50 @@ void q2_statusbar_armour_state(q2_statusbar *b, u32 inv_flags)
 }
 
 /* ------------------------------------------------------------------------- */
+/* The powerup timer — 0x80035B38                                             */
+/* ------------------------------------------------------------------------- */
+void q2_statusbar_powerup_state(q2_statusbar *b, const q2_inventory *inv)
+{
+    static const u8 k_icon[] = {
+        Q2_SBAR_ICON_POWERUP_QUAD,
+        Q2_SBAR_ICON_POWERUP_INVULN,
+        Q2_SBAR_ICON_POWERUP_ENVIRO,
+        Q2_SBAR_ICON_POWERUP_BREATHER
+    };
+    s32 until[sizeof(k_icon) / sizeof(k_icon[0])];
+    size_t i;
+
+    if (!b)
+        return;
+
+    b->powerup_icon    = Q2_SBAR_ICON_NONE;
+    b->powerup_seconds = 0;
+    if (!inv)
+        return;
+
+    /* These are client+0xAC through +0xB8, in the exact walk order at
+     * 0x80035B58. Do not reorder them by the strength of an effect: four live
+     * timers still display only the first word in this sequence. */
+    until[0] = inv->quad_until;
+    until[1] = inv->invuln_until;
+    until[2] = inv->enviro_until;
+    until[3] = inv->breather_until;
+
+    for (i = 0; i < sizeof(until) / sizeof(until[0]); i++) {
+        u32 left;
+
+        /* `sltu now, deadline`: the deadline tick itself is inactive. */
+        if (b->ticks >= (u32)until[i])
+            continue;
+
+        left = (u32)until[i] - b->ticks;
+        b->powerup_icon = k_icon[i];
+        b->powerup_seconds = (u8)(left / Q2_SBAR_POWERUP_SECONDS_TICKS);
+        return;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
 /* One cell of the sheet, as the emitter at 0x80033320 draws it: a POLY_GT4    */
 /* whose four corners carry the same colour.                                  */
 /* ------------------------------------------------------------------------- */
@@ -420,6 +464,62 @@ static u32 emit_counter(const q2_statusbar *b, u16 tpage, u16 clut,
     return emitted;
 }
 
+/* The two upper-right digit fields belong to the powerup timer alone. Unlike
+ * the three main counters they never flash, and their ICON field precedes them
+ * in the console's assembled record list (13, 14, 15). */
+static u32 emit_powerup_timer(const q2_statusbar *b, u16 tpage, u16 clut,
+                              psx_ot *ot, u32 bucket, int ox, int oy)
+{
+    const q2_icon_rect *r;
+    const q2_sbar_field *fi;
+    q2_icon_size is;
+    u8 seconds;
+    u32 emitted = 0;
+    int digit, first, last;
+
+    if (b->powerup_icon == Q2_SBAR_ICON_NONE)
+        return 0;
+
+    r = q2_icon_rect_get(b->icons, b->powerup_icon);
+    if (!r || (r->w == 1 && r->h == 1))
+        return 0;
+
+    fi = &q2_sbar_fields[Q2_SBAR_FIELD_UP_ICON];
+    is = q2_icon_draw_size_of(b->players, b->powerup_icon, r->w, r->h);
+    emitted += emit_cell(ot, bucket, tpage, pal_clut(b, r->id, clut),
+                         ox + b->anchor_x + fi->dx,
+                         oy + b->anchor_y + fi->dy,
+                         r->u, r->v, r->w, r->h, is.w, is.h);
+
+    /* The console's pickup duration is thirty seconds and the UI owns two
+     * numeral fields. A value below ten therefore occupies only the units
+     * field, keeping its right edge fixed just like the three main counters. */
+    seconds = b->powerup_seconds;
+    first = seconds >= 10 ? Q2_SBAR_FIELD_UP_DIGIT0
+                          : Q2_SBAR_FIELD_UP_DIGIT1;
+    last = Q2_SBAR_FIELD_UP_DIGIT1;
+    for (digit = first; digit <= last; digit++) {
+        const q2_sbar_field *fd = &q2_sbar_fields[digit];
+        u8 value = (digit == Q2_SBAR_FIELD_UP_DIGIT0) ? seconds / 10
+                                                       : seconds % 10;
+        q2_icon_size ds = q2_icon_draw_size_of(b->players, 1,
+                                                Q2_SBAR_DIGIT_W,
+                                                Q2_SBAR_DIGIT_H);
+
+        emitted += emit_cell(ot, bucket, tpage,
+                             pal_clut(b, Q2_SBAR_PAL_DIGITS, clut),
+                             ox + b->anchor_x + fd->dx,
+                             oy + b->anchor_y + fd->dy,
+                             (u8)(value * Q2_SBAR_DIGIT_PITCH),
+                             Q2_SBAR_DIGIT_V,
+                             Q2_SBAR_DIGIT_W, Q2_SBAR_DIGIT_H,
+                             (u8)(ds.w ? ds.w : Q2_SBAR_DIGIT_W),
+                             (u8)(ds.h ? ds.h : Q2_SBAR_DIGIT_H));
+    }
+
+    return emitted;
+}
+
 u32 q2_statusbar_build_ot(const q2_statusbar *b, u16 tpage, u16 clut,
                           psx_ot *ot, u32 bucket, int origin_x, int origin_y)
 {
@@ -508,6 +608,11 @@ u32 q2_statusbar_build_ot(const q2_statusbar *b, u16 tpage, u16 clut,
         n += emit_counter(b, tpage, clut, ot, bucket, origin_x, origin_y,
                           Q2_SBAR_ARMOUR, b->armour, b->armour_icon,
                           Q2_SBAR_LOW_AMMO, false, true);
+
+    /* The console invokes this before the pickup-caption sub-draw. It is an
+     * independent timer: an item caption cannot suppress it, and its source
+     * is the powerup expiry words rather than `last_item`. */
+    n += emit_powerup_timer(b, tpage, clut, ot, bucket, origin_x, origin_y);
 
     /*
      * The pickup caption's icon — field 16, from the fourth sub-draw at

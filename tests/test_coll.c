@@ -399,6 +399,66 @@ static void test_push_vector(void)
 }
 
 /* ------------------------------------------------------------------------- */
+/*
+ * The two contact slots, and which extreme each of them keeps.
+ *
+ * `ground_normal` keeps the largest SIGNED ny — the flattest floor of the frame.
+ * `last_normal` keeps the smallest |ny| — the most WALL-LIKE contact. They are
+ * different comparisons on purpose (0x80045318 vs 0x800453CC), and the second
+ * one is the port's only wall detector: the ladder flag, the velocity clip and
+ * the water-exit jump all read it.
+ *
+ * It is reset to (0, 4096, 0) once per tick, and 4096 is the largest |ny| a
+ * 1.3.12 unit normal can hold, so the sentinel is chosen to LOSE to the frame's
+ * first real contact. Keeping the largest |ny| instead — which this port did —
+ * makes the predicate unsatisfiable against its own sentinel and freezes the
+ * field on the flat floor that was never touched. Every one of its readers then
+ * silently does nothing, for the whole session.
+ */
+static void test_contact_slots(void)
+{
+    q2_collision c;
+    q2_move_ent  ent;
+    s16 delta[3];
+
+    printf("the two contact slots\n");
+    open_hull(&c, false);
+
+    memset(&ent, 0, sizeof(ent));
+    ent.pos[0] = 1500; ent.pos[1] = 500; ent.pos[2] = 500;
+    ent.node = 1;
+    ent.max_slope_ny = Q2_MAX_SLOPE_NY;
+
+    /* The per-tick reset the mover's caller applies (0x80045AC8). */
+    ent.last_normal[0] = 0; ent.last_normal[1] = 4096; ent.last_normal[2] = 0;
+
+    /* Straight into node 1's +X face at x = 2000, which is a vertical wall. */
+    delta[0] = 900; delta[1] = 0; delta[2] = 0;
+    q2_move_checked(&c, &ent, delta, 0, false, false, NULL, NULL, NULL);
+
+    check_eq_i(ent.last_normal[0], 4096,
+               "a wall contact replaces the flat sentinel in last_normal");
+    check_eq_i(ent.last_normal[1], 0,
+               "and its ny is zero, which is what makes it read as a wall");
+
+    /*
+     * And the sentinel must not be replaced by something FLATTER than itself.
+     * A second contact with a larger |ny| loses, so the frame's answer is the
+     * most wall-like surface it touched and not the last one it happened to
+     * touch.
+     */
+    ent.last_normal[0] = 0; ent.last_normal[1] = 4096; ent.last_normal[2] = 0;
+    ent.pos[0] = 1500; ent.pos[1] = 500; ent.pos[2] = 500;
+    ent.node = 1;
+
+    delta[0] = 0; delta[1] = 900; delta[2] = 0;   /* +Y is down: into the floor */
+    q2_move_checked(&c, &ent, delta, 0, false, false, NULL, NULL, NULL);
+
+    check_eq_i(ent.last_normal[1], 4096,
+               "a floor as flat as the sentinel does not displace it");
+}
+
+/* ------------------------------------------------------------------------- */
 static void test_step_move(void)
 {
     q2_collision c;
@@ -874,6 +934,7 @@ int main(void)
     test_move_through_portal();
     test_16bit_frame();
     test_push_vector();
+    test_contact_slots();
     test_step_move();
     test_box_sweep();
     test_world_sweep();

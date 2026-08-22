@@ -94,6 +94,10 @@
 #define Q2_SAVE_MAGIC      "Q2PS"
 
 /*
+ * 4 — the water life-support state joined the player chunk: accumulated air,
+ * its next deadline, and the every-other-warning latch. A save taken mid-dive
+ * must not return the player to the surface with a fresh breath.
+ *
  * 3 — the movement frame's own state joined the player chunk: the second flag
  * word, the view-recentre latch, and the three view kicks with their deadlines.
  *
@@ -105,7 +109,7 @@
  *
  * Version 1 was a flat format that stored a raw `q2_inventory`.
  */
-#define Q2_SAVE_VERSION    3   /* the BRKS chunk is additive: an older file
+#define Q2_SAVE_VERSION    4   /* the BRKS chunk is additive: an older file
                                * simply has none, and a reader that does not
                                * know the tag skips it — which is what the
                                * chunked format is for */

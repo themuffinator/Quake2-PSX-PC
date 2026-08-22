@@ -8834,14 +8834,13 @@ Three findings came out of it, and the first is the one with reach beyond this s
   deadline holds, at a position carried in the string. The port had it pushed into the four-slot ring,
   where it aged on the wrong clock, stacked under "Selected Blaster" and sat in the wrong corner.
 
-**Still not implemented, and read enough to say what it is:** the FIFTH sub-draw, `0x80035B38`, which fills
-the upper-RIGHT icon and the two digits beside it (fields 13, 14, 15). It walks the four powerup deadlines
-at `client+172/176/180/184` in order, takes the first still running, and shows the seconds left —
-`(deadline - now) / 300`, the divide by 300 done with the magic multiply `0x1B4E81B5 >> 37` — beside rect
-40, 41, 42 or 43, which are quad damage, invulnerability, the environment suit and the rebreather *by the
-same effect-id-is-rect-index rule above*. None active fills the field with rect 0 and draws nothing. It is a
-POWERUP TIMER rather than part of the pickup display, so it is left for its own pass rather than folded
-into this one.
+**Resolved — the fifth sub-draw is the upper-right powerup timer.** `0x80035B38` fills fields 13, 14 and
+15 from the four expiry words at `client+172/176/180/184`, walking them as quad, invulnerability,
+environment suit and rebreather. The first one whose unsigned deadline is strictly after the level clock
+wins, and its count is `(deadline - now) / 300` (the module uses the magic multiply `0x1B4E81B5 >> 37`).
+It selects rect 40, 41, 42 or 43 by that same memory-order index; no active deadline supplies rect 0 and
+draws nothing. The implementation is `q2_statusbar_powerup_state()` plus the status-bar emitter, kept
+separate from the upper-left pickup caption because the retail sub-draws are separate too.
 
 **And two item-path defects the same reading turned up:**
 

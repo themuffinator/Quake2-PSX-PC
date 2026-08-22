@@ -224,11 +224,9 @@ static q2_event_outcome run_item(q2_event_rt *rt, const q2_event_item *item)
             rt->mover_count++;
             return Q2_EVENT_OK;
         }
-        /*
-         * Deliberately inert. The s16 slots hold Scene node indices on disc and
-         * runtime object indices after a load-time pre-pass that has not been
-         * decoded, so acting on the disc values would move the wrong geometry.
-         */
+        /* A standalone runtime has no mover set to own this item. The playable
+         * client installs the callback above and resolves the immutable item
+         * offset through q2_movers_trigger_item instead. */
         rt->skipped_movers++;
         return Q2_EVENT_UNSUPPORTED;
 
@@ -259,8 +257,21 @@ static q2_event_outcome run_item(q2_event_rt *rt, const q2_event_item *item)
         }
         return Q2_EVENT_OK;
 
+    case Q2_EVOP_FX:
+        /*
+         * 0x80027840 only acts on the fixed, 8-byte form. Its target is the
+         * current player, a question this generic runtime cannot answer, so
+         * the owner gets the validated item and applies the damage.
+         */
+        if (q2_events_get_fx_damage(item, NULL, NULL)) {
+            rt->fx_count++;
+            if (rt->on_fx)
+                rt->on_fx(rt->on_fx_user, item);
+        }
+        return Q2_EVENT_OK;
+
     default:
-        /* FX, WAIT and anything else: recognised but not yet implemented.
+        /* WAIT and anything else: recognised but not yet implemented.
          * Counting them separately from movers would imply more certainty
          * about them than we have. */
         return Q2_EVENT_OK;

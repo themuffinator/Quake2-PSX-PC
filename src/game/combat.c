@@ -140,27 +140,27 @@ void q2_actor_from_player(q2_actor *a, const q2_inventory *inv,
      * 1 was docked a frag for being shot.
      */
     /*
-     * And so do the three CLIENT TIMERS, for the same reason and with a worse
-     * failure. `env_next` is client+0x94, the deadline that throttles acid and
-     * lava to once per 400 and once per 100 ticks; the invulnerability and
-     * protection deadlines are client+0xB0 and +0xB4. All three are properties
-     * of the player and not of a hit, and clearing them here made the throttle
+     * And so does the one CLIENT-ONLY timer which has no inventory field:
+     * `env_next` is client+0x94, the deadline that throttles acid and lava to
+     * once per 400 and once per 100 ticks. Clearing it here made that throttle
      * unobservable: a hazard volume calls this every tick, each call reset the
      * deadline it had just armed, and 20 points of lava landed thirty times a
      * second instead of three. Standing in it killed a full-health player
      * inside a fifth of a second, which is fast enough to look like the volume
      * test being wrong rather than the throttle being erased.
+     *
+     * The two protection deadlines are different. They ARE inventory state:
+     * client+0xB0 and +0xB4 are `invuln_until` and `enviro_until`, respectively.
+     * The damage actor is a projection of that client record, so carrying its
+     * stale copies back through this refresh silently made both pickups visual
+     * only. Reload them from the inventory below, every damage attempt.
      */
     owner   = a->owner;
     {
         s32 env     = a->env_next;
-        s32 invuln  = a->invuln_until;
-        s32 protect = a->protect_until;
 
         q2_actor_init(a);
         a->env_next      = env;
-        a->invuln_until  = invuln;
-        a->protect_until = protect;
     }
     a->owner = owner;
     if (pos) {
@@ -186,6 +186,8 @@ void q2_actor_from_player(q2_actor *a, const q2_inventory *inv,
     a->armour_class = 0;
     a->cells        = inv->ammo[Q2_AMMO_CELLS];
     a->gib_health   = -100;
+    a->invuln_until = inv->invuln_until;
+    a->protect_until = inv->enviro_until;
 }
 
 void q2_actor_to_player(const q2_actor *a, q2_inventory *inv)

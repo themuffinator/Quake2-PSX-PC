@@ -230,20 +230,22 @@ typedef struct q2_player {
     s32  fall_time;     /* client+0xD4, a level-clock deadline                */
 
     /*
-     * Water. The three fields 0x8003D254 keeps, which is the LAST call the
-     * player's frame makes (0x8003B00C) and which this port had no counterpart
-     * to at all — so entering and leaving water was silent.
+     * Water. The five fields 0x8003D254 keeps, which is the LAST call the
+     * player's frame makes (0x8003B00C). Entering and leaving water are edges;
+     * remaining submerged is a life-support clock with its own armour-bypassing
+     * damage path.
      *
      * `wade` counts consecutive ticks in shallow water and exists only so the
      * splash fires on the FIRST one; `water_air` is non-zero while submerged
-     * and is what makes leaving water an edge rather than a level. Retail also
-     * accumulates breath into `water_air` and drowns you on it (0x8003D300..
-     * 0x8003D448) — that half is a life-support subsystem rather than a
-     * movement one and is not implemented here, so this holds a plain latch.
+     * and is what makes leaving water an edge. While submerged it accumulates
+     * the engine's dt, is reset to one by a live rebreather, and scales the
+     * periodic drowning damage after its 300-tick deadline expires.
      */
     s32  wade;          /* client+0x80                                       */
     s32  water_air;     /* client+0x84                                       */
+    s32  water_next;    /* client+0x88, next breath/drowning pass            */
     s32  splash_time;   /* client+0xD8, a level-clock deadline                */
+    bool water_voice;   /* client+0xDF, every-other drowning pass emits sound */
 
     /*
      * The other two view kicks 0x80038260 composes, kept here because it reads
@@ -1424,6 +1426,12 @@ q2_fire_result_v2 q2_sim_fire(q2_sim *sim);
 /* Hurt the player, going through the same damage path everything else does. */
 q2_damage_result q2_sim_hurt_player(q2_sim *sim, q2_actor *attacker,
                                     s16 damage, s16 mod, const s32 point[3]);
+
+/* Apply a validated Events FX item to the current player. Returns false when
+ * the item is not the retail fixed-size FX form. The original leaves
+ * T_Damage's point argument uninitialised; this reproducible port uses NULL,
+ * so the hit has no invented directional knockback. */
+bool q2_sim_apply_event_fx(q2_sim *sim, const q2_event_item *item);
 
 /* The aim vector the fire functions read, built from the current view. 1.3.12,
  * which is the scale every weapon's own shift assumes. */

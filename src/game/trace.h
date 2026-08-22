@@ -70,10 +70,21 @@
 typedef struct q2_move_ent {
     s32 pos[3];            /* +0x00 */
     s16 ground_normal[3];  /* +0x0C: the contact normal with the largest ny   */
-    s16 last_normal[3];    /* +0x12: the contact normal with the largest |ny| */
+    /*
+     * +0x12: the contact with the SMALLEST |ny| — the most wall-like surface
+     * touched this frame, which is what makes this slot a wall detector rather
+     * than a second floor slot. It is reset to (0, 4096, 0) before each frame's
+     * moves precisely because 4096 is the largest |ny| there is, so the
+     * sentinel always loses to a real contact. 0x800453CC.
+     */
+    s16 last_normal[3];
     u32 flags;             /* +0x44 */
-    s16 max_slope_ny;      /* +0x48: the steepest ny that still counts as
-                            *        ground; compared with `<`               */
+    /*
+     * +0x48: the steepest ny that still counts as ground; compared with `<`.
+     * Q2_MAX_SLOPE_NY (2600) for every entity — 0x8006C1B0 writes it right
+     * after the allocator's memset, so it is never zero on the console.
+     */
+    s16 max_slope_ny;
     s32 node;              /* +0x4E: the cached collision cell               */
 } q2_move_ent;
 

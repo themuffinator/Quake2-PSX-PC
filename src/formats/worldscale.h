@@ -255,6 +255,30 @@ Q2PSX_INLINE s32 q2_world_snap(s32 v, s32 grid)
 #define Q2_STEP_HEIGHT_LOW  108
 
 /*
+ * The steepest surface that still counts as ground — entity+0x9C, compared with
+ * a strict `<` against the contact normal's ny.
+ *
+ * It is not a per-entity choice. The allocator at 0x8006C098 hands out a
+ * 768-byte slot from the entity array, zeroes it through the BIOS memset at
+ * 0x8006C18C, and then writes this:
+ *
+ *     8006C1B0  addiu v1, zero, 2600
+ *     8006C1B4  sh    v1, 156(v0)      ; entity+0x9C
+ *
+ * so every entity in the game starts with it. The player spawn at 0x8003B250
+ * calls that allocator and never overwrites +0x9C, which `access 0x9C`
+ * confirms — so the player keeps 2600. 2600/4096 is cos 50.6 degrees.
+ *
+ * This matters more than a slope limit sounds like it should, because three
+ * different rules read it: whether a move may declare ground, whether the jump
+ * thinks it has a floor, and whether the velocity clip runs at all. Left at
+ * zero — which is what a memset gives you, and what this port ran with — every
+ * surface with any upward component at all is standable, a 89-degree wall reads
+ * as a floor, and the clip never fires.
+ */
+#define Q2_MAX_SLOPE_NY    2600  /* 0x8006C1B0                                */
+
+/*
  * The player's half-extent, on every axis.
  *
  * This is the real hull, not a query margin — that question is now closed.

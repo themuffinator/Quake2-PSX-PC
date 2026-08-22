@@ -48,8 +48,14 @@
  *     0x08  s32  y
  *     0x0C  s32  z
  *     0x10  u16  angle      0..3958; 0/1015/2041/3068 dominate (INFERRED)
- *     0x12  u16  link       0xFFFF means none, in 482 of 673
- *     0x14  u16  flags      47 distinct values, UNKNOWN
+ *     0x12  u16  link       copied verbatim as the signed entity.target
+ *                           halfword by 0x8007E608/0x8007E614. 0xFFFF is
+ *                           the observed no-link sentinel (482 of 673).
+ *     0x14  u16  flags      map spawn flags. The entity filler at
+ *                           0x8007E61C masks this to its low nine bits and
+ *                           writes those into entity.spawnflags bits 18..26.
+ *                           Individual meanings are creature-defined (the
+ *                           Insane uses 0x08, 0x10, 0x40 and 0x80).
  *     0x16  u16  index      slot 0..323, not strictly monotonic, UNKNOWN
  *
  * Path record (path group only), 24 bytes:
@@ -97,6 +103,15 @@
 #define Q2_POP_LINK_NONE   0xFFFFu
 #define Q2_POP_TERM_FFFF   0xFFFFFFFFu
 
+/*
+ * The placement record's nine map-authored flag bits.  0x8007E61C clears
+ * entity.spawnflags bits 18..26, then ORs these bits there.  Do not promote
+ * this to an entity-class-specific enum: the same transport belongs to every
+ * creature, while the individual bits belong to its own module.
+ */
+#define Q2_POP_SPAWN_FLAGS_MASK   0x01FFu
+#define Q2_POP_SPAWN_FLAGS_SHIFT  18u
+
 typedef struct q2_pop_group {
     char name[13];
     u32  spawn_offset;   /* 0 when absent */
@@ -107,8 +122,8 @@ typedef struct q2_pop_spawn {
     u32 class_id;
     s32 x, y, z;
     u16 angle;
-    u16 link;
-    u16 flags;
+    u16 link;        /* verbatim source for q2_monster.target (signed) */
+    u16 flags;       /* low 9 -> q2_monster.spawnflags bits 18..26 */
     u16 index;
 } q2_pop_spawn;
 

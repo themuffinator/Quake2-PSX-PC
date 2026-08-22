@@ -421,6 +421,87 @@ static void test_armour_class_upkeep(void)
           "a shard after losing body armour draws the grey vest");
 }
 
+/* The fifth sub-draw, 0x80035B38: the three fields at the upper right are not
+ * part of the pickup caption. They are a first-live-deadline selector over the
+ * four powerup expiry words, with a strict unsigned expiry edge. */
+static void test_powerup_timer(void)
+{
+    q2_inventory inv;
+    q2_statusbar b;
+    q2_icon_tables icons;
+    psx_ot ot;
+    u32 with, without;
+
+    q2_inventory_init(&inv);
+    q2_statusbar_init(&b, NULL, 1);
+    b.ticks = 1200;
+
+    q2_statusbar_powerup_state(&b, &inv);
+    CHECK(b.powerup_icon == Q2_SBAR_ICON_NONE && b.powerup_seconds == 0,
+          "no live deadline leaves the upper-right timer blank");
+
+    /* Equality is expired: the retail code is `sltu now, deadline`, rather
+     * than a signed comparison or a <= test. */
+    inv.quad_until = (s32)b.ticks;
+    q2_statusbar_powerup_state(&b, &inv);
+    CHECK(b.powerup_icon == Q2_SBAR_ICON_NONE,
+          "the deadline tick itself is no longer active");
+
+    inv.quad_until     = (s32)(b.ticks + 30 * Q2_SBAR_POWERUP_SECONDS_TICKS);
+    inv.invuln_until   = (s32)(b.ticks + 12 * Q2_SBAR_POWERUP_SECONDS_TICKS);
+    inv.enviro_until   = (s32)(b.ticks + 8 * Q2_SBAR_POWERUP_SECONDS_TICKS);
+    inv.breather_until = (s32)(b.ticks + 5 * Q2_SBAR_POWERUP_SECONDS_TICKS);
+    q2_statusbar_powerup_state(&b, &inv);
+    CHECK(b.powerup_icon == Q2_SBAR_ICON_POWERUP_QUAD &&
+          b.powerup_seconds == 30,
+          "quad wins even when another live timer has less time left");
+
+    inv.quad_until = (s32)b.ticks;
+    q2_statusbar_powerup_state(&b, &inv);
+    CHECK(b.powerup_icon == Q2_SBAR_ICON_POWERUP_INVULN &&
+          b.powerup_seconds == 12,
+          "the walk advances to invulnerability once quad expires");
+
+    inv.invuln_until = (s32)(b.ticks + 1);
+    inv.enviro_until = (s32)b.ticks;
+    inv.breather_until = (s32)b.ticks;
+    q2_statusbar_powerup_state(&b, &inv);
+    CHECK(b.powerup_icon == Q2_SBAR_ICON_POWERUP_INVULN &&
+          b.powerup_seconds == 0,
+          "a fraction of a second is active and draws zero after flooring");
+
+    memset(&icons, 0, sizeof(icons));
+    icons.rect_count = Q2_ICON_COUNT;
+    icons.rect[0].u = 255; icons.rect[0].v = 255;
+    icons.rect[0].w = 1;   icons.rect[0].h = 1;
+    icons.rect[Q2_SBAR_ICON_POWERUP_QUAD].u = 64;
+    icons.rect[Q2_SBAR_ICON_POWERUP_QUAD].v = 96;
+    icons.rect[Q2_SBAR_ICON_POWERUP_QUAD].w = 32;
+    icons.rect[Q2_SBAR_ICON_POWERUP_QUAD].h = 24;
+    icons.rect[Q2_SBAR_ICON_POWERUP_QUAD].id = 8;
+
+    if (psx_ot_init(&ot, 64, 256) != Q2_OK) {
+        CHECK(0, "an ordering table for the powerup timer");
+        return;
+    }
+
+    q2_statusbar_init(&b, &icons, 1);
+    q2_statusbar_anchor(&b, 93, 201);
+    b.weapon = Q2_SBAR_WEAPON_NO_AMMO;
+    psx_ot_clear(&ot);
+    without = q2_statusbar_build_ot(&b, 1, 0, &ot, 8, 0, 0);
+
+    b.powerup_icon = Q2_SBAR_ICON_POWERUP_QUAD;
+    b.powerup_seconds = 30;
+    psx_ot_clear(&ot);
+    with = q2_statusbar_build_ot(&b, 1, 0, &ot, 8, 0, 0);
+    CHECK(with == without + 3,
+          "a two-digit powerup timer emits its icon and two numerals (%u vs %u)",
+          with, without);
+
+    psx_ot_free(&ot);
+}
+
 /*
  * The pickup caption's icon — field 16, filled by the fourth sub-draw at
  * `0x800359C0`.
@@ -505,6 +586,7 @@ int main(void)
     test_split_screen_sizes();
     test_armour_icon_select();
     test_armour_class_upkeep();
+    test_powerup_timer();
     test_pickup_icon();
 
     if (g_fail) {

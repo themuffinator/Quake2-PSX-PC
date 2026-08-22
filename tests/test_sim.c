@@ -53,6 +53,151 @@ static bool sound_raised(const q2_sim *sim, q2_ent_sound which)
     return false;
 }
 
+typedef struct fx_probe {
+    u32 count;
+    s16 mod;
+    s16 damage;
+} fx_probe;
+
+static void on_fx(void *user, const q2_event_item *item)
+{
+    fx_probe *probe = (fx_probe *)user;
+
+    if (!probe || !q2_events_get_fx_damage(item, &probe->mod,
+                                            &probe->damage))
+        return;
+    probe->count++;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Opcode 0x13 is not an effect-group: the retail dispatcher turns it directly
+ * into T_Damage for the player who entered the record. Its eight-byte shape is
+ * confirmed by all seven PAL items; this one is WASTE3's mod 0, damage 65. */
+static void test_script_fx_damage(void)
+{
+    static const u8 raw[] = {
+        12, 0, 1, 0,             /* one 12-byte record */
+        Q2_EVOP_FX, 8,           /* opcode + fixed item length */
+        0, 0, 65, 0, 0xF8, 0x77 /* mod, damage, unused tail */
+    };
+    q2_events events;
+    q2_event_rt rt;
+    q2_event_item item;
+    fx_probe probe;
+    q2_sim sim;
+    s32 spawn[3] = { 0, 0, 0 };
+    s16 health;
+
+    printf("script FX damage\n");
+    memset(&events, 0, sizeof(events));
+    memset(&probe, 0, sizeof(probe));
+    events.data         = raw;
+    events.size         = sizeof(raw);
+    events.record_count = 1;
+    events.first_record = 0;
+
+    check(q2_event_rt_init(&rt, &events) == Q2_OK,
+          "the fixed-size FX record starts a runtime");
+    rt.on_fx      = on_fx;
+    rt.on_fx_user = &probe;
+    check(q2_event_rt_trigger(&rt, 0), "the FX record queues");
+    check(q2_event_rt_update(&rt) == Q2_EVENT_OK,
+          "the FX record completes without changing zones");
+    check_eq_i(rt.fx_count, 1, "the runtime records the decoded FX");
+    check_eq_i(probe.count, 1, "the FX callback receives it");
+    check_eq_i(probe.mod, Q2_MOD_NONE, "FX reads its signed mod at payload +0");
+    check_eq_i(probe.damage, 65, "FX reads its signed damage at payload +2");
+    q2_event_rt_free(&rt);
+
+    item.op      = Q2_EVOP_FX;
+    item.opcode  = Q2_EVOP_FX;
+    item.len     = 8;
+    item.offset  = 4;
+    item.payload = raw + 6;
+
+    q2_sim_init(&sim, NULL, 50);
+    q2_sim_spawn(&sim, spawn, 0);
+    sim.combat.inv.armour = 0;
+    health = sim.combat.inv.health;
+    check(q2_sim_apply_event_fx(&sim, &item),
+          "a retail-form FX item reaches the player damage path");
+    check_eq_i(sim.combat.inv.health, health - 65,
+               "WASTE3's FX takes its complete 65 health points");
+    check_eq_i(sim.combat.self.last_attacker, -1,
+               "script FX is a world hit, never credited to a player");
+
+    item.len = 4;
+    check(!q2_sim_apply_event_fx(&sim, &item),
+          "a non-retail FX length is rejected before it can damage");
+    check_eq_i(sim.combat.inv.health, health - 65,
+               "the rejected FX leaves health unchanged");
+}
+
+/* ------------------------------------------------------------------------- */
+/* The original's underwater timer is a separate life-support system, not a
+ * variant of the shallow-water movement flags. It uses the level dt, bypasses
+ * armour with MOD 8, and a rebreather resets air rather than blocking damage. */
+static void test_underwater_air(void)
+{
+    q2_sim sim;
+    q2_input in;
+    s32 spawn[3] = { 0, 0, 0 };
+    s16 health;
+    int i;
+
+    printf("underwater air\n");
+    memset(&in, 0, sizeof(in));
+    q2_sim_init(&sim, NULL, 50);
+    q2_sim_spawn(&sim, spawn, 0);
+    sim.player[0].ground_y = INT32_MAX;
+    sim.env_flags = Q2_ENT_UNDERWATER;
+    sim.combat.inv.armour = 200;
+    health = sim.combat.inv.health;
+
+    /* Twelve hundred dt units is where `air >> 10` first becomes one on the
+     * 300-tick drowning pass. Armour must not absorb MOD 8. */
+    for (i = 0; i < 130; i++)
+        q2_sim_tick(&sim, &in, Q2_DT_NOMINAL);
+    check(sim.player[0].water_air >= 1200,
+          "submersion accumulates the engine dt into air");
+    check(sim.combat.inv.health < health,
+          "the drowning clock eventually applies damage");
+    check_eq_i(sim.combat.inv.armour, 200,
+               "drowning bypasses armour through MOD 8");
+
+    /* A new life starts a fresh breath and splash sequence.  This also makes
+     * command-line placement in an authored water volume deterministic. */
+    sim.player[0].wade        = 4;
+    sim.player[0].water_air   = 4096;
+    sim.player[0].water_next  = 9000;
+    sim.player[0].splash_time = 8000;
+    sim.player[0].water_voice = true;
+    q2_sim_spawn(&sim, spawn, 0);
+    check_eq_i(sim.player[0].wade, 0,
+               "spawning clears the shallow-water edge latch");
+    check_eq_i(sim.player[0].water_air, 0,
+               "spawning clears the previous life's air counter");
+    check_eq_i(sim.player[0].water_next, 0,
+               "spawning clears the previous life's drowning deadline");
+    check_eq_i(sim.player[0].splash_time, 0,
+               "spawning clears the previous life's splash cooldown");
+    check(!sim.player[0].water_voice,
+          "spawning clears the alternating drowning-voice latch");
+
+    q2_sim_init(&sim, NULL, 50);
+    q2_sim_spawn(&sim, spawn, 0);
+    sim.player[0].ground_y = INT32_MAX;
+    sim.env_flags = Q2_ENT_UNDERWATER;
+    sim.combat.inv.breather_until = 100000;
+    health = sim.combat.inv.health;
+    for (i = 0; i < 400; i++)
+        q2_sim_tick(&sim, &in, Q2_DT_NOMINAL);
+    check_eq_i(sim.player[0].water_air, 1,
+               "a live rebreather resets air to the retail sentinel");
+    check_eq_i(sim.combat.inv.health, health,
+               "a live rebreather prevents drowning damage");
+}
+
 /* ------------------------------------------------------------------------- */
 static void test_tick_rate(void)
 {
@@ -1639,6 +1784,8 @@ int main(void)
 {
     printf("Q2PSX-PC simulation tests\n\n");
 
+    test_script_fx_damage();
+    test_underwater_air();
     test_autoswitch();
     test_tick_rate();
     test_gravity();

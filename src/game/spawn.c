@@ -160,6 +160,36 @@ q2_result q2_spawn_from_population(q2_monster_set *out, const q2_population *pop
             m->health     = Q2_SPAWN_DEFAULT_HEALTH;
             m->max_health = Q2_SPAWN_DEFAULT_HEALTH;
             m->gib_health = -Q2_SPAWN_DEFAULT_HEALTH / 2;
+
+            /*
+             * AND THE OTHER HALFWORD THE FILLER CARRIES.  0x8007E608 loads
+             * Population.spawn.link and 0x8007E614 stores it straight into
+             * entity+0x16: there is no sentinel conversion.  In particular,
+             * the common 0xFFFF arrives as signed -1.  `monster_start_go`
+             * deliberately tests `target > 0`, while an individual module
+             * may inspect the raw non-zero value for a different purpose.
+             */
+            m->target = (s16)rec.link;
+
+            /*
+             * THE MAP'S SPAWN FLAGS ARE NOT A MODULE DETAIL.
+             *
+             * Before the module's spawn export runs, 0x8007E61C..0x8007E62C
+             * copies the low nine bits of Population.spawn.flags into bits
+             * 18..26 of entity+0x1C:
+             *
+             *   flags = (flags & 0xF803FFFF) | ((record.flags & 0x1FF) << 18)
+             *
+             * The high seven source bits are deliberately discarded.  The
+             * preserved part contains ordinary entity state, including the
+             * in-use bit which is raised below.  This is shared placement
+             * state, not a special case for the Insane: its spawn code is
+             * simply the first module whose four variants make the missing
+             * hand-off conspicuous.
+             */
+            m->spawnflags = (m->spawnflags & 0xF803FFFFu) |
+                            (((u32)rec.flags & Q2_POP_SPAWN_FLAGS_MASK)
+                             << Q2_POP_SPAWN_FLAGS_SHIFT);
             m->in_use     = true;
             m->spawnflags |= Q2_SVFLAG_INUSE;
 

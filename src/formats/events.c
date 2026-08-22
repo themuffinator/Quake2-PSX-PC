@@ -279,3 +279,21 @@ bool q2_events_get_call_index(const q2_event_item *item, u8 *index_out)
 
     return true;
 }
+
+bool q2_events_get_fx_damage(const q2_event_item *item, s16 *mod_out,
+                             s16 *damage_out)
+{
+    /* 0x80027840 rejects every size except 8 before it reads either operand.
+     * The parser always supplies a payload for a valid item, but retaining the
+     * guard makes this safe for callers that construct an item for a test. */
+    if (!item || item->opcode != Q2_EVOP_FX || item->len != 8 ||
+        !item->payload)
+        return false;
+
+    if (mod_out)
+        *mod_out = q2_rd_s16(item->payload);
+    if (damage_out)
+        *damage_out = q2_rd_s16(item->payload + 2);
+
+    return true;
+}

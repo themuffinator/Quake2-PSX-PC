@@ -841,6 +841,11 @@ static void write_player(wbuf *w, const q2_save *s)
     w_s32(w, p->pain_time);
     w_s16(w, p->prev_health);
     w_s16(w, p->prev_armour);
+    w_s32(w, p->wade);
+    w_s32(w, p->water_air);
+    w_s32(w, p->water_next);
+    w_s32(w, p->splash_time);
+    w_bool(w, p->water_voice);
 
     write_move_ent(w, &p->ent);
 
@@ -883,6 +888,11 @@ static void read_player(rbuf *r, q2_save *s)
     p->pain_time  = r_s32(r);
     p->prev_health = r_s16(r);
     p->prev_armour = r_s16(r);
+    p->wade        = r_s32(r);
+    p->water_air   = r_s32(r);
+    p->water_next  = r_s32(r);
+    p->splash_time = r_s32(r);
+    p->water_voice = r_bool(r);
 
     read_move_ent(r, &p->ent);
 }

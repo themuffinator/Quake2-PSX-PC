@@ -8,19 +8,18 @@
  * ---------------------------------------------------------------------------
  * What works and what does not, and why
  * ---------------------------------------------------------------------------
- * WORKS: trigger, enable, disable, zone gates, and therefore level progression
- * and teleports. These handlers operate purely on record offsets, which are
- * on-disc data that events.h already decodes correctly.
+ * WORKS: trigger, enable, disable, zone gates, movers, direct script damage,
+ * and therefore level progression, teleports, doors and lifts. The generic
+ * runtime reports the owner-specific operations through callbacks; the client
+ * installs those callbacks when it owns the matching mover and simulation
+ * sets.
  *
- * DOES NOT WORK: doors and lifts. Not because the opcodes are unknown — 0x03,
- * 0x04 and 0x05 are identified as movers — but because the s16 slots inside a
- * mover item hold a Scene NODE index on disc and a RUNTIME OBJECT index after
- * load. The engine rewrites those bytes in place during a load-time pre-pass
- * that has not been decoded. Executing a mover against the disc values would
- * move the wrong thing, so the runtime records the intent and does nothing.
- *
- * That is a deliberate choice. A mover that visibly moves the wrong geometry is
- * harder to notice, and harder to debug, than one that plainly does not run.
+ * Mover operands are Scene-node indices on disc and runtime-object indices
+ * after the console's load-time pre-pass. The port deliberately does not
+ * reproduce that in-place rewrite: mover.h builds its own objects from the
+ * pristine data, then the callback keys them by the item's immutable chunk
+ * offset. That preserves the retail mapping without making borrowed Events
+ * bytes mutable.
  *
  * ---------------------------------------------------------------------------
  * Mutable state
@@ -43,7 +42,7 @@
 typedef enum q2_event_outcome {
     Q2_EVENT_OK = 0,
     Q2_EVENT_ZONE_CHANGE,   /* a zone gate fired; see pending_zone */
-    Q2_EVENT_UNSUPPORTED    /* a mover was reached and skipped     */
+    Q2_EVENT_UNSUPPORTED    /* an owner-specific item had no hook  */
 } q2_event_outcome;
 
 typedef struct q2_event_rt {
@@ -114,6 +113,18 @@ typedef struct q2_event_rt {
     void  *on_explosive_user;
 
     u32   explosive_count;   /* FXGROUP items the runtime has reached */
+
+    /*
+     * An FX opcode — direct T_Damage from a script rather than an effect
+     * group. The operands are native to Events, but its target is the live
+     * player, so the runtime reports it to its simulation owner. Unlike the
+     * graphical-sounding name suggests, the seven PAL-disc items are hazards:
+     * lava in BIGGUN and a 65-point world hit in WASTE3.
+     */
+    void (*on_fx)(void *user, const q2_event_item *item);
+    void  *on_fx_user;
+
+    u32   fx_count;          /* valid FX items the runtime has reached */
 
     /*
      * ABORT THE REST OF THIS RECORD — the engine's own `gp[0x423C]`.
