@@ -246,11 +246,16 @@ static const q2_uf_prim_info uf_table[Q2_UF_PRIM_COUNT] = {
     {28, 1, Q2_UF_OP_U8,       "time_a", "written to obj+0x4C UNSCALED"},
     {29, 1, Q2_UF_OP_U8,       "time_b", "* 300; 0xFF => never"}}},
 
-{Q2_UF_PISTON, "PISTON", 20, true, true, 4, {
-    {5,  1, Q2_UF_OP_U8,      "param_a", "obj+0x3A"},
-    {6,  1, Q2_UF_OP_U16,     "param_b", "obj+0x44"},
-    {8,  1, Q2_UF_OP_OBJSLOT, "object",  NULL},
-    {16, 1, Q2_UF_OP_U16,     "time",    "obj+0x4E, UNSCALED"}}},
+{Q2_UF_PISTON, "PISTON", 20, true, true, 6, {
+    {4,  1, Q2_UF_OP_U8,      "axis", "low two bits -> obj+0x50 bits 14..15"},
+    {5,  1, Q2_UF_OP_U8,      "speed", "obj+0x3A"},
+    {6,  1, Q2_UF_OP_S16,     "target", "obj+0x44"},
+    {8,  4, Q2_UF_OP_OBJSLOT, "objects",
+     "FOUR slots at +8/+10/+12/+14; the constructor loops over all four"},
+    {16, 1, Q2_UF_OP_U16,     "time", "obj+0x4E, UNSCALED"},
+    {18, 1, Q2_UF_OP_S16,     "pusher",
+     "zero leaves obj+0x28 NULL; non-zero allocates the pusher that runs "
+     "0x80051EC0's carry/rollback/crush path"}}},
 
 /* ---- buttons and breakables -------------------------------------------- */
 {Q2_UF_ROTBUTTON, "ROTBUTTON", 12, true, true, 2, {

@@ -97,6 +97,9 @@ static q2_mover *mover_push(q2_mover_set *set)
         m->portal_node = -1;
         m->partner     = -1;
         m->wait_timer  = Q2_MOVER_WAIT_NEVER;
+        /* Every normal mover constructor allocates its +0x28 pusher. PISTON
+         * overwrites this from item[+18]'s explicit gate below. */
+        m->blocks_player = 1;
         /* A mover starts fully closed, so its portal starts sealed. */
         m->sealed      = 1;
         m->sound_pending = Q2_MVSND_NONE;
@@ -652,19 +655,16 @@ q2_result q2_movers_build_calls(q2_mover_set *out, const q2_events *events,
 
             case Q2_UF_PISTON:
                 m->silent = 1;          /* see DISH above */
-                /* A crusher. `time` is UNSCALED, which is the table's word for
-                 * it and the reason it is not multiplied here. */
+                /* 0x8002D114 copies the low two axis bits, then walks ALL
+                 * four slots. Its signed +18 word is a pusher gate: only a
+                 * non-zero value calls 0x800555D8 and stores the resulting
+                 * object at +0x28 for the per-frame 0x80051EC0 call. */
+                m->axis       = p[4] & 3u;
                 m->speed      = p[5];
-                m->target     = (s16)q2_rd_u16(p + 6);
-                m->node[0]    = q2_rd_s16(p + 8);
-                m->part_count = (m->node[0] >= 0) ? 1 : 0;
+                m->target     = q2_rd_s16(p + 6);
+                collect_nodes(m, p, 8);
                 m->wait_timer = q2_rd_u16(p + 16);
-                /*
-                 * "A crusher does not stop for you" was this port's reading,
-                 * not the console's: PISTON's constructor (0x8002D114) installs
-                 * no obstruction override, and only MOVER_A's arm sets one. It
-                 * stops like everything else.
-                 */
+                m->blocks_player = q2_rd_s16(p + 18) != 0;
                 break;
 
             default:
@@ -962,8 +962,11 @@ u32 q2_movers_tick(q2_mover_set *set, s32 dt, u16 player_keys)
  * Would this mover's next step run into something, and is it allowed to?
  *
  * 0x80025CBC. The direction decides which bit of `block_flags` exempts it: bit
- * 0 while opening, bit 1 while closing. A PISTON has both — it is a crusher —
- * and everything else has neither, so an ordinary door stops.
+ * 0 while opening, bit 1 while closing. Only MOVER_A installs the opening bit;
+ * pusher-enabled CALL movers leave both clear and therefore enter the blocked
+ * state after a failed carry. The crusher damage is the generic 0x80051E74
+ * rollback path, not an obstruction-ignore bit. A zero-gate PISTON owns no
+ * pusher, so it never asks this question in the first place.
  */
 static bool mover_obstructed(q2_mover_set *set, u32 index, q2_mover *m,
                              s32 step, q2_mover_blocked_fn blocked, void *user)
@@ -971,7 +974,7 @@ static bool mover_obstructed(q2_mover_set *set, u32 index, q2_mover *m,
     u8  exempt;
     s32 sweep[3];
 
-    if (!blocked || step == 0)
+    if (!m->blocks_player || !blocked || step == 0)
         return false;
 
     mover_step_vec(m, step, sweep);
@@ -991,7 +994,7 @@ static bool mover_obstructed(q2_mover_set *set, u32 index, q2_mover *m,
     }
 
     if (m->block_flags & exempt)
-        return false;               /* a crusher does not care */
+        return false;               /* this MOVER_A arm does not care */
 
     if (m->state != Q2_MV_BLOCKED) {
         m->saved_state = m->state;

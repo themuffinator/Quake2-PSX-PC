@@ -225,7 +225,7 @@ typedef enum q2_uf_prim {
     Q2_UF_GLASS,          /* breakable; also the object's damage callback     */
     Q2_UF_DISH,           /* one-shot timed object                            */
     Q2_UF_B3ROCKS,        /* timed object + two global object pointers        */
-    Q2_UF_PISTON,         /* crusher; installs its own per-frame tick         */
+    Q2_UF_PISTON,         /* linear piston; +18 optionally installs a pusher */
     Q2_UF_LOADMAP,        /* change level                                     */
     Q2_UF_INSECRET,       /* secret found: message, sound, counter++          */
     Q2_UF_CREBATCH,       /* spawn a Population group by name                 */

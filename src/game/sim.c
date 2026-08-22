@@ -873,8 +873,10 @@ q2_result q2_sim_attach_movers(q2_sim *sim, const q2_mover_set *set,
     mover_targets_drop(sim);
 
     if (set && scene) {
-        for (i = 0; i < set->count; i++)
-            parts += set->movers[i].part_count;
+        for (i = 0; i < set->count; i++) {
+            if (set->movers[i].blocks_player)
+                parts += set->movers[i].part_count;
+        }
     }
 
     if (parts == 0) {
@@ -912,6 +914,9 @@ q2_result q2_sim_attach_movers(q2_sim *sim, const q2_mover_set *set,
     out = 0;
     for (i = 0; i < set->count; i++) {
         const q2_mover *m = &set->movers[i];
+
+        if (!m->blocks_player)
+            continue;
 
         for (p = 0; p < m->part_count && out < parts; p++) {
             q2_move_target *t = &sim->volumes[out];
@@ -1004,6 +1009,9 @@ void q2_sim_movers_update(q2_sim *sim, const q2_mover_set *set)
     for (i = 0; i < set->count; i++) {
         const q2_mover *m = &set->movers[i];
 
+        if (!m->blocks_player)
+            continue;
+
         for (p = 0; p < m->part_count && out < sim->mover_count; p++, out++) {
             q2_move_target *t    = &sim->volumes[out];
             const s32      *base = &sim->mover_base[out * 6u];
@@ -1064,6 +1072,63 @@ void q2_sim_movers_update(q2_sim *sim, const q2_mover_set *set)
             }
         }
     }
+}
+
+/* ------------------------------------------------------------------------- */
+/* A moving volume carries, or crushes, the player -- 0x80046234/0x80051E74 */
+/* ------------------------------------------------------------------------- */
+bool q2_sim_mover_push(q2_sim *sim, const s32 step[3])
+{
+    q2_player *p;
+    s16        delta[3];
+    s32        saved_pos[3];
+    s32        saved_node;
+    int        k;
+
+    if (!sim || !step)
+        return true;
+
+    p = &sim->player[sim->cur_player];
+    for (k = 0; k < 3; k++)
+        delta[k] = (s16)step[k];
+
+    /* The retail helper is reached only after a level collision context has
+     * been installed.  Keep the no-hull harness useful, though: without a
+     * world there is nothing that can pin the carried player. */
+    if (!sim->coll_ready) {
+        for (k = 0; k < 3; k++)
+            p->ent.pos[k] += delta[k];
+    } else {
+        /* 0x800462B8 saves these three words and 0x8004638C saves the cached
+         * cell.  The failed move's contact state is deliberately NOT restored:
+         * the console restores only this position/cell quartet. */
+        for (k = 0; k < 3; k++)
+            saved_pos[k] = p->ent.pos[k];
+        saved_node = p->ent.node;
+
+        /* 0x80046350 passes the {0, 0} mode at 0x800AE930 to 0x800456B0:
+         * collision only, no grounded step, unstick or entity retry. */
+        if (!q2_move_checked(&sim->coll, &p->ent, delta, 0, false, false,
+                             NULL, NULL, NULL)) {
+            for (k = 0; k < 3; k++)
+                p->ent.pos[k] = saved_pos[k];
+            p->ent.node = saved_node;
+            return false;
+        }
+    }
+
+    p->pos[0] = p->ent.pos[0];
+    p->pos[1] = q2_sim_feet_y(p->ent.pos[1]);
+    p->pos[2] = p->ent.pos[2];
+    p->on_ground = (p->ent.flags & Q2_ENT_GROUNDED_MASK) != 0;
+    sim->current_node = p->ent.node;
+    return true;
+}
+
+q2_damage_result q2_sim_mover_crush(q2_sim *sim)
+{
+    return q2_sim_hurt_player(sim, NULL, Q2_MOVER_CRUSH_DAMAGE,
+                               Q2_MOD_CRUSH, NULL);
 }
 
 /*

@@ -1492,6 +1492,8 @@ static bool client_mover_blocked(u32 index, const s32 step[3], void *user)
 
     if (!c->movers_ready || index >= c->movers.count)
         return false;
+    if (!c->movers.movers[index].blocks_player)
+        return false;
     if (!c->sim[0].mover_count)
         return false;
 
@@ -1547,6 +1549,22 @@ static bool client_mover_blocked(u32 index, const s32 step[3], void *user)
         if (phi[1] <= mt->min[1] + Q2_STEP_HEIGHT)
             continue;
 
+        /*
+         * 0x800519B0 does not simply reject the step. It first sends every
+         * overlap through 0x80046234 by the mover's complete three-vector.
+         * The push either frees the volume (so it can commit this tick) or is
+         * rolled back; only the latter reaches 0x80051E74's 30-point
+         * MOD_CRUSH T_Damage.  Returning "blocked" without this attempt made
+         * every pusher a static stop and discarded the generic crush arm.
+         */
+        if (q2_sim_mover_push(&c->sim[0], step)) {
+            /* A multi-part door can meet the player again on its next part;
+             * test the carried origin, not the box from before the push. */
+            client_player_box(c, plo, phi);
+            continue;
+        }
+
+        q2_sim_mover_crush(&c->sim[0]);
         return true;
     }
 

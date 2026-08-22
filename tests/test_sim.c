@@ -1130,6 +1130,71 @@ static bool open_box_hull(q2_collision *out)
     return q2_collision_parse(out, &zf, Q2_COLL_SECONDARY) == Q2_OK;
 }
 
+/* ------------------------------------------------------------------------- */
+/* PISTON's +18 word gates its pusher; all four slots remain visual parts. */
+static void test_piston_decode(void)
+{
+    static const u8 funcs[16] = {
+        1, 0, 0, 0, 'P', 'I', 'S', 'T', 'O', 'N', 0, 0, 0, 0, 0, 0
+    };
+    u8 raw[32];
+    q2_userfuncs uf;
+    q2_events events;
+    q2_mover_set set;
+
+    printf("piston decode\n");
+
+    memset(raw, 0, sizeof(raw));
+    /* Events header: no directory, then one 24-byte record at +8. */
+    hwr16(raw + 8, 24);
+    raw[10] = 1;
+    raw[12] = Q2_EVOP_CALL;
+    raw[13] = 20;
+    /* raw+14 is UserFuncs index zero and raw+15 the CALL pad. */
+    raw[16] = 2;              /* +4: axis, deliberately not the old Y default */
+    raw[17] = 10;             /* +5: speed */
+    hwr16(raw + 18, (u16)-314); /* +6: signed target */
+    hwr16(raw + 20, 115);     /* +8 */
+    hwr16(raw + 22, 129);     /* +10 */
+    hwr16(raw + 24, (u16)-1); /* +12 */
+    hwr16(raw + 26, (u16)-1); /* +14 */
+    hwr16(raw + 28, 1);       /* +16: time */
+    hwr16(raw + 30, 0);       /* +18: no pusher */
+
+    memset(&uf, 0, sizeof(uf));
+    uf.data  = funcs;
+    uf.size  = (u32)sizeof(funcs);
+    uf.count = 1;
+    memset(&events, 0, sizeof(events));
+    events.data         = raw;
+    events.size         = (u32)sizeof(raw);
+    events.record_count = 1;
+    events.first_record = 8;
+    memset(&set, 0, sizeof(set));
+
+    check(q2_movers_build_calls(&set, &events, &uf, NULL, NULL) == Q2_OK,
+          "a PISTON call decodes");
+    check_eq_i(set.count, 1, "and produces one visual mover");
+    if (set.count) {
+        check_eq_i(set.movers[0].axis, 2, "PISTON keeps its authored axis bits");
+        check_eq_i(set.movers[0].target, -314, "and keeps its signed target");
+        check_eq_i(set.movers[0].part_count, 2, "and reads all populated object slots");
+        check_eq_i(set.movers[0].node[0], 115, "its first visual node survives");
+        check_eq_i(set.movers[0].node[1], 129, "its second visual node survives");
+        check(!set.movers[0].blocks_player,
+              "a zero +18 leaves the PISTON without a collision pusher");
+    }
+    q2_movers_free(&set);
+
+    hwr16(raw + 30, 1);
+    memset(&set, 0, sizeof(set));
+    check(q2_movers_build_calls(&set, &events, &uf, NULL, NULL) == Q2_OK,
+          "a pusher-enabled PISTON call decodes");
+    check(set.count && set.movers[0].blocks_player,
+          "a non-zero +18 enables the collision pusher");
+    q2_movers_free(&set);
+}
+
 static void test_hull_movement(void)
 {
     q2_sim sim;
@@ -1236,6 +1301,60 @@ static void test_hull_movement(void)
     check_eq_i(sim.player[0].ent.pos[1], HULL_SY, "back on the floor plane");
 
     /* q2_collision borrows the chunk it was parsed from; nothing to release. */
+    sim.coll_ready = false;
+}
+
+/* ------------------------------------------------------------------------- */
+/* 0x80046234 is not an obstruction test: it first tries to carry the player. */
+static void test_mover_push(void)
+{
+    q2_sim sim;
+    s32 spawn[3];
+    s32 step[3] = { 180, 0, 0 };
+    s32 before;
+    s16 health;
+
+    printf("mover push and crush\n");
+
+    q2_sim_init(&sim, NULL, 50);
+    if (!open_box_hull(&sim.coll)) {
+        check(false, "the synthetic hull parses for a mover push");
+        return;
+    }
+    sim.coll_ready = true;
+
+    spawn[0] = 2000;
+    spawn[1] = q2_sim_feet_y(HULL_SY / 2);
+    spawn[2] = 2000;
+    q2_sim_spawn(&sim, spawn, 0);
+
+    check(q2_sim_mover_push(&sim, step),
+          "a mover carries a player when the destination is clear");
+    check_eq_i(sim.player[0].ent.pos[0], 2180,
+               "the carry uses the full mover X step");
+    check_eq_i(sim.player[0].pos[0], 2180,
+               "and synchronises the feet-space player position");
+
+    /* A pusher does not leave a partly slid player embedded in the wall. The
+     * retail helper restores the origin and lets its caller deal MOD_CRUSH. */
+    sim.player[0].ent.pos[0] = HULL_SX - 100;
+    sim.player[0].pos[0]     = HULL_SX - 100;
+    sim.player[0].ent.node   = 0;
+    before = sim.player[0].ent.pos[0];
+    check(!q2_sim_mover_push(&sim, step),
+          "a pinned player vetoes the mover instead of receiving a partial push");
+    check_eq_i(sim.player[0].ent.pos[0], before,
+               "a failed carry restores the entity origin");
+    check_eq_i(sim.player[0].pos[0], before,
+               "and leaves the feet-space origin in lockstep");
+
+    health = sim.combat.inv.health;
+    q2_sim_mover_crush(&sim);
+    check_eq_i(sim.combat.inv.health, health - Q2_MOVER_CRUSH_DAMAGE,
+               "the mover rollback deals the retail 30 points of crush damage");
+    check_eq_i(sim.combat.self.last_mod, Q2_MOD_CRUSH,
+               "and records MOD_CRUSH rather than inventing knockback");
+
     sim.coll_ready = false;
 }
 
@@ -1565,6 +1684,7 @@ static void test_train(void)
     m.target      = 32516;    /* isqrt of the above, TRUNCATED to s16 */
     m.speed       = 4;
     m.axis        = 1;
+    m.blocks_player = 1;
     m.wait_timer  = Q2_MOVER_WAIT_NEVER;
     m.wait_reset  = Q2_MOVER_WAIT_NEVER;
     m.sound_pending = Q2_MVSND_NONE;
@@ -1798,7 +1918,9 @@ int main(void)
     test_ground_projection();
     test_liquid();
     test_fall_damage();
+    test_piston_decode();
     test_hull_movement();
+    test_mover_push();
     test_ease_boundary();
     test_variable_dt();
     test_four_players();

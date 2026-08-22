@@ -1080,7 +1080,9 @@ bool q2_sim_next_blast(q2_sim *sim, s32 out[3]);
  */
 
 /*
- * Put a zone's DOORS AND LIFTS into the move world, so they are solid.
+ * Put a zone's pusher-enabled doors and lifts into the move world, so they are
+ * solid. Visual-only movers (including PAL PISTON calls with +18 == 0) are not
+ * registered.
  *
  * One target per Scene node each mover translates, taking the node record's
  * raw bbox — 0x800555D8 copies `scene_node_record + 16`, six s32, verbatim, so
@@ -1106,6 +1108,24 @@ q2_result q2_sim_attach_movers(q2_sim *sim, const q2_mover_set *set,
  * Call once per tick, immediately after q2_movers_tick.
  */
 void q2_sim_movers_update(q2_sim *sim, const q2_mover_set *set);
+
+/*
+ * 0x80046234 and the 0x80051E74 damage arm: when a moving volume reaches a
+ * player, retail first tries to carry that player by the volume's complete
+ * three-axis step.  This is deliberately a plain collision move -- no step
+ * sequence, no slide retries and no other mover sweep.  If it cannot complete,
+ * the origin is restored and the mover's generic rollback damages the blocker
+ * for thirty points with MOD_CRUSH.
+ *
+ * The boolean is the first half: true means the player was carried and the
+ * mover may commit its step; false means the caller must veto that step.  Keep
+ * the damage as a separate entry because one mover can own several boxes and
+ * retail damages only after its whole attempted move has rolled back.
+ */
+bool q2_sim_mover_push(q2_sim *sim, const s32 step[3]);
+
+#define Q2_MOVER_CRUSH_DAMAGE 30
+q2_damage_result q2_sim_mover_crush(q2_sim *sim);
 
 /*
  * Attach the map's trigger volumes and event script.

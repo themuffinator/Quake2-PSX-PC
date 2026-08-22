@@ -284,6 +284,15 @@ typedef struct q2_mover {
     u8  axis;           /* 0 = X, 1 = Y, 2 = Z */
 
     /*
+     * Whether this mover owns the retail +0x28 pusher object and therefore
+     * puts its parts in the collision world.  The ordinary mover constructors
+     * all do; PISTON takes this from its signed item[+18] gate.  The PAL disc's
+     * thirteen PISTON calls all leave that word zero, so they animate their
+     * Scene nodes without becoming solid or entering 0x80051EC0.
+     */
+    u8  blocks_player;
+
+    /*
      * THE TRAIN, and the only mover in this engine that is not axis-aligned.
      *
      * `is_path` selects the displacement rule. Clear, and the mover slides
@@ -461,8 +470,10 @@ u32 q2_movers_trigger_item(q2_mover_set *set, u32 item_offset);
  * BUTTON and PISTON are built here too: both name a target AND a speed, which
  * is what a mover needs. A button's speed is literally one unit a tick — the
  * table says `travel`'s SIGN selects obj+0x3A = +1 or -1 and its magnitude goes
- * to obj+0x44 — and a PISTON is a crusher, so it ignores obstruction in both
- * directions rather than one.
+ * to obj+0x44. A PISTON has four object slots and a signed +18 pusher gate.
+ * Only a non-zero gate allocates its +0x28 pusher, which is what can reach the
+ * generic carry/rollback MOD_CRUSH path. All thirteen PAL PISTON calls leave
+ * that gate zero: they are visual actuators, not solid crushers.
  *
  * STALE TEXT REMOVED. This block used to say PLATFORM, DISH and CAGELIFT1 were
  * "deliberately NOT built here" because none of them names both a target and a
@@ -531,15 +542,17 @@ void q2_mover_displacement(const q2_mover *m, s32 out[3]);
  *
  * `blocked(index, step, user)` is asked, before a step is committed, whether
  * moving mover `index` by `step` along its own axis would sweep through
- * something. That is 0x80051EC0's return — it reports 0 when 0x800519B0 finds
- * an entity in the swept box — and 0x80025CBC is what acts on it:
+ * something. That is 0x80051EC0's return — it reports 0 when 0x800519B0 cannot
+ * carry an entity out of the swept box — and 0x80025CBC is what acts on it:
  *
  *   opening (state 1) and bit 0 of obj+0x58 clear -> stop
  *   closing (state 3) and bit 1 clear             -> stop
  *   the matching bit SET                          -> carry on regardless
  *
  * and "stop" means: save the state, enter state 4, load the timer at obj+0x56
- * with 16. A PISTON sets both bits, which is what makes it a crusher.
+ * with 16. A pusher-enabled PISTON sets neither bit; its generic failed-carry
+ * path inflicts 30 MOD_CRUSH damage before this state handler receives the
+ * veto. A zero-gate PISTON has no pusher and never calls this path.
  *
  * Passing NULL is the old behaviour and never blocks.
  */

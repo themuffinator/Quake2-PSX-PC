@@ -468,35 +468,45 @@ int cmd_zonescript(const disc *d, const char *only_map)
                                     call.prim == Q2_UF_LIFT1 ||
                                     call.prim == Q2_UF_CAGELIFT1) {
                                     size_t boff = (size_t)(pp - cev.data);
-                                    u32 zq, so;
-                                    bool any = false;
+                                    u32 zq, so, sq;
+                                    bool any = false, common_any = false;
                                     /* The slot's own offset, per primitive —
                                      * OBJDRAWOFF's is +4, BUTTON's +12,
                                      * PLATFORM's +20, and reading +4 for all
                                      * three is reading the invert flag and a
-                                     * coordinate. */
-                                    u32 sl = 4;
+                                     * coordinate. PISTON alone among this
+                                     * group owns four slots, at +8..+14. */
+                                    u32 sl = 4, slot_count = 1;
 
                                     if (call.prim == Q2_UF_BUTTON)   sl = 12;
                                     if (call.prim == Q2_UF_PLATFORM) sl = 20;
                                     if (call.prim == Q2_UF_LIFT1 ||
                                         call.prim == Q2_UF_CAGELIFT1) sl = 8;
-                                    if (call.prim == Q2_UF_PISTON)   sl = 8;
+                                    if (call.prim == Q2_UF_PISTON) {
+                                        sl = 8;
+                                        slot_count = 4;
+                                    }
 
-                                    so = (u32)(sl + 2);
+                                    so = sl + 2 * slot_count;
                                     if (item.len < so)
                                         continue;
 
                                     objslot_items++;
-                                    if (q2_rd_s16(pp + sl) >= 0)
+                                    for (sq = 0; sq < slot_count; sq++) {
+                                        if (q2_rd_s16(pp + sl + 2 * sq) >= 0)
+                                            common_any = true;
+                                    }
+                                    if (common_any)
                                         objslot_common++;
 
                                     for (zq = 0; zq < zcount; zq++) {
                                         if (boff + so > zev[zq].size)
                                             continue;
-                                        if (q2_rd_s16(zev[zq].data + boff + sl)
-                                            >= 0)
-                                            any = true;
+                                        for (sq = 0; sq < slot_count; sq++) {
+                                            if (q2_rd_s16(zev[zq].data + boff + sl +
+                                                          2 * sq) >= 0)
+                                                any = true;
+                                        }
                                     }
                                     if (any)
                                         objslot_zone++;
@@ -504,19 +514,23 @@ int cmd_zonescript(const disc *d, const char *only_map)
                                         objslot_nowhere++;
 
                                     if (verbose) {
-                                        printf("    %s: %-10s slot COMMON %d",
+                                        printf("    %s: %-10s slots COMMON",
                                                g_maps[mi],
                                                call.info ? call.info->name
-                                                         : "?",
-                                               q2_rd_s16(pp + sl));
+                                                         : "?");
+                                        for (sq = 0; sq < slot_count; sq++)
+                                            printf(" %d", q2_rd_s16(pp + sl +
+                                                                       2 * sq));
                                         for (zq = 0; zq < zcount; zq++) {
                                             if (boff + so > zev[zq].size) {
                                                 printf(", zone%u SHORT", zq);
                                                 continue;
                                             }
-                                            printf(", zone%u %d", zq,
-                                                   q2_rd_s16(zev[zq].data +
-                                                             boff + sl));
+                                            printf(", zone%u", zq);
+                                            for (sq = 0; sq < slot_count; sq++)
+                                                printf(" %d", q2_rd_s16(
+                                                    zev[zq].data + boff + sl +
+                                                    2 * sq));
                                         }
                                         printf("\n");
                                     }
@@ -1241,7 +1255,7 @@ int cmd_zonescript(const disc *d, const char *only_map)
     printf("    script LIGHT calls in COMMON: %u TIMEDLIGHT, %u FLKLIGHT;"
            " the trigger sweep RUNS %u of them\n",
            light_timed, light_flk, live_lit_run);
-    printf("    OBJSLOT-carrying items : %u; first slot usable in "
+    printf("    OBJSLOT-carrying items : %u; a slot usable in "
            "COMMON : %u, in some zone : %u, nowhere : %u\n",
            objslot_items, objslot_common, objslot_zone, objslot_nowhere);
     printf("    MISEVENT keys : %u, resolved : %u (EXE table %u, the map's own %u)\n",

@@ -6882,7 +6882,7 @@ projection is right the weapon comes with it, and the two remaining entries on t
           ROTHATCH             15       15         yes
           INLAVA               14       14         yes
           INWATER              10       10         yes
-          PISTON               13        8         no   — crushers
+          PISTON               13        8         no   — visual-only on PAL (+18 gate is zero)
           TIMER                14        7         no
           UNDERWATER            7        7         yes
           OBJDRAWOFF            7        6         no
@@ -7206,10 +7206,16 @@ frame exists, "the weapon looks smaller" is an impression from mid-play footage 
       honour the gate, and the difference between the two numbers is the gate working rather than the
       teleport failing.
 
-- [x] 81. **BUTTON and PISTON join the movers, and the rejections are the interesting part.** Both name a
+- [x] 81. **BUTTON and PISTON join the movers, and the PISTON pusher is gated.** Both name a
       target AND a speed, which is what a mover needs — a button's speed is literally one unit a tick
-      (`travel`'s sign selects `obj+0x3A` = +1 or -1 and its magnitude goes to `obj+0x44`), and a PISTON
-      is a crusher, so it ignores obstruction in both directions rather than one.
+      (`travel`'s sign selects `obj+0x3A` = +1 or -1 and its magnitude goes to `obj+0x44`). PISTON's
+      constructor copies its low-two-bit axis at `+4`, speed at `+5`, signed target at `+6`, and all FOUR
+      object slots at `+8/+10/+12/+14`. Its signed `+18` word decides whether it creates `obj+0x28`, the
+      pusher whose per-frame call reaches the shared carry/rollback path. A pusher first tries to carry a
+      blocker, restores it when the carry cannot finish, and then calls
+      `T_Damage(NULL, blocker, 30, MOD_CRUSH, NULL)` at `0x80051E74` before the normal blocked handler sees
+      the veto. **Every one of the thirteen PAL PISTON calls has `+18 == 0`**, so none creates that pusher:
+      they animate geometry only and are not solid crushers.
 
       **PLATFORM and DISH are not built**, for the same reason as CAGELIFT1: PLATFORM names neither a
       target nor a speed and DISH names no speed. A mover with speed zero is triggered, ticks, and never
@@ -7218,13 +7224,13 @@ frame exists, "the weapon looks smaller" is an impression from mid-play footage 
       The builder now DROPS a mover with no node or no speed rather than keeping one that cannot move,
       and logging what it dropped is where the useful measurement is:
 
-          POWER2  PISTON built, 1 node — the crusher works
+          POWER2  PISTON built, 2 nodes — visual actuator, +18 pusher gate clear
           JAIL4   BUTTON rejected, 0 nodes — its object slot reads -1
           LAB     4 LIFT1 rejected, 0 nodes; 2 built
           BASE0   1 LIFT1 rejected with FOUR nodes and speed 0
 
       So the OBJSLOT emptiness of #78 is not confined to OBJDRAWOFF: BUTTON has it too. But it is not
-      universal either — PISTON's slot resolves, and the rotators' resolve 41 of 95. Whatever leaves an
+      universal either — PISTON's first two slots resolve, and the rotators' resolve 41 of 95. Whatever leaves an
       object slot empty is per-primitive or per-item rather than a property of the format, and BASE0's
       LIFT1 shows the same thing on the OTHER operand: four good nodes and a speed of zero.
 
@@ -7318,7 +7324,7 @@ frame exists, "the weapon looks smaller" is an impression from mid-play footage 
       the authored Scene node index lives in the other buffer. That is #56's shape again, in a field #56
       never looked at.
 
-      Measured across the disc — every OBJSLOT-carrying item's first slot, in COMMON and in every zone:
+      Measured across the disc — every relevant OBJSLOT (all four for PISTON), in COMMON and in every zone:
 
           85 items;  usable in COMMON : 26,  usable in some zone : 81,  nowhere : 4
 
