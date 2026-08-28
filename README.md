@@ -153,6 +153,24 @@ cmake --build build
 SDL3 is optional. Without it you still get the core libraries and the offline tools;
 with it you get the playable client.
 
+## Releases
+
+Prebuilt Windows, Linux and macOS archives are on the
+[releases page](https://github.com/themuffinator/Q2-PSX-PC/releases). They contain
+the three executables and the documentation, and — like this repository — no game
+assets: you supply your own disc.
+
+The version lives in one file, [`VERSION`](VERSION), which CMake reads to seed the
+generated header, so what a binary prints, what the tag says and what the archive is
+called cannot disagree. [`CHANGELOG.md`](CHANGELOG.md) is the queue that becomes the
+release notes. [`docs/RELEASING.md`](docs/RELEASING.md) describes both, and how a
+release is cut.
+
+```bash
+q2psx-inspect --version
+python scripts/version.py show
+```
+
 ## Running the client without a player
 
 Everything the frame does — the tick, the viewport build, the world draw, the

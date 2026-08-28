@@ -1,20 +1,31 @@
 # Manual release.
 #
-# Run from the Actions tab. Takes a version, bumps it in CMakeLists.txt, tags
-# the commit, builds every platform, and publishes a GitHub release with the
-# archives attached.
+# Run from the Actions tab. Resolves a version, checks there are notes to
+# publish, builds and tests every platform, and only then tags the commit and
+# publishes a GitHub release with the archives attached.
 #
 # Manual rather than tag-triggered on purpose: cutting a release should be a
 # decision someone makes, not a side effect of pushing a tag that might have
 # been created by accident or by a rebase.
 #
-# The build is deliberately verified BEFORE the tag is pushed. A tag that
-# points at a commit which does not compile is worse than no tag, because it
-# looks releasable forever after.
+# THE ORDER IS THE DESIGN.
 #
-# NOTE ON CONTENT: the archives contain executables and documentation only.
-# This project ships no game assets — a user supplies their own disc — and the
-# packaging steps below list files explicitly rather than globbing a directory,
+#   1. validate  resolve the version, refuse a collision or a step backwards,
+#                refuse an empty changelog, render the notes. Nothing has been
+#                built or written, so a bad input costs about twenty seconds.
+#   2. build     every platform, tested, packaged. Any failure stops here.
+#   3. publish   commit, tag, push, release.
+#
+# The tag is pushed after the build succeeds, never before. A tag pointing at a
+# commit that does not compile is worse than no tag, because it looks releasable
+# forever after.
+#
+# Every decision this workflow makes is delegated to a script in scripts/, so it
+# can be reproduced and debugged on a laptop. See docs/RELEASING.md.
+#
+# NOTE ON CONTENT: the archives contain executables and documentation only. This
+# project ships no game assets — a player supplies their own disc — and
+# scripts/package.py builds them from an explicit file list rather than a glob,
 # so nothing can be swept in by accident.
 
 name: Release
@@ -22,85 +33,147 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version to release, e.g. 0.2.0 (no leading v)'
+      bump:
+        description: 'Which part to bump. "none" releases the version in VERSION as it stands.'
         required: true
+        type: choice
+        options: [none, patch, minor, major, explicit]
+        default: none
+      version:
+        description: 'Exact version, e.g. 0.2.0 — only read when bump is "explicit"'
+        required: false
         type: string
+        default: ''
+      summary:
+        description: 'Optional one-line lead above the release notes'
+        required: false
+        type: string
+        default: ''
       prerelease:
         description: 'Mark as a pre-release'
         required: false
         type: boolean
         default: false
-      notes:
-        description: 'One-line summary for the release notes'
+      dry_run:
+        description: 'Build and package, but do not commit, tag or publish'
         required: false
-        type: string
-        default: ''
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: read
+
+# Two releases at once would race on the tag and on main. Queue instead, and
+# never cancel one that is already publishing.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.12'
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Reject a bad version before anything is built or tagged.
+  # Decide what is being released, and refuse it here if it is not releasable.
   # ---------------------------------------------------------------------------
-  check:
+  validate:
     name: Validate
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.v.outputs.version }}
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      title: ${{ steps.resolve.outputs.title }}
+      previous_tag: ${{ steps.resolve.outputs.previous_tag }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      date: ${{ steps.date.outputs.date }}
     steps:
       - uses: actions/checkout@v4
         with:
+          # Tags are how the version resolver knows what has already shipped.
+          # A shallow clone has none, and every collision check would pass.
           fetch-depth: 0
 
-      - name: Validate the version
-        id: v
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build date
+        id: date
+        run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      # Inputs reach the shell through the environment, never through ${{ }}
+      # interpolation into the script body: an input containing shell syntax
+      # would otherwise run as part of this step.
+      - name: Resolve the version
+        id: resolve
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXPLICIT: ${{ inputs.version }}
         run: |
-          VERSION="${{ inputs.version }}"
+          case "$BUMP" in
+            none)     ARGS=() ;;
+            explicit) ARGS=(--set "$EXPLICIT") ;;
+            *)        ARGS=(--bump "$BUMP") ;;
+          esac
+          python scripts/version.py resolve "${ARGS[@]}" --github-output "$GITHUB_OUTPUT"
+          python scripts/version.py resolve "${ARGS[@]}"
 
-          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::'$VERSION' is not MAJOR.MINOR.PATCH"
-            exit 1
-          fi
+      # A release with nothing to say about itself is worse than no release.
+      - name: Check there are release notes
+        run: python scripts/changelog.py check --require-entries
 
-          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
-            echo "::error::tag v$VERSION already exists"
-            exit 1
-          fi
+      - name: Render the notes
+        env:
+          SUMMARY: ${{ inputs.summary }}
+        run: |
+          python scripts/release_notes.py \
+            --version "${{ steps.resolve.outputs.version }}" \
+            --date "${{ steps.date.outputs.date }}" \
+            --commit "${{ github.sha }}" \
+            --previous-tag "${{ steps.resolve.outputs.previous_tag }}" \
+            --summary "$SUMMARY" \
+            --output .tmp/release-notes.md
 
-          # Refuse to go backwards. Comparing against the highest existing tag
-          # catches the common slip of releasing 0.1.9 after 0.2.0.
-          LATEST=$(git tag -l 'v*' | sed 's/^v//' | sort -V | tail -1)
-          if [ -n "$LATEST" ]; then
-            HIGHEST=$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -V | tail -1)
-            if [ "$HIGHEST" != "$VERSION" ]; then
-              echo "::error::$VERSION is not newer than the latest tag $LATEST"
-              exit 1
-            fi
-          fi
-
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Releasing $VERSION (previous: ${LATEST:-none})"
+      - name: Summarise
+        run: |
+          {
+            echo "## Releasing \`${{ steps.resolve.outputs.tag }}\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`${{ steps.resolve.outputs.version }}\` |"
+            echo "| Previous | \`${{ steps.resolve.outputs.previous_tag || 'none — first release' }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Pre-release | ${{ inputs.prerelease }} |"
+            echo "| Dry run | ${{ inputs.dry_run }} |"
+            echo
+            echo "<details><summary>Release notes as they will be published</summary>"
+            echo
+            cat .tmp/release-notes.md
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # Build and test everything before the tag exists.
+  # Build, test and package every platform, before the tag exists.
   # ---------------------------------------------------------------------------
   build:
-    name: Build ${{ matrix.name }}
-    needs: check
+    name: Build ${{ matrix.platform }}
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
+      # One platform failing makes the release wrong, so stop the others rather
+      # than spend twenty minutes producing an incomplete set of archives.
       fail-fast: true
       matrix:
         include:
-          - name: windows-x64
+          - platform: windows-x64
             os: windows-latest
             cc: cl
-          - name: linux-x64
+          - platform: linux-x64
             os: ubuntu-latest
             cc: gcc
-          - name: macos-arm64
+          - platform: macos-arm64
             os: macos-latest
             cc: clang
 
@@ -108,6 +181,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
@@ -124,14 +201,14 @@ jobs:
             libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev \
             libwayland-dev libxkbcommon-dev libdrm-dev libgbm-dev
 
-      # Set the version in the build system so the generated header matches the
-      # tag. This edit is local to the build job; the tag job commits its own.
-      - name: Set the version
+      # Stamping goes through the resolver rather than writing the file
+      # directly, so the same validation runs here as in the validate job. The
+      # edit is local to this runner; the publish job commits its own.
+      - name: Stamp the version
         shell: bash
         run: |
-          sed -i.bak -E 's/^        VERSION [0-9]+\.[0-9]+\.[0-9]+/        VERSION ${{ needs.check.outputs.version }}/' CMakeLists.txt
-          rm -f CMakeLists.txt.bak
-          grep -n 'VERSION ${{ needs.check.outputs.version }}' CMakeLists.txt
+          python scripts/version.py resolve --set "${{ needs.validate.outputs.version }}" --write
+          cat VERSION
 
       - name: Configure
         run: >
@@ -139,6 +216,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_C_COMPILER=${{ matrix.cc }}
           -DQ2PSX_BUILD_CLIENT=ON
+          -DQ2PSX_BUILD_TOOLS=ON
           -DQ2PSX_FETCH_SDL3=ON
 
       - name: Build
@@ -147,113 +225,143 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-      # Files are listed one by one rather than copied by glob: this project
-      # must never ship game assets, and an explicit list cannot sweep one in.
+      # The point of a single-source version is that the binary agrees with it.
+      # This is where that stops being a claim.
+      - name: Check the binary reports the release version
+        shell: bash
+        run: |
+          EXE=""
+          [ "${{ runner.os }}" = "Windows" ] && EXE=".exe"
+          "./build/bin/q2psx-inspect$EXE" --version | tee reported.txt
+          grep -qx "Q2PSX-PC ${{ needs.validate.outputs.version }}" reported.txt
+
       - name: Package
         shell: bash
         run: |
-          VERSION="${{ needs.check.outputs.version }}"
-          NAME="q2psx-pc-$VERSION-${{ matrix.name }}"
-          mkdir -p "dist/$NAME"
-
-          EXE=""
-          if [ "${{ runner.os }}" = "Windows" ]; then EXE=".exe"; fi
-
-          cp "build/bin/q2psx$EXE"          "dist/$NAME/" || true
-          cp "build/bin/q2psx-inspect$EXE"  "dist/$NAME/"
-
-          # SDL3 ships beside the client on Windows.
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp build/bin/SDL3.dll "dist/$NAME/" || true
-          fi
-
-          cp README.md              "dist/$NAME/"
-          cp docs/FORMATS.md        "dist/$NAME/"
-          cp docs/FIDELITY.md       "dist/$NAME/"
-          cp docs/ARCHITECTURE.md   "dist/$NAME/"
-          cp docs/openquestions.md  "dist/$NAME/"
-
-          cd dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "$NAME.zip" "$NAME"
-          else
-            tar czf "$NAME.tar.gz" "$NAME"
-          fi
+          python scripts/package.py stage \
+            --build-dir build \
+            --out-dir dist \
+            --version "${{ needs.validate.outputs.version }}" \
+            --platform "${{ matrix.platform }}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
+          name: ${{ matrix.platform }}
           path: |
             dist/*.zip
             dist/*.tar.gz
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Only now that every platform built and tested: commit, tag, publish.
+  # Everything built and tested. Stamp, tag, publish.
+  #
+  # A dry run runs this whole job except the four steps that write something,
+  # so the packaging, the checksums and the notes are all proven against the
+  # real archives without touching the repository.
   # ---------------------------------------------------------------------------
   publish:
-    name: Tag and publish
-    needs: [check, build]
+    name: ${{ inputs.dry_run && 'Dry run' || 'Tag and publish' }}
+    needs: [validate, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Bump the version and tag
-        run: |
-          VERSION="${{ needs.check.outputs.version }}"
-
-          sed -i -E "s/^        VERSION [0-9]+\.[0-9]+\.[0-9]+/        VERSION $VERSION/" CMakeLists.txt
-          grep -n "VERSION $VERSION" CMakeLists.txt
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add CMakeLists.txt
-          git commit -m "Release $VERSION"
-          git tag -a "v$VERSION" -m "Release $VERSION"
-
-          git push origin HEAD:main
-          git push origin "v$VERSION"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: dist
           merge-multiple: true
 
-      - name: List what is being published
-        run: ls -la artifacts
+      - name: Checksum the archives
+        run: python scripts/package.py checksums --archive-dir dist
+
+      # Both files move together or the release is inconsistent: VERSION says
+      # what this is, and the changelog's dated section says what is in it.
+      - name: Stamp the version and the changelog
+        run: |
+          python scripts/version.py resolve --set "${{ needs.validate.outputs.version }}" --write
+          python scripts/changelog.py release \
+            --version "${{ needs.validate.outputs.version }}" \
+            --date "${{ needs.validate.outputs.date }}"
+          git --no-pager diff --stat
+
+      # Rendered after stamping, so the notes come from the dated section that
+      # is about to be committed, and with the archives in hand, so the download
+      # table lists exactly what is attached.
+      - name: Render the notes
+        env:
+          SUMMARY: ${{ inputs.summary }}
+        run: |
+          python scripts/release_notes.py \
+            --version "${{ needs.validate.outputs.version }}" \
+            --date "${{ needs.validate.outputs.date }}" \
+            --commit "${{ needs.validate.outputs.commit }}" \
+            --previous-tag "${{ needs.validate.outputs.previous_tag }}" \
+            --summary "$SUMMARY" \
+            --archive-dir dist \
+            --output .tmp/release-notes.md
+
+      - name: Show what would be published
+        run: |
+          {
+            echo "## ${{ needs.validate.outputs.title }}"
+            echo
+            echo '### Attached'
+            echo '```'
+            ls -lh dist
+            echo '```'
+            echo
+            echo '### SHA256SUMS.txt'
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+            echo
+            echo '### Notes'
+            echo
+            cat .tmp/release-notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The branch is pushed before the tag: if main has moved since the build
+      # started, this fails and leaves no tag behind, which is the recoverable
+      # order. Re-run the workflow rather than forcing anything.
+      - name: Commit and tag
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add VERSION CHANGELOG.md
+          git commit -m "Release ${{ needs.validate.outputs.version }}"
+          git tag -a "${{ needs.validate.outputs.tag }}" \
+                  -m "${{ needs.validate.outputs.title }}"
+
+          git push origin "HEAD:${{ github.ref_name }}"
+          git push origin "${{ needs.validate.outputs.tag }}"
 
       - name: Publish the release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ needs.check.outputs.version }}
-          name: Q2PSX-PC ${{ needs.check.outputs.version }}
-          prerelease: ${{ inputs.prerelease }}
-          generate_release_notes: true
-          body: |
-            ${{ inputs.notes }}
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ needs.validate.outputs.tag }}" \
+            dist/*.zip dist/*.tar.gz dist/SHA256SUMS.txt \
+            --verify-tag \
+            --title "${{ needs.validate.outputs.title }}" \
+            --notes-file .tmp/release-notes.md \
+            ${{ inputs.prerelease && '--prerelease' || '' }}
 
-            A native PC recreation of Quake II for PlayStation. Not an emulator:
-            the game's logic runs natively, and the PlayStation's GPU and GTE
-            semantics are reproduced so it still looks the way it did.
+          echo "Published: $(gh release view '${{ needs.validate.outputs.tag }}' --json url -q .url)" \
+            >> "$GITHUB_STEP_SUMMARY"
 
-            **You need your own Quake II PSX disc.** This download contains no
-            game assets. Point the client at a `.cue`, `.bin`, `.img` or `.iso`:
-
-            ```
-            q2psx --disc "Quake II (Europe).cue"
-            ```
-
-            `q2psx-inspect` is the offline tool — it identifies a disc, verifies
-            every level file against the documented schema, decodes the audio
-            and textures, and renders a level to an image without a window.
-
-            See `FORMATS.md` for the reverse-engineered on-disc formats and
-            `openquestions.md` for what is still unknown.
-          files: |
-            artifacts/*.zip
-            artifacts/*.tar.gz
-          fail_on_unmatched_files: true
+      - name: Dry run — nothing was published
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "::notice::Dry run. ${{ needs.validate.outputs.tag }} was not created and nothing was published."
+          echo "The archives are attached to this workflow run, and the notes are in the summary above."

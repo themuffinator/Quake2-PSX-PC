@@ -58,6 +58,10 @@ jobs:
           # hash and the version header would lose its tag context.
           fetch-depth: 0
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Install Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
 
@@ -79,6 +83,50 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-      - name: Report version
-        run: ./build/bin/q2psx-inspect --version
+      # Not just "does it run": the version it prints has to be the one in the
+      # VERSION file. That chain - file, CMake, generated header, binary - is what
+      # the release workflow relies on, and this is where it is checked. The
+      # expected line comes from version.py rather than from the file directly, so
+      # this also exercises the resolver on all four toolchains.
+      - name: Check the reported version matches VERSION
         shell: bash
+        run: |
+          EXPECTED="$(python scripts/version.py show | head -1)"
+          ./build/bin/q2psx-inspect --version | tee reported.txt
+          head -1 reported.txt | grep -qxF "$EXPECTED"
+          echo "binary and VERSION agree: $EXPECTED"
+
+  # ---------------------------------------------------------------------------
+  # The release path is the one path that cannot be debugged in production: a
+  # broken script is found while cutting a release, with a half-tagged
+  # repository to clean up. So it is tested here, on every change.
+  # ---------------------------------------------------------------------------
+  tooling:
+    name: Release tooling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The version resolver's collision and ordering checks are about tags,
+          # so a clone without them would test nothing.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test the version, changelog, notes and packaging tools
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
+
+      - name: VERSION is well-formed and has not fallen behind the tags
+        run: python scripts/version.py check
+
+      - name: The changelog parses and its headings are the ones we use
+        run: python scripts/changelog.py check
+
+      # Rendering the notes for whatever the next release would be catches a
+      # broken template on a pull request rather than mid-release.
+      - name: The next release's notes render
+        run: |
+          python scripts/version.py show
+          python scripts/release_notes.py --version "$(cat VERSION)" --commit "${{ github.sha }}"

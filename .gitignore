@@ -47,6 +47,14 @@ _deps/
 compile_commands.json
 .cache/
 
+# Release staging. scripts/package.py assembles archives here; they are build
+# output, not sources, and they are attached to a GitHub release instead.
+/dist/
+
+# Python bytecode, from the release tooling in scripts/ and tools/.
+__pycache__/
+*.pyc
+
 # Editors
 .vs/
 .vscode/

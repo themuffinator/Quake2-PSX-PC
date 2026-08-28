@@ -1,8 +1,35 @@
 cmake_minimum_required(VERSION 3.20)
+
+# ---------------------------------------------------------------------------
+# Version
+#
+# The version lives in the VERSION file at the repository root and nowhere
+# else. This reads it, project() derives PROJECT_VERSION_* from it, the
+# generated header derives from those, and scripts/version.py reads the same
+# file — so the binary, the git tag and the release archives cannot disagree
+# about what was built.
+#
+# A plain text file rather than a literal in the project() call below: cutting
+# a release means writing the new version, and rewriting a file that holds one
+# number cannot go wrong the way a regex against build-system source can.
+# ---------------------------------------------------------------------------
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" Q2PSX_VERSION_RAW)
+string(STRIP "${Q2PSX_VERSION_RAW}" Q2PSX_VERSION_RAW)
+
+if(NOT Q2PSX_VERSION_RAW MATCHES "^[0-9]+\.[0-9]+\.[0-9]+$")
+    message(FATAL_ERROR
+        "VERSION must hold a bare MAJOR.MINOR.PATCH; got '${Q2PSX_VERSION_RAW}'")
+endif()
+
 project(Q2PSX-PC
-        VERSION 0.1.0
+        VERSION ${Q2PSX_VERSION_RAW}
         DESCRIPTION "Native PC recreation of Quake II for PlayStation 1"
         LANGUAGES C)
+
+# Editing VERSION re-runs configure, so a bumped version cannot be left behind
+# in an incremental build.
+set_property(DIRECTORY APPEND PROPERTY
+    CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -15,12 +42,18 @@ endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# Shared libraries land beside the executables that need them. A fetched SDL3
+# is the only one, and a release archive is assembled by copying this directory
+# — if the library built somewhere else, the archive ships a client that cannot
+# start.
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # ---------------------------------------------------------------------------
-# Version
+# Generated version header
 #
-# The version is declared once, in the project() call above. The generated
-# header derives from it, so a binary cannot report a version that disagrees
-# with the build system.
+# The generated header derives from PROJECT_VERSION, which came from the
+# VERSION file above, so a binary cannot report a version that disagrees with
+# the build system or with the tag the release workflow pushed.
 #
 # Git state is captured when available. Outside a checkout the describe string
 # falls back to the bare version rather than inventing a hash.

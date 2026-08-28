@@ -5,3 +5,8 @@
 # unnormalised CRLF. Preserve that representation, but force textual diffs now
 # those bytes are reconstructed as portable '\0' character constants.
 src/client/main.c -text diff whitespace=cr-at-eol
+
+# VERSION is read by CMake, by the release scripts and by a shell in CI. Pin it
+# to LF: under `text=auto` a Windows checkout would hand every one of them a
+# version string with a carriage return welded to the end of it.
+VERSION text eol=lf
