@@ -20,6 +20,29 @@ change; see [`docs/RELEASING.md`](docs/RELEASING.md).
 ## [Unreleased]
 
 ### Reconstruction
+- _Nothing yet._
+
+### Client
+- _Nothing yet._
+
+### Rendering and audio
+- _Nothing yet._
+
+### Tools
+- _Nothing yet._
+
+### Fixes
+- _Nothing yet._
+
+### Build and packaging
+- _Nothing yet._
+
+### Documentation
+- _Nothing yet._
+
+## [0.1.0] - 2026-08-28
+
+### Reconstruction
 - Every on-disc format is read: the `.DAT` container, zones, scene graph, geometry, collision hulls, spawns, lights, triggers, level scripts, sound banks, models and animation. Checked across the PAL disc's 164 level files — 461,852 vertices, 274,936 quads, 139,240 collision planes, 94,642 collision portals, 1,723 models, 2,036,080 animation keys and 2,475 sounds — with zero failures.
 - `docs/openquestions.md` closes with no open questions: 157 resolved, 18 partial with the remaining residue stated, and 4 marked terminal because this disc cannot answer them.
 - All seven creature modules are transcribed from their own MIPS, 57 of 57 callbacks, together with the framework they run on — `T_Damage`, `M_ReactToDamage`, and the 71-slot import table named end to end.
