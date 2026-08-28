@@ -156,7 +156,7 @@ with it you get the playable client.
 ## Releases
 
 Prebuilt Windows, Linux and macOS archives are on the
-[releases page](https://github.com/themuffinator/Q2-PSX-PC/releases). They contain
+[releases page](https://github.com/themuffinator/Quake2-PSX-PC/releases). They contain
 the three executables and the documentation, and — like this repository — no game
 assets: you supply your own disc.
 
