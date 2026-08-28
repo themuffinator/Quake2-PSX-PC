@@ -27,6 +27,7 @@ change; see [`docs/RELEASING.md`](docs/RELEASING.md).
 - The `.STX` film format is read *and* written. All 5,301 frames of the three films decode, and the encoder returns every one of `TAKE1BP.STX`'s 7,712 sectors byte-identical, EDC and Reed-Solomon included.
 
 ### Client
+- `q2psx --version` reports the build and the commit it came from, the way `q2psx-inspect` already did.
 - The campaign plays through: eleven levels across five units, Strogg Outpost to Final Showdown, with the mission screen at every unit boundary, the briefing on arrival, and the inventory carried across.
 - The boot chain runs ahead of the menu — four logo screens and the intro film — and the campaign ends on the outro, both played to the frame the original stops them at rather than to the end of the file.
 - The front end: title screen, single- and multiplayer pages, player, sound and video options, the credits, and all nine memory-card screens.
@@ -45,12 +46,13 @@ change; see [`docs/RELEASING.md`](docs/RELEASING.md).
 - `stx2avi` demuxes a film into the raw video and audio streams ffmpeg can mux, driving the same decoder the game uses rather than a second one.
 
 ### Fixes
-- _Nothing yet._
+- The repository could not be cloned on Windows at all. A tracked file was called `nul.ppm`, and `NUL` is a DOS device name, so Git refuses to create it: the *checkout* failed, not the build. Renamed to `parity-frame.ppm`, content unchanged, and `scripts/check_paths.py` now fails CI on any tracked path Windows cannot create.
 
 ### Build and packaging
 - The version lives in one file, `VERSION`, which CMake reads to seed `project()` and the generated `version.h`. A binary, a tag and an archive cannot disagree about what was built.
 - A manual release workflow builds Windows, Linux and macOS, tests each, and only then tags and publishes — so a tag never points at a commit that does not compile. `scripts/` holds the version, changelog, release-note and packaging tools it runs, each usable by hand.
-- CI builds and tests on GCC, Clang, MSVC and Apple Clang with warnings as errors.
+- CI builds and tests on GCC, Clang, MSVC and Apple Clang with warnings as errors, and checks that the version each binary reports is the one in `VERSION`.
+- A fetched SDL3 never shipped in the Linux or macOS archives, so those would have contained a client that could not start. Shared libraries now build beside the executables and the client carries an `$ORIGIN` rpath.
 
 ### Documentation
 - `docs/RELEASING.md` describes the versioning scheme and how to cut a release.

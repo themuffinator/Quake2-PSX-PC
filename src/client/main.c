@@ -156,6 +156,7 @@
 #include "statusbar.h"
 #include "trig.h"
 #include "vag.h"
+#include "version.h"
 #include "viewweapon.h"
 #include "vmtables.h"
 #include "vram.h"
@@ -12565,6 +12566,7 @@ static void usage(void)
     printf("           square one buffer pixel per window pixel: a 1.5x stretch\n");
     printf("           stretch fill the window, whatever shape it is\n");
     printf("  --saves  where save files live (default: the platform's own)\n");
+    printf("\n  --version, -v  what this build is, and the commit it came from\n");
     printf("\n  running without a player:\n");
     printf("  --headless    no window, no audio; a fixed 1/30 s step\n");
     printf("  --demo        drive the pad from a fixed script rather than keys\n");
@@ -12907,6 +12909,15 @@ int main(int argc, char **argv)
     int scale = 3;
     int i;
     u64 last;
+
+    /* Answered before any setup, and before --disc is required: someone
+     * asking a binary what it is should not need a disc to find out. The
+     * same check, in the same place, as q2psx-inspect. */
+    if (argc >= 2 && (strcmp(argv[1], "--version") == 0 ||
+                      strcmp(argv[1], "-v") == 0)) {
+        q2_version_print();
+        return 0;
+    }
 
     memset(&c, 0, sizeof(c));
     /* PrimaryColl cell +28 carries the exact SortData byte offset used by the

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the version, changelog, release-note and packaging tools.
+"""Tests for the version, changelog, release-note, packaging and path tools.
 
 The release path is the one path that cannot be debugged in production: a script
 that breaks is discovered while cutting a release, with a half-tagged repository
@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import changelog  # noqa: E402
+import check_paths  # noqa: E402
 import package  # noqa: E402
 import release_notes  # noqa: E402
 import version as version_mod  # noqa: E402
@@ -428,6 +429,59 @@ class Packaging(unittest.TestCase):
         empty.mkdir()
         with self.assertRaises(package.PackageError):
             package.write_checksums(empty)
+
+
+class WindowsCheckoutablePaths(unittest.TestCase):
+    """The guard on the defect that made this repository un-clonable on Windows.
+
+    A file called nul.ppm was committed. NUL is a DOS device name, so Git for
+    Windows refuses to create it and the checkout fails outright -- not the
+    build, the clone. Nothing said so until a Windows runner tried it.
+    """
+
+    def flags(self, *paths: str) -> list[str]:
+        return [why for _path, why in check_paths.problems(list(paths))]
+
+    def test_the_file_that_started_this(self):
+        self.assertTrue(self.flags("nul.ppm"))
+
+    def test_every_dos_device_name(self):
+        for name in ("con", "PRN", "Aux", "NUL", "com1", "COM9", "lpt1", "LPT9"):
+            for path in (name, f"{name}.txt", f"docs/{name}.md"):
+                with self.subTest(path=path):
+                    self.assertTrue(self.flags(path), path)
+
+    def test_a_device_name_is_matched_before_the_first_dot(self):
+        # Windows resolves nul.ppm to the device; nullify.c is an ordinary file.
+        self.assertTrue(self.flags("nul.tar.gz"))
+        self.assertFalse(self.flags("nullify.c"))
+        self.assertFalse(self.flags("annul.md"))
+        self.assertFalse(self.flags("src/console.c"))
+
+    def test_illegal_characters(self):
+        for path in ('src/a"b.c', "src/a:b.c", "src/a|b.c", "src/a?b.c", "src/a*b.c"):
+            with self.subTest(path=path):
+                self.assertTrue(self.flags(path), path)
+
+    def test_trailing_dot_or_space(self):
+        self.assertTrue(self.flags("docs./README.md"))
+        self.assertTrue(self.flags("docs /README.md"))
+        self.assertTrue(self.flags("README.md "))
+
+    def test_case_collisions(self):
+        # Two files that are one file on a case-insensitive filesystem: the
+        # checkout is dirty the moment it is made.
+        self.assertTrue(self.flags("src/Main.c", "src/main.c"))
+        self.assertFalse(self.flags("src/main.c", "src/other.c"))
+
+    def test_ordinary_paths_pass(self):
+        self.assertEqual(
+            self.flags("README.md", "src/client/main.c", "docs/FORMATS.md", "scripts/version.py"),
+            [],
+        )
+
+    def test_this_repository_is_clean(self):
+        self.assertEqual(check_paths.main([]), 0)
 
 
 if __name__ == "__main__":

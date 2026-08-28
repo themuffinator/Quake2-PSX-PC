@@ -124,6 +124,12 @@ jobs:
       - name: The changelog parses and its headings are the ones we use
         run: python scripts/changelog.py check
 
+      # A file called nul.ppm made this repository impossible to clone on
+      # Windows -- the checkout failed, not the build -- and nothing said so
+      # until a Windows runner tried it. Now it fails here, with the reason.
+      - name: Every tracked path can be checked out on Windows
+        run: python scripts/check_paths.py
+
       # Rendering the notes for whatever the next release would be catches a
       # broken template on a pull request rather than mid-release.
       - name: The next release's notes render

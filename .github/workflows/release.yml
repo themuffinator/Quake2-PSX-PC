@@ -260,7 +260,7 @@ jobs:
   # real archives without touching the repository.
   # ---------------------------------------------------------------------------
   publish:
-    name: ${{ inputs.dry_run && 'Dry run' || 'Tag and publish' }}
+    name: Publish
     needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:

@@ -113,7 +113,13 @@ python scripts/package.py stage --platform linux-x64
 python scripts/package.py checksums --archive-dir dist
 ```
 
-`scripts/test_release_tooling.py` covers all four, and CI runs it, so a change
+`scripts/check_paths.py` is the fifth, and it is not about releasing: it rejects
+any tracked path Windows cannot check out. A file called `nul.ppm` once made the
+repository impossible to clone on Windows — `NUL` is a DOS device name, so the
+*checkout* failed, not the build — and nothing reported it until a Windows runner
+tried. It runs in CI so the next one fails on a pull request instead.
+
+`scripts/test_release_tooling.py` covers all five, and CI runs it, so a change
 here fails on a pull request rather than at release time.
 
 ## What ends up in an archive
