@@ -47,6 +47,8 @@ change; see [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ### Fixes
 - The repository could not be cloned on Windows at all. A tracked file was called `nul.ppm`, and `NUL` is a DOS device name, so Git refuses to create it: the *checkout* failed, not the build. Renamed to `parity-frame.ppm`, content unchanged, and `scripts/check_paths.py` now fails CI on any tracked path Windows cannot create.
+- Nothing had ever built on Linux. The link failed on undefined `sin` and `sqrt` because nothing asked for libm, which glibc keeps in a library of its own where Windows and macOS fold it into the C runtime.
+- `disc.c` did not compile under GCC either. `fseeko`, `ftello`, `off_t` and `strtok_r` are POSIX rather than C11, and this project compiles as strict C11, under which glibc hides them — and an implicitly declared `strtok_r` would have truncated its returned pointer to 32 bits on a 64-bit host. A CD image can exceed what C11's `long`-based `fseek` reaches, so the POSIX interfaces are declared rather than given up.
 
 ### Build and packaging
 - The version lives in one file, `VERSION`, which CMake reads to seed `project()` and the generated `version.h`. A binary, a tag and an archive cannot disagree about what was built.

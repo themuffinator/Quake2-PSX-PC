@@ -627,7 +627,11 @@ bool q2_model_anim_at_held(const q2_model *m, u32 tick, q2_model_anim *out,
                            u32 *within, bool *clamped)
 {
     u32 begin, end, offset;
-    q2_model_anim last;
+    /* `have_last` is what actually guards the read below, but MSVC does not
+     * track the correlation between a flag and the value it guards and warns
+     * (C4701) that `last` may be used uninitialised. Zeroing it costs nothing
+     * and is the honest value for "no animation was walked past". */
+    q2_model_anim last = {0};
     bool have_last = false;
 
     if (clamped)

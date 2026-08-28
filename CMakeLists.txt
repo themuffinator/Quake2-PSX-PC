@@ -120,6 +120,15 @@ if(NOT MSVC)
     target_compile_options(q2psx_flags INTERFACE -fwrapv)
 endif()
 
+# glibc keeps the math functions in a library of their own; on Windows and macOS
+# they are part of the C runtime, which is why nothing here had ever asked for
+# them and every Linux link failed on undefined `sin` and `sqrt`. Carried on the
+# flags target so every library and executable inherits it, since the trig and
+# the fixed-point helpers are used throughout.
+if(UNIX)
+    target_link_libraries(q2psx_flags INTERFACE m)
+endif()
+
 # ---------------------------------------------------------------------------
 # Core libraries
 # ---------------------------------------------------------------------------

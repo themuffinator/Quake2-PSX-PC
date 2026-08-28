@@ -1,3 +1,22 @@
+/*
+ * fseeko, ftello, off_t and strtok_r are POSIX, not C11, and this project
+ * compiles as strict C11 (CMAKE_C_EXTENSIONS OFF). glibc hides them under that
+ * standard, so a GCC build failed here with `off_t undeclared` and, worse,
+ * `implicit declaration of strtok_r` -- which under C's old implicit-int rule
+ * would have truncated a returned pointer to 32 bits on a 64-bit host.
+ *
+ * They are a requirement rather than a convenience: a CD image can exceed the
+ * 2 GB that C11's `long`-based fseek reaches, and C11 offers no 64-bit file
+ * offset at all. Windows takes the _fseeki64 branch below instead.
+ *
+ * A feature-test macro binds only if nothing has been included yet, so this
+ * sits above the project header as well: disc.h reaches <stdbool.h> and
+ * friends through q2psx.h.
+ */
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "disc.h"
 
 #include <ctype.h>
