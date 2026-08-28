@@ -145,7 +145,14 @@ static void test_wrapping_delta(void)
      */
     make_light(&l, 40000, 0, 0, 255, 255, 255, 32767);
     q2_light_delta(&l, origin, d);
-    check_eq_i(d[0], (s16)40000, "a far light wraps rather than saturating");
+    {
+        /* The truncation is the point: cast a variable, so the deliberate
+         * wrap is not read as a constant that does not fit (MSVC C4310). */
+        s32 beyond_s16 = 40000;
+
+        check_eq_i(d[0], (s16)beyond_s16,
+                   "a far light wraps rather than saturating");
+    }
     check(d[0] < 0, "and comes out on the opposite side");
 }
 

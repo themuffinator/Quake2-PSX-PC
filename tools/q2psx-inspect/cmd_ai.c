@@ -319,7 +319,15 @@ int cmd_ai(const disc *d)
                 "import +0x98 is monster_fire_rocket");
     check_split(&e, 0x8007DBAC, 0x8007DBB0, 0x800621F8, true,
                 "import +0x9C is monster_fire_laser");
-    check_imm(&e, 0x8007DB54, (s32)(s16)0x8006, "the family is one lui apart");
+    {
+        /* 0x8006 sign-extends to a negative s16, which is what the lui
+         * being checked does. Through a variable, so the wrap is not read
+         * as a constant that does not fit (MSVC C4310). */
+        u32 lui_imm = 0x8006u;
+
+        check_imm(&e, 0x8007DB54, (s32)(s16)lui_imm,
+                  "the family is one lui apart");
+    }
 
     /* --------------------------------------------------------------------- */
     /*

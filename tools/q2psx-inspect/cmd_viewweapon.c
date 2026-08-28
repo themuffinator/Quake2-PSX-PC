@@ -365,7 +365,7 @@ static int render_view(disc *d, q2_vm_tables *tab, const char *map,
     q2_world_render render;
     q2_world_stats stats;
     q2_model_bank bank;
-    q2_model model;
+    q2_model model = { 0 };      /* filled only on a successful load */
     q2_viewweapon vw;
     q2_common_file common;
     q2_buf cbuf;
@@ -1015,7 +1015,7 @@ int cmd_viewweapon(disc *d, const char *weapon, const char *out,
 
                     for (i = 0; i < sizeof(named) / sizeof(named[0]); i++) {
                         q2_model       m;
-                        q2_model_move  mv;
+                        q2_model_move  mv = { 0 };   /* `got` guards it */
                         s32            idx;
                         bool           got = false;
 
@@ -1081,7 +1081,7 @@ int cmd_viewweapon(disc *d, const char *weapon, const char *out,
                      */
                     {
                         q2_model      m;
-                        q2_model_move mv;
+                        q2_model_move mv = { 0 };    /* `got` guards it */
                         s32           idx = q2_model_bank_find(&bank,
                                                                t.model_name[6]);
                         bool inside = false, outside_unscaled = false;

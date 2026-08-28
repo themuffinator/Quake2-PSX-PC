@@ -200,7 +200,7 @@ static void test_frame_roundtrip(void)
         memset(&f, 0, sizeof(f));
         f.number = 1;
         f.size   = e.size;
-        f.qscale = q;
+        f.qscale = (u16)q;
         f.width  = Q2_STX_WIDTH;
         f.height = Q2_STX_HEIGHT;
         f.num_codes = (u16)e.num_codes;

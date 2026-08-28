@@ -249,7 +249,8 @@ void q2_sim_combat_init(q2_sim *sim)
     /* A fresh player has the blaster and nothing else, which is what the
      * spawn path at 0x8003D4FC leaves in the weapon fields. */
     sim->combat.weapon_id        = Q2_WID_BLASTER;
-    sim->combat.inv.weapons      = q2_weapon_tables_builtin()->owned_bit[Q2_WID_BLASTER];
+    sim->combat.inv.weapons      =
+        (u16)q2_weapon_tables_builtin()->owned_bit[Q2_WID_BLASTER];
     sim->combat.chaingun_bullets = 1;
 
     q2_actor_from_player(&sim->combat.self, &sim->combat.inv, sim->player[sim->cur_player].pos);
@@ -464,7 +465,7 @@ q2_fire_result_v2 q2_sim_fire(q2_sim *sim)
      * see weapon.h. Drawn AFTER the shot so the flash does not perturb the
      * spread sequence, which is what the fire function's own ordering does.
      */
-    if (q2_weapon_has_muzzle_light(sim->combat.weapon_id)) {
+    if (q2_weapon_has_muzzle_light((u8)sim->combat.weapon_id)) {
         static const u8 flash[3] = { Q2_MUZZLE_LIGHT_R, Q2_MUZZLE_LIGHT_G,
                                      Q2_MUZZLE_LIGHT_B };
         s32 inner, outer;

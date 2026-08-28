@@ -631,7 +631,7 @@ static int module_pages(const disc *d, const char *map)
      * claim that should fail loudly if the ids ever stop resolving.
      */
     {
-        q2_lb_scene scene;
+        q2_lb_scene scene = { 0 };   /* `got` guards it; MSVC C4701 */
         q2_ai_module mod;
         bool got = false;
 

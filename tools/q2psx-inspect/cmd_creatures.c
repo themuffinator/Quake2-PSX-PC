@@ -161,7 +161,9 @@ static void report(const q2_creature *c, const q2_cre_impl *impl)
             static const char *names[Q2_CRE_MAX_MOVES];
             u32 named;
 
-            memset(names, 0, sizeof(names));
+    /* Cast for MSVC: an array of pointers-to-const reaching a void *
+     * parameter reads as discarding const (C4090). */
+    memset((void *)names, 0, sizeof(names));
             named = q2_creature_move_names(c, g_img, g_img_size, names,
                                            (u32)(sizeof(names) /
                                                  sizeof(names[0])));
@@ -192,7 +194,9 @@ static void report(const q2_creature *c, const q2_cre_impl *impl)
                 {
                     static const char *un[64];
                     u32 nu, z;
-                    memset(un, 0, sizeof(un));
+    /* Cast for MSVC: an array of pointers-to-const reaching a void *
+     * parameter reads as discarding const (C4090). */
+    memset((void *)un, 0, sizeof(un));
                     nu = q2_creature_unclaimed_names(c, g_img, g_img_size, un,
                                                      64);
                     g_unclaimed += nu;
@@ -226,7 +230,9 @@ static void report(const q2_creature *c, const q2_cre_impl *impl)
     {
         static const char *sn[32];
         u32 ns, z;
-        memset(sn, 0, sizeof(sn));
+    /* Cast for MSVC: an array of pointers-to-const reaching a void *
+     * parameter reads as discarding const (C4090). */
+    memset((void *)sn, 0, sizeof(sn));
         ns = q2_creature_sound_names(c, g_img, g_img_size, sn, 32);
         printf("    sounds    : %u named", ns);
         for (z = 0; z < ns && z < 12; z++)

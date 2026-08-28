@@ -232,7 +232,7 @@ void q2_weapon_refund(q2_inventory *inv, int weapon_id)
         return;
 
     need = tab->ammo_per_shot[weapon_id];
-    type = tab->ammo_type[weapon_id];
+    type = (s8)tab->ammo_type[weapon_id];
 
     if (need > 0 && type >= 0 && type < Q2_AMMO_COUNT)
         inv->ammo[type] = (s16)(inv->ammo[type] + (s16)need);
@@ -248,7 +248,7 @@ bool q2_weapon_consume(q2_inventory *inv, int weapon_id)
         return false;
 
     need = tab->ammo_per_shot[weapon_id];
-    type = tab->ammo_type[weapon_id];
+    type = (s8)tab->ammo_type[weapon_id];
     if (need == 0)
         return true;
     if (type < 0 || type >= Q2_AMMO_COUNT || inv->ammo[type] < (s16)need)

@@ -570,7 +570,10 @@ s32 q2_creature_world_death_frame(const q2_creature_world *w,
     if (!mod)
         return -1;
 
-    memset(names, 0, sizeof(names));
+    /* Cast for MSVC: it reads an array of pointers-to-const reaching a
+     * void * parameter as discarding const (C4090). This array is a
+     * local, and zeroing it is exactly what is meant. */
+    memset((void *)names, 0, sizeof(names));
     named = q2_creature_move_names(&mod->cre, mod->image, mod->size, names,
                                    (u32)(sizeof(names) / sizeof(names[0])));
     if (!named)
@@ -657,7 +660,10 @@ const char *q2_creature_world_sound_name(const q2_creature_world *w,
     if (!mod)
         return NULL;
 
-    memset(names, 0, sizeof(names));
+    /* Cast for MSVC: it reads an array of pointers-to-const reaching a
+     * void * parameter as discarding const (C4090). This array is a
+     * local, and zeroing it is exactly what is meant. */
+    memset((void *)names, 0, sizeof(names));
     n = q2_creature_sound_names(&mod->cre, mod->image, mod->size, names,
                                 (u32)(sizeof(names) / sizeof(names[0])));
 

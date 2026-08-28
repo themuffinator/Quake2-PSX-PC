@@ -153,7 +153,9 @@ static bool sort_entity_projects(const q2_world_zone *z, s32 index,
 {
     const psx_ot_area_screen *parent = sort_screen_parent(state, parent_index);
     psx_ot_area_screen front, zero, out;
-    q2_scene_node node;
+    /* `valid_node` is what guards every read of this, but the compiler does
+     * not correlate a flag with the value it guards (MSVC C4701). */
+    q2_scene_node node = { 0 };
     const q2_point_group *grp = NULL;
     bool all_zero = true, all_positive = true;
     bool valid_node;
@@ -832,12 +834,19 @@ u32 q2_world_build_ot(const q2_world_zone *z,
     gte_matrix rot, spin;
     q2_world_render local;
     q2_sort_reader order;
+    /* Same: `have_screen_state` guards it. Only `.current` is read under
+     * that flag, so zeroing the cursor is enough -- the record array is
+     * written by sort_screen_begin, and it is far too big to zero on every
+     * call for a warning. */
     sort_screen_state screen_state;
     bool have_order = false;
     bool have_screen_state = false;
     u32 next_node = 0;
     u32 emitted = 0;
     u32 n;
+
+    memset(&screen_state.current, 0, sizeof(screen_state.current));
+    screen_state.count = 0;
 
     if (!z || !cam || !ot || !gte)
         return 0;

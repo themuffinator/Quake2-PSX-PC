@@ -95,6 +95,19 @@ add_library(q2psx_flags INTERFACE)
 
 if(MSVC)
     target_compile_options(q2psx_flags INTERFACE /W4 /permissive- /utf-8)
+    # C4100 is MSVC's unreferenced-parameter warning, the same thing the GCC and
+    # Clang branch below turns off with -Wno-unused-parameter. The transcribed
+    # callbacks all share one signature whether or not a given one reads every
+    # argument, so this is off for the same reason on every compiler rather than
+    # only on two of them.
+    target_compile_options(q2psx_flags INTERFACE /wd4100)
+    # C4127, "conditional expression is constant". The test suites assert the
+    # constants transcribed from the executable through the same CHECK macro
+    # they use for everything else -- CHECK(Q2_MISSION_BODY_Y == 36, ...) --
+    # and that is exactly what those tests are for. GCC and Clang have no
+    # equivalent warning enabled, so this is MSVC-only noise over a
+    # deliberate and pervasive idiom.
+    target_compile_options(q2psx_flags INTERFACE /wd4127)
     target_compile_definitions(q2psx_flags INTERFACE _CRT_SECURE_NO_WARNINGS)
     if(Q2PSX_WERROR)
         target_compile_options(q2psx_flags INTERFACE /WX)

@@ -1372,7 +1372,7 @@ static void model_faces_check(const q2_model_bank *bank, u32 index,
             (*clut_bad)++;
         if ((fc.flags >> 5) != 0)
             (*blend_set)++;
-        if ((fc.flags & 0x1F) >= m->texpage_count)
+                        if ((fc.flags & 0x1Fu) >= (u32)m->texpage_count)
             (*page_bad)++;
     }
 }
@@ -3056,7 +3056,7 @@ static u32 draw_map_creatures(disc *d, const char *map, const q2_camera *cam,
 
             for (k = 0; q2_pop_get_spawn(&pop, &grp, k, &sp); k++) {
                 const q2_class_entry *e = q2_class_find(&tbl, sp.class_id);
-                q2_model mdl;
+                q2_model mdl = { 0 };   /* a flag guards it; MSVC C4701 */
                 bool found = false;
                 u32 m;
 
