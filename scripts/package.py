@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import shutil
 import sys
 import tarfile
@@ -86,6 +87,30 @@ def find_runtime_libraries(build_dir: Path) -> list[Path]:
     return list(found.values())
 
 
+def copy_runtime_library(source: Path, destination: Path) -> str:
+    """Copy a runtime library, keeping a symlink a symlink.
+
+    A fetched SDL3 installs as the usual three-name chain --
+    ``libSDL3.so -> libSDL3.so.0 -> libSDL3.so.0.2.8`` -- and the client's
+    DT_NEEDED names the middle one. Copying each of them by value would put
+    three identical four-megabyte files in the archive; keeping the links is
+    both smaller and the layout a Linux install has anyway.
+
+    Falls back to copying where symlinks cannot be created, which is Windows
+    without the privilege -- and Windows has no chain to preserve, only
+    SDL3.dll.
+    """
+    if source.is_symlink():
+        target = os.readlink(source)
+        try:
+            destination.symlink_to(target)
+            return f"{source.name} -> {target}"
+        except (OSError, NotImplementedError):
+            pass
+    shutil.copy2(source, destination)
+    return source.name
+
+
 def stage(
     *,
     build_dir: Path,
@@ -111,8 +136,7 @@ def stage(
 
     if "q2psx" in expect:
         for library in find_runtime_libraries(build_dir):
-            shutil.copy2(library, staging / library.name)
-            print(f"  {library.name}")
+            print(f"  {copy_runtime_library(library, staging / library.name)}")
 
     for source_rel, dest_rel in DOCUMENTS.items():
         source = ROOT / source_rel

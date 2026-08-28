@@ -377,6 +377,60 @@ class Packaging(unittest.TestCase):
         )
         self.assertTrue((staging / "libSDL3.so.0").is_file())
 
+    def test_a_shared_library_symlink_chain_stays_links(self):
+        """A fetched SDL3 is three names for one file.
+
+        libSDL3.so -> libSDL3.so.0 -> libSDL3.so.0.2.8, and the client's
+        DT_NEEDED names the middle one. Dereferencing each would put three
+        identical four-megabyte files in the archive.
+        """
+        self.make_binaries("q2psx", "q2psx-inspect", "stx2avi")
+        real = self.build / "bin" / "libSDL3.so.0.2.8"
+        real.write_bytes(b"ELF fake shared object")
+        try:
+            (self.build / "bin" / "libSDL3.so.0").symlink_to("libSDL3.so.0.2.8")
+            (self.build / "bin" / "libSDL3.so").symlink_to("libSDL3.so.0")
+        except (OSError, NotImplementedError):
+            self.skipTest("this platform cannot create symlinks")
+
+        staging = package.stage(
+            build_dir=self.build,
+            out_dir=self.root / "dist",
+            version="0.1.0",
+            platform="linux-x64",
+            expect=package.EXECUTABLES,
+        )
+
+        self.assertTrue((staging / "libSDL3.so.0.2.8").is_file())
+        self.assertFalse((staging / "libSDL3.so.0.2.8").is_symlink())
+        # The two the loader walks through are links, not copies.
+        self.assertTrue((staging / "libSDL3.so.0").is_symlink())
+        self.assertTrue((staging / "libSDL3.so").is_symlink())
+        # And the chain still resolves inside the staging directory.
+        self.assertEqual((staging / "libSDL3.so").resolve(), (staging / "libSDL3.so.0.2.8").resolve())
+
+    def test_a_tar_keeps_the_symlink_chain(self):
+        import tarfile
+
+        self.make_binaries("q2psx", "q2psx-inspect", "stx2avi")
+        (self.build / "bin" / "libSDL3.so.0.2.8").write_bytes(b"ELF fake")
+        try:
+            (self.build / "bin" / "libSDL3.so.0").symlink_to("libSDL3.so.0.2.8")
+        except (OSError, NotImplementedError):
+            self.skipTest("this platform cannot create symlinks")
+
+        staging = package.stage(
+            build_dir=self.build,
+            out_dir=self.root / "dist",
+            version="0.1.0",
+            platform="linux-x64",
+            expect=package.EXECUTABLES,
+        )
+        with tarfile.open(package.make_archive(staging, "linux-x64")) as bundle:
+            members = {Path(m.name).name: m for m in bundle.getmembers()}
+        self.assertTrue(members["libSDL3.so.0"].issym())
+        self.assertTrue(members["libSDL3.so.0.2.8"].isfile())
+
     def test_archives_use_the_format_each_platform_can_open(self):
         self.make_binaries("q2psx-inspect")
         for platform, suffix in (("windows-x64", ".zip"), ("linux-x64", ".tar.gz")):
