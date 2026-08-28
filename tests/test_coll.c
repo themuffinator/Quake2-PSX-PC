@@ -247,9 +247,21 @@ static void test_solid_bit(void)
     check(q2_coll_point_in_node(&c, 2, p), "node 2 holds the point when open");
 
     open_hull(&c, true);
-    check(q2_collision_node_is_solid(&c, 2), "bit 15 of first_plane reads as solid");
-    check(!q2_coll_point_in_node(&c, 2, p),
-          "a solid node holds nothing, whatever its planes say");
+    {
+        /* Three checks rather than one, because this failed on a compiler
+         * nobody here could reproduce and "a solid node holds nothing" does
+         * not say which half broke. In order: the bit reached the chunk, the
+         * accessor sees it, and the query acts on it. */
+        const u8 *rec = g_chunk + 4 + 2 * Q2_COLL_NODE_SIZE;
+        u32 raw = (u32)rec[24] | ((u32)rec[25] << 8);
+
+        check_eq_i(raw & Q2_COLL_SOLID, Q2_COLL_SOLID,
+                   "the solid bit is in the chunk");
+        check_eq_i(q2_collision_node_is_solid(&c, 2) ? 1 : 0, 1,
+                   "bit 15 of first_plane reads as solid");
+        check_eq_i(q2_coll_point_in_node(&c, 2, p) ? 1 : 0, 0,
+                   "a solid node holds nothing, whatever its planes say");
+    }
     check_eq_i(q2_collision_node_plane_count(&c, 2), 6,
                "the plane count still masks the solid bit off");
 }
