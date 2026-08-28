@@ -32,10 +32,11 @@ change; see [`docs/RELEASING.md`](docs/RELEASING.md).
 - _Nothing yet._
 
 ### Fixes
-- _Nothing yet._
+- Warnings-as-errors had never passed on any compiler, so CI had been red since 20 August and nothing it said could be trusted. All 33 are fixed rather than switched off: two were real undefined behaviour (`gte_sxy` read through a `psx_xy` in the glint and bolt draws), one was a dead computation left behind by an earlier fix, one was an always-true bound on a `u8`, and thirteen were formats that really could truncate a path or a menu label and now say what they cut to. GCC, Clang and MSVC.
 
 ### Build and packaging
-- _Nothing yet._
+- The repository is licensed: GPL-2.0, in `LICENSE`, and it ships in the release archives as that licence requires.
+- Five megabytes of rendered frames — a title screen, a HUD test, two model renders, two level renders and an accidental screenshot of a terminal window — were tracked at the repository root while the README said the repository contains no game assets. They are gone, `.gitignore` covers them, and `scripts/check_paths.py` now fails the build on any tracked file that is an image, a sound or a film — by extension *or* by magic number, because the screenshot was a PNG named `C`.
 
 ### Documentation
 - _Nothing yet._

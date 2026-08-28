@@ -163,15 +163,16 @@ q2_result q2_identify(const disc *d, q2_build_id *out)
 
     memset(out, 0, sizeof(*out));
 
-    strncpy(out->creation_time, disc_creation_time(d), sizeof(out->creation_time) - 1);
+    q2_str_copy(out->creation_time, sizeof(out->creation_time),
+                disc_creation_time(d));
     out->volume_sectors = disc_volume_sectors(d);
 
     r = disc_read_boot_info(d, &boot);
     if (r != Q2_OK) {
         Q2_WARN("no SYSTEM.CNF on this disc — cannot read the boot executable name");
     } else {
-        strncpy(out->serial,   boot.serial,   sizeof(out->serial) - 1);
-        strncpy(out->exe_name, boot.exe_name, sizeof(out->exe_name) - 1);
+        q2_str_copy(out->serial,   sizeof(out->serial),   boot.serial);
+        q2_str_copy(out->exe_name, sizeof(out->exe_name), boot.exe_name);
     }
 
     out->region = region_from_serial(out->serial);

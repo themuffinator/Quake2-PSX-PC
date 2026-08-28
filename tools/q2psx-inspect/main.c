@@ -515,8 +515,8 @@ static void census_add(census *c, const dat_archive *ar, const char *path)
     }
     if (i == c->variant_count && c->variant_count < CENSUS_MAX_SCHEMAS) {
         schema_variant *v = &c->variants[c->variant_count++];
-        strncpy(v->schema, schema, sizeof(v->schema) - 1);
-        strncpy(v->example, path, sizeof(v->example) - 1);
+        q2_str_copy(v->schema,  sizeof(v->schema),  schema);
+        q2_str_copy(v->example, sizeof(v->example), path);
         v->count = 1;
         v->chunk_count = ar->chunk_count;
     }
@@ -825,8 +825,9 @@ static int cmd_verify(disc *d)
                             spawn_placed  += st.placed;
                             spawn_oob     += st.out_of_range;
                             for (k = 0; k < ms.count; k++) {
-                                if (ms.monsters[k].class_id >= 0 &&
-                                    ms.monsters[k].class_id < Q2_MONSTER_CLASS_COUNT)
+                                /* class_id is a u8, so only the ceiling
+                                 * can fail: >= 0 is always true. */
+                                if (ms.monsters[k].class_id < Q2_MONSTER_CLASS_COUNT)
                                     class_seen[ms.monsters[k].class_id] = 1;
                             }
                         }

@@ -77,3 +77,21 @@ const u8 *q2_buf_at(const q2_buf *buf, size_t offset, size_t need)
         return NULL;
     return buf->data + offset;
 }
+
+void q2_str_copy(char *dst, size_t cap, const char *src)
+{
+    size_t i;
+
+    if (!dst || !cap)
+        return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+
+    /* Stops at cap - 1 whether or not a terminator turns up first, so a
+     * fixed-width field with no NUL is read no further than its width. */
+    for (i = 0; i + 1 < cap && src[i]; i++)
+        dst[i] = src[i];
+    dst[i] = '\0';
+}

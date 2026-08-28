@@ -739,7 +739,8 @@ static bool actor_cylinder_interval(const s32 origin[3], const s32 dir[3],
                                     const q2_actor *t, s32 fallback_radius,
                                     s64 *out_enter, s64 *out_exit)
 {
-    s64 ox, oz, a, b, disc;
+    /* `disc` would shadow the disc type; this is a quadratic discriminant. */
+    s64 ox, oz, a, b, discriminant;
     s64 h_enter, h_exit, v_enter, v_exit;
     s64 radius;
     s64 ymin, ymax;
@@ -799,14 +800,14 @@ static bool actor_cylinder_interval(const s32 origin[3], const s32 dir[3],
          * negative value by four before rejecting it can overflow s64 even
          * though all retail-scale hits remain exact. The positive arm is
          * bounded by Q2_TRACE_EXACT_TERM_MAX and is safe to scale. */
-        disc = radius * radius * a - cross * cross;
+        discriminant = radius * radius * a - cross * cross;
 
         /* 0x80054768 uses a strict comparison for the tangent case. */
-        if (disc <= 0)
+        if (discriminant <= 0)
             return false;
-        disc *= 4;
+        discriminant *= 4;
 
-        root  = trace_isqrt(disc);
+        root  = trace_isqrt(discriminant);
         denom = 2 * a;
         /* 0x800B11D8 receives +/-2048 and divides by a, i.e. these
          * (-b +/- sqrt(d)) * 4096 / (2a) roots, truncated toward zero. */

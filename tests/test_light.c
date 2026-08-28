@@ -729,7 +729,9 @@ static void test_flare_geometry(void)
         s32 rim_x = 0, rim_y = 0;      /* the widest rim offset seen  */
         s32 arm_x = 0, arm_y = 0;      /* the longest arm             */
         s32 diag_x = 0;
-        psx_xy centre;
+        /* `have_centre` is what guards the reads below, but the compiler
+         * does not correlate a flag with the value it guards. */
+        psx_xy centre = { 0, 0 };
         bool have_centre = false;
 
         for (i = 0; i < ot.prim_count; i++) {

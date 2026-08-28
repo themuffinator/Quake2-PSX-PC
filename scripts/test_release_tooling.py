@@ -244,7 +244,11 @@ class Changelog(unittest.TestCase):
                 changelog.prepare_release(self.path, "0.1.0", bad)
 
     def test_the_projects_own_changelog_parses(self):
-        self.assertEqual(changelog.main(["check", "--require-entries"]), 0)
+        # Structure only, not `--require-entries`: an empty queue is the correct
+        # state immediately after a release, and this has to hold at any point
+        # in the cycle. Demanding entries is the release's gate, not the
+        # repository's invariant.
+        self.assertEqual(changelog.main(["check"]), 0)
 
 
 class ReleaseNotes(unittest.TestCase):
@@ -536,6 +540,66 @@ class WindowsCheckoutablePaths(unittest.TestCase):
 
     def test_this_repository_is_clean(self):
         self.assertEqual(check_paths.main([]), 0)
+
+
+class NoGameAssetsTracked(unittest.TestCase):
+    """The README says this repository contains no game assets.
+
+    Seven images had been committed to the root regardless. Six were pictures of
+    id Software's artwork drawn off a disc; the seventh was an accidental
+    screenshot. A claim the build cannot check is a claim that drifts.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_the_files_that_were_committed(self):
+        flagged = check_paths.media_blobs(
+            ["hud.ppm", "mob.ppm", "model.ppm", "zone.ppm", "titlescreen.png", "README.md"]
+        )
+        self.assertEqual(flagged, ["hud.ppm", "mob.ppm", "model.ppm", "zone.ppm", "titlescreen.png"])
+
+    def test_source_and_documentation_pass(self):
+        self.assertEqual(
+            check_paths.media_blobs(
+                ["README.md", "src/game/combat.c", "scripts/version.py", "docs/FORMATS.md", "VERSION"]
+            ),
+            [],
+        )
+
+    def test_media_hiding_under_a_harmless_name(self):
+        # The real one was a PNG called C, from a redirection meant for a path
+        # starting C:. Nothing about the name gave it away.
+        (self.root / "C").write_bytes(bytes([0x89]) + b"PNG" + bytes([13, 10, 26, 10]) + b"rest")
+        self.assertEqual(check_paths.media_by_content(["C"], self.root), [("C", "PNG image")])
+
+    def test_every_magic_number(self):
+        cases = {
+            "a.bin": (bytes([0x89]) + b"PNG" + bytes([13, 10, 26, 10]), "PNG image"),
+            "b.bin": (bytes([0xFF, 0xD8, 0xFF]), "JPEG image"),
+            "c.bin": (b"GIF89a", "GIF image"),
+            "d.bin": (b"RIFF....WAVE", "RIFF audio or video"),
+            "e.bin": (b"OggS", "Ogg stream"),
+            "f.bin": (b"P6\n512 480\n255\n", "Netpbm image"),
+        }
+        for name, (head, kind) in cases.items():
+            (self.root / name).write_bytes(head)
+        found = dict(check_paths.media_by_content(list(cases), self.root))
+        for name, (_head, kind) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(found.get(name), kind)
+
+    def test_text_files_are_not_mistaken_for_media(self):
+        (self.root / "notes.md").write_text("# Heading\n\nProse.\n", encoding="utf-8")
+        (self.root / "code.c").write_text(
+            "#include <stdio.h>\nint main(void){return 0;}\n", encoding="utf-8"
+        )
+        (self.root / "plain.txt").write_text("Point at a .cue and it runs.\n", encoding="utf-8")
+        self.assertEqual(
+            check_paths.media_by_content(["notes.md", "code.c", "plain.txt"], self.root), []
+        )
 
 
 if __name__ == "__main__":

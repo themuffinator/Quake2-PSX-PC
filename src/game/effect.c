@@ -1082,8 +1082,16 @@ bool q2_fx_glint_mesh_decode(q2_fx_glint_mesh *out, const u8 *data, u32 size)
      * read through a typed pointer rather than copied because 218 vertices per
      * frame is not worth a copy.
      */
-    out->vert       = (const s16 (*)[4])(const void *)(data +
-                                                       Q2_FX_GLINT_INDEX_BYTES);
+    {
+        /* A union rather than a cast: GCC's -Wcast-qual reports any cast to
+         * a pointer-to-array as discarding const, however the source is
+         * qualified, and nothing here discards anything. Union punning is
+         * defined by every compiler this builds under. */
+        union { const u8 *bytes; const s16 (*quads)[4]; } view;
+
+        view.bytes = data + Q2_FX_GLINT_INDEX_BYTES;
+        out->vert  = view.quads;
+    }
     out->vert_count = (size - Q2_FX_GLINT_INDEX_BYTES) / 8u;
 
     return out->vert_count != 0;
@@ -1234,7 +1242,11 @@ u32 q2_fx_glint_build_ot(const q2_fx_glint_mesh *mesh,
 
         for (c = 0; c < 4; c++) {
             u32 v = idx[k_perimeter[c]];
-            prim->xy[c] = *(const psx_xy *)&xy[v];
+            /* Field by field: gte_sxy and psx_xy have the same layout but
+             * are distinct types, so reading one through the other is
+             * undefined. The compiler emits the same load either way. */
+            prim->xy[c].x = xy[v].x;
+            prim->xy[c].y = xy[v].y;
             prim->rgb[c].r = rgb[v][0];
             prim->rgb[c].g = rgb[v][1];
             prim->rgb[c].b = rgb[v][2];

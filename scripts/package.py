@@ -47,6 +47,9 @@ EXECUTABLES = ["q2psx", "q2psx-inspect", "stx2avi"]
 DOCUMENTS = {
     "README.md": "README.md",
     "CHANGELOG.md": "CHANGELOG.md",
+    # GPL-2.0 section 1 requires the licence to travel with the binary. This is
+    # not documentation and it is not optional.
+    "LICENSE": "LICENSE",
     "docs/ARCHITECTURE.md": "docs/ARCHITECTURE.md",
     "docs/FIDELITY.md": "docs/FIDELITY.md",
     "docs/FORMATS.md": "docs/FORMATS.md",

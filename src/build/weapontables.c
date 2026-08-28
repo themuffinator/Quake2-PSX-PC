@@ -13,41 +13,45 @@
  * stays falsifiable.
  */
 static const q2_weapon_tables k_builtin = {
-    { 0 },                                  /* exe: not owned by the builtin  */
+    /* `exe` is deliberately absent. The builtin owns no executable image,
+     * and a member omitted from a designated initialiser is zero-filled,
+     * which is what the braces here had been reaching for. Naming every
+     * other member also stops this table shifting silently if the struct
+     * ever gains one. */
 
     /* ammo_per_shot — 0x8009DB4C, 1-based. The BFG's fifty is what pins the
      * indexing: read 0-based it would land on the railgun. */
-    { 0, 0, 1, 2, 1, 1, 1, 1, 1, 1, 1, 50, 0 },
+    .ammo_per_shot = { 0, 0, 1, 2, 1, 1, 1, 1, 1, 1, 1, 50, 0 },
 
     /* ammo_type — 0x8009DC5C. shells 0, bullets 1, grenades 2, rockets 3,
      * cells 4, slugs 5. The blaster's 0 is never consulted: it costs nothing. */
-    { 0, 0, 0, 0, 1, 1, 2, 2, 3, 4, 5, 4, 0 },
+    .ammo_type = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 4, 5, 4, 0 },
 
     /* owned_bit — 0x8009DC2C. 1 << (id - 1); slot 12's zero is what makes the
      * original's 1..12 cycle scan reject the phantom slot. */
-    { 0, 0x001, 0x002, 0x004, 0x008, 0x010, 0x020,
+    .owned_bit = { 0, 0x001, 0x002, 0x004, 0x008, 0x010, 0x020,
          0x040, 0x080, 0x100, 0x200, 0x400, 0 },
 
     /* fire_fn — 0x8009D704. Slot 0 is 0x8004EB08, which is literally
      * `jr ra; nop`: a do-nothing shot for "no weapon". */
-    { 0x8004EB08u, 0x8004BFBCu, 0x8004C1C0u, 0x8004C488u, 0x8004C744u,
+    .fire_fn = { 0x8004EB08u, 0x8004BFBCu, 0x8004C1C0u, 0x8004C488u, 0x8004C744u,
       0x8004CA9Cu, 0x8004EBDCu, 0x8004CE18u, 0x8004D038u, 0x8004D250u,
       0x8004D498u, 0x8004EB10u, 0 },
 
     /* name — 0x8009DB9C. Four of these fill all twelve bytes with no NUL. */
-    { "", "Blaster G", "Shotgun G", "Supershot G", "Machinegun G",
+    .name = { "", "Blaster G", "Shotgun G", "Supershot G", "Machinegun G",
       "Chaingun G", "HandGren G", "GrenLaunch G", "RockLaunch G",
       "HyperBlast G", "Railgun G", "Bfg G", "" },
 
     /* autoswitch — 0x8009DB7C, 0-terminated. Explosives are absent by design:
      * the BFG, the grenade launcher and hand grenades never auto-select. */
-    { 10, 9, 8, 5, 4, 3, 2, 1, 0, 0, 0, 0 },
-    8,
+    .autoswitch = { 10, 9, 8, 5, 4, 3, 2, 1, 0, 0, 0, 0 },
+    .autoswitch_count = 8,   /* excludes the terminating zero */
 
     /* muzzle — 0x800AE9C4 onward, stored (right, up, forward) with the middle
      * component already negated as every fire function negates it. Weapons
      * whose offset lives inside their projectile spawner read zero here. */
-    {
+    .muzzle = {
         {   0,   0,   0 },   /* 0  no weapon                                 */
         {  80,  56, 250 },   /* 1  blaster           0x800AE9C4              */
         {  76,  80, 250 },   /* 2  shotgun           0x800AE9CC              */
@@ -64,12 +68,12 @@ static const q2_weapon_tables k_builtin = {
     },
 
     /* armour — 0x8009C5EC. PC Quake II's own six numbers, on all six. */
-    { {  25,  50, 1229,    0 },      /* jacket */
+    .armour = { {  25,  50, 1229,    0 },      /* jacket */
       {  50, 100, 2458, 1229 },      /* combat */
       { 100, 200, 3277, 2458 } },    /* body   */
 
     /* sound — 0x800ACBC8, 12-byte stride. */
-    { "wep_railgf1a", "wep_noammo",   "wep_grenlb1b", "wep_hgrenc1b",
+    .sound = { "wep_railgf1a", "wep_noammo",   "wep_grenlb1b", "wep_hgrenc1b",
       "wep_hgrent1a", "wep_shotgr1b", "wep_sshotr1b", "wep_grenlx1a",
       "wep_blastf1a", "wep_shotgf1b", "wep_sshotf1b", "wep_machgf1b",
       "wep_chngnu1a", "wep_chngnl1a", "wep_chngnd1a", "wep_hyprbf1a",
@@ -78,7 +82,7 @@ static const q2_weapon_tables k_builtin = {
 
     /* bolt_shape — 0x8009DB1C. Eight corners of a 20 x 20 x 100 box, which is
      * the bolt's oriented hull; 0x8004D70C rotates each into the entity. */
-    { { -10, -10, -50 }, {  10, -10, -50 },
+    .bolt_shape = { { -10, -10, -50 }, {  10, -10, -50 },
       { -10, -10,  50 }, {  10, -10,  50 },
       { -10,  10, -50 }, {  10,  10, -50 },
       { -10,  10,  50 }, {  10,  10,  50 } }

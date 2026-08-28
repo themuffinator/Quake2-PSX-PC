@@ -297,6 +297,15 @@ a clean reimplementation for interoperability and preservation, in the tradition
 ScummVM. You must supply your own legally-obtained Quake II PSX disc. Quake II is a
 trademark of id Software LLC.
 
+The code here is licensed under the **GNU General Public License, version 2** — see
+[`LICENSE`](LICENSE) — which is the licence id Software released the Quake engines
+under and the one this project's neighbours use. Copyright the Q2PSX-PC contributors.
+
+That "no game assets" line is checked rather than asserted: `scripts/check_paths.py`
+fails the build if any tracked file is an image, a sound or a film, by extension **or**
+by magic number, so a render dropped in the working tree cannot be committed by
+accident. It has been, and that is why the check exists.
+
 ## Layout
 
 ```

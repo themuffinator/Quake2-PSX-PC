@@ -122,7 +122,9 @@ int cmd_items(disc *d)
     char first_shadow_path[160] = "";
     char first_shadow_group[13] = "";
     char first_shadow_model[Q2_ITEM_MODEL_LEN + 1] = "";
-    q2_pop_place first_shadow_place;
+    /* Only read when a shadowed placement was actually found, but the
+     * compiler cannot see that the counter and this move together. */
+    q2_pop_place first_shadow_place = { 0 };
 
     if (!d)
         return 1;
@@ -294,7 +296,8 @@ int cmd_items(disc *d)
                         shadow_places++;
                         if (!first_shadow_path[0]) {
                             snprintf(first_shadow_path,
-                                     sizeof(first_shadow_path), "%s",
+                                     sizeof(first_shadow_path), "%.*s",
+                                     (int)(sizeof(first_shadow_path) - 1),
                                      file->path);
                             snprintf(first_shadow_group,
                                      sizeof(first_shadow_group), "%s",

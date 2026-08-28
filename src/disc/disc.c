@@ -141,7 +141,18 @@ static void path_resolve_sibling(char *out, size_t cap, const char *base, const 
         dirlen = cap - 1;
     memcpy(out, base, dirlen);
     out[dirlen] = '\0';
-    strncat(out, rel, cap - strlen(out) - 1);
+    /* Join, truncating rather than overflowing. strncat's remaining-space
+     * idiom is correct but GCC cannot see that it always terminates, and
+     * spelling the bound out is clearer than the arithmetic was. */
+    {
+        size_t room = cap - dirlen - 1;
+        size_t take = strlen(rel);
+
+        if (take > room)
+            take = room;
+        memcpy(out + dirlen, rel, take);
+        out[dirlen + take] = '\0';
+    }
 }
 
 static u64 file_size_of(FILE *fp)
@@ -1104,7 +1115,8 @@ q2_result disc_read_boot_info(const disc *d, disc_boot_info *out)
                 digits[n] = '\0';
 
                 if (n >= 5) {
-                    snprintf(out->serial, sizeof(out->serial), "%.4s-%s", name, digits);
+                    snprintf(out->serial, sizeof(out->serial), "%.4s-%.*s",
+                             name, (int)(sizeof(out->serial) - 6), digits);
                 } else {
                     str_copy(out->serial, sizeof(out->serial), name);
                 }

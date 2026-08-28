@@ -659,7 +659,8 @@ int cmd_lights(const disc *d)
                 continue;
             }
 
-            snprintf(current_map, sizeof(current_map), "%s", f->path);
+            snprintf(current_map, sizeof(current_map), "%.*s",
+                     (int)(sizeof(current_map) - 1), f->path);
             map_lights = 0;
 
             if (q2_lights_parse(&lights, &cf) == Q2_OK) {

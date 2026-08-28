@@ -57,6 +57,29 @@ static int g_total;
  */
 static double probe_x0, probe_x1, probe_y0, probe_y1;
 
+/*
+ * An inline compare rather than strncasecmp. That function is POSIX, not C11,
+ * and this project compiles as strict C11 -- under which glibc hides it, so the
+ * call below was an implicit declaration and the platform #ifdef around it was
+ * buying nothing. The names are fixed-width ASCII with no locale in play, which
+ * is the same reasoning src/formats/model.c gives for doing it this way.
+ */
+static bool name_ieq(const char *a, const char *b, size_t n)
+{
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        int ca = a[i] >= 'a' && a[i] <= 'z' ? a[i] - 32 : a[i];
+        int cb = b[i] >= 'a' && b[i] <= 'z' ? b[i] - 32 : b[i];
+
+        if (ca != cb)
+            return false;
+        if (!ca)
+            return true;
+    }
+    return true;
+}
+
 static bool imm_at(const q2_exe *e, u32 addr, s32 *out)
 {
     u32 word;
@@ -799,11 +822,7 @@ int cmd_viewweapon(disc *d, const char *weapon, const char *out,
         } else {
             for (w = 0; w < Q2_VM_SLOTS; w++) {
                 if (t.model_name[w][0] &&
-#ifdef _WIN32
-                    _strnicmp(t.model_name[w], weapon, 12) == 0)
-#else
-                    strncasecmp(t.model_name[w], weapon, 12) == 0)
-#endif
+                    name_ieq(t.model_name[w], weapon, 12))
                 { want = w; break; }
             }
             if (want < 0) {

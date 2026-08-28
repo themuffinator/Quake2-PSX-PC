@@ -103,7 +103,8 @@ static bool scan_map(const disc *d, map_info *m, q2_buf *reference)
     q2_start_pos_list sl;
     u32 k;
 
-    snprintf(path, sizeof(path), "Q2DATA/LEVELS/%s/COMMON.DAT", m->name);
+    snprintf(path, sizeof(path), "Q2DATA/LEVELS/%.*s/COMMON.DAT",
+             (int)(sizeof(path) - 32), m->name);
     if (disc_read_file(d, path, &file) != Q2_OK)
         return false;
     if (q2_common_open(&cf, &file) != Q2_OK) {

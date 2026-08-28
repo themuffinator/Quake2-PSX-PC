@@ -551,8 +551,12 @@ u32 q2_projectiles_build_ot(const struct q2_projectiles *list,
             prim->tpage            = Q2_FX_ABR_ADD;
             prim->rgb[0]           = tint;
 
-            for (c = 0; c < 4; c++)
-                prim->xy[c] = *(const psx_xy *)&xy[idx[c]];
+            for (c = 0; c < 4; c++) {
+                /* gte_sxy and psx_xy share a layout but are distinct types;
+                 * reading one through the other is undefined. */
+                prim->xy[c].x = xy[idx[c]].x;
+                prim->xy[c].y = xy[idx[c]].y;
+            }
 
             emitted++;
         }

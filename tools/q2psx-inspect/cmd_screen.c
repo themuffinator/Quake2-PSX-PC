@@ -161,7 +161,9 @@ static void print_view(const q2_screen *s, const char *tag,
 static void print_layout(q2_screen *s, q2_screen_layout l, int players)
 {
     int i;
-    char tag[16];
+    /* "view " plus an int: eleven digits and a terminator, so sixteen was
+     * one short of what a hostile view_count could print. */
+    char tag[24];
 
     q2_screen_set_layout(s, l, players);
 

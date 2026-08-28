@@ -1128,7 +1128,6 @@ u32 q2_vw_build_ot(const q2_viewweapon *vw,
     bool              posed = false;
     s32 origin[3];
     s32 angles[3];
-    s32 angles_view[3];
     s16 rot_out[3][3];
 
     if (!vw || !vw->model || !cam || !ot || !gte)
@@ -1141,11 +1140,8 @@ u32 q2_vw_build_ot(const q2_viewweapon *vw,
 
     q2_vw_place(vw, feet, view_offset, aim, kick, origin, angles);
 
-    /* The view part of those angles, without the clip's — the composition above
-     * needs the camera's rotation on its own. */
-    angles_view[0] = -((aim ? aim[0] : 0) + (kick ? kick[0] : 0));
-    angles_view[1] =  ((aim ? aim[1] : 0) + (kick ? kick[1] : 0));
-    angles_view[2] =  ((aim ? aim[2] : 0) + (kick ? kick[2] : 0));
+    /* q2_vw_place fills `angles` for callers that want the composed
+     * rotation; this path builds its own from the camera below. */
     (void)angles;
 
     /*
@@ -1247,9 +1243,9 @@ u32 q2_vw_build_ot(const q2_viewweapon *vw,
          *
          * Reconstructing it was exact only by luck. `q2_model_build_ot` uses
          * `q2_rotation_view(cam->yaw, cam->pitch, cam->roll)`, and this built a
-         * yaw/pitch matrix from `angles_view`, so the two agreed only while the
-         * roll was zero and the caller's aim + kick happened to equal the
-         * camera's angles. Taking the camera directly makes
+         * yaw/pitch matrix from the aim and the kick, so the two agreed only
+         * while the roll was zero and the caller's aim + kick happened to
+         * equal the camera's angles. Taking the camera directly makes
          * `camera * (camera^T * clip) == clip` true by construction for any
          * camera, which is what the cancellation is for.
          */

@@ -142,4 +142,18 @@ void      q2_buf_free(q2_buf *buf);
 /* Bounds-checked slice of a buffer; returns NULL if the range escapes it. */
 const u8 *q2_buf_at(const q2_buf *buf, size_t offset, size_t need);
 
+/*
+ * Copy a string into a fixed-width field, truncating rather than overflowing,
+ * and always terminating.
+ *
+ * This exists because `strncpy(dst, src, sizeof dst - 1)` on a pre-zeroed
+ * struct is correct and unreadable: it relies on the zeroing for the
+ * terminator, which is somewhere else entirely, and GCC's
+ * -Wstringop-truncation cannot see that and says so on every call.
+ *
+ * It also reads no further than `cap - 1` bytes of `src`, so a fixed-width
+ * on-disc field carrying no NUL -- which is most of them -- is safe to pass.
+ */
+void q2_str_copy(char *dst, size_t cap, const char *src);
+
 #endif /* Q2PSX_H */

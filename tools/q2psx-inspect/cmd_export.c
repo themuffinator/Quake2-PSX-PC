@@ -898,8 +898,10 @@ static int export_zone(disc *d, const char *map, u32 zone_index,
     }
 
     snprintf(base, sizeof(base), "%s_ZONE%u", map, zone_index);
-    snprintf(obj_path, sizeof(obj_path), "%s/%s.obj", mapdir, base);
-    snprintf(mtl_path, sizeof(mtl_path), "%s/%s.mtl", mapdir, base);
+    snprintf(obj_path, sizeof(obj_path), "%.*s/%s.obj",
+             (int)(sizeof(obj_path) - sizeof(base) - 8), mapdir, base);
+    snprintf(mtl_path, sizeof(mtl_path), "%.*s/%s.mtl",
+             (int)(sizeof(mtl_path) - sizeof(base) - 8), mapdir, base);
 
     fp = fopen(obj_path, "wb");
     if (!fp) {
@@ -1218,7 +1220,7 @@ static void export_models(disc *d, const char *map, tex_bank *tb,
     q2_buf buf;
     u32 zone;
 
-    snprintf(dir, sizeof(dir), "%s/models", mapdir);
+    snprintf(dir, sizeof(dir), "%.*s/models", (int)(sizeof(dir) - 16), mapdir);
 
     snprintf(path, sizeof(path), "Q2DATA/LEVELS/%s/COMMON.DAT", map);
     if (disc_read_file(d, path, &buf) == Q2_OK) {
@@ -1273,7 +1275,7 @@ static u32 export_sounds(disc *d, const char *map, const char *mapdir)
     if (q2_sound_bank_load(&bank, d, map) != Q2_OK)
         return 0;
 
-    snprintf(dir, sizeof(dir), "%s/sounds", mapdir);
+    snprintf(dir, sizeof(dir), "%.*s/sounds", (int)(sizeof(dir) - 16), mapdir);
     make_dir(dir);
 
     for (i = 0; i < bank.count; i++) {
@@ -1300,7 +1302,9 @@ static u32 export_sounds(disc *d, const char *map, const char *mapdir)
 
         /* The runtime sound id is the bank index plus one — slot 0 is a null
          * placeholder — so the file name carries the id, not the index. */
-        snprintf(path, sizeof(path), "%s/%03u_%s.wav", dir, i + 1, name);
+        snprintf(path, sizeof(path), "%.*s/%03u_%.*s.wav",
+                 (int)(sizeof(path) - sizeof(name) - 24), dir,
+                 i + 1, (int)(sizeof(name) - 1), name);
         if (got && write_wav16(path, pcm, got, 1, vag.sample_rate))
             done++;
 
@@ -1334,8 +1338,8 @@ static u32 export_music(disc *d, const char *outdir)
             if (q2_xa_track_open(&track, d, letter, channel) != Q2_OK)
                 continue;
 
-            snprintf(path, sizeof(path), "%s/QUAKE_%c_ch%u.wav", dir, letter,
-                     channel);
+            snprintf(path, sizeof(path), "%.*s/QUAKE_%c_ch%u.wav",
+                     (int)(sizeof(path) - 32), dir, letter, channel);
             if (!wav_open(&w, path, XA_CHANNELS, XA_SAMPLE_RATE))
                 continue;
 
@@ -1374,7 +1378,8 @@ static u32 export_cdda(disc *d, const char *outdir)
             continue;
 
         make_dir(dir);
-        snprintf(path, sizeof(path), "%s/track%02d.wav", dir, t->number);
+        snprintf(path, sizeof(path), "%.*s/track%02d.wav",
+                 (int)(sizeof(path) - 32), dir, t->number);
         if (!wav_open(&w, path, 2, 44100))
             continue;
 
@@ -1584,7 +1589,8 @@ int cmd_export(disc *d, const char *outdir, const char *what,
         have_vram = (q2_vram_load(&vs, d, map) == Q2_OK);
         if (have_vram) {
             tb.vs = &vs;
-            snprintf(tb.dir, sizeof(tb.dir), "%s/textures", mapdir);
+            snprintf(tb.dir, sizeof(tb.dir), "%.*s/textures",
+                     (int)(sizeof(tb.dir) - 16), mapdir);
             if (wants(what, "texture") || wants(what, "map") ||
                 wants(what, "model"))
                 make_dir(tb.dir);

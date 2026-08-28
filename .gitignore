@@ -70,3 +70,17 @@ dump/
 .tmp/
 *.log
 /artifacts
+
+# Rendered frames. `q2psx-inspect render` and the client's --shot write these,
+# and what they draw is the disc's own artwork, so they fall under the very
+# first rule in this file. Seven had been committed to the repository root --
+# a title screen, a HUD test, two model renders, two level renders and an
+# accidental screenshot of a terminal window -- while the README said the
+# repository contains no game assets. scripts/check_paths.py now fails CI on
+# any that come back.
+*.ppm
+*.pgm
+*.pnm
+/*.png
+/*.bmp
+/*.tga

@@ -407,8 +407,9 @@ static void card_page(q2_menu *m, const q2_save_ui *ui, int state)
     } else if (page == q2_mcard_page(Q2_MCARD_LOAD_MESSAGE)) {
         /* Both rows, because an empty override falls back to the table's own
          * label and the second one says HERE. */
-        snprintf(m->text[0], Q2_MENU_TEXT_MAX, "%s", ui->message);
-        snprintf(m->text[1], Q2_MENU_TEXT_MAX, "%s",
+        snprintf(m->text[0], Q2_MENU_TEXT_MAX, "%.*s",
+                 Q2_MENU_TEXT_MAX - 1, ui->message);
+        snprintf(m->text[1], Q2_MENU_TEXT_MAX, "%.*s", Q2_MENU_TEXT_MAX - 1,
                  ui->detail[0] ? ui->detail : " ");
     }
 }
