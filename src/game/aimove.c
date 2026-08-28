@@ -127,9 +127,11 @@ bool q2_M_CheckBottom(q2_monster *m)
 bool q2_SV_movestep(q2_monster *m, const s32 move[3], bool relink)
 {
     const q2_ai_world *w = q2_ai_get_world();
-    s32 oldorg[3], neworg[3], end[3];
+    s32 oldorg[3], neworg[3], end[3], lifted[3];
     q2_ai_trace tr;
     s32 stepsize;
+    bool has_move;
+    bool recover_startsolid = false;
 
     if (!m || !move)
         return false;
@@ -137,6 +139,7 @@ bool q2_SV_movestep(q2_monster *m, const s32 move[3], bool relink)
     oldorg[0] = m->pos[0];
     oldorg[1] = m->pos[1];
     oldorg[2] = m->pos[2];
+    has_move = move[0] != 0 || move[1] != 0 || move[2] != 0;
 
     /* --- flying and swimming ------------------------------------------- */
     if (m->flags & (Q2_FL_FLY | Q2_FL_SWIM)) {
@@ -241,29 +244,43 @@ bool q2_SV_movestep(q2_monster *m, const s32 move[3], bool relink)
         w->trace(w->user, m->pos, m->mins, m->maxs, lift, m,
                  Q2_MASK_MONSTERSOLID, &tr);
 
-        if (tr.allsolid)
-            return false;
+        /* 0x8005FFC4 sends a start-solid lift to the retail recovery arm. */
+        if (tr.startsolid) {
+            recover_startsolid = true;
+        } else {
+            if (tr.allsolid)
+                return false;
 
-        /* The console's alternate arm at 0x8005FFC4 branches on the result's
-         * startsolid into a whole recovery block (0x800600EC..0x80060214) that
-         * this port does not have; refusing the step is the conservative half
-         * of it and is what was here before. */
-        if (tr.startsolid)
-            return false;
+            lifted[0] = tr.endpos[0];
+            lifted[1] = tr.endpos[1];
+            lifted[2] = tr.endpos[2];
 
-        neworg[0] = tr.endpos[0];
-        neworg[1] = tr.endpos[1];
-        neworg[2] = tr.endpos[2];
+            /*
+             * 0x8005FFCC..0x8005FFE0 carries however much of the lift was
+             * achieved into the wished Y. This only differs from simply
+             * using the lift endpoint when move[1] is non-zero.
+             */
+            neworg[0] = m->pos[0] + move[0];
+            neworg[1] = m->pos[1] + move[1]
+                      + (lifted[1] - m->pos[1]);
+            neworg[2] = m->pos[2] + move[2];
+        }
     }
 
-    /* --- 2. the horizontal move, at the raised height -------------------- */
-    {
-        end[0] = m->pos[0] + move[0];
-        end[1] = neworg[1];
-        end[2] = m->pos[2] + move[2];
+    /* A start-solid lift skips both ordinary traces. 0x8005FFC4 -> 600CC. */
+    if (!recover_startsolid) {
+        /* --- 2. the horizontal move, at the raised height ----------------
+         * 0x8005FFE4..0x80060010 skips this trace when every move component
+         * is zero. In that case the fraction gate below deliberately still
+         * observes the LIFT result. */
+        if (has_move) {
+            end[0] = neworg[0];
+            end[1] = neworg[1];
+            end[2] = neworg[2];
 
-        w->trace(w->user, neworg, m->mins, m->maxs, end, m,
-                 Q2_MASK_MONSTERSOLID, &tr);
+            w->trace(w->user, lifted, m->mins, m->maxs, end, m,
+                     Q2_MASK_MONSTERSOLID, &tr);
+        }
 
         if (tr.allsolid || tr.startsolid)
             return false;
@@ -274,26 +291,55 @@ bool q2_SV_movestep(q2_monster *m, const s32 move[3], bool relink)
         if (tr.fraction != Q2_TRACE_ONE)
             return false;
 
-        neworg[0] = tr.endpos[0];
-        neworg[1] = tr.endpos[1];
-        neworg[2] = tr.endpos[2];
-    }
+        if (has_move) {
+            neworg[0] = tr.endpos[0];
+            neworg[1] = tr.endpos[1];
+            neworg[2] = tr.endpos[2];
+        }
 
-    /* --- 3. the drop ----------------------------------------------------- */
-    end[0] = neworg[0];
-    end[1] = m->pos[1] + move[1] + stepsize;
-    end[2] = neworg[2];
+        /* --- 3. the drop ------------------------------------------------- */
+        end[0] = neworg[0];
+        end[1] = m->pos[1] + stepsize;
+        end[2] = neworg[2];
 
-    w->trace(w->user, neworg, m->mins, m->maxs, end, m,
-             Q2_MASK_MONSTERSOLID, &tr);
-
-    if (tr.allsolid)
-        return false;
-
-    if (tr.startsolid) {
-        neworg[1] += stepsize;
         w->trace(w->user, neworg, m->mins, m->maxs, end, m,
                  Q2_MASK_MONSTERSOLID, &tr);
+
+        /* 0x800600D8..0x800600E8 biases an ordinary landing one unit up. */
+        tr.endpos[1] -= 1;
+
+        if (tr.startsolid)
+            recover_startsolid = true;
+        else if (tr.allsolid)
+            return false;
+    }
+
+    if (recover_startsolid) {
+        /*
+         * 0x800600EC..0x80060214 — retry without stepping. Retail first
+         * traces origin -> origin+move and insists on an exact 4096 fraction.
+         * A zero move bypasses that trace (the three component tests at
+         * 0x80060128..0x80060150). It then drops from the unstepped wish
+         * position to original-Y + stepsize. This arm serves a start-solid
+         * result from either the lift or the ordinary drop.
+         */
+        neworg[0] = m->pos[0] + move[0];
+        neworg[1] = m->pos[1] + move[1];
+        neworg[2] = m->pos[2] + move[2];
+
+        if (has_move) {
+            w->trace(w->user, m->pos, m->mins, m->maxs, neworg, m,
+                     Q2_MASK_MONSTERSOLID, &tr);
+            if (tr.fraction != Q2_TRACE_ONE)
+                return false;
+        }
+
+        end[0] = neworg[0];
+        end[1] = m->pos[1] + stepsize;
+        end[2] = neworg[2];
+        w->trace(w->user, neworg, m->mins, m->maxs, end, m,
+                 Q2_MASK_MONSTERSOLID, &tr);
+
         if (tr.allsolid || tr.startsolid)
             return false;
     }

@@ -161,9 +161,10 @@
  *     corpse_ticks -= dt;
  *     if (corpse_ticks <= 0) { corpse_ticks = 1; think = body_fade; }
  *
- * and `body_fade` (0x8005B358) takes `dt * 16` off the entity's scale at +0xFC
- * each tick and releases the model when it reaches zero. 4096 is 1.0, so the
- * body shrinks away over 256 dt of scale — under a second — after its five.
+ * and `body_fade` (0x8005B358) takes `dt * 16` off entity+0xFC each tick and
+ * releases the model when it reaches zero. The draw-time access census shows
+ * that +0xFC is a lighting intensity, not a geometric scale: the body darkens
+ * away over 256 dt — under a second — after its five-second wait.
  *
  * **Nothing in this chain respawns the player.** The corpse animates, waits its
  * 1500 and dissolves; putting a player back is 0x8003DDF8, and 0x8003DDF8 has
@@ -223,7 +224,7 @@
  * the console goes back to the front end on its own. */
 #define Q2_PDEATH_ABANDON_TICKS   1200
 
-/* The body's scale at +0xFC, and what body_fade takes off it per dt
+/* The body's light intensity at +0xFC, and what body_fade takes off it per dt
  * (0x8005B36C, `sll v1, v1, 4`). */
 #define Q2_PDEATH_SCALE_ONE       4096
 #define Q2_PDEATH_FADE_RATE       16
@@ -326,7 +327,7 @@ typedef struct q2_player_death {
     s16  gib_health;      /* entity+0x44                                */
     s16  corpse_ticks;    /* entity+0xF4                                */
     s16  box_y;           /* entity+0x6E, flattened to 143 when down    */
-    s16  scale;           /* entity+0xFC                                */
+    s16  scale;           /* entity+0xFC light intensity (retained name) */
     s16  velocity[3];     /* entity+0xE0..0xE4                          */
     s16  pitch;           /* entity+0xE6                                */
 
@@ -403,9 +404,9 @@ bool q2_player_death_tick(q2_player_death *d, s16 health, s32 dt,
 
 /*
  * The frame cursor walking past the end of the death move — 0x8003DF90's
- * `animflags |= 1`. The port has no player model to advance, so the client
- * reports the animation's end here instead, and a caller with no model at all
- * can call it immediately: single player never reads the flag.
+ * `animflags |= 1`. The client advances the rendered Male2 cursor and reports
+ * that edge here. A caller with no usable model can still call it immediately:
+ * single player never reads the flag.
  */
 void q2_player_death_anim_ended(q2_player_death *d);
 

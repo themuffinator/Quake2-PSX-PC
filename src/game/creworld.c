@@ -685,6 +685,23 @@ u32 q2_creature_world_summon(q2_creature_world *w, const char *group)
             if (m->group != gi || m->in_use || m->dead)
                 continue;
             m->in_use = true;
+
+            /*
+             * A held batch missed `q2_monster_set_wake`: that sweep quite
+             * correctly skips records whose in-use latch is clear. Merely
+             * raising the latch here therefore produced a model whose module
+             * had been bound, but whose generic monster start never ran — no
+             * stand move, no q2_M_MoveFrame think, and no next-think time.
+             * BASE1's adjacent LiftRoom Soldier and Infantry are the visible
+             * instance: CREBATCH made them appear and they remained inert.
+             *
+             * Retail does not pre-spawn and hold the group. Its selected-group
+             * pass creates the entity at this point and reaches
+             * monster_start_go as part of that spawn. Calling the same start
+             * here closes the seam introduced by the port's dormant-record
+             * representation without inventing a second wake path.
+             */
+            q2_monster_start_go(m);
             woke++;
         }
         break;

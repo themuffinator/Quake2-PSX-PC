@@ -228,7 +228,7 @@ void q2_weapon_refund(q2_inventory *inv, int weapon_id)
     u32 need;
     s8  type;
 
-    if (!inv || weapon_id <= 0 || weapon_id >= Q2_WEAPON_COUNT)
+    if (!inv || weapon_id <= 0 || weapon_id > Q2_WID_COUNT)
         return;
 
     need = tab->ammo_per_shot[weapon_id];
@@ -236,6 +236,26 @@ void q2_weapon_refund(q2_inventory *inv, int weapon_id)
 
     if (need > 0 && type >= 0 && type < Q2_AMMO_COUNT)
         inv->ammo[type] = (s16)(inv->ammo[type] + (s16)need);
+}
+
+bool q2_weapon_consume(q2_inventory *inv, int weapon_id)
+{
+    const q2_weapon_tables *tab = q2_weapon_tables_builtin();
+    u32 need;
+    s8  type;
+
+    if (!inv || weapon_id <= 0 || weapon_id > Q2_WID_COUNT)
+        return false;
+
+    need = tab->ammo_per_shot[weapon_id];
+    type = tab->ammo_type[weapon_id];
+    if (need == 0)
+        return true;
+    if (type < 0 || type >= Q2_AMMO_COUNT || inv->ammo[type] < (s16)need)
+        return false;
+
+    inv->ammo[type] = (s16)(inv->ammo[type] - (s16)need);
+    return true;
 }
 
 int q2_weapon_autoselect(const q2_inventory *inv)
@@ -399,7 +419,11 @@ q2_fire_result_v2 q2_weapon_fire(q2_inventory *inv, q2_rng *rng,
             res.next_fire = now + Q2_WEAPON_DRY_REFIRE;
             return res;
         }
-        inv->ammo[type] = (s16)(inv->ammo[type] - need);
+        /* Grenade3 is paid for at RELEASE, not at prime. 0x8004A7C0 is in
+         * the held entity's 411-crossing arm, after the throw sound and just
+         * before state 3. Every other fire function spends here. */
+        if (w->kind != Q2_FK_HAND_GRENADE)
+            inv->ammo[type] = (s16)(inv->ammo[type] - need);
     }
 
     res.fired = true;
@@ -508,13 +532,12 @@ q2_fire_result_v2 q2_weapon_fire(q2_inventory *inv, q2_rng *rng,
         for (k = 0; k < 3; k++)
             s->dir[k] = (aim ? aim[k] : 0) * Q2_AIM_SCALE_ROCKET;
         s->damage = damage;
-        res.projectile_speed = Q2_ROCKET_SPEED;
+        res.projectile_timer = Q2_ROCKET_LIFETIME;
         res.sound = Q2_WSND_ROCKET;
         break;
     }
 
-    case Q2_FK_GRENADE:
-    case Q2_FK_HAND_GRENADE: {
+    case Q2_FK_GRENADE: {
         q2_shot *s = &res.shot[res.shot_count++];
         s16 local[3];
         s32 dir[3];
@@ -540,10 +563,23 @@ q2_fire_result_v2 q2_weapon_fire(q2_inventory *inv, q2_rng *rng,
         memcpy(s->dir, dir, sizeof(s->dir));
         s->damage = damage;
 
-        res.projectile_speed  = Q2_GRENADE_LAUNCH_SPEED;
-        res.projectile_timer  = Q2_HAND_GRENADE_TIMER;
-        res.sound = (w->kind == Q2_FK_GRENADE) ? Q2_WSND_GRENADE_LAUNCH
-                                               : Q2_WSND_HANDGREN_THROW;
+        res.projectile_timer = Q2_GRENADE_LAUNCH_FUSE;
+        res.sound = Q2_WSND_GRENADE_LAUNCH;
+        break;
+    }
+
+    case Q2_FK_HAND_GRENADE: {
+        q2_shot *s = &res.shot[res.shot_count++];
+
+        /* 0x8004AA6C creates Grenade3 hidden at the owner's eye. It has no
+         * launch direction yet: the held think supplies the charged vector
+         * only when the view-model crosses 411. A zero vector is therefore
+         * meaningful for this kind rather than a failed projectile. */
+        memcpy(s->origin, origin, sizeof(s->origin));
+        s->damage = damage;
+        res.projectile_timer = Q2_HAND_GRENADE_FUSE;
+        /* Prime and throw belong to animation crossings 261 and 411. */
+        res.sound = -1;
         break;
     }
 
@@ -554,7 +590,7 @@ q2_fire_result_v2 q2_weapon_fire(q2_inventory *inv, q2_rng *rng,
         for (k = 0; k < 3; k++)
             s->dir[k] = aim ? aim[k] : 0;
         s->damage = damage;
-        res.projectile_speed = Q2_BFG_SPEED_UNREAD;
+        res.projectile_timer = Q2_BFG_LIFETIME;
         res.sound = Q2_WSND_BFG;
         break;
     }

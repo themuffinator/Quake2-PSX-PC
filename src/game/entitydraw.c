@@ -48,24 +48,21 @@ bool q2_entity_resolve_model(q2_entity *e, const q2_model_bank *bank)
      * against a first clip of 108. `q2psx-inspect modelents` runs that
      * comparison.
      *
-     * So +2 is the model's TOTAL animation length. What an ITEM wants is still
-     * the clip it is playing, which is what this resolves — the two coincide on
-     * every item on the disc because every item model has one clip, and saying
-     * so is cheaper than discovering it again. The item table names up to two
-     * clips in its `extra` list; the first is what a spawned item plays, and an
-     * item with no clip named holds its rest pose.
+     * So +2 is the model's TOTAL animation length. Every item model on the disc
+     * has exactly one clip, and the item renderer always begins at that first
+     * clip. The item record's final halfwords are posed SHADOW VERTICES, not
+     * clip numbers — the consumer at 0x800784CC reads them only after the model
+     * draw and sends each through the vertex poser.
      */
     e->clip_length = 0;
     {
         q2_model m;
 
         if (q2_model_get(bank, (u32)index, &m) == Q2_OK) {
-            if (e->clip_count > 0) {
-                q2_model_anim clip;
+            q2_model_anim clip;
 
-                if (q2_model_anim_get(&m, e->clip[0], &clip))
-                    e->clip_length = clip.frames;
-            }
+            if (q2_model_anim_get(&m, 0, &clip))
+                e->clip_length = clip.frames;
 
             /*
              * AND THE MODEL'S OWN VERTICAL BIAS, which is why items sat in the
@@ -123,6 +120,9 @@ u32 q2_entity_build_ot(q2_entity_set *set, const q2_entity_draw_ctx *ctx,
         q2_model_pose pose[POSE_MAX];
         q2_model_instance inst;
         q2_model_draw_stats ms;
+        q2_coll_node cell;
+        s32 coll_node;
+        s32 sort_area = -1;
         bool posed = false;
 
         if (!e->in_use)
@@ -132,19 +132,6 @@ u32 q2_entity_build_ot(q2_entity_set *set, const q2_entity_draw_ctx *ctx,
             stats->considered++;
 
         if (!q2_entity_visible(e, ctx->player)) {
-            if (stats)
-                stats->invisible++;
-            continue;
-        }
-
-        /* A materialising item at zero scale collapses to a point. The engine
-         * still draws the degenerate quads; skipping them costs nothing visible
-         * and keeps the ordering table for primitives that cover a pixel.
-         *
-         * BOTH scales, because the engine multiplies them (0x8006B298) and a
-         * transient effect drives the second one to zero as it dies. Testing
-         * only `scale` would keep drawing a finished explosion at a point. */
-        if (e->scale <= 0 || e->fade <= 0) {
             if (stats)
                 stats->invisible++;
             continue;
@@ -167,10 +154,11 @@ u32 q2_entity_build_ot(q2_entity_set *set, const q2_entity_draw_ctx *ctx,
          * Pose it on the frame its think left — AND POSE IT EVEN WHEN NOTHING
          * ANIMATES IT, which is why the medkits were in the floor.
          *
-         * This ran only when `clip_count > 0`, and an item's clip count is its
-         * table record's `extra_count`, which is zero for most of them. An
-         * unposed model draws its vertices RAW, and a part's rest transform is
-         * not the identity: on BASE1, `Large Medi P` reads Y 62..242 raw
+         * This used to run only when the item record's final list was nonempty,
+         * because that list had been mislabelled as clips. It is actually a
+         * list of shadow-footprint vertices, so most items skipped their only
+         * clip and drew their vertices RAW. A part's rest transform is not the
+         * identity: on BASE1, `Large Medi P` reads Y 62..242 raw
          * against −94..86 posed, a translation of −156, and `Medi P` reads
          * 43..168 against −65..60, a translation of −108. Both are health
          * pickups; `Shells P` and `Adrenal P` in the same bank translate by
@@ -186,9 +174,8 @@ u32 q2_entity_build_ot(q2_entity_set *set, const q2_entity_draw_ctx *ctx,
          */
         if (m.hdr.num_parts <= POSE_MAX) {
             q2_model_anim clip;
-            u32 want = e->clip_count > 0 ? (u32)e->clip[0] : 0u;
 
-            if (q2_model_anim_get(&m, want, &clip)) {
+            if (q2_model_anim_get(&m, 0, &clip)) {
                 s32 frame = clip.frames > 0 ? (e->frame % clip.frames) : 0;
                 if (q2_model_pose_at(&m, &clip, (u32)frame, pose) == Q2_OK)
                     posed = true;
@@ -205,29 +192,87 @@ u32 q2_entity_build_ot(q2_entity_set *set, const q2_entity_draw_ctx *ctx,
         inst.origin[2]     = e->origin[2];
         inst.yaw           = e->angles[1];
         /*
-         * THE PRODUCT OF THE TWO, which is what the engine hands the matrix:
+         * +0xFC/+0xFE DO NOT SCALE GEOMETRY.
          *
-         *     8006B2A4  mult v1, v0      ; +0xFC * +0xFE
-         *     8006B2BC  sra  a1, v1, 11
+         * The only draw-time readers are inside 0x8006AFE8, and their
+         * destination at 0x800DDD1C is installed with SetLightMatrix at
+         * 0x8006BBD4.  The model rotation installed immediately afterwards
+         * comes from entity+0x2C0 and never reads either halfword.  They are
+         * light-intensity factors, consumed by q2_light_env_build below.
          *
-         * Folded here as `>> 12` rather than `>> 11` so that the pair the
-         * allocator initialises — 4096 and 4096 — is exactly Q2_ONE_12 and
-         * every entity that predates `fade` looks the way it always did. The
-         * console's shift normalises the same product further downstream; what
-         * matters is that the default is the identity and that a `fade` of half
-         * is half the size, which both readings agree on.
+         * Keeping the generic instance transform neutral matters for every
+         * animated value: a materialising pickup brightens without growing,
+         * an explosion darkens without shrinking, and a corpse dissolves by
+         * illumination rather than collapsing toward its origin.
          */
-        inst.scale         = (s32)(((s64)e->scale * (s64)e->fade) >> 12);
+        inst.scale         = Q2_ONE_12;
         inst.clut4_count_a = ctx->clut4_count_a;
         inst.tpage         = ctx->tpage;
 
         /*
-         * The glow tint. The engine writes zero into the three bytes while the
-         * light block is running and 127 when a materialise finishes, so a lit
-         * item is DARKENED by its own glow rather than brightened — the dynamic
-         * light is what puts the colour back. Reproducing that means an item
-         * with no glow keeps the neutral 128 and a glowing one modulates.
+         * Render flag bit 0 gates 0x800784CC. The item table's final list is
+         * copied into the model wrapper's +4 slot at 0x80059AC0 and consumed
+         * there as GLOBAL STORAGE vertex indices. Item spawn leaves +0x94 at
+         * zero, so a record without such vertices collapses to a degenerate
+         * footprint and emits nothing — exactly why only twelve records carry
+         * a list.
+         *
+         * The height expression is retail's
+         *     entity+0x30 - entity+0xA8 - entity+0xF8
+         * and is zero for an item sitting at its spawn floor because the model
+         * offset cancels. Keeping the expression rather than a literal zero
+         * preserves the shrink when another path raises the draw origin.
          */
+        inst.shadow_enabled      = (e->render_flags & 1u) != 0;
+        inst.shadow_vertex       = e->shadow_vertex;
+        inst.shadow_vertex_count = e->shadow_vertex_count;
+        inst.shadow_radius       = 0; /* item placement never writes +0x94 */
+        inst.shadow_height       = e->spawn_origin[1] - e->origin[1]
+                                 - e->model_offset;
+        inst.shadow_origin[0]    = e->spawn_origin[0];
+        inst.shadow_origin[1]    = e->spawn_origin[1];
+        inst.shadow_origin[2]    = e->spawn_origin[2];
+
+        /* Movement stores SecondaryColl byte +32 in retail entity byte +0x9E
+         * (0x80046B08). Transient model entities already carry the Scene area
+         * their spawner supplied; ordinary items recover the same value from
+         * the cell they occupy. This is the insertion-point selector, not a
+         * material or collision-solidness flag. */
+        coll_node = ctx->coll
+                  ? (e->node >= 0
+                        ? e->node
+                        : q2_coll_find_node(ctx->coll, e->pos, -1, true))
+                  : ctx->coll_node;
+        if (e->render_flags & Q2_RF_TRANSIENT) {
+            sort_area = e->surface & 0x7F;
+        } else if (ctx->coll && coll_node >= 0 &&
+                   q2_collision_get_node(ctx->coll, (u32)coll_node, &cell)) {
+            sort_area = cell.contents & 0x7F;
+        }
+        inst.sort_area = sort_area;
+        inst.sort_quick = (e->render_flags & Q2_RF_QUICK_SORT) != 0;
+        {
+            int axis;
+
+            for (axis = 0; axis < 3; axis++) {
+                /* Item linking has already expanded +0x78 into an absolute
+                 * box. The transient model spawner retains mins/maxs in the
+                 * entity frame, so do the linker's origin addition here. */
+                if (e->render_flags & Q2_RF_TRANSIENT) {
+                    inst.sort_bounds_min[axis] =
+                        e->pos[axis] + e->bounds_min[axis];
+                    inst.sort_bounds_max[axis] =
+                        e->pos[axis] + e->bounds_max[axis];
+                } else {
+                    inst.sort_bounds_min[axis] = e->bounds_min[axis];
+                    inst.sort_bounds_max[axis] = e->bounds_max[axis];
+                }
+            }
+            inst.sort_bounds_valid = true;
+        }
+
+        /* `tint` is only the unlit diagnostic fallback. The retail draw always
+         * takes entity+0x2AC through the GTE back-colour path below. */
         if (e->flags & Q2_ITEM_GLOW) {
             inst.tint[0] = e->glow[0];
             inst.tint[1] = e->glow[1];
@@ -248,29 +293,15 @@ u32 q2_entity_build_ot(q2_entity_set *set, const q2_entity_draw_ctx *ctx,
             q2_light_set lit;
             /* The entity's OWN cell when the hull is available — the engine
              * keeps it at entity+0xA2 — and the caller's single node only as a
-             * fallback. See the note in entitydraw.h. */
-            s32 node = ctx->coll
-                           ? q2_coll_find_node(ctx->coll, e->origin, -1, true)
-                           : ctx->coll_node;
-
-            q2_light_gather(&lit, ctx->lights, e->origin, node, false);
-            /*
-             * The intensity is the entity's OWN SCALE, not a neutral constant.
-             * `0x8006B298` reads `+0xFC` and `+0xFE` and folds them as
-             * `(a * b) >> 11`; the allocator sets both to 4096 at
-             * `0x8006C1B8`, and `+0xFE` is never written again on anything this
-             * port spawns — but `+0xFC` is `e->scale`, and it moves.
-             *
-             * So an item is lit in proportion to how big it currently is: a
-             * materialising pickup fades up with its own growth instead of
-             * arriving fully lit at zero size, and the title screen's logo dims
-             * to a quarter when a sub-page shrinks it (levelbin.h). Passing
-             * Q2_LIGHT_ONE twice reproduced the engine only for entities that
-             * happened to be at full size, which is most of them and is why the
-             * substitution went unnoticed.
-             */
-            q2_light_env_build(&env, &lit, e->scale, Q2_LIGHT_ONE,
-                               (e->flags & Q2_ITEM_GLOW) ? e->glow : NULL);
+             * fallback. The same lookup selected its render area above. */
+            q2_light_gather(&lit, ctx->lights, e->origin, coll_node,
+                            (s16)e->remove_in);
+            /* BOTH intensity fields feed the light environment. 0x8006B298
+             * scales the GTE light-matrix rows by their product and 0x8006B468
+             * applies the same product to the back colour. +0xFC drives item,
+             * logo and corpse fades; the explosion think at 0x8005A68C is the
+             * located writer of +0xFE. */
+            q2_light_env_build(&env, &lit, e->scale, e->fade, e->glow);
             inst.light = &env;
         }
 
@@ -279,6 +310,7 @@ u32 q2_entity_build_ot(q2_entity_set *set, const q2_entity_draw_ctx *ctx,
         if (stats) {
             stats->drawn++;
             stats->faces_emitted += ms.faces_emitted;
+            stats->shadows_emitted += ms.shadows_emitted;
             stats->ot_overflow   += ms.ot_overflow;
         }
     }
@@ -384,6 +416,7 @@ static bool bolt_basis(const s32 dir[3], s16 m[3][3])
 }
 
 u32 q2_projectiles_build_ot(const struct q2_projectiles *list,
+                            const q2_collision *coll,
                             const q2_camera *cam, psx_ot *ot, gte_state *gte)
 {
     const q2_weapon_tables *wt = q2_weapon_tables_builtin();
@@ -399,11 +432,36 @@ u32 q2_projectiles_build_ot(const struct q2_projectiles *list,
         u16     z[8];
         bool    ok[8];
         psx_rgb tint;
+        s32 sort_area = -1;
+        s32 area_bucket = -1;
+        s32 batch = PSX_OT_BATCH_INVALID;
         u32     f;
         int     v;
 
-        if (!p->in_use)
+        /* Grenade3 state 1 hides all four model parts with flag 0x80 at
+         * 0x8004ABF0. It is the hand model that shows the grenade while held;
+         * the projectile body appears only after the 411 release crossing. */
+        if (!p->in_use || (p->kind == Q2_PROJ_HAND_GRENADE &&
+                           p->node == Q2_PROJ_NODE_HELD))
             continue;
+
+        if (psx_ot_area_active(ot) && coll) {
+            q2_coll_node cell;
+            s32 node = p->node;
+            u32 resolved;
+
+            if (node < 0)
+                node = q2_coll_find_node(coll, p->pos, -1, true);
+            if (node >= 0 &&
+                q2_collision_get_node(coll, (u32)node, &cell)) {
+                if (!psx_ot_area_bucket(ot, cell.contents & 0x7Fu,
+                                        &resolved))
+                    continue;
+                sort_area = cell.contents & 0x7F;
+                area_bucket = (s32)resolved;
+            }
+        }
+        q2_camera_apply_area_projection(cam, ot, sort_area, gte);
         if (!bolt_basis(p->vel, m))
             continue;
 
@@ -435,6 +493,24 @@ u32 q2_projectiles_build_ot(const struct q2_projectiles *list,
                                       &xy[v], &z[v]);
         }
 
+        if (sort_area >= 0) {
+            gte_sxy centre_xy;
+            u16 centre_z;
+
+            if (gte_project_point(gte,
+                                  p->pos[0] - cam->pos[0],
+                                  p->pos[1] - cam->pos[1],
+                                  p->pos[2] - cam->pos[2],
+                                  &centre_xy, &centre_z)) {
+                /* Projectile body rendering is inferred (entitydraw.h), but
+                 * once present it obeys the same point/Quick contract as the
+                 * other small dynamic effect chains. */
+                batch = psx_ot_batch_begin_point(
+                            ot, (u32)sort_area, true, (s16)centre_z,
+                            p->pos, cam->pos);
+            }
+        }
+
         for (f = 0; f < 6; f++) {
             const u8 *idx = k_bolt_face[f];
             psx_prim *prim;
@@ -452,10 +528,19 @@ u32 q2_projectiles_build_ot(const struct q2_projectiles *list,
             /* The mean depth as the key too, so a bolt and the geometry it
              * shares a bucket with sort by depth rather than by which emitter
              * ran first. See psx_ot_add_depth. */
-            prim = psx_ot_add_depth(ot,
-                                    (u16)q2_ot_bucket_for_depth(
-                                        ot, depth / 4u, cam->sort_range),
-                                    depth / 4u);
+            if (area_bucket >= 0) {
+                prim = batch >= 0
+                     ? psx_ot_batch_add(ot, batch)
+                     : psx_ot_add_bucket_depth(ot, (u32)area_bucket,
+                                               (u16)(depth / 4u),
+                                               depth / 4u);
+            } else {
+                prim = psx_ot_add_depth(
+                           ot,
+                           (u16)q2_ot_bucket_for_depth(
+                               ot, depth / 4u, cam->sort_range),
+                           depth / 4u);
+            }
             if (!prim)
                 break;
 

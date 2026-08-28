@@ -3732,20 +3732,24 @@ static int cmd_render(disc *d, const char *map, int zone_index, const char *out_
             disc_read_file(d, cpath, &cbuf) == Q2_OK) {
             q2_zone_file   zf;
             q2_common_file cf;
-            q2_events      zev;
+            q2_events      zev, zops;
             q2_userfuncs   uf;
 
             /*
-             * COMMON's Events, not the zone's. The zone file carries a chunk
-             * named Events too, and the engine never loads it — its loader does
-             * not look the name up. Building from it showed rotators no console
-             * ever turns.
+             * Walk COMMON's script, but read its object slots from this zone's
+             * same-offset Events copy. That is the constructor's gp+372/gp+376
+             * split at 0x800285CC; building from either chunk alone chooses the
+             * wrong nodes in zones where their copies differ.
              */
             if (q2_zone_open(&zf, &zbuf) == Q2_OK &&
                 q2_common_open(&cf, &cbuf) == Q2_OK &&
                 q2_events_parse_common(&zev, &cf) == Q2_OK &&
-                q2_userfuncs_parse(&uf, &cf) == Q2_OK &&
-                q2_rotators_build(&g_render_rot, &zev, &uf) == Q2_OK) {
+                q2_events_parse_zone(&zops, &zf) == Q2_OK &&
+                q2_userfuncs_parse(&uf, &cf) == Q2_OK) {
+                q2_rotators_set_operand_source(&g_render_rot, zev.data,
+                                               zops.data, zops.size);
+                if (q2_rotators_build(&g_render_rot, &zev, &uf,
+                                      &zone.scene) == Q2_OK) {
                 u32 ri, moved = 0;
                 s32 t;
 
@@ -3771,10 +3775,13 @@ static int cmd_render(disc *d, const char *map, int zone_index, const char *out_
                 printf("  rotators      : %u, %u tick-moves over %d ticks\n",
                        g_render_rot.count, moved, rot_ticks);
                 for (ri = 0; ri < g_render_rot.count; ri++)
-                    printf("    node %d  axis %u  angle %d\n",
+                    printf("    node %d  axis %u  angle %d  pivot [%d %d %d]\n",
                            g_render_rot.rotators[ri].node,
                            g_render_rot.rotators[ri].axis,
-                           g_render_rot.rotators[ri].angle);
+                           g_render_rot.rotators[ri].angle,
+                           g_render_rot.rotators[ri].pivot[0],
+                           g_render_rot.rotators[ri].pivot[1],
+                           g_render_rot.rotators[ri].pivot[2]);
 
                 /*
                  * Frame the rotator that turned the most, rather than the whole
@@ -3793,9 +3800,12 @@ static int cmd_render(disc *d, const char *map, int zone_index, const char *out_
                      * there and frame the whole zone, and the pair would come
                      * from two different cameras. The probe is a second set off
                      * the same script, run the same way, and thrown away.
-                     */
+                    */
                     memset(&probe, 0, sizeof(probe));
-                    if (q2_rotators_build(&probe, &zev, &uf) == Q2_OK) {
+                    q2_rotators_set_operand_source(&probe, zev.data,
+                                                   zops.data, zops.size);
+                    if (q2_rotators_build(&probe, &zev, &uf,
+                                          &zone.scene) == Q2_OK) {
                         u32 pi;
                         s32 pt;
 
@@ -3835,6 +3845,7 @@ static int cmd_render(disc *d, const char *map, int zone_index, const char *out_
                                    best, g_focus[0], g_focus[1], g_focus[2]);
                         }
                     }
+                }
                 }
             }
         }
@@ -4770,7 +4781,8 @@ static int cmd_events(disc *d)
                              */
                             common_open = true;
                             if (q2_userfuncs_parse(&cuf, &ccf) == Q2_OK &&
-                                q2_rotators_build(&rs, &ev, &cuf) == Q2_OK) {
+                                q2_rotators_build(&rs, &ev, &cuf,
+                                                  NULL) == Q2_OK) {
                                 rot_ready   = true;
                                 rot_built  += rs.count;
                                 rctx.uf     = &cuf;

@@ -180,35 +180,37 @@ static int dump_icons(const disc *d, const q2_build_id *id)
            Q2_ICON_ADDR_AFTER);
 
     /*
-     * The vocabulary. Each rect's fifth byte is the item's `effect` dispatch
-     * index, so joining against the item table names every icon — and the
-     * weapon-to-ammo table is the proof, because every weapon lands on its own
-     * ammunition and nothing in the decode arranged that.
+     * The rect is selected by INDEX. Its fifth byte is the palette index the
+     * sprite is drawn with; all three status-bar sub-draws copy it into field
+     * byte +8 and none scans the table (icontable.h). Item names still line up
+     * for pickup captions because that path deliberately uses the item's
+     * effect as the rect index, which is a different fact.
      */
     {
         q2_item_table itm;
         bool have = (q2_item_table_load(&itm, d, id) == Q2_OK);
         u32 named = 0, k;
 
-        printf("\nWhat each rect IS - the fifth byte is the item's `effect`\n");
+        printf("\nIcon rects - selected by index; fifth byte is a palette\n");
         for (i = 0; i < it.rect_count; i++) {
             const char *what = NULL;
 
-            if (have && it.rect[i].id)
+            if (have && i)
                 for (k = 0; k < itm.count; k++)
-                    if (itm.def[k].effect == it.rect[i].id) {
+                    if (itm.def[k].effect == i) {
                         what = itm.def[k].model;
                         break;
                     }
             if (what)
                 named++;
             else
-                printf("  rect %2u  effect %3u  (no item has this effect)\n",
+                printf("  rect %2u  palette %3u  (no item uses this rect)\n",
                        i, it.rect[i].id);
         }
-        printf("  %u of %u rects name an item\n", named, it.rect_count);
+        printf("  %u of %u rect indices are also item effect ids\n",
+               named, it.rect_count);
 
-        printf("\nWeapon -> ammo (0x%08X, EFFECT IDS, consumed 1-based)\n",
+        printf("\nWeapon -> ammo (0x%08X, RECT INDICES, consumed 1-based)\n",
                Q2_ICON_ADDR_AMMO_ICON);
         for (i = 0; i < Q2_ICON_WEAPONS; i++) {
             const char *what = "(none)";
@@ -219,12 +221,11 @@ static int dump_icons(const disc *d, const q2_build_id *id)
                         what = itm.def[k].model;
                         break;
                     }
-            printf("  weapon %2u -> effect %3u -> %-14s%s\n", i,
+            printf("  weapon %2u -> rect %3u -> %-14s%s\n", i,
                    it.ammo_icon[i], what, i == 0 ? "(no weapon)" : "");
         }
-        printf("  every weapon names its own ammunition, which is what rules\n"
-               "  out reading these as rect indices - that gives the shotgun\n"
-               "  Flame Fuel and the rocket launcher Combat Armour.\n");
+        printf("  the executable multiplies each entry by the five-byte rect\n"
+               "  stride before adding the rect-table base (0x80035374).\n");
     }
 
     printf("\nSplit-screen size (0x800353C8): 1P %ux%u, 2P %ux%u, 3P+ %ux%u\n",
@@ -232,7 +233,8 @@ static int dump_icons(const disc *d, const q2_build_id *id)
            q2_icon_draw_size(2, 1).w, q2_icon_draw_size(2, 1).h,
            q2_icon_draw_size(4, 1).w, q2_icon_draw_size(4, 1).h);
 
-    printf("\nThe numerals (0x%08X): %d cells, %dx%d at v=%d, u = %d * digit\n",
+    printf("\nThe numerals (0x%08X): %d digits, then minus and blank;"
+           " %dx%d at v=%d, u = %d * digit\n",
            Q2_SBAR_DIGIT_ADDR, Q2_SBAR_DIGITS, Q2_SBAR_DIGIT_W,
            Q2_SBAR_DIGIT_H, Q2_SBAR_DIGIT_V, Q2_SBAR_DIGIT_PITCH);
 
@@ -253,7 +255,24 @@ static int dump_icons(const disc *d, const q2_build_id *id)
                    q2_sbar_fields[d2].dx, q2_sbar_fields[ic].dx);
         }
     }
-    printf("  (the left-to-right order is from retail capture, not the code)\n");
+    printf("  the call sites prove this order: 0x80035178 / 0x800352C0 /"
+           " 0x80035554\n");
+
+    printf("\nInstalled split hooks (all per viewport)\n"
+           "  0x80033D30  two stacked:      16 fields, frags 13..15\n"
+           "  0x80034288  two side-by-side: 16 fields, armour/frags at"
+           " y + 40 - screen_h\n"
+           "  0x80034830  quad:             11 fields from x[view*11]"
+           " and y[view]\n");
+    for (i = 0; i < Q2_SBAR_QUAD_VIEWS; i++)
+        printf("    quad view %u  y=%d  health icon x=%d  ammo icon x=%d"
+               "  frags x=%d/%d/%d\n", i,
+               q2_sbar_fields_quad[i][0].dy,
+               q2_sbar_fields_quad[i][0].dx,
+               q2_sbar_fields_quad[i][4].dx,
+               q2_sbar_fields_quad[i][8].dx,
+               q2_sbar_fields_quad[i][9].dx,
+               q2_sbar_fields_quad[i][10].dx);
 
     /*
      * "which rect is which item" is ANSWERED, and not through the fifth byte.
@@ -264,7 +283,8 @@ static int dump_icons(const disc *d, const q2_build_id *id)
      */
     printf("\nRect index == item effect id (0x80035A58 / 0x80035B10), so\n"
            "`q2psx-inspect items` names every icon in its caption column.\n"
-           "STILL open: the frag field at +330 (0x80037CAC).\n");
+           "STILL open: the one-player auxiliary icon at +330"
+           " (0x80037CAC).\n");
 
     q2_icon_tables_free(&it);
     return (on_grid + blank == it.rect_count) ? 0 : 1;

@@ -223,9 +223,10 @@ const q2_hud_palette *q2_hud_palette_get(const q2_hud_tables *t, u32 id);
 
 /*
  * Put the whole bank in VRAM, at the (x, y) each record's position gives it —
- * the boot loop at `0x8007610C`. Both the overlay and the menu draw out of it,
- * so it lives here rather than in either of them; calling it twice is harmless
- * because it writes the same halfwords to the same places.
+ * the 256-entry record zero at (0,255), then the sixteen-entry records placed
+ * by the boot loop at `0x8007610C`. Both the overlay and the menu draw out of
+ * it, so it lives here rather than in either of them; calling it twice is
+ * harmless because it writes the same halfwords to the same places.
  */
 struct psx_vram;
 void q2_hud_palettes_upload(const q2_hud_tables *t, struct psx_vram *vram);

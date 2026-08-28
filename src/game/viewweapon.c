@@ -115,6 +115,14 @@ void q2_vw_init(q2_viewweapon *vw, const q2_vm_tables *tab, int weapon)
         return;
 
     memset(vw, 0, sizeof(*vw));
+    /* The entity allocator at 0x8006C1B8..0x8006C1FC establishes these before
+     * the view-model constructor writes its positive +0xF4 at 0x8004F750. */
+    vw->scale      = Q2_ONE_12;
+    vw->fade       = Q2_ONE_12;
+    vw->light_selector = 1;
+    vw->glow[0]    = 0x40;
+    vw->glow[1]    = 0x40;
+    vw->glow[2]    = 0x40;
     vw->frame_sound = -1;
     vw->anim_end    = -1;
     vw->hyper_ramp  = VW_HYPER_RAMP_ONE;
@@ -278,6 +286,10 @@ static void q2_vw_idle_fire_check(q2_viewweapon *vw, bool fire_held,
     vw->spin_accum      = 0;
     vw->spin_rate       = 1;
     vw->last_fire_frame = -1;
+    vw->cook            = false;
+    vw->hand_prev_anim  = vw->anim_pos;
+    vw->hand_cook_ticks = 0;
+    vw->hand_release    = false;
     vw->fires_started++;
     begin_key(vw);
 }
@@ -498,14 +510,29 @@ static void fire_state_step(q2_viewweapon *vw, s32 step, bool fire_held)
          * key's remaining time GROWS by the step, so the clip cannot advance
          * and the grenade is held for as long as the trigger is down.
          */
+        /* Grenade3's own think owns both sounds/transitions. It compares the
+         * current model position against the prior one at 0x8004A474 and
+         * 0x8004A4A8, so a long substep still raises each crossing once. */
+        if (vw->anim_pos >= Q2_VW_HAND_PRIME_POSITION &&
+            vw->hand_prev_anim < Q2_VW_HAND_PRIME_POSITION)
+            vw->frame_sound = Q2_WSND_HANDGREN_PRIME;
+
         if (fire_held && vw->anim_pos >= Q2_VW_COOK_POSITION) {
             vw->anim_pos = Q2_VW_COOK_POSITION;
             vw->frame    = 1;
             vw->left    += step;
             vw->cook     = true;
+            vw->hand_cook_ticks += step;
         } else {
             vw->cook = false;
         }
+
+        if (vw->anim_pos >= Q2_VW_HAND_RELEASE_POSITION &&
+            vw->hand_prev_anim < Q2_VW_HAND_RELEASE_POSITION) {
+            vw->hand_release = true;
+            vw->frame_sound  = Q2_WSND_HANDGREN_THROW;
+        }
+        vw->hand_prev_anim = vw->anim_pos;
         break;
 
     default:
@@ -705,6 +732,48 @@ s16 q2_vw_take_frame_sound(q2_viewweapon *vw)
     snd = vw->frame_sound;
     vw->frame_sound = -1;
     return snd;
+}
+
+s32 q2_vw_take_hand_grenade_cook(q2_viewweapon *vw)
+{
+    s32 ticks;
+
+    if (!vw)
+        return 0;
+    ticks = vw->hand_cook_ticks;
+    vw->hand_cook_ticks = 0;
+    return ticks;
+}
+
+bool q2_vw_take_hand_grenade_release(q2_viewweapon *vw)
+{
+    bool release;
+
+    if (!vw)
+        return false;
+    release = vw->hand_release;
+    vw->hand_release = false;
+    return release;
+}
+
+void q2_vw_hand_grenade_expired(q2_viewweapon *vw)
+{
+    if (!vw || vw->weapon != VW_HAND_GRENADE || vw->state != Q2_VM_FIRE)
+        return;
+
+    /* 0x8004AA1C..0x8004AA40, after the held grenade detonates. It does not
+     * begin a new key: it writes frame and remaining time directly, leaving
+     * the current interpolation total exactly as the executable does. */
+    vw->frame           = 2;
+    vw->left            = 150;
+    vw->anim_pos        = 0;
+    vw->anim_end        = -1;
+    vw->anim_flags      = (u16)((vw->anim_flags | 1u) & ~2u);
+    vw->cook            = false;
+    vw->hand_prev_anim  = 0;
+    vw->hand_cook_ticks = 0;
+    vw->hand_release    = false;
+    vw->frame_sound     = -1;
 }
 
 /*
@@ -1131,6 +1200,21 @@ u32 q2_vw_build_ot(const q2_viewweapon *vw,
 
     inst.model     = vw->model;
     inst.pose      = posed ? pose : NULL;
+    /* +0xFC/+0xFE scale the GTE light matrix and back colour, not the model
+     * transform. The caller passes them to q2_light_env_build; geometry keeps
+     * the allocator-neutral transform just like an ordinary entity. */
+    inst.scale = Q2_ONE_12;
+    /*
+     * The view-weapon entity is permanently assigned screen area 1 at
+     * 0x8004EE58 (`sb 1, entity+0x9E`).  It later reaches the ordinary model
+     * renderer, whose 0x8006BEB0 call selects that area before projecting it.
+     *
+     * This is observable because 0x80065684 is stateful: its negative selector
+     * is a no-op.  Leaving the prototype's default -1 here therefore inherited
+     * whichever portal-local origin the last particle or projectile installed,
+     * moving and clipping the gun as the visible area list changed.
+     */
+    inst.sort_area = 1;
     inst.origin[0] = origin[0];
     inst.origin[1] = origin[1];
     inst.origin[2] = origin[2];

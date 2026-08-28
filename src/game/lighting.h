@@ -27,8 +27,8 @@
  *       - the WORLD dynamic list, 16 slots at 0x800E3D18;
  *       - the STATIC lights of the collision node the entity stands in,
  *         through SpaceLights (see spacelights.h);
- *       - or, for a view-space entity, the VIEW dynamic list at 0x800E3ED8
- *         instead of both of the above.
+ *       - or, when signed entity halfword +0xF4 is negative, the VIEW dynamic
+ *         list at 0x800E3ED8 instead of both of the above.
  *     An entity with no collision node gets one synthetic light instead of the
  *     static ones — see Q2_LIGHT_FALLBACK_*.
  *  3. Each offer computes a distance attenuation (0x80076040), scales the
@@ -134,8 +134,8 @@ typedef struct q2_light_world {
      * The two runtime lists.
      *
      * `world` lights everything standing in the map, and is refilled from empty
-     * every frame (0x80075B94). `view` is the list the +0xF4 branch reaches for
-     * instead — and **nothing in the image ever appends to it.** Its end pointer
+     * every frame (0x80075B94). `view` is the list the **negative +0xF4** branch
+     * reaches instead — and **nothing in the image ever appends to it.** Its end pointer
      * at `0x800B2EC4` has exactly two writers, both of which reset it to the
      * start of the array. The two arrays are also contiguous, and the world
      * appender's full test is a compare against the view array's base, so what
@@ -143,7 +143,7 @@ typedef struct q2_light_world {
      * view over its end.
      *
      * The consequence is a real behaviour and not a gap in this port: an entity
-     * that takes the view-space branch gets NO lights at all and is drawn by its
+     * whose signed +0xF4 is negative gets NO lights at all and is drawn by its
      * back colour alone. The field is kept because the engine's storage is kept.
      */
     q2_light dynamic_world[Q2_DYNLIGHT_MAX];
@@ -268,12 +268,13 @@ bool q2_light_set_add(q2_light_set *set, const s32 origin[3], const q2_light *l)
  * 0x8006AFE8 — the whole gather for one entity.
  *
  * `coll_node` is the SecondaryCol node the entity stands in, or negative for
- * none (which selects the fallback light). `view_space` picks the view dynamic
- * list and skips both the world list and the static lights, which is the branch
- * the original takes on the entity's +0xF4.
+ * none (which selects the fallback light). `entity_f4` is the signed halfword
+ * at entity +0xF4: values >= 0 pick the world/static path; values < 0 pick the
+ * view dynamic list and skip both. Passing the field rather than a boolean is
+ * deliberate — the viewmodel writes literal +1 and therefore takes WORLD.
  */
 void q2_light_gather(q2_light_set *set, const q2_light_world *w,
-                     const s32 origin[3], s32 coll_node, bool view_space);
+                     const s32 origin[3], s32 coll_node, s16 entity_f4);
 
 /*
  * 0x8006B184…0x8006B4B8 — turn a finished gather into GTE state.

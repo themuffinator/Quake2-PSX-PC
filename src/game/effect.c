@@ -1151,6 +1151,11 @@ u32 q2_fx_glint_build_ot(const q2_fx_glint_mesh *mesh,
         !cam || !ot || !gte || width == 0)
         return 0;
 
+    /* The retail custom-entity driver selects entity+0x9E before reaching this
+     * emitter.  This legacy entry point has no area argument, so it likewise
+     * consumes the caller's current projection.  In particular, selector -1
+     * must not be used as a reset: 0x80065684 returns immediately for it. */
+
     /*
      * 0x800649C8 transforms vertices in threes while its counter is under 94,
      * so one call covers the first 96 of the mesh however long the mesh is. A
@@ -1506,6 +1511,9 @@ static u32 draw_groups(q2_fx_world *w, const q2_camera *cam, u32 viewport,
         u32 colour[2];
         bool semi[2];
         psx_rgb rgb[2];
+        u32 area_bucket = 0;
+        bool area_routed = psx_ot_area_active(ot);
+        s32 batch = PSX_OT_BATCH_INVALID;
         u32 i;
 
         if (g->life == 0)
@@ -1515,6 +1523,19 @@ static u32 draw_groups(q2_fx_world *w, const q2_camera *cam, u32 viewport,
          * one viewport without touching the others. */
         if (viewport < 4 && (g->view_mask & (1u << viewport)))
             continue;
+
+        /* Particle groups live on retail's area +12 batch list. A stale area
+         * has no screen-change record to drain, so the whole private chain is
+         * culled instead of falling back to a global depth bucket and painting
+         * through the current room. */
+        if (area_routed &&
+            !psx_ot_area_bucket(ot, g->area & 0x7Fu, &area_bucket))
+            continue;
+
+        q2_camera_apply_area_projection(cam, ot,
+                                        area_routed ? (s32)(g->area & 0x7Fu)
+                                                    : -1,
+                                        gte);
 
         /*
          * 0x80030644. A group whose quad count exceeds what is left of the
@@ -1550,6 +1571,14 @@ static u32 draw_groups(q2_fx_world *w, const q2_camera *cam, u32 viewport,
             continue;
         }
 
+        if (area_routed) {
+            /* 0x800308B4 registers one point record for the whole group on
+             * area +12. Every quad remains in its private chain. */
+            batch = psx_ot_batch_begin_point(
+                        ot, g->area & 0x7Fu, true, (s16)base_z,
+                        base, cam->pos);
+        }
+
         /*
          * 0x800307F4: the on-screen side is `size / z`, clamped up to two
          * pixels so a distant burst never vanishes entirely.
@@ -1579,9 +1608,17 @@ static u32 draw_groups(q2_fx_world *w, const q2_camera *cam, u32 viewport,
                                    pt[2] - cam->pos[2], &xy, &z))
                 continue;
 
-            prim = psx_ot_add_depth(ot,
-                                    (u16)bucket_for(ot, z, 1, cam->sort_range),
-                                    sort_key_for(z, 1));
+            if (area_routed) {
+                prim = batch >= 0
+                     ? psx_ot_batch_add(ot, batch)
+                     : psx_ot_add_bucket_depth(ot, area_bucket,
+                                               base_z, base_z);
+            } else {
+                prim = psx_ot_add_depth(
+                           ot,
+                           (u16)bucket_for(ot, z, 1, cam->sort_range),
+                           sort_key_for(z, 1));
+            }
             if (!prim) {
                 w->stats.ot_overflow++;
                 break;
@@ -1658,15 +1695,33 @@ static u32 draw_groups(q2_fx_world *w, const q2_camera *cam, u32 viewport,
 static u32 draw_beam_ring(psx_ot *ot, gte_state *gte, const q2_camera *cam,
                           const q2_fx_face *faces, u32 face_count,
                           const gte_sxy *xy, const u16 *z, const bool *ok,
-                          u32 vert_count, q2_fx_stats *stats)
+                          u32 vert_count, s32 sort_area, s32 area_bucket,
+                          const s32 sort_point[3],
+                          q2_fx_stats *stats)
 {
     u32 emitted = 0, f;
+    s32 batch = PSX_OT_BATCH_INVALID;
 
     /*
      * The table's four indices are a GPU packet's Z order; `psx_prim` wants the
      * perimeter. Corners 2 and 3 swap — see the note in draw_groups.
      */
     static const int k_perimeter[4] = { 0, 1, 3, 2 };
+
+    if (sort_area >= 0 && sort_point) {
+        gte_sxy sort_xy;
+        u16 sort_z;
+
+        if (gte_project_point(gte,
+                              sort_point[0] - cam->pos[0],
+                              sort_point[1] - cam->pos[1],
+                              sort_point[2] - cam->pos[2],
+                              &sort_xy, &sort_z)) {
+            batch = psx_ot_batch_begin_point(
+                        ot, (u32)sort_area, true, (s16)sort_z,
+                        sort_point, cam->pos);
+        }
+    }
 
     for (f = 0; f < face_count; f++) {
         psx_prim *prim;
@@ -1685,9 +1740,18 @@ static u32 draw_beam_ring(psx_ot *ot, gte_state *gte, const q2_camera *cam,
         if (!good)
             continue;
 
-        prim = psx_ot_add_depth(ot,
-                                (u16)bucket_for(ot, depth, 4, cam->sort_range),
-                                sort_key_for(depth, 4));
+        if (sort_area >= 0) {
+            prim = batch >= 0
+                 ? psx_ot_batch_add(ot, batch)
+                 : psx_ot_add_bucket_depth(ot, (u32)area_bucket,
+                                           (u16)(depth / 4u),
+                                           sort_key_for(depth, 4));
+        } else {
+            prim = psx_ot_add_depth(
+                       ot,
+                       (u16)bucket_for(ot, depth, 4, cam->sort_range),
+                       sort_key_for(depth, 4));
+        }
         if (!prim) {
             stats->ot_overflow++;
             break;
@@ -1743,12 +1807,26 @@ static u32 draw_beams(q2_fx_world *w, const q2_camera *cam,
     for (n = 0; n < w->beam_count; n++) {
         q2_fx_beam *b = &w->beam[n];
         s32 delta[3], unit[3], step[3], hex[6][3];
+        s32 sort_area = -1;
+        s32 area_bucket = -1;
         s64 sq;
         s32 len, segments, s;
         int k;
 
         if (!b->tube)
             continue;
+
+        if (psx_ot_area_active(ot)) {
+            u32 resolved;
+
+            if (!psx_ot_area_bucket(ot,
+                                    (u32)b->area & 0x7Fu, &resolved))
+                continue;
+            sort_area = b->area & 0x7F;
+            area_bucket = (s32)resolved;
+        }
+
+        q2_camera_apply_area_projection(cam, ot, sort_area, gte);
 
         for (k = 0; k < 3; k++)
             delta[k] = b->to[k] - b->from[k];
@@ -1805,7 +1883,9 @@ static u32 draw_beams(q2_fx_world *w, const q2_camera *cam,
 
             emitted += draw_beam_ring(ot, gte, cam, b->tube,
                                       Q2_FX_BEAM_TUBE_FACES,
-                                      xy, z, ok, Q2_FX_BEAM_VERTS, &w->stats);
+                                      xy, z, ok, Q2_FX_BEAM_VERTS,
+                                      sort_area, area_bucket,
+                                      near_pt, &w->stats);
 
             /*
              * The caps close the near end of the first segment and the far end
@@ -1816,7 +1896,9 @@ static u32 draw_beams(q2_fx_world *w, const q2_camera *cam,
             if (s == 0 && b->cap_near) {
                 emitted += draw_beam_ring(ot, gte, cam, b->cap_near,
                                           Q2_FX_BEAM_CAP_FACES,
-                                          xy, z, ok, 6, &w->stats);
+                                          xy, z, ok, 6,
+                                          sort_area, area_bucket,
+                                          near_pt, &w->stats);
             }
             if (s == segments - 1 && b->cap_far) {
                 gte_sxy fxy[6];
@@ -1830,7 +1912,9 @@ static u32 draw_beams(q2_fx_world *w, const q2_camera *cam,
                 }
                 emitted += draw_beam_ring(ot, gte, cam, b->cap_far,
                                           Q2_FX_BEAM_CAP_FACES,
-                                          fxy, fz, fok, 6, &w->stats);
+                                          fxy, fz, fok, 6,
+                                          sort_area, area_bucket,
+                                          far_pt, &w->stats);
             }
         }
     }

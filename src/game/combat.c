@@ -1,5 +1,6 @@
 #include "combat.h"
 
+#include <math.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------------- */
@@ -70,16 +71,26 @@ void q2_combat_rules_default(q2_combat_rules *r)
 /* ------------------------------------------------------------------------- */
 void q2_actor_init(q2_actor *a)
 {
+    int k;
+
     if (!a)
         return;
     memset(a, 0, sizeof(*a));
     a->owner         = -1;      /* not a player until a caller says so */
     a->last_attacker = -1;
-    a->radius = 286;      /* the movement sweep's half extent, FORMATS §5 */
+    a->radius = 286;      /* entity+0x94, the live actor's X/Z radius */
+    a->height = 572;      /* entity+0x96, from origin-286 to origin+286 */
+    for (k = 0; k < 3; k++) {
+        a->mins[k] = -286;
+        a->maxs[k] =  286;
+    }
 }
 
 void q2_actor_from_monster(q2_actor *a, const q2_monster *m)
 {
+    s32 radius;
+    int k;
+
     if (!a || !m)
         return;
     q2_actor_init(a);
@@ -91,6 +102,39 @@ void q2_actor_from_monster(q2_actor *a, const q2_monster *m)
     a->has_client = false;
     a->is_monster = (m->svflags & Q2_SVF_MONSTER) != 0;
     a->has_enemy  = (m->enemy != NULL);
+
+    /*
+     * 0x800544EC clips X/Z against entity+0x94 and Y as a separate interval.
+     * q2_monster owns the corresponding hull in this port. In particular,
+     * q2_monster_corpse_detach makes it wider and much shorter; dropping these
+     * six values here made a dead body keep its standing hit volume.
+     */
+    radius = 0;
+    for (k = 0; k < 3; k++) {
+        s32 lo, hi;
+
+        a->mins[k] = m->mins[k];
+        a->maxs[k] = m->maxs[k];
+        if (k == 1)
+            continue;
+        lo = m->mins[k] < 0 ? -(s32)m->mins[k] : (s32)m->mins[k];
+        hi = m->maxs[k] < 0 ? -(s32)m->maxs[k] : (s32)m->maxs[k];
+        if (lo > radius) radius = lo;
+        if (hi > radius) radius = hi;
+    }
+    if (radius > 0)
+        a->radius = radius;
+    {
+        s32 height = (s32)m->maxs[1] - m->mins[1];
+
+        /* The console quarters one 572-unit height field to 143. The port's
+         * symmetric hull quarters -286 and +286 separately to -71/+71 and
+         * therefore loses the odd unit; put it back in the actor projection. */
+        if (m->corpse && height > 0 && m->mins[1] < 0 && m->maxs[1] > 0)
+            height++;
+        if (height > 0 && height <= 32767)
+            a->height = (s16)height;
+    }
 
     /*
      * AND WHETHER IT CAN BE HURT AT ALL, which never crossed this boundary.
@@ -608,10 +652,227 @@ int                  q2_combat_scan_who = Q2_COMBAT_SCAN_OTHER;
 /* Both the total and the shooter's own slot, so neither has to be derived. */
 #define SCAN_BUMP(field)                                                          do {                                                                              q2_combat_scan.field++;                                                       if (q2_combat_scan_who >= 0 &&                                                    q2_combat_scan_who < Q2_COMBAT_SCAN_SLOTS)                                    q2_combat_scan_by[q2_combat_scan_who].field++;                        } while (0)
 
-/* Shared scan: the nearest actor whose sphere the ray crosses within the
- * fraction the world allows. Returns its index, or -1. */
+static s64 trace_isqrt(s64 v)
+{
+    s64 lo = 0, hi = 3037000499LL, best = 0;
+
+    if (v <= 0)
+        return 0;
+    if (hi > v)
+        hi = v;
+    while (lo <= hi) {
+        s64 mid = lo + (hi - lo) / 2;
+        if (mid == 0 || mid <= v / mid) {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return best;
+}
+
+/*
+ * Normal retail inputs stay well inside this exact-integer envelope. A bullet
+ * direction is the 4096 aim scaled by four (plus sub-4096 spread), rail is the
+ * unscaled aim, and a target which survived the broad box can be only one
+ * segment length plus its 286/429-unit radius away. Projectile tick segments
+ * are shorter still. Keeping each horizontal term <= 30000 bounds cross^2,
+ * radius^2*a, the discriminant and the fixed-root numerator below to s64.
+ *
+ * The public host API nevertheless accepts arbitrary s32 coordinates. Those
+ * use the long-double arm instead of invoking signed-overflow UB; that arm is
+ * not reached by retail-scale gameplay.
+ */
+#define Q2_TRACE_EXACT_TERM_MAX 30000
+
+static bool trace_term_is_exact(s64 v)
+{
+    if (v < 0)
+        v = -v;
+    return v <= Q2_TRACE_EXACT_TERM_MAX;
+}
+
+static s64 trace_root_from_long_double(long double v)
+{
+    if (v >= 2147483647.0L)
+        return 2147483647;
+    if (v <= -2147483647.0L)
+        return -2147483647;
+    return (s64)v;               /* C truncates toward zero, as 0x800B11D8 */
+}
+
+/* 0x800546B0..0x80054704 rejects a centre whose dot along the sweep is not
+ * positive. Only the sign is needed, so do not route arbitrary host s32 input
+ * through q2_combat_ray_dist_sq's dot*4096 fraction. */
+static bool actor_centre_is_ahead(const s32 origin[3], const s32 dir[3],
+                                  const q2_actor *t)
+{
+    s64 rel[3];
+    int k;
+    bool exact = true;
+
+    for (k = 0; k < 3; k++) {
+        rel[k] = (s64)t->origin[k] - origin[k];
+        if (!trace_term_is_exact(rel[k]) || !trace_term_is_exact(dir[k]))
+            exact = false;
+    }
+    if (exact) {
+        s64 dot = (s64)dir[0] * rel[0] + (s64)dir[1] * rel[1] +
+                  (s64)dir[2] * rel[2];
+        return dot > 0;
+    }
+    return (long double)dir[0] * rel[0] +
+           (long double)dir[1] * rel[1] +
+           (long double)dir[2] * rel[2] > 0.0L;
+}
+
+/*
+ * The literal narrow phase in 0x800544EC.
+ *
+ * X/Z solve a quadratic against entity+0x94, producing the two entry/exit
+ * roots in 1.0.12. Y is not part of that distance: it produces its own slab
+ * interval, and the function intersects the two. That distinction is visible
+ * at a box corner and after the corpse volume is made wider and shorter.
+ */
+static bool actor_cylinder_interval(const s32 origin[3], const s32 dir[3],
+                                    const q2_actor *t, s32 fallback_radius,
+                                    s64 *out_enter, s64 *out_exit)
+{
+    s64 ox, oz, a, b, disc;
+    s64 h_enter, h_exit, v_enter, v_exit;
+    s64 radius;
+    s64 ymin, ymax;
+
+    if (!origin || !dir || !t)
+        return false;
+
+    radius = t->radius > 0 ? t->radius : fallback_radius;
+    if (radius <= 0)
+        return false;
+
+    /* 0x800545F4..0x8005467C: the cheap swept-box rejection precedes the
+     * quadratic. Besides saving the solve, this defines the degenerate
+     * vertical-ray case where the horizontal quadratic has a == 0. */
+    {
+        s64 end[3];
+        s64 xmin, xmax, zmin, zmax;
+
+        end[0] = (s64)origin[0] + dir[0];
+        end[1] = (s64)origin[1] + dir[1];
+        end[2] = (s64)origin[2] + dir[2];
+        xmin = origin[0] < end[0] ? origin[0] : end[0];
+        xmax = origin[0] > end[0] ? origin[0] : end[0];
+        zmin = origin[2] < end[2] ? origin[2] : end[2];
+        zmax = origin[2] > end[2] ? origin[2] : end[2];
+        if (xmax < (s64)t->origin[0] - radius ||
+            xmin > (s64)t->origin[0] + radius ||
+            zmax < (s64)t->origin[2] - radius ||
+            zmin > (s64)t->origin[2] + radius)
+            return false;
+    }
+
+    ox = (s64)origin[0] - t->origin[0];
+    oz = (s64)origin[2] - t->origin[2];
+
+    if (dir[0] == 0 && dir[2] == 0) {
+        /* The retail solver explicitly returns 0..4096 here. The broad box
+         * above is therefore the exact horizontal test for a vertical ray. */
+        h_enter = -(s64)0x7FFFFFFF;
+        h_exit  =  (s64)0x7FFFFFFF;
+    } else if (trace_term_is_exact(dir[0]) &&
+               trace_term_is_exact(dir[2]) &&
+               trace_term_is_exact(ox) && trace_term_is_exact(oz) &&
+               trace_term_is_exact(radius)) {
+        s64 cross;
+        s64 root;
+        s64 denom;
+
+        a = (s64)dir[0] * dir[0] + (s64)dir[2] * dir[2];
+        b = 2 * ((s64)dir[0] * ox + (s64)dir[2] * oz);
+
+        cross = (s64)dir[0] * oz - (s64)dir[2] * ox;
+        /* b^2 - 4ac == 4(r^2*a - cross^2). This equivalent form avoids
+         * overflowing on the two large, nearly cancelling b^2/4ac terms. */
+        /* Test the unscaled discriminant first. A legal host actor can have a
+         * broad-box-overlapping but very off-axis centre; multiplying that
+         * negative value by four before rejecting it can overflow s64 even
+         * though all retail-scale hits remain exact. The positive arm is
+         * bounded by Q2_TRACE_EXACT_TERM_MAX and is safe to scale. */
+        disc = radius * radius * a - cross * cross;
+
+        /* 0x80054768 uses a strict comparison for the tangent case. */
+        if (disc <= 0)
+            return false;
+        disc *= 4;
+
+        root  = trace_isqrt(disc);
+        denom = 2 * a;
+        /* 0x800B11D8 receives +/-2048 and divides by a, i.e. these
+         * (-b +/- sqrt(d)) * 4096 / (2a) roots, truncated toward zero. */
+        h_enter = ((-b - root) * 4096) / denom;
+        h_exit  = ((-b + root) * 4096) / denom;
+    } else {
+        long double la = (long double)dir[0] * dir[0] +
+                         (long double)dir[2] * dir[2];
+        long double lb = 2.0L * ((long double)dir[0] * ox +
+                                 (long double)dir[2] * oz);
+        long double lc = (long double)ox * ox +
+                         (long double)oz * oz -
+                         (long double)radius * radius;
+        long double ld = lb * lb - 4.0L * la * lc;
+        long double root;
+
+        if (ld <= 0.0L)
+            return false;
+        root = sqrtl(ld);
+        h_enter = trace_root_from_long_double(
+            (-lb - root) * 4096.0L / (2.0L * la));
+        h_exit = trace_root_from_long_double(
+            (-lb + root) * 4096.0L / (2.0L * la));
+    }
+    if (h_enter > h_exit)
+        return false;
+
+    /* 0x80054834..0x8005483C builds exactly these two endpoints: the lower
+     * face is always origin.y + 286, and entity+0x96 reaches upward from it. */
+    ymax = (s64)t->origin[1] + 286;
+    ymin = ymax - (t->height > 0
+                       ? t->height
+                       : (s32)t->maxs[1] - t->mins[1]);
+
+    if (dir[1] > 0) {
+        v_enter = ((ymin - origin[1]) * 4096) / dir[1];
+        v_exit  = ((ymax - origin[1]) * 4096) / dir[1];
+    } else if (dir[1] < 0) {
+        s64 denom = -(s64)dir[1];
+        v_enter = (((s64)origin[1] - ymax) * 4096) / denom;
+        v_exit  = (((s64)origin[1] - ymin) * 4096) / denom;
+    } else {
+        if ((s64)origin[1] < ymin || (s64)origin[1] > ymax)
+            return false;
+        v_enter = -(s64)0x7FFFFFFF;
+        v_exit  =  (s64)0x7FFFFFFF;
+    }
+
+    if (v_enter > h_enter)
+        h_enter = v_enter;
+    if (v_exit < h_exit)
+        h_exit = v_exit;
+    if (h_enter > h_exit)
+        return false;
+
+    if (out_enter)
+        *out_enter = h_enter;
+    if (out_exit)
+        *out_exit = h_exit;
+    return true;
+}
+
+/* Shared scan: the nearest actor whose cylinder the segment crosses within
+ * the fraction the world allows. Returns its index, or -1. */
 static s32 nearest_hit(const s32 origin[3], const s32 dir[3],
-                       s32 world_fraction, s32 hit_radius,
+                       s32 world_fraction, s32 fallback_radius,
                        q2_actor **targets, u32 count, u32 skip_mask_index,
                        s64 *out_along)
 {
@@ -621,8 +882,7 @@ static s32 nearest_hit(const s32 origin[3], const s32 dir[3],
 
     for (i = 0; i < count; i++) {
         q2_actor *t = targets[i];
-        s64 along = 0, d2;
-        s64 reach;
+        s64 along = 0, leave = 0;
 
         SCAN_BUMP(tested);
         if (!t || i == skip_mask_index) {
@@ -660,19 +920,21 @@ static s32 nearest_hit(const s32 origin[3], const s32 dir[3],
             continue;
         }
 
-        d2 = q2_combat_ray_dist_sq(origin, dir, t->origin, &along);
-        if (along <= 0) {
+        if (!actor_centre_is_ahead(origin, dir, t)) {
             SCAN_BUMP(behind);
             continue;
         }
-        if (along > world_fraction) {
-            SCAN_BUMP(beyond_world);
+
+        if (!actor_cylinder_interval(origin, dir, t, fallback_radius,
+                                     &along, &leave) || leave <= 0 ||
+            along > 4096) {
+            SCAN_BUMP(off_axis);
             continue;
         }
-
-        reach = (s64)hit_radius + t->radius;
-        if (d2 > reach * reach) {
-            SCAN_BUMP(off_axis);
+        if (along < 0)
+            along = 0;
+        if (along > world_fraction) {
+            SCAN_BUMP(beyond_world);
             continue;
         }
 
@@ -706,18 +968,18 @@ q2_damage_result q2_combat_melee(q2_actor *attacker, q2_actor *target,
 }
 
 s32 q2_combat_nearest_on_segment(const s32 origin[3], const s32 dir[3],
-                                 s32 hit_radius, q2_actor **targets,
+                                 s32 fallback_radius, q2_actor **targets,
                                  u32 count)
 {
     if (!origin || !dir || !targets)
         return -1;
-    return nearest_hit(origin, dir, 4096, hit_radius, targets, count,
+    return nearest_hit(origin, dir, 4096, fallback_radius, targets, count,
                        (u32)-1, NULL);
 }
 
 s32 q2_combat_fire_bullet(q2_actor *attacker, const s32 origin[3],
                           const s32 dir[3], s16 damage, s32 world_fraction,
-                          s32 hit_radius, q2_actor **targets, u32 count,
+                          s32 fallback_radius, q2_actor **targets, u32 count,
                           const q2_combat_rules *rules,
                           q2_damage_result *out)
 {
@@ -733,7 +995,7 @@ s32 q2_combat_fire_bullet(q2_actor *attacker, const s32 origin[3],
     if (world_fraction <= 0 || world_fraction > 4096)
         world_fraction = (world_fraction <= 0) ? 0 : 4096;
 
-    idx = nearest_hit(origin, dir, world_fraction, hit_radius,
+    idx = nearest_hit(origin, dir, world_fraction, fallback_radius,
                       targets, count, (u32)-1, &along);
     if (idx < 0)
         return -1;
@@ -752,7 +1014,7 @@ s32 q2_combat_fire_bullet(q2_actor *attacker, const s32 origin[3],
 
 u32 q2_combat_fire_rail(q2_actor *attacker, const s32 origin[3],
                         const s32 dir[3], s16 damage, s32 world_fraction,
-                        s32 hit_radius, q2_actor **targets, u32 count,
+                        s32 fallback_radius, q2_actor **targets, u32 count,
                         const q2_combat_rules *rules)
 {
     u32 hit = 0, i;
@@ -762,11 +1024,11 @@ u32 q2_combat_fire_rail(q2_actor *attacker, const s32 origin[3],
     if (world_fraction <= 0 || world_fraction > 4096)
         world_fraction = (world_fraction <= 0) ? 0 : 4096;
 
-    /* The rail does not stop: 0x800493A8 loops from each impact, so everything
-     * on the beam takes the full amount. */
+    /* The rail does not stop in this port: retain its established target-list
+     * order while replacing only the volume test. */
     for (i = 0; i < count; i++) {
         q2_actor *t = targets[i];
-        s64 along = 0, d2, reach;
+        s64 along = 0, leave = 0;
         s32 point[3];
         int k;
 
@@ -774,12 +1036,14 @@ u32 q2_combat_fire_rail(q2_actor *attacker, const s32 origin[3],
         if (!t || !t->takedamage)
             continue;
 
-        d2 = q2_combat_ray_dist_sq(origin, dir, t->origin, &along);
-        if (along <= 0 || along > world_fraction)
+        if (!actor_centre_is_ahead(origin, dir, t))
             continue;
-
-        reach = (s64)hit_radius + t->radius;
-        if (d2 > reach * reach)
+        if (!actor_cylinder_interval(origin, dir, t, fallback_radius,
+                                     &along, &leave) || leave <= 0)
+            continue;
+        if (along < 0)
+            along = 0;
+        if (along > world_fraction || along > 4096)
             continue;
 
         for (k = 0; k < 3; k++)

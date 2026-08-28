@@ -220,7 +220,17 @@ void q2_combat_rules_default(q2_combat_rules *r);
 /* ------------------------------------------------------------------------- */
 typedef struct q2_actor {
     s32  origin[3];
-    s32  radius;            /* entity+0x94, used by the radius sweep         */
+    /*
+     * The volume clipped by 0x800544EC. The narrow phase is a vertical
+     * cylinder, not the sphere the first reconstruction used: entity+0x94 is
+     * its horizontal radius and the entity's vertical bounds form a separate
+     * slab. Keeping the local bounds also carries the corpse resize across
+     * q2_actor_from_monster instead of silently restoring a standing body.
+     */
+    s32  radius;            /* entity+0x94, horizontal X/Z radius            */
+    s16  height;            /* entity+0x96, Y slab height                    */
+    s16  mins[3];           /* retained source hull for actor projection     */
+    s16  maxs[3];           /* its Y span seeds height above                 */
 
     s16  health;
     s16  gib_health;        /* below this the body is destroyed              */
@@ -307,7 +317,7 @@ typedef struct q2_combat_scan_stats {
     u32 dead;
     u32 behind;         /* the target is behind the muzzle                   */
     u32 beyond_world;   /* the world stopped the ray first                   */
-    u32 off_axis;       /* the ray passed outside the target's sphere        */
+    u32 off_axis;       /* outside the horizontal cylinder or vertical slab  */
     u32 hit;
 } q2_combat_scan_stats;
 
@@ -392,7 +402,8 @@ s16 q2_combat_splash_at(s16 damage, s32 dist);
 /*     origin as the damage point, so it knocks nothing back (mod 7 is not in  */
 /*     the knockback set)                                                      */
 /*   - a thrown grenade is the SAME spawner the grenade launcher uses          */
-/*     (0x8004A088 from 0x80061728) at speed 600 rather than 900               */
+/*     (0x8004A088 from 0x80061728); its wrapper uses 600 in the ballistic      */
+/*     solve and also passes 600 as the spawner's +0xF4 timer                  */
 /*   - a rocket is 0x8004AF28 from 0x80062164, with the aim scaled by 3/2      */
 /*   - a BFG blast is 0x8004BE04 from a two-line wrapper at 0x800621BC         */
 /*                                                                            */
@@ -406,9 +417,9 @@ s16 q2_combat_splash_at(s16 damage, s32 dist);
 q2_damage_result q2_combat_melee(q2_actor *attacker, q2_actor *target,
                                  s16 damage, const q2_combat_rules *rules);
 
-/* Creatures throw their grenades slower than the launcher does: 600 against
- * 900 (0x80061724 against 0x8004CF9C). */
-#define Q2_CREATURE_GRENADE_SPEED 600
+/* The creature wrapper's grenade argument. It participates in the ballistic
+ * solve and is then reused as the fuse passed at 0x80061724. */
+#define Q2_CREATURE_GRENADE_ARG 600
 
 /* ------------------------------------------------------------------------- */
 /* Tracing                                                                    */
@@ -425,39 +436,38 @@ s64 q2_combat_ray_dist_sq(const s32 origin[3], const s32 dir[3],
                           const s32 point[3], s64 *out_along);
 
 /*
- * How close a trace has to pass to count as a hit.
- *
- * The console does not do this: 0x800544EC sweeps the entity list with the
- * real hulls. The port has no entity hulls yet, so it tests spheres, and the
- * radius is the player's own 286-unit half-extent — the one number the
- * collision work established as a real body size rather than a margin
- * (FORMATS.md §9.12). MODELLED, and it is the one place the hit test differs
- * from the original in kind rather than in constants.
+ * Fallback horizontal radius for callers which project an actor without a
+ * usable entity radius. Normal actors carry their own radius and Y slab, just
+ * as 0x800544EC reads entity+0x94/+0x96; this value is not added to that hull.
+ * There is no moving-radius argument at either the hitscan call 0x8004891C or
+ * the entity/projectile mover call 0x80046A98: both pass start, end and the
+ * entity to ignore, and the sweep reads only each candidate's entity+0x94.
  */
 #define Q2_HITSCAN_RADIUS 286
 
 /*
- * The nearest actor a segment passes through, or -1. Shared by the bullet path
- * and the projectile mover, which need the same question answered.
+ * The nearest actor whose vertical cylinder a segment enters, or -1. Shared
+ * by the bullet path and the projectile mover, which need the same question
+ * answered. `fallback_radius` is only used for an actor with no radius.
  */
 s32 q2_combat_nearest_on_segment(const s32 origin[3], const s32 dir[3],
-                                 s32 hit_radius, q2_actor **targets,
+                                 s32 fallback_radius, q2_actor **targets,
                                  u32 count);
 
 /*
  * One hitscan trace, 0x8004874C.
  *
  * The trace runs from `origin` to `origin + dir` and stops at the first actor
- * whose sphere of `hit_radius` it crosses. `world_fraction` is 4096 when
- * nothing solid is in the way, or the 1.0.12 fraction at which the world stops
- * it — pass the result of the caller's own world trace, so this module does not
- * need to know about collision hulls.
+ * cylinder it crosses. `world_fraction` is 4096 when nothing solid is in the
+ * way, or the 1.0.12 fraction at which the world stops it — pass the result of
+ * the caller's own world trace, so this module does not need to know about
+ * collision hulls.
  *
  * Returns the index of the actor hit, or -1.
  */
 s32 q2_combat_fire_bullet(q2_actor *attacker, const s32 origin[3],
                           const s32 dir[3], s16 damage, s32 world_fraction,
-                          s32 hit_radius, q2_actor **targets, u32 count,
+                          s32 fallback_radius, q2_actor **targets, u32 count,
                           const q2_combat_rules *rules,
                           q2_damage_result *out);
 
@@ -468,7 +478,7 @@ s32 q2_combat_fire_bullet(q2_actor *attacker, const s32 origin[3],
  */
 u32 q2_combat_fire_rail(q2_actor *attacker, const s32 origin[3],
                         const s32 dir[3], s16 damage, s32 world_fraction,
-                        s32 hit_radius, q2_actor **targets, u32 count,
+                        s32 fallback_radius, q2_actor **targets, u32 count,
                         const q2_combat_rules *rules);
 
 #endif /* Q2PSX_COMBAT_H */

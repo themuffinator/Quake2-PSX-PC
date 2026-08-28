@@ -5,7 +5,7 @@
 #include <string.h>
 
 /*
- * The thirteen fields, in the order the original builds them on the stack at
+ * The seventeen fields, in the order the original builds them on the stack at
  * `0x800337EC`…`0x80033A5C`. The order is the executable's, not sorted by x —
  * kept that way so the table can be checked against the disassembly line for
  * line rather than after a rearrangement.
@@ -16,7 +16,7 @@ const q2_sbar_field q2_sbar_fields[Q2_SBAR_FIELDS] = {
     { -71,  1,  8, 14 },   /*  1  health digit 0                        */
     { -47,  1,  8, 14 },   /*  2  health digit 1                        */
     { -23,  1,  8, 14 },   /*  3  health digit 2                        */
-    { 135,  1,  8, 14 },   /*  4  ammo icon                             */
+    { 135,  0,  8, 14 },   /*  4  ammo icon                             */
     {  64,  1,  8, 14 },   /*  5  ammo digit 0                          */
     {  88,  1,  8, 14 },   /*  6  ammo digit 1                          */
     { 112,  1,  8, 14 },   /*  7  ammo digit 2                          */
@@ -33,50 +33,70 @@ const q2_sbar_field q2_sbar_fields[Q2_SBAR_FIELDS] = {
 };
 
 /*
- * The two-player layout, from `0x80033D30` — a different table, not a scaled
- * one. Two counters, digits 20 apart, and the far-right field 24 further out
- * than the one-player table puts it.
+ * The stacked two-player layout, from `0x80033D30`. The previous transcription
+ * stopped after record eight; the function actually builds sixteen and passes
+ * groups 0..3, 4..7, 8..11 and 13..15 to health, ammo, armour and signed frags.
  */
-const q2_sbar_field q2_sbar_fields_2p[Q2_SBAR_FIELDS_2P] = {
-    { 106,  0, 38, 14 },   /* 0  health icon                            */
-    {  46,  1,  8, 14 },   /* 1  health digit 0                         */
-    {  66,  1,  8, 14 },   /* 2  health digit 1                         */
-    {  86,  1,  8, 14 },   /* 3  health digit 2                         */
-    { 230,  1,  8, 14 },   /* 4  ammo icon                              */
-    { 170,  1,  8, 14 },   /* 5  ammo digit 0                           */
-    { 190,  1,  8, 14 },   /* 6  ammo digit 1                           */
-    { 210,  1,  8, 14 },   /* 7  ammo digit 2                           */
-    { 354,  1,  8, 14 }    /* 8  the frag count                         */
+const q2_sbar_field q2_sbar_fields_2h[Q2_SBAR_FIELDS_2H] = {
+    { 106,  1, 38, 14 }, {  46, 0, 8, 14 },
+    {  66,  0,  8, 14 }, {  86, 0, 8, 14 },
+    { 230,  1, 38, 14 }, { 170, 0, 8, 14 },
+    { 190,  0,  8, 14 }, { 210, 0, 8, 14 },
+    { 354,  1,  8, 14 }, { 294, 0, 8, 14 },
+    { 314,  0,  8, 14 }, { 334, 0, 8, 14 },
+    { 400,  0,  8, 14 }, { 422, 0, 8, 14 },
+    { 442,  0,  8, 14 }, { 462, 0, 8, 14 }
 };
 
 /*
- * The quad layout, from 0x80034288. `dy` is the constant part only: the eight
- * fields q2_sbar_field_4p_is_lower() flags have the live screen height
- * subtracted, so they sit 40 pixels above the bottom of whatever mode the
- * display is in rather than at a fixed line.
- *
- * Read verbatim, in the order the builder writes them — which is not sorted by
- * position, and the field at +400 is the one that breaks the pattern. Left as
- * found rather than tidied: an order that looks wrong and is the original's is
- * worth more than one that looks right and is invented.
+ * The side-by-side two-player layout, from `0x80034288` — formerly mislabelled
+ * as quad. The selector at 0x8003FA10 hands this callback only to layout_two_v.
+ * Records 8..11 and 13..15 use `anchor_y + 40 - screen_height`; `dy` below is
+ * the constant part and q2_sbar_2v_fields() performs the live subtraction.
  */
-const q2_sbar_field q2_sbar_fields_4p[Q2_SBAR_FIELDS_4P] = {
-    {  76,  1, 38, 14 },   /*  0  upper left  icon                       */
-    {  16,  0,  8, 14 },   /*  1  upper left  digit 0                    */
-    {  36,  0,  8, 14 },   /*  2  upper left  digit 1                    */
-    {  56,  0,  8, 14 },   /*  3  upper left  digit 2                    */
-    { 230,  1, 38, 14 },   /*  4  upper right icon                       */
-    { 170,  0,  8, 14 },   /*  5  upper right digit 0                    */
-    { 190,  0,  8, 14 },   /*  6  upper right digit 1                    */
-    { 210,  0,  8, 14 },   /*  7  upper right digit 2                    */
-    {  76, Q2_SBAR_4P_LOWER_DY,  8, 14 },   /*  8  lower left  icon      */
-    {  16, Q2_SBAR_4P_LOWER_DY,  8, 14 },   /*  9  lower left  digit 0   */
-    {  36, Q2_SBAR_4P_LOWER_DY,  8, 14 },   /* 10  lower left  digit 1   */
-    {  56, Q2_SBAR_4P_LOWER_DY,  8, 14 },   /* 11  lower left  digit 2   */
-    { 400,  0,  8, 14 },   /* 12  the odd one out, on the upper row      */
-    { 210, Q2_SBAR_4P_LOWER_DY,  8, 14 },   /* 13  lower right digit 2   */
-    { 170, Q2_SBAR_4P_LOWER_DY,  8, 14 },   /* 14  lower right digit 0   */
-    { 190, Q2_SBAR_4P_LOWER_DY,  8, 14 }    /* 15  lower right digit 1   */
+const q2_sbar_field q2_sbar_fields_2v[Q2_SBAR_FIELDS_2V] = {
+    {  76, 1, 38, 14 }, {  16, 0, 8, 14 },
+    {  36, 0,  8, 14 }, {  56, 0, 8, 14 },
+    { 230, 1, 38, 14 }, { 170, 0, 8, 14 },
+    { 190, 0,  8, 14 }, { 210, 0, 8, 14 },
+    {  76, Q2_SBAR_2V_UPPER_DY, 8, 14 },
+    {  16, Q2_SBAR_2V_UPPER_DY, 8, 14 },
+    {  36, Q2_SBAR_2V_UPPER_DY, 8, 14 },
+    {  56, Q2_SBAR_2V_UPPER_DY, 8, 14 },
+    { 400, 0, 8, 14 },
+    { 210, Q2_SBAR_2V_UPPER_DY, 8, 14 },
+    { 170, Q2_SBAR_2V_UPPER_DY, 8, 14 },
+    { 190, Q2_SBAR_2V_UPPER_DY, 8, 14 }
+};
+
+/* 0x80034830 indexes these as `view * 11 + field`. The first and third rows
+ * share x, as do the second and fourth; the y table is {110,110,1,1}. */
+const q2_sbar_field
+q2_sbar_fields_quad[Q2_SBAR_QUAD_VIEWS][Q2_SBAR_FIELDS_QUAD] = {
+    {
+        { 56,110,38,14 }, { 16,110,8,14 }, { 30,110,8,14 },
+        { 44,110, 8,14 }, {142,110,38,14 }, {100,110,8,14 },
+        {114,110, 8,14 }, {128,110,8,14 }, {198,110,8,14 },
+        {212,110, 8,14 }, {238,110,8,14 }
+    },
+    {
+        {208,110,38,14 }, {168,110,8,14 }, {182,110,8,14 },
+        {196,110, 8,14 }, {112,110,38,14 }, { 70,110,8,14 },
+        { 84,110, 8,14 }, { 98,110,8,14 }, {  6,110,8,14 },
+        { 20,110, 8,14 }, { 34,110,8,14 }
+    },
+    {
+        { 56,1,38,14 }, { 16,1,8,14 }, { 30,1,8,14 },
+        { 44,1, 8,14 }, {142,1,38,14 }, {100,1,8,14 },
+        {114,1, 8,14 }, {128,1,8,14 }, {198,1,8,14 },
+        {212,1, 8,14 }, {238,1,8,14 }
+    },
+    {
+        {208,1,38,14 }, {168,1,8,14 }, {182,1,8,14 },
+        {196,1, 8,14 }, {112,1,38,14 }, { 70,1,8,14 },
+        { 84,1, 8,14 }, { 98,1,8,14 }, {  6,1,8,14 },
+        { 20,1, 8,14 }, { 34,1,8,14 }
+    }
 };
 
 /*
@@ -90,9 +110,45 @@ const q2_sbar_strip_pos q2_sbar_strip_2p[Q2_SBAR_STRIP_SLOTS] = {
     { 381, 95 }, { 419, 95 }
 };
 
-bool q2_sbar_field_4p_is_lower(int field)
+bool q2_sbar_field_2v_is_upper(int field)
 {
-    return field >= 8 && field < Q2_SBAR_FIELDS_4P && field != 12;
+    return (field >= 8 && field <= 11) || (field >= 13 && field <= 15);
+}
+
+void q2_sbar_2v_fields(int screen_h,
+                       q2_sbar_field out[Q2_SBAR_FIELDS_2V])
+{
+    int i;
+
+    if (!out)
+        return;
+    memcpy(out, q2_sbar_fields_2v, sizeof(q2_sbar_fields_2v));
+    for (i = 0; i < Q2_SBAR_FIELDS_2V; i++)
+        if (q2_sbar_field_2v_is_upper(i))
+            out[i].dy = (s16)(out[i].dy - screen_h);
+}
+
+void q2_sbar_quad_fields(int view, int frags,
+                         q2_sbar_field out[Q2_SBAR_FIELDS_QUAD])
+{
+    if (!out)
+        return;
+    if (view < 0 || view >= Q2_SBAR_QUAD_VIEWS)
+        view = 0;
+    memcpy(out, q2_sbar_fields_quad[view],
+           sizeof(q2_sbar_fields_quad[view]));
+
+    /* 0x80034D24..0x80034DA8: on the right-hand views only, keep one- and
+     * two-character frag values against the inner edge. A negative value uses
+     * two characters (minus and magnitude), including -5. */
+    if (view == 1 || view == 3) {
+        if (frags >= 0 && frags < 10) {
+            out[10].dx = out[8].dx;
+        } else if (frags < 100) {
+            out[9].dx  = out[8].dx;
+            out[10].dx = q2_sbar_fields_quad[view][9].dx;
+        }
+    }
 }
 
 /*
@@ -152,6 +208,39 @@ int q2_sbar_digits_of(int value, u8 out[Q2_SBAR_COUNTER_DIGITS])
     return n;
 }
 
+void q2_sbar_frag_glyphs(int frags, u8 out[Q2_SBAR_COUNTER_DIGITS])
+{
+    int negative;
+    int value;
+
+    if (!out)
+        return;
+
+    if (frags < -99)
+        frags = -99;                 /* 0x80037DB8..0x80037DC4 */
+    if (frags > 999)
+        frags = 999;                 /* outside the authored match range */
+
+    negative = frags < 0;
+    value = negative ? -frags : frags;
+
+    out[0] = value >= 100 ? (u8)(value / 100) : Q2_SBAR_GLYPH_BLANK;
+    value %= 100;
+    out[1] = (out[0] != Q2_SBAR_GLYPH_BLANK || value >= 10)
+                 ? (u8)(value / 10)
+                 : Q2_SBAR_GLYPH_BLANK;
+    out[2] = (u8)(value % 10);
+
+    /* 0x80034F58..0x80034F84: put the sign immediately before the first
+     * significant digit, so -5 is {blank, minus, 5} and -15 is {minus,1,5}. */
+    if (negative) {
+        if (out[1] == Q2_SBAR_GLYPH_BLANK)
+            out[1] = Q2_SBAR_GLYPH_MINUS;
+        else
+            out[0] = Q2_SBAR_GLYPH_MINUS;
+    }
+}
+
 /* ------------------------------------------------------------------------- */
 void q2_statusbar_init(q2_statusbar *b, const q2_icon_tables *icons,
                        int players)
@@ -161,6 +250,10 @@ void q2_statusbar_init(q2_statusbar *b, const q2_icon_tables *icons,
     memset(b, 0, sizeof(*b));
     b->icons   = icons;
     b->players = players > 0 ? players : 1;
+    b->layout  = b->players >= 3 ? Q2_SBAR_LAYOUT_QUAD
+                                 : (b->players == 2 ? Q2_SBAR_LAYOUT_TWO_H
+                                                    : Q2_SBAR_LAYOUT_ONE);
+    b->screen_h = 248;
     b->visible = true;
 }
 
@@ -177,6 +270,20 @@ void q2_statusbar_anchor(q2_statusbar *b, s16 x, s16 y)
         return;
     b->anchor_x = x;
     b->anchor_y = y;
+}
+
+void q2_statusbar_layout(q2_statusbar *b, q2_sbar_layout layout,
+                         int view_index, int screen_h)
+{
+    if (!b)
+        return;
+    if (layout < Q2_SBAR_LAYOUT_ONE || layout > Q2_SBAR_LAYOUT_QUAD)
+        layout = Q2_SBAR_LAYOUT_ONE;
+    b->layout = layout;
+    b->view_index = (view_index >= 0 && view_index < Q2_SBAR_QUAD_VIEWS)
+                        ? view_index : 0;
+    if (screen_h > 0)
+        b->screen_h = screen_h;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -390,7 +497,8 @@ static bool counter_is_low(const q2_statusbar *b, int value, int threshold,
 }
 
 /* One counter: its digits, then its icon. */
-static u32 emit_counter(const q2_statusbar *b, u16 tpage, u16 clut,
+static u32 emit_counter(const q2_statusbar *b, const q2_sbar_field *fields,
+                        u16 tpage, u16 clut,
                         psx_ot *ot, u32 bucket, int ox, int oy,
                         q2_sbar_counter which, int value, int icon_index,
                         int low_threshold, bool solid_at_zero,
@@ -427,7 +535,7 @@ static u32 emit_counter(const q2_statusbar *b, u16 tpage, u16 clut,
 
         if (f < 0)
             continue;
-        fd = &q2_sbar_fields[f];
+        fd = &fields[f];
 
         emitted += emit_cell(ot, bucket, tpage, digit_clut,
                              ox + b->anchor_x + fd->dx,
@@ -450,7 +558,7 @@ static u32 emit_counter(const q2_statusbar *b, u16 tpage, u16 clut,
         int f = q2_sbar_icon_field(which);
 
         if (r && f >= 0 && !(r->w == 1 && r->h == 1)) {
-            const q2_sbar_field *fd = &q2_sbar_fields[f];
+            const q2_sbar_field *fd = &fields[f];
             q2_icon_size is = q2_icon_draw_size_of(b->players, 1, r->w, r->h);
 
             emitted += emit_cell(ot, bucket, tpage,
@@ -461,6 +569,52 @@ static u32 emit_counter(const q2_statusbar *b, u16 tpage, u16 clut,
         }
     }
 
+    return emitted;
+}
+
+/* 0x80037DA4 — the signed three-cell frag counter used by every split hook. */
+static u32 emit_frags(const q2_statusbar *b, const q2_sbar_field *fields,
+                      const u8 field_index[Q2_SBAR_COUNTER_DIGITS],
+                      u16 tpage, u16 clut, psx_ot *ot, u32 bucket,
+                      int ox, int oy)
+{
+    u8 glyph[Q2_SBAR_COUNTER_DIGITS];
+    q2_icon_size size = q2_icon_draw_size_of(b->players, 1,
+                                             Q2_SBAR_DIGIT_W,
+                                             Q2_SBAR_DIGIT_H);
+    u16 glyph_clut = pal_clut(b, b->frags < 0 ? Q2_SBAR_PAL_LOW
+                                               : Q2_SBAR_PAL_DIGITS,
+                              clut);
+    u32 emitted = 0;
+    int i;
+
+    q2_sbar_frag_glyphs(b->frags, glyph);
+    for (i = 0; i < Q2_SBAR_COUNTER_DIGITS; i++) {
+        const q2_sbar_field *fd;
+        u8 u, v, w, h;
+
+        if (glyph[i] == Q2_SBAR_GLYPH_BLANK)
+            continue;
+        if (glyph[i] == Q2_SBAR_GLYPH_MINUS) {
+            u = 0;
+            v = 192;
+            w = Q2_SBAR_DIGIT_W;
+            h = Q2_SBAR_DIGIT_H;
+        } else {
+            u = (u8)(glyph[i] * Q2_SBAR_DIGIT_PITCH);
+            v = Q2_SBAR_DIGIT_V;
+            w = Q2_SBAR_DIGIT_W;
+            h = Q2_SBAR_DIGIT_H;
+        }
+
+        fd = &fields[field_index[i]];
+        emitted += emit_cell(ot, bucket, tpage, glyph_clut,
+                             ox + b->anchor_x + fd->dx,
+                             oy + b->anchor_y + fd->dy,
+                             u, v, w, h,
+                             (u8)(size.w ? size.w : Q2_SBAR_DIGIT_W),
+                             (u8)(size.h ? size.h : Q2_SBAR_DIGIT_H));
+    }
     return emitted;
 }
 
@@ -523,12 +677,44 @@ static u32 emit_powerup_timer(const q2_statusbar *b, u16 tpage, u16 clut,
 u32 q2_statusbar_build_ot(const q2_statusbar *b, u16 tpage, u16 clut,
                           psx_ot *ot, u32 bucket, int origin_x, int origin_y)
 {
+    static const u8 split_frag_fields[Q2_SBAR_COUNTER_DIGITS] = { 13, 14, 15 };
+    static const u8 quad_frag_fields[Q2_SBAR_COUNTER_DIGITS] = { 8, 9, 10 };
+    q2_sbar_field scratch[Q2_SBAR_FIELDS_2V];
+    const q2_sbar_field *fields = q2_sbar_fields;
+    const u8 *frag_fields = split_frag_fields;
+    bool show_armour = true;
+    bool show_frags = false;
+    bool show_one_extras = false;
     u32 n = 0;
 
     if (!b || !ot || !b->visible || tpage == 0)
         return 0;
 
-    n += emit_counter(b, tpage, clut, ot, bucket, origin_x, origin_y,
+    switch (b->layout) {
+    case Q2_SBAR_LAYOUT_TWO_H:
+        fields = q2_sbar_fields_2h;
+        show_frags = true;
+        break;
+    case Q2_SBAR_LAYOUT_TWO_V:
+        q2_sbar_2v_fields(b->screen_h, scratch);
+        fields = scratch;
+        show_frags = true;
+        break;
+    case Q2_SBAR_LAYOUT_QUAD:
+        q2_sbar_quad_fields(b->view_index, b->frags, scratch);
+        fields = scratch;
+        frag_fields = quad_frag_fields;
+        show_armour = false;
+        show_frags = true;
+        break;
+    case Q2_SBAR_LAYOUT_ONE:
+    default:
+        show_one_extras = true;
+        break;
+    }
+
+    n += emit_counter(b, fields, tpage, clut, ot, bucket,
+                      origin_x, origin_y,
                       Q2_SBAR_HEALTH, b->health, b->health_icon,
                       Q2_SBAR_LOW_HEALTH, true, true);
 
@@ -562,7 +748,8 @@ u32 q2_statusbar_build_ot(const q2_statusbar *b, u16 tpage, u16 clut,
      * blaster shows no ammo, shotgun shows "10". Modelled as the behaviour
      * rather than by reproducing the out-of-bounds read.
      */
-    n += emit_counter(b, tpage, clut, ot, bucket, origin_x, origin_y,
+    n += emit_counter(b, fields, tpage, clut, ot, bucket,
+                      origin_x, origin_y,
                       Q2_SBAR_AMMO, b->ammo,
                       q2_icon_ammo_for_weapon(b->icons, b->weapon),
                       Q2_SBAR_LOW_AMMO, false,
@@ -600,19 +787,27 @@ u32 q2_statusbar_build_ot(const q2_statusbar *b, u16 tpage, u16 clut,
      * not been found, so nothing is done about it here rather than guessing at
      * a threshold; it is openquestions material, not a fix.
      */
-    if (b->showing_power)
-        n += emit_counter(b, tpage, clut, ot, bucket, origin_x, origin_y,
+    if (show_armour && b->showing_power)
+        n += emit_counter(b, fields, tpage, clut, ot, bucket,
+                          origin_x, origin_y,
                           Q2_SBAR_ARMOUR, b->cells, b->armour_icon,
                           Q2_SBAR_LOW_AMMO, false, true);
-    else if (b->armour > 0)
-        n += emit_counter(b, tpage, clut, ot, bucket, origin_x, origin_y,
+    else if (show_armour && b->armour > 0)
+        n += emit_counter(b, fields, tpage, clut, ot, bucket,
+                          origin_x, origin_y,
                           Q2_SBAR_ARMOUR, b->armour, b->armour_icon,
                           Q2_SBAR_LOW_AMMO, false, true);
+
+    if (show_frags)
+        n += emit_frags(b, fields, frag_fields, tpage, clut, ot, bucket,
+                        origin_x, origin_y);
 
     /* The console invokes this before the pickup-caption sub-draw. It is an
      * independent timer: an item caption cannot suppress it, and its source
      * is the powerup expiry words rather than `last_item`. */
-    n += emit_powerup_timer(b, tpage, clut, ot, bucket, origin_x, origin_y);
+    if (show_one_extras)
+        n += emit_powerup_timer(b, tpage, clut, ot, bucket,
+                                origin_x, origin_y);
 
     /*
      * The pickup caption's icon — field 16, from the fourth sub-draw at
@@ -625,7 +820,7 @@ u32 q2_statusbar_build_ot(const q2_statusbar *b, u16 tpage, u16 clut,
      * q2_hud_pickup_build_ot, and the note there on why the two halves of one
      * sub-draw live in two modules.
      */
-    if (b->pickup_icon != 0) {
+    if (show_one_extras && b->pickup_icon != 0) {
         const q2_icon_rect *r = q2_icon_rect_get(b->icons, b->pickup_icon);
 
         if (r && !(r->w == 1 && r->h == 1)) {
@@ -645,9 +840,8 @@ u32 q2_statusbar_build_ot(const q2_statusbar *b, u16 tpage, u16 clut,
      * console's own two guards: nothing for a zero index, and one sprite when
      * both slots name the same weapon (0x80036188 / 0x80036198).
      */
-    {
-        const q2_sbar_strip_pos *pos =
-            (b->players >= 2) ? q2_sbar_strip_2p : q2_sbar_strip;
+    if (show_one_extras) {
+        const q2_sbar_strip_pos *pos = q2_sbar_strip;
         int i;
 
         for (i = 0; i < Q2_SBAR_STRIP_SLOTS; i++) {

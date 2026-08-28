@@ -106,6 +106,15 @@ static void test_raise_to_idle(void)
      * swap, which is a different moment.
      */
     q2_vw_init(&vw, &g_tab, 1);
+    CHECK(vw.scale == Q2_ONE_12 && vw.fade == Q2_ONE_12,
+          "the allocator scales are %d/%d, expected 4096/4096",
+          (int)vw.scale, (int)vw.fade);
+    CHECK(vw.glow[0] == 0x40 && vw.glow[1] == 0x40 && vw.glow[2] == 0x40,
+          "the allocator ambient is %02X/%02X/%02X, expected 40/40/40",
+          vw.glow[0], vw.glow[1], vw.glow[2]);
+    CHECK(vw.light_selector == 1,
+          "the constructor +0xF4 is %d, expected literal +1",
+          (int)vw.light_selector);
     CHECK(vw.state == Q2_VM_LOWER, "a fresh weapon starts in lower, got %s",
           q2_vm_state_name(vw.state));
     q2_vw_advance(&vw, 10, false, Q2_VW_FIRE_NONE);
@@ -780,6 +789,17 @@ static void test_grenade_cook_waits_for_the_arm(void)
     q2_viewweapon vw;
     s32 before;
 
+    /* Grenade3 compares current and previous model positions: 261 primes once
+     * and 411 throws once. */
+    park_in_fire(&vw, 6, 0);
+    vw.hand_prev_anim = Q2_VW_HAND_PRIME_POSITION - 1;
+    vw.anim_pos       = Q2_VW_HAND_PRIME_POSITION;
+    q2_vw_advance(&vw, 1, false, Q2_VW_FIRE_NONE);
+    CHECK(q2_vw_take_frame_sound(&vw) == Q2_WSND_HANDGREN_PRIME,
+          "crossing 261 plays the hand-grenade prime sample");
+    CHECK(q2_vw_take_frame_sound(&vw) == -1,
+          "the prime crossing is a drained one-shot");
+
     park_in_fire(&vw, 6, 0);
     vw.anim_pos = Q2_VW_COOK_POSITION - 1;
     before = vw.left;
@@ -800,10 +820,46 @@ static void test_grenade_cook_waits_for_the_arm(void)
           (int)vw.left, (int)before);
     CHECK(vw.anim_pos == Q2_VW_COOK_POSITION,
           "the arm holds where it is, at %d", (int)vw.anim_pos);
+    CHECK(q2_vw_take_hand_grenade_cook(&vw) == 10,
+          "the held entity receives the same ten cook ticks");
+    CHECK(q2_vw_take_hand_grenade_cook(&vw) == 0,
+          "cook time drains rather than being counted twice");
 
-    /* Letting go releases it, and the clip runs out from where it stopped. */
+    /* Letting go unpins it; the actual throw is model position 411. */
     q2_vw_advance(&vw, 10, false, Q2_VW_FIRE_NONE);
-    CHECK(!vw.cook, "releasing the trigger throws it");
+    CHECK(!vw.cook, "releasing the trigger lets the throw animation continue");
+    vw.hand_prev_anim = Q2_VW_HAND_RELEASE_POSITION - 1;
+    vw.anim_pos       = Q2_VW_HAND_RELEASE_POSITION;
+    q2_vw_advance(&vw, 1, false, Q2_VW_FIRE_NONE);
+    CHECK(q2_vw_take_hand_grenade_release(&vw),
+          "crossing 411 releases Grenade3");
+    CHECK(!q2_vw_take_hand_grenade_release(&vw),
+          "the release crossing is a drained one-shot");
+    CHECK(q2_vw_take_frame_sound(&vw) == Q2_WSND_HANDGREN_THROW,
+          "and crossing 411 plays the throw sample");
+
+    /* A fuse that reaches zero while held takes the forced-reset arm at
+     * 0x8004AA1C rather than playing the throw tail. */
+    park_in_fire(&vw, 6, 1);
+    vw.anim_pos        = Q2_VW_COOK_POSITION;
+    vw.anim_end        = 470;
+    vw.anim_flags      = 2;
+    vw.cook            = true;
+    vw.hand_cook_ticks = 20;
+    vw.hand_release    = true;
+    vw.frame_sound     = Q2_WSND_HANDGREN_THROW;
+    q2_vw_hand_grenade_expired(&vw);
+    CHECK(vw.frame == 2, "a cooked-off grenade forces fire frame 2");
+    CHECK(vw.left == 150, "with the retail 150 ticks remaining");
+    CHECK(vw.anim_pos == 0 && vw.anim_end == -1,
+          "and clears/rewinds the hand model move");
+    CHECK((vw.anim_flags & 1) != 0 && (vw.anim_flags & 2) == 0,
+          "marking the move played rather than playing");
+    CHECK(!vw.cook && q2_vw_take_hand_grenade_cook(&vw) == 0 &&
+          !q2_vw_take_hand_grenade_release(&vw),
+          "with no stale cook or release output");
+    CHECK(q2_vw_take_frame_sound(&vw) == -1,
+          "and no throw sound after an in-hand detonation");
 }
 
 
@@ -855,6 +911,66 @@ static void test_rotmatrix_order(void)
     }
 }
 
+/*
+ * Retail does not restore a full projection after every regional emitter.
+ * Instead the weapon entity owns area 1 (0x8004EE58), and model draw selects
+ * that area at 0x8006BEB0.  A negative selector is a no-op, so retaining the
+ * prototype's default -1 would leave the last projectile's portal offset in
+ * force for the gun.
+ */
+static void test_viewweapon_selects_area_one(void)
+{
+    q2_viewweapon vw;
+    q2_model model;
+    q2_model_instance proto;
+    q2_camera cam;
+    psx_ot ot;
+    gte_state gte;
+    psx_ot_area_screen region;
+    static const s32 feet[3] = { 0, 0, 0 };
+    static const s16 aim[3] = { 0, 0, 0 };
+    static const s16 kick[3] = { 0, 0, 0 };
+
+    memset(&vw, 0, sizeof(vw));
+    memset(&model, 0, sizeof(model));
+    memset(&cam, 0, sizeof(cam));
+    memset(&region, 0, sizeof(region));
+    gte_init(&gte);
+
+    CHECK(psx_ot_init(&ot, 64, 16) == Q2_OK,
+          "viewweapon projection OT allocates");
+    if (!ot.bucket_head)
+        return;
+
+    cam.projection = 160;
+    psx_ot_set_authored_window(&ot, 2, 51);
+    psx_ot_set_window(&ot, 4, 49);
+    psx_ot_area_prepare(&ot, 512, 248, 0, 0, 256, 124);
+    region.min_x = 32;
+    region.min_y = 16;
+    region.max_x = 200;
+    region.max_y = 120;
+    CHECK(psx_ot_area_register_screen(&ot, 7, 43, &region),
+          "regional projection registers");
+
+    q2_camera_apply_area_projection(&cam, &ot, 7, &gte);
+    CHECK((gte.ofx >> 16) == 224 && (gte.ofy >> 16) == 108,
+          "test begins with the preceding regional origin, got (%d,%d)",
+          (int)(gte.ofx >> 16), (int)(gte.ofy >> 16));
+
+    q2_model_instance_init(&proto);
+    proto.sort_area = 7;       /* prove q2_vw_build_ot owns the override */
+    proto.bucket_override = 1;
+    vw.model = &model;         /* zero faces: projection is the only output */
+    (void)q2_vw_build_ot(&vw, &proto, feet, 0, aim, kick,
+                         &cam, &ot, &gte, NULL);
+
+    CHECK((gte.ofx >> 16) == 256 && (gte.ofy >> 16) == 124,
+          "weapon area 1 restores viewport projection, got (%d,%d)",
+          (int)(gte.ofx >> 16), (int)(gte.ofy >> 16));
+    psx_ot_free(&ot);
+}
+
 /* ------------------------------------------------------------------------- */
 int main(void)
 {
@@ -878,6 +994,7 @@ int main(void)
     test_hyperblaster_loop();
     test_grenade_cook_waits_for_the_arm();
     test_rotmatrix_order();
+    test_viewweapon_selects_area_one();
 
     if (g_fail == 0)
         printf("test_viewweapon: all checks passed\n");

@@ -375,7 +375,11 @@ static void test_projectiles(void)
                "with a blast radius of 1300");
     check_eq_i(list.p[idx].mod, Q2_MOD_ROCKET, "and mod 15");
     check(list.p[idx].vel[2] > 0, "moving the way it was aimed");
-    check_eq_i(list.p[idx].expires, 0, "and no fuse");
+    check_eq_i(list.p[idx].expires, Q2_ROCKET_LIFETIME,
+               "and the spawner's 20000-tick lifetime");
+    check_eq_i(list.p[idx].vel[2],
+               ((s64)(aim[2] * Q2_AIM_SCALE_ROCKET) * 4096) / Q2_VEL_DIV,
+               "using the doubled aim as shared-entity velocity");
 
     /* A rocket that meets a wall damages what is nearby and is consumed. */
     {
@@ -397,6 +401,19 @@ static void test_projectiles(void)
               "the rocket is consumed by the wall");
         check(near_by.health < 500, "and the blast reaches a bystander");
         check(!list.p[idx].in_use, "the slot is freed");
+    }
+
+    /* Its 20000-tick field is only a safety lifetime. At 0x8004ADB0 retail
+     * frees the rocket; it does not run the impact/explosion arm. */
+    {
+        give_all(&inv);
+        r = q2_weapon_fire(&inv, &rng, NULL, Q2_WID_ROCKET_LAUNCHER,
+                           eye, 0, 0, 0, aim, 0, 0, false, false, 0);
+        idx = q2_projectile_launch(&list, &r, 0, 0);
+
+        check(q2_projectile_expire(&list, (u32)idx),
+              "an elapsed rocket safety lifetime frees the slot");
+        check(!list.p[idx].in_use, "the expired rocket is gone quietly");
     }
 
     /* A bolt's direction is its velocity, and the hyperblaster's is half the
@@ -430,7 +447,8 @@ static void test_projectiles(void)
                        aim, 0, 0, false, false, 0);
     idx = q2_projectile_launch(&list, &r, 0, 100);
     check(idx >= 0, "the launcher spawns a grenade");
-    check(list.p[idx].expires > 100, "with a fuse");
+    check_eq_i(list.p[idx].expires, 100 + Q2_GRENADE_LAUNCH_FUSE,
+               "with the 900 argument as its fuse, not its speed");
     check_eq_i(list.p[idx].splash_radius, Q2_SPLASH_RADIUS_GRENADE,
                "and a blast radius of 1000");
     check(list.p[idx].vel[1] < 0,
@@ -443,8 +461,138 @@ static void test_projectiles(void)
 
         q2_projectile_step(&list, (u32)idx, 40, Q2_DT_NOMINAL, 101, &step);
         check(list.p[idx].vel[1] > before, "gravity pulls it back down");
+        check_eq_i(step.to[1] - step.from[1],
+                   ((s64)(-Q2_GRENADE_LAUNCH_UP + 40 * Q2_DT_NOMINAL) *
+                    Q2_DT_NOMINAL) / Q2_VEL_DIV,
+                   "with the shared mover's signed divide toward zero");
         check(step.to[2] > step.from[2], "while it keeps going forward");
         check(!step.expired, "and the fuse has not run out");
+        check_eq_i(step.to[2] - step.from[2],
+                   ((s64)Q2_GRENADE_LAUNCH_FORWARD * Q2_DT_NOMINAL) /
+                       Q2_VEL_DIV,
+                   "and raw forward velocity advances by vel * dt / 320");
+    }
+
+    /* Grenade3 is not Grenade2 with another fuse. 0x8004AA6C creates it in
+     * hidden state 1, owner-attached with raw charge 4096; 0x8004A368 charges
+     * and releases it later, and only that release spends ammo. */
+    {
+        q2_projectiles hand;
+        q2_proj_step st;
+        s32 attached[3] = { 111, 222, 333 };
+        s32 released_at[3] = { 80, -50, 200 };
+        s32 raw_dir[3] = { 0, -Q2_HAND_GRENADE_RELEASE_UP,
+                           Q2_HAND_GRENADE_CHARGE_START + 120 };
+        s32 before_ammo, h;
+
+        q2_projectiles_init(&hand);
+        give_all(&inv);
+        before_ammo = inv.ammo[Q2_AMMO_GRENADES];
+        r = q2_weapon_fire(&inv, &rng, NULL, Q2_WID_HAND_GRENADE,
+                           eye, 0, 0, 0, aim, 100, 0,
+                           false, false, 0);
+        check(r.fired, "a hand grenade primes");
+        check_eq_i(inv.ammo[Q2_AMMO_GRENADES], before_ammo,
+                   "priming does not spend its grenade");
+        check_eq_i(r.sound, -1,
+                   "prime/throw sounds belong to model crossings, not fire");
+
+        h = q2_projectile_launch(&hand, &r, 3, 100);
+        check(h >= 0, "Grenade3 allocates a held entity");
+        check_eq_i(q2_projectile_hand_held_index(&hand, 3), h,
+                   "identified by owner while held");
+        check_eq_i(hand.p[h].node, Q2_PROJ_NODE_HELD,
+                   "with the hidden held-state sentinel");
+        check_eq_i(q2_projectile_hand_charge(&hand, 3),
+                   Q2_HAND_GRENADE_CHARGE_START,
+                   "and raw charge 4096");
+        check_eq_i(hand.p[h].expires, 100 + Q2_HAND_GRENADE_FUSE,
+                   "while its 1650-tick fuse is already running");
+
+        q2_projectile_step(&hand, (u32)h, Q2_GRAVITY,
+                           Q2_DT_NOMINAL, 101, &st);
+        check_eq_i(st.to[0], st.from[0], "held Grenade3 does not move in X");
+        check_eq_i(st.to[1], st.from[1], "held Grenade3 does not fall");
+        check_eq_i(st.to[2], st.from[2], "held Grenade3 does not move forward");
+
+        check(q2_projectile_hand_update(&hand, 3, attached, 20),
+              "the owner attaches and cooks it");
+        check_eq_i(hand.p[h].pos[0], attached[0], "attachment copies X");
+        check_eq_i(hand.p[h].pos[1], attached[1], "attachment copies Y");
+        check_eq_i(hand.p[h].pos[2], attached[2], "attachment copies Z");
+        check_eq_i(q2_projectile_hand_charge(&hand, 3),
+                   Q2_HAND_GRENADE_CHARGE_START + 120,
+                   "twenty cook ticks add exactly 6*20 charge");
+
+        check(q2_projectile_hand_release(&hand, 3, released_at, raw_dir),
+              "the 411 crossing releases it");
+        check_eq_i(hand.p[h].node, Q2_PROJ_NODE_UNKNOWN,
+                   "release restores the fresh-entity collision sentinel");
+        check_eq_i(q2_projectile_hand_held_index(&hand, 3), -1,
+                   "and it is no longer owner-attached");
+        check_eq_i(hand.p[h].vel[1],
+                   ((s64)raw_dir[1] * 4096) / Q2_VEL_DIV,
+                   "release converts raw upward velocity through /320");
+        check_eq_i(hand.p[h].vel[2],
+                   ((s64)raw_dir[2] * 4096) / Q2_VEL_DIV,
+                   "and preserves the charged forward component");
+
+        check(q2_weapon_consume(&inv, Q2_WID_HAND_GRENADE),
+              "release can charge the deferred ammo");
+        check_eq_i(inv.ammo[Q2_AMMO_GRENADES], before_ammo - 1,
+                   "exactly one grenade is spent at release");
+    }
+
+    /* BFGBlast rotates a raw length-768 vector, advances it through a private
+     * /64 mover, and counts down 2400 at entity+0xF4. */
+    {
+        q2_projectiles l4;
+        q2_proj_step st;
+        s32 bfg;
+
+        q2_projectiles_init(&l4);
+        give_all(&inv);
+        r = q2_weapon_fire(&inv, &rng, NULL, Q2_WID_BFG, eye, 0, 0, 0,
+                           aim, 0, 0, false, false, 0);
+        bfg = q2_projectile_launch(&l4, &r, 0, 37);
+        check(bfg >= 0, "the BFG spawns its dedicated blast");
+        check_eq_i(l4.p[bfg].expires, 37 + Q2_BFG_LIFETIME,
+                   "with the read 2400-tick lifetime");
+
+        q2_projectile_step(&l4, (u32)bfg, Q2_GRAVITY, Q2_DT_NOMINAL, 38, &st);
+        check_eq_i(st.to[2] - st.from[2],
+                   (Q2_BFG_RAW_SPEED * Q2_DT_NOMINAL) / Q2_BFG_VEL_DIV,
+                   "and its custom mover advances raw 768 velocity through /64");
+        check_eq_i(st.to[1] - st.from[1], 0,
+                   "without shared-entity gravity");
+        check(q2_projectile_expire(&l4, (u32)bfg),
+              "and the BFG safety lifetime uses the quiet free path");
+        check(!l4.p[bfg].in_use, "rather than inventing a delayed BFG blast");
+    }
+
+    /* RotMatrix already supplies a fixed-point forward column. Retail rotates
+     * local {0,0,768} componentwise and never normalises that column. A short,
+     * oblique test vector makes the old Euclidean-normalisation substitution
+     * impossible to hide; the negative odd component also pins arithmetic
+     * right-shift rounding. */
+    {
+        q2_projectiles l5;
+        s16 matrix_aim[3] = { 2048, -2049, 2048 };
+        s32 bfg;
+        int k;
+
+        q2_projectiles_init(&l5);
+        give_all(&inv);
+        r = q2_weapon_fire(&inv, &rng, NULL, Q2_WID_BFG, eye, 0, 0, 0,
+                           matrix_aim, 0, 0, false, false, 0);
+        bfg = q2_projectile_launch(&l5, &r, 0, 0);
+        check(bfg >= 0, "the BFG accepts an oblique matrix column");
+        for (k = 0; k < 3; k++) {
+            s32 raw = (s32)(((s64)matrix_aim[k] * Q2_BFG_RAW_SPEED) >> 12);
+            check_eq_i(l5.p[bfg].vel[k],
+                       ((s64)raw * 4096) / Q2_BFG_VEL_DIV,
+                       "BFG component is fixed multiply, not normalisation");
+        }
     }
 
     /* The fuse does run out. */
@@ -482,11 +630,11 @@ static void test_projectiles(void)
             check(d2 == d1 * 2, "and twice the dt moves it exactly twice as far");
         }
 
-        /* And the absolute figure: a bolt's velocity IS its direction in
-         * 1.0.12, so a nominal tick advances it by dir * 12. */
+        /* And the absolute figure: a bolt's raw velocity IS its direction,
+         * while the list stores the same value in 1.0.12. */
         check_eq_i((s64)s1.to[2] - s1.from[2],
-                   ((s64)l2.p[b].vel[2] * Q2_DT_NOMINAL) >> 12,
-                   "one tick is vel * dt >> 12");
+                   ((s64)l2.p[b].vel[2] * Q2_DT_NOMINAL) / 4096,
+                   "one tick recovers the raw velocity and multiplies by dt");
     }
 
     /*
@@ -497,7 +645,7 @@ static void test_projectiles(void)
     {
         q2_projectiles l3;
         q2_proj_step   st;
-        s32 g, before;
+        s32 g, before, tick;
 
         q2_projectiles_init(&l3);
         give_all(&inv);
@@ -518,6 +666,19 @@ static void test_projectiles(void)
         check_eq_i(((s64)(l3.p[g].vel[1] - before) * Q2_DT_NOMINAL) >> 12,
                    ((s64)Q2_GRAVITY * Q2_DT_NOMINAL * Q2_DT_NOMINAL) / Q2_VEL_DIV,
                    "and it falls at the same rate the player does");
+
+        for (tick = 0; tick < 100; tick++)
+            q2_projectile_step(&l3, (u32)g, Q2_GRAVITY,
+                               Q2_DT_NOMINAL, 1, &st);
+        check_eq_i(l3.p[g].vel[1],
+                   ((s64)Q2_TERMINAL_VY * 4096) / Q2_VEL_DIV,
+                   "the shared mover caps grenade fall speed at raw +8192");
+
+        q2_projectile_step(&l3, (u32)g, Q2_GRAVITY,
+                           Q2_DT_NOMINAL, 1, &st);
+        check_eq_i(l3.p[g].vel[1],
+                   ((s64)Q2_TERMINAL_VY * 4096) / Q2_VEL_DIV,
+                   "and the one-sided terminal clamp remains stable");
     }
 }
 

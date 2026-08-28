@@ -217,6 +217,40 @@ static void test_anim_at_holds_the_last_frame(void)
     check_eq(within, 4, "at the same frame — a hold does not drift");
 }
 
+static void test_subframe_cursor(void)
+{
+    q2_model_cursor c;
+    q2_model m;
+    q2_model_anim a;
+    u32 within = 0;
+    bool held = true;
+
+    memset(&c, 0, sizeof(c));
+    check_eq(q2_model_cursor_phase(&c, 300, 10), 300,
+             "first AI base is installed at phase zero");
+    check_eq(q2_model_cursor_phase(&c, 300, 10), 310,
+             "first render phase is one third of an AI interval");
+    check_eq(q2_model_cursor_phase(&c, 300, 10), 320,
+             "second render phase retains the cursor");
+    check_eq(q2_model_cursor_phase(&c, 330, 10), 330,
+             "the next AI base resets phase instead of being chased");
+    check_eq(q2_model_cursor_phase(&c, 330, 50), 359,
+             "a long render step clamps inside the 0..29 retail phase");
+    check_eq(q2_model_cursor_phase(&c, 30, 10), 30,
+             "an animation loop also installs its new base directly");
+
+    build_timeline(&m);
+    check_eq(q2_model_anim_at_position_held(&m, 47, &a, &within, &held), 1,
+             "a position with a remainder resolves");
+    check_eq(held, 0, "the in-range position is not held");
+    check_eq(within, 7, "the seven-tenths remainder reaches pose interpolation");
+
+    check_eq(q2_model_anim_at_position_held(&m, 151, &a, &within, &held), 1,
+             "a position beyond the synthetic timeline is held");
+    check_eq(held, 1, "the held position reports the divergence");
+    check_eq(within, 40, "a held final key discards the unusable remainder");
+}
+
 /* ------------------------------------------------------------------------- */
 /* Block A: the face draw order                                               */
 /* ------------------------------------------------------------------------- */
@@ -347,6 +381,7 @@ int main(void)
     test_moves_tile_without_gaps();
     test_position_formula();
     test_anim_at_holds_the_last_frame();
+    test_subframe_cursor();
 
     puts("");
     puts("block A: the face draw order");

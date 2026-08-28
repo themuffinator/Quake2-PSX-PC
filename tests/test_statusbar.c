@@ -128,76 +128,70 @@ static void test_two_rows(void)
     CHECK(q2_sbar_fields[Q2_SBAR_FIELD_UP_DIGIT1].dx -
           q2_sbar_fields[Q2_SBAR_FIELD_UP_DIGIT0].dx == Q2_SBAR_DIGIT_PITCH,
           "and they step by one numeral");
-    /* The frag field is on the MAIN row, far right. */
-    CHECK(q2_sbar_fields[Q2_SBAR_FIELD_FRAGS].dy == 0,
-          "the frag count is on the main row");
-    CHECK(q2_sbar_fields[Q2_SBAR_FIELD_FRAGS].dx >
+    /* The one-player auxiliary icon is on the main row, far right. Numeric
+     * frags use three fields only in the split hooks. */
+    CHECK(q2_sbar_fields[Q2_SBAR_FIELD_AUX_ICON].dy == 0,
+          "the auxiliary icon is on the main row");
+    CHECK(q2_sbar_fields[Q2_SBAR_FIELD_AUX_ICON].dx >
           q2_sbar_fields[q2_sbar_icon_field(Q2_SBAR_ARMOUR)].dx,
           "and right of everything else");
 }
 
 static void test_two_player_layout(void)
 {
+    q2_sbar_field side[Q2_SBAR_FIELDS_2V];
     int i;
 
     /*
-     * The 2P hook builds its OWN table — two counters, digits 20 apart. This is
-     * the thing a port gets wrong by assuming one layout scaled: the console
-     * does not scale, it has another table.
+     * Both two-player hooks build sixteen fields. The earlier decode stopped
+     * the stacked hook after nine and mislabelled the side-by-side hook as
+     * quad; the selector at 0x8003FA10 proves which callback belongs to which.
      */
     for (i = 1; i < 3; i++)
-        CHECK(q2_sbar_fields_2p[i + 1].dx - q2_sbar_fields_2p[i].dx == 20,
-              "2P health digits step 20, got %d",
-              q2_sbar_fields_2p[i + 1].dx - q2_sbar_fields_2p[i].dx);
-    CHECK(q2_sbar_fields_2p[6].dx - q2_sbar_fields_2p[5].dx == 20,
-          "2P ammo digits step 20");
-    /* Every 2P offset is positive: a split viewport's anchor is near its left
-     * edge, so negative offsets would fall outside it. */
-    for (i = 0; i < Q2_SBAR_FIELDS_2P; i++)
-        CHECK(q2_sbar_fields_2p[i].dx >= 0,
-              "2P field %d is inside the viewport", i);
+        CHECK(q2_sbar_fields_2h[i + 1].dx - q2_sbar_fields_2h[i].dx == 20,
+              "2H health digits step 20");
+    CHECK(q2_sbar_fields_2h[8].dx == 354 &&
+          q2_sbar_fields_2h[9].dx == 294,
+          "2H includes the armour group omitted by the old transcription");
+    CHECK(q2_sbar_fields_2h[13].dx == 422 &&
+          q2_sbar_fields_2h[15].dx == 462,
+          "2H signed frags occupy records 13..15");
+
+    q2_sbar_2v_fields(248, side);
+    CHECK(side[0].dx == 76 && side[4].dx == 230,
+          "2V puts health and ammo along the bottom");
+    CHECK(side[8].dy == 40 - 248 && side[13].dy == 40 - 248,
+          "2V uses the live framebuffer height for armour and frags");
+    CHECK(side[12].dy == 0,
+          "2V record 12 does not take the height subtraction");
 }
 
 static void test_quad_layout(void)
 {
-    int i, lower = 0;
+    q2_sbar_field f[Q2_SBAR_FIELDS_QUAD];
 
     /*
-     * The quad layout is SIXTEEN fields, not a scaled copy of either of the
-     * others — four counters over two rows, because in four-player split the
-     * bar carries every player's counters at once instead of being drawn per
-     * viewport.
+     * The real quad hook is 0x80034830: eleven fields PER VIEWPORT, indexed
+     * through the 44 halfwords at 0x8009C600 and four y values at 0x800AE808.
      */
-    for (i = 1; i < 3; i++) {
-        CHECK(q2_sbar_fields_4p[i + 1].dx - q2_sbar_fields_4p[i].dx == 20,
-              "quad digits step 20, got %d",
-              q2_sbar_fields_4p[i + 1].dx - q2_sbar_fields_4p[i].dx);
-        CHECK(q2_sbar_fields_4p[i + 5].dx - q2_sbar_fields_4p[i + 4].dx == 20,
-              "and so does the second counter");
-    }
-    /* The icon sits one more step past the last digit, both times. */
-    CHECK(q2_sbar_fields_4p[0].dx - q2_sbar_fields_4p[3].dx == 20,
-          "the upper-left icon follows its digits by one step");
-    CHECK(q2_sbar_fields_4p[4].dx - q2_sbar_fields_4p[7].dx == 20,
-          "and so does the upper-right one");
+    CHECK(q2_sbar_fields_quad[0][0].dx == 56 &&
+          q2_sbar_fields_quad[0][10].dx == 238,
+          "quad view 0 consumes the first eleven x offsets");
+    CHECK(q2_sbar_fields_quad[1][0].dx == 208 &&
+          q2_sbar_fields_quad[1][8].dx == 6,
+          "quad view 1 consumes the second eleven x offsets");
+    CHECK(q2_sbar_fields_quad[0][0].dy == 110 &&
+          q2_sbar_fields_quad[2][0].dy == 1,
+          "top views use y 110 and bottom views y 1");
 
-    /* The two icon fields are the wide ones; every digit field is 8. */
-    CHECK(q2_sbar_fields_4p[0].init_w == 38 && q2_sbar_fields_4p[4].init_w == 38,
-          "the upper row's two icons are 38 wide");
-    CHECK(q2_sbar_fields_4p[1].init_w == 8, "and a digit is 8");
-
-    /* Eight fields hang off the bottom of the screen rather than the top. */
-    for (i = 0; i < Q2_SBAR_FIELDS_4P; i++)
-        if (q2_sbar_field_4p_is_lower(i))
-            lower++;
-    CHECK(lower == 7, "seven fields are measured from the bottom, got %d", lower);
-    CHECK(!q2_sbar_field_4p_is_lower(12),
-          "the field at x=400 is on the upper row despite its index");
-
-    /* Every offset is positive: a quarter viewport's anchor is near its left
-     * edge, so a negative offset would fall outside it. */
-    for (i = 0; i < Q2_SBAR_FIELDS_4P; i++)
-        CHECK(q2_sbar_fields_4p[i].dx >= 0, "quad field %d is inside", i);
+    q2_sbar_quad_fields(1, 7, f);
+    CHECK(f[10].dx == 6, "a one-digit right-view frag hugs the inner edge");
+    q2_sbar_quad_fields(1, -7, f);
+    CHECK(f[9].dx == 6 && f[10].dx == 20,
+          "a signed right-view frag reserves minus plus one digit");
+    q2_sbar_quad_fields(1, 100, f);
+    CHECK(f[8].dx == 6 && f[9].dx == 20 && f[10].dx == 34,
+          "three-digit right-view frags retain all three fields");
 }
 
 static void test_icon_vocabulary(void)
@@ -289,6 +283,26 @@ static void test_digits_of(void)
     /* Three cells is the ceiling, and a negative must not underflow. */
     CHECK(q2_sbar_digits_of(1234, d) == 3, "over 999 clamps");
     CHECK(q2_sbar_digits_of(-5, d) == 1 && d[0] == 0, "negative reads zero");
+}
+
+static void test_frag_glyphs(void)
+{
+    u8 g[Q2_SBAR_COUNTER_DIGITS];
+
+    q2_sbar_frag_glyphs(7, g);
+    CHECK(g[0] == Q2_SBAR_GLYPH_BLANK &&
+          g[1] == Q2_SBAR_GLYPH_BLANK && g[2] == 7,
+          "a positive single frag is right aligned");
+    q2_sbar_frag_glyphs(-7, g);
+    CHECK(g[0] == Q2_SBAR_GLYPH_BLANK &&
+          g[1] == Q2_SBAR_GLYPH_MINUS && g[2] == 7,
+          "-7 is blank, minus, seven");
+    q2_sbar_frag_glyphs(-15, g);
+    CHECK(g[0] == Q2_SBAR_GLYPH_MINUS && g[1] == 1 && g[2] == 5,
+          "-15 is minus, one, five");
+    q2_sbar_frag_glyphs(-200, g);
+    CHECK(g[0] == Q2_SBAR_GLYPH_MINUS && g[1] == 9 && g[2] == 9,
+          "retail clamps the negative end to -99");
 }
 
 static void test_split_screen_sizes(void)
@@ -583,6 +597,7 @@ int main(void)
     test_quad_layout();
     test_icon_vocabulary();
     test_digits_of();
+    test_frag_glyphs();
     test_split_screen_sizes();
     test_armour_icon_select();
     test_armour_class_upkeep();

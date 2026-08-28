@@ -166,9 +166,9 @@ enum {
     Q2_EVREC_HASRUN   = 0x01,
     Q2_EVREC_RT1      = 0x02,
     Q2_EVREC_RT2      = 0x04,
-    Q2_EVREC_CAT_A    = 0x08,   /* the three category bits are still unknown */
-    Q2_EVREC_CAT_B    = 0x10,   /* 0x10 is the loader's default             */
-    Q2_EVREC_CAT_C    = 0x20,
+    Q2_EVREC_CAT_A    = 0x08,   /* run on the first frame inside a trigger  */
+    Q2_EVREC_CAT_B    = 0x10,   /* run on every frame inside                */
+    Q2_EVREC_CAT_C    = 0x20,   /* run on the first frame after leaving     */
     Q2_EVREC_ONESHOT  = 0x40,   /* on run, DISABLED := ONESHOT              */
     Q2_EVREC_DISABLED = 0x80    /* record is skipped                        */
 };

@@ -85,9 +85,167 @@ static void matrix_apply_t(const s16 m[3][3], const s32 v[3], s32 out[3])
  * the tail of the chain and draws last — which is the console's own chaining
  * direction (`swl t1, 2(t6)` at 0x800B2620).
  */
-static void link_face(psx_ot *ot, psx_prim *prim, u32 bucket)
+static void link_face(psx_ot *ot, psx_prim *prim, u32 bucket, s32 batch)
 {
-    psx_ot_link_prim(ot, prim, bucket, PSX_OT_KEY_NONE);
+    if (batch >= 0)
+        psx_ot_batch_link_prim(ot, batch, prim);
+    else
+        psx_ot_link_prim(ot, prim, bucket, PSX_OT_KEY_NONE);
+}
+
+/* Map one GLOBAL STORAGE vertex index to its owning part and apply that part's
+ * live pose. This is the pair 0x8006D608 / 0x8006C6C8 used by the shadow path;
+ * it deliberately ignores each part's scratch-window `vert_base`, which is a
+ * face-indexing destination and not the model's storage order. */
+static bool shadow_pose_vertex(const q2_model *m, const q2_model_pose *pose,
+                               u32 index, s32 out[3])
+{
+    u32 part, cursor = 0;
+
+    if (!m || !out)
+        return false;
+
+    for (part = 0; part < m->hdr.num_parts; part++) {
+        q2_model_part p;
+
+        if (!q2_model_get_part(m, part, &p))
+            return false;
+        if (index < cursor + p.num_verts) {
+            q2_model_vertex v;
+
+            if (!q2_model_get_vertex(m, index, &v))
+                return false;
+
+            if (pose) {
+                s16 rot[3][3];
+                s32 local[3] = { v.x, v.y, v.z };
+
+                q2_quat_to_matrix(rot, pose[part].q);
+                matrix_apply(rot, local, out);
+                out[0] += pose[part].t[0];
+                out[1] += pose[part].t[1];
+                out[2] += pose[part].t[2];
+            } else {
+                out[0] = v.x;
+                out[1] = v.y;
+                out[2] = v.z;
+            }
+            return true;
+        }
+        cursor += p.num_verts;
+    }
+    return false;
+}
+
+/* 0x800784CC — one modulated, subtractive POLY_FT4 under a model. */
+static bool emit_shadow(const q2_model_instance *inst, const q2_camera *cam,
+                        psx_ot *ot, gte_state *gte, const s16 view[3][3],
+                        u32 bucket, s32 batch, q2_model_draw_stats *stats)
+{
+    s32 min_x, max_x, min_z, max_z;
+    s32 factor;
+    s16 yaw[3][3];
+    s32 base_offset[3], camera_space[3];
+    psx_prim *prim;
+    u32 i, count;
+    static const u8 uv[4][2] = {
+        { Q2_MODEL_SHADOW_U0, Q2_MODEL_SHADOW_V0 },
+        { Q2_MODEL_SHADOW_U1, Q2_MODEL_SHADOW_V0 },
+        { Q2_MODEL_SHADOW_U0, Q2_MODEL_SHADOW_V1 },
+        { Q2_MODEL_SHADOW_U1, Q2_MODEL_SHADOW_V1 }
+    };
+
+    if (!inst->shadow_enabled || inst->shadow_height >= Q2_MODEL_SHADOW_FADE)
+        return false;
+
+    min_x = min_z = -inst->shadow_radius;
+    max_x = max_z =  inst->shadow_radius;
+
+    count = inst->shadow_vertex_count;
+    if (count > Q2_MODEL_SHADOW_VERTEX_MAX)
+        count = Q2_MODEL_SHADOW_VERTEX_MAX;
+    for (i = 0; i < count; i++) {
+        s32 v[3];
+
+        if (!inst->shadow_vertex ||
+            !shadow_pose_vertex(inst->model, inst->pose,
+                                inst->shadow_vertex[i], v))
+            continue;
+        if (v[0] < min_x) min_x = v[0];
+        if (v[0] > max_x) max_x = v[0];
+        if (v[2] < min_z) min_z = v[2];
+        if (v[2] > max_z) max_z = v[2];
+    }
+
+    /* The signed divide-by-600 sequence at 0x800786B0..0x80078764. Use a
+     * wider product to avoid C overflow while retaining truncation toward zero. */
+    factor = Q2_MODEL_SHADOW_FADE - inst->shadow_height;
+    min_x = (s32)(((s64)min_x * factor) / Q2_MODEL_SHADOW_FADE);
+    max_x = (s32)(((s64)max_x * factor) / Q2_MODEL_SHADOW_FADE);
+    min_z = (s32)(((s64)min_z * factor) / Q2_MODEL_SHADOW_FADE);
+    max_z = (s32)(((s64)max_z * factor) / Q2_MODEL_SHADOW_FADE);
+    if (min_x >= max_x || min_z >= max_z)
+        return false;
+
+    prim = psx_ot_alloc(ot);
+    if (!prim) {
+        if (stats)
+            stats->ot_overflow++;
+        return false;
+    }
+
+    /* Retail applies yaw to each local corner first, stores the s16 result,
+     * then applies the view transform based at entity+0x2C. Keep that
+     * intermediate rounding instead of collapsing the two matrices. */
+    q2_rotation_yaw_pitch(yaw, -inst->yaw, 0);
+    base_offset[0] = inst->shadow_origin[0] - cam->pos[0];
+    base_offset[1] = inst->shadow_origin[1] - cam->pos[1];
+    base_offset[2] = inst->shadow_origin[2] - cam->pos[2];
+    matrix_apply(view, base_offset, camera_space);
+    {
+        gte_matrix gm;
+        memcpy(gm.m, view, sizeof(gm.m));
+        gte_set_rotation(gte, &gm);
+    }
+    gte_set_translation(gte, camera_space[0], camera_space[1],
+                        camera_space[2]);
+
+    /* libgpu Z order, exactly as the four packet fields are filled:
+     * maxX/maxZ, minX/maxZ, maxX/minZ, minX/minZ. */
+    for (i = 0; i < 4; i++) {
+        s32 local[3], rotated[3];
+        gte_sxy xy;
+        u16 z;
+
+        local[0] = (i & 1u) ? min_x : max_x;
+        local[1] = 0;
+        local[2] = (i & 2u) ? min_z : max_z;
+        matrix_apply(yaw, local, rotated);
+        (void)gte_project_point(gte, (s16)rotated[0], (s16)rotated[1],
+                                (s16)rotated[2], &xy, &z);
+        prim->xy[i].x = xy.x;
+        prim->xy[i].y = xy.y;
+        prim->uv[i].u = uv[i][0];
+        prim->uv[i].v = uv[i][1];
+    }
+
+    prim->kind             = PSX_PRIM_FT4;
+    prim->rgb[0].r         = 128;
+    prim->rgb[0].g         = 128;
+    prim->rgb[0].b         = 128;
+    prim->tpage            = psx_make_tpage(0, 1, PSX_BLEND_SUB,
+                                             PSX_TEX_4BIT);
+    prim->clut             = inst->shadow_clut;
+    prim->semi_transparent = true;
+    prim->textured_blend   = true;
+    prim->quad_zorder      = true;
+
+    /* The shadow call follows model drawing and AddPrim prepends it, so it is
+     * visited first and the model paints over it. */
+    link_face(ot, prim, bucket, batch);
+    if (stats)
+        stats->shadows_emitted++;
+    return true;
 }
 
 void q2_model_instance_init(q2_model_instance *inst)
@@ -97,7 +255,10 @@ void q2_model_instance_init(q2_model_instance *inst)
     memset(inst, 0, sizeof(*inst));
     inst->scale   = Q2_ONE_12;
     inst->tint[0] = inst->tint[1] = inst->tint[2] = 128;
-    inst->bucket_override = -1;    /* sort per face unless a caller says not to */
+    inst->sort_area       = -1;
+    inst->bucket_override = -1;
+    inst->shadow_clut = psx_make_clut(Q2_MODEL_SHADOW_CLUT_X,
+                                      Q2_MODEL_SHADOW_CLUT_Y);
 }
 
 u32 q2_model_build_ot(const q2_model_instance *inst,
@@ -126,6 +287,7 @@ u32 q2_model_build_ot(const q2_model_instance *inst,
     u16       order[Q2_MODEL_MAX_FACES];
     u32       built_count = 0;
     u32       bucket = 0;
+    s32       batch = PSX_OT_BATCH_INVALID;
     bool      reorder;
 
     if (!inst || !inst->model || !cam || !ot || !gte)
@@ -154,6 +316,11 @@ u32 q2_model_build_ot(const q2_model_instance *inst,
     /* The same basis the world is drawn with, roll included — models and brush
      * geometry must lean together or the two separate as soon as you strafe. */
     q2_rotation_view_anamorphic(view, cam->yaw, cam->pitch, cam->roll);
+
+    /* 0x8006BEB0 calls the retail screen-record selector before either the
+     * origin or a vertex is projected.  Models in a portal area therefore use
+     * that area's local GTE origin and are clipped by the matching DRAWENV. */
+    q2_camera_apply_area_projection(cam, ot, inst->sort_area, gte);
 
     /*
      * A MODEL IS ONE THING IN THE TABLE, and this port used to make it N.
@@ -218,8 +385,43 @@ u32 q2_model_build_ot(const q2_model_instance *inst,
          * straight to the linker put near models in low buckets and let the
          * whole world paint over them.
          */
-        bucket = psx_ot_depth_bucket(
-                     ot, q2_ot_bucket_for_depth(ot, otz, cam->sort_range));
+        if (inst->sort_area >= 0 && psx_ot_area_active(ot)) {
+            if (!psx_ot_area_bucket(ot,
+                                    (u32)inst->sort_area & 0x7Fu, &bucket)) {
+                /* The area's screen record is stale. Retail's active-area
+                 * chooser rejects the entity here; falling back to global
+                 * depth lets actors in another room paint through its walls. */
+                return 0;
+            }
+
+            /* The model record is a bounds record on either list. +4 is the
+             * projected origin depth written at 0x8006C078, +8 points at the
+             * entity's absolute +0x78 AABB (0x8006BCB8), and render flag
+             * 0x00800000 alone chooses Quick over Standard. */
+            {
+                s32 fallback_min[3], fallback_max[3];
+                const s32 *bounds_min = inst->sort_bounds_min;
+                const s32 *bounds_max = inst->sort_bounds_max;
+                int axis;
+
+                if (!inst->sort_bounds_valid) {
+                    for (axis = 0; axis < 3; axis++)
+                        fallback_min[axis] = fallback_max[axis] =
+                            inst->origin[axis];
+                    bounds_min = fallback_min;
+                    bounds_max = fallback_max;
+                }
+
+                batch = psx_ot_batch_begin_box(
+                            ot, (u32)inst->sort_area & 0x7Fu,
+                            inst->sort_quick, (s16)otz,
+                            bounds_min, bounds_max, cam->pos);
+            }
+        } else {
+            bucket = psx_ot_depth_bucket(
+                         ot, q2_ot_bucket_for_depth(ot, otz,
+                                                    cam->sort_range));
+        }
     }
 
     /*
@@ -268,23 +470,18 @@ u32 q2_model_build_ot(const q2_model_instance *inst,
                           inst->roll);
 
     /*
-     * Uniform scale, applied to the instance's own matrix — which is where the
-     * engine applies it too (0x8006B298 scales the rows of entity+0x2C0). Doing
-     * it here rather than to the vertices means a part's TRANSLATION scales with
-     * it, so a half-size model's parts stay attached instead of drifting apart.
-     *
-     * Only scales down in practice: an item ramps 0 -> 4096 while it
-     * materialises. A scale above 4096 would push the 1.3.12 matrix entries out
-     * of s16, so it is clamped rather than allowed to wrap.
+     * Optional port-side uniform transform. Retail does not derive this from
+     * entity+0xFC/+0xFE: the apparent ScaleMatrix calls at 0x8006B298 operate
+     * on the GTE light matrix assembled by 0x8006AFE8. Apply an explicit scale
+     * here when a diagnostic/tool asks for one, and keep normal entities at
+     * Q2_ONE_12.
      */
     /*
      * The UNSCALED instance rotation, kept for the light basis.
      *
-     * Scale belongs on the position path — a part's translation has to shrink
-     * with the model or the parts drift apart — but a light DIRECTION is not a
-     * position. Composing the scaled matrix into the light basis applied the
-     * scale a second time (the caller already passes it as `intensity_a`), so a
-     * half-size instance was lit at a quarter.
+     * An explicit geometric scale belongs on the position path — a part's
+     * translation has to follow it or the parts drift apart — but a light
+     * DIRECTION is not a position and therefore keeps the unscaled basis.
      */
     memcpy(spin_unscaled, spin, sizeof(spin_unscaled));
 
@@ -589,7 +786,7 @@ u32 q2_model_build_ot(const q2_model_instance *inst,
             } else {
                 /* Too many faces to hold: link now, in file order, which is
                  * what this did before block A was read. */
-                link_face(ot, prim, bucket);
+                link_face(ot, prim, bucket, batch);
             }
 
             prim->kind = PSX_PRIM_GT4;
@@ -679,9 +876,12 @@ u32 q2_model_build_ot(const q2_model_instance *inst,
             if (!p)
                 continue;
 
-            link_face(ot, p, bucket);
+            link_face(ot, p, bucket, batch);
         }
     }
+
+    if (emit_shadow(inst, cam, ot, gte, view, bucket, batch, stats))
+        emitted++;
 
     return emitted;
 }

@@ -65,30 +65,89 @@
 #ifndef Q2PSX_VAG_H
 #define Q2PSX_VAG_H
 
+#include "disc.h"
+#include "q2psx.h"
+
 /* ------------------------------------------------------------------------- */
-/* The SPU pitch modifier                                                     */
+/* Sound-request pitch and the SPU rate                                       */
 /* ------------------------------------------------------------------------- */
 /*
  * A voice's playback pitch is not simply its VAG header rate. The engine
- * derives the SPU pitch from that rate and then scales it by a per-sound
- * modifier over 32; the DEFAULT is 35, i.e. 1.09375, about one and a half
- * semitones up.
+ * first quantises the header rate into the SPU's 0x1000 == 44100 Hz pitch
+ * domain, then scales it by a per-SOUND-REQUEST modifier over 32. The default
+ * modifier is 35: 1.09375, about one and a half semitones up.
  *
  * A player that ignores it runs every effect in the game 9.375% flat, which is
  * audible as a general dullness rather than as any one wrong sound — which is
  * why it survived a pass that fixed which sounds play and when.
  *
- * The per-sound values are NOT transcribed yet. Two things are known to differ
- * from the default and are recorded here rather than guessed at in code: the
- * weapon path draws a fresh modifier per shot from a small range, so no two
- * shots are identical clips, and several named sounds carry their own fixed
- * offsets. Until those are read, everything plays at the default.
+ * The executable settles the whole state transition:
+ *
+ *   0x80071BF8  initialise byte +1/+4/+5 to 35 and clear flags
+ *   0x80072B80  add a nonzero signed delta to current (byte storage wraps)
+ *   0x80073B14  upper = current + a1, lower = current + a2, set flag bit 0
+ *   0x8007270C  randomising start: current = lower + rand() % (upper-lower)
+ *   0x80072A00  direct start: copy current without drawing a random number
+ *   0x8007293C  copy current << 3 into the voice pitch fields
+ *   0x800724EC  floor(sample_rate * 0x1000 / 44100), once at sample load
+ *   0x80071CA0  floor(base_pitch * (current << 3) / 256), at voice update
+ *
+ * Bounds are therefore upper-EXCLUSIVE. The five core-player registrations at
+ * 0x8003C2D4..0x8003C328 configure `pla_gasp1` and `pla_drown1` as 30..38,
+ * `pla_burn1` and `pla_burn2` as 33..34, and `pla_wade3` as 32..37. Weapon
+ * setup proves why this cannot be a filename lookup: two distinct request
+ * records for `wep_machgf1b` get different ranges, and the +24/+16 clone is
+ * subsequently played through the DIRECT path, which bypasses its variation.
+ * Creature modules can own still more request records for that same filename.
+ *
+ * This state deliberately carries no name. A later caller must reconstruct
+ * which RETAIL REQUEST and which START PATH raised an event; assigning pitch by
+ * VAG filename would merge records the executable keeps separate.
  */
-#define Q2_SFX_PITCH_UNITY    32
-#define Q2_SFX_PITCH_DEFAULT  35
+#define Q2_SFX_PITCH_UNITY       32u
+#define Q2_SFX_PITCH_DEFAULT     35u
+#define Q2_SPU_PITCH_ONE       4096u
+#define Q2_SPU_OUTPUT_RATE    44100u
 
-#include "disc.h"
-#include "q2psx.h"
+typedef struct q2_sfx_pitch {
+    u8   current;
+    u8   upper;          /* exclusive when `varying` is true */
+    u8   lower;
+    bool varying;
+} q2_sfx_pitch;
+
+/* The exact default request state written by 0x80071BF8. */
+void q2_sfx_pitch_init(q2_sfx_pitch *pitch);
+
+/* 0 is the executable's "leave unchanged" sentinel (0x80073A34). */
+void q2_sfx_pitch_set(q2_sfx_pitch *pitch, s32 modifier);
+
+/* The identical exports at 0x80072B80 and 0x80072C00 add a nonzero delta and
+ * store the low byte. This deliberately retains that byte-wrap behaviour. */
+void q2_sfx_pitch_add(q2_sfx_pitch *pitch, s32 delta);
+
+/* Configure the two signed offsets used by 0x80073B14. Invalid or empty
+ * ranges are rejected without changing `pitch`; every retail caller is valid. */
+bool q2_sfx_pitch_set_range(q2_sfx_pitch *pitch,
+                            s32 upper_delta, s32 lower_delta);
+
+/* Whether beginning this request through `randomising_path` needs a rand()
+ * draw. Check this BEFORE advancing the caller's RNG: the direct path and a
+ * fixed request consume no random number in the executable. */
+bool q2_sfx_pitch_needs_random(const q2_sfx_pitch *pitch,
+                               bool randomising_path);
+
+/* Begin one voice. The randomising path mutates `current`, just as byte +1 in
+ * the retail request record is overwritten; the direct path returns it as-is.
+ * `random_value` is the already-drawn non-negative rand() result. */
+u8 q2_sfx_pitch_begin(q2_sfx_pitch *pitch, bool randomising_path,
+                      u32 random_value);
+
+/* The exact two-stage console conversion. The first result is the value sent
+ * to the SPU. The second expresses the same effective rate as a 16.16 source
+ * cursor step for a host mixer running at `output_rate`; zero is invalid. */
+u32 q2_sfx_spu_pitch(u32 sample_rate, u8 modifier);
+u32 q2_sfx_step_16_16(u32 sample_rate, u8 modifier, u32 output_rate);
 
 #define VAG_HEADER_SIZE   48
 #define SPU_BLOCK_SIZE    16

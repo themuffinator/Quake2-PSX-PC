@@ -20,7 +20,7 @@
  *     ent->flags  = rec->flags
  *     ent->effect = rec->effect             // the touch dispatch index
  *     ent->scale  = (rec->flags & 2) ? 0 : 4096
- *     ent->model->clips = &rec->extra[0]
+ *     ent->model->shadow_vertices = &rec->shadow_vertex[0]
  *
  * So the columns are: which place id selects this record, which MODEL it wears,
  * how it BEHAVES (flags), and what COLLECTING it does (effect). The last is an
@@ -63,13 +63,14 @@
  * game and wrong.
  *
  * ---------------------------------------------------------------------------
- * `place->unk` is an angle, not flags
+ * The place record packs yaw and difficulty exclusions
  * ---------------------------------------------------------------------------
  * The spawner at `0x80058930` reads `lhu place[+0x0C]`, masks `0xFFF` and
  * stores it as the entity's yaw. So the low twelve bits of the place record's
- * halfword are a heading on the 4096-step circle and bits 12…15 are something
- * else — which is why the observed values 4096 / 32768 / 36864 / 53248 looked
- * like "flags OR'd with one" to a reader treating the whole halfword as a unit.
+ * halfword are a heading on the 4096-step circle. The list walker at
+ * `0x8007F538` tests 0x2000 / 0x4000 / 0x8000 as NOT_EASY / NOT_MEDIUM /
+ * NOT_HARD before it calls the spawner. Bit 12 has no executable reader; it is
+ * a map-wide authoring marker (all places or none on every map that has one).
  */
 #ifndef Q2PSX_ITEMTABLE_H
 #define Q2PSX_ITEMTABLE_H
@@ -80,7 +81,7 @@
 
 #define Q2_ITEM_RECORD_SIZE 24
 #define Q2_ITEM_MODEL_LEN   12
-#define Q2_ITEM_EXTRA_MAX    4
+#define Q2_ITEM_SHADOW_VERTEX_MAX 4
 
 /* PAL build. Per-build data, and refusing an uncatalogued executable is the
  * point: every one of these columns would decode into *something* at the wrong
@@ -173,8 +174,16 @@ typedef struct q2_item_def {
     u16  flags;                           /* +0x02 see q2_item_flag           */
     char model[Q2_ITEM_MODEL_LEN + 1];    /* +0x04 CastList name, NOT always
                                            *       NUL-terminated on disc     */
-    u16  extra[Q2_ITEM_EXTRA_MAX];        /* +0x10 0xFFFF-terminated list     */
-    u8   extra_count;                     /* entries before the terminator    */
+    /*
+     * Global model-storage vertex indices used to grow the entity's shadow
+     * footprint beyond its +0x94 radius. The renderer at 0x800784CC poses up
+     * to four of them through 0x8006D608 / 0x8006C6C8, accumulates their X/Z
+     * extrema, then draws the `chars.lbm` shadow tile over that footprint.
+     * This is not an animation-clip list: values such as Rocketl's 95 exceed
+     * both the model's clip and face counts but are valid storage vertices.
+     */
+    u16  shadow_vertex[Q2_ITEM_SHADOW_VERTEX_MAX]; /* +0x10, 0xFFFF-ended */
+    u8   shadow_vertex_count;              /* entries before terminator       */
 } q2_item_def;
 
 /* 64 real records plus the terminator. */

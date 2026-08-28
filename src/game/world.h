@@ -6,10 +6,12 @@
  * the GTE, and emits a POLY_GT4 into the ordering table. From there the backend
  * has exactly the primitive stream the original hardware saw.
  *
- * Nothing here converts to floating point. Vertices go in as s16, come out of
- * the GTE as integer screen positions, and land in the OT bucket the GTE's
- * AVSZ4 chose. That is the whole point: the wobble and the sort artefacts are
- * produced here, not simulated later.
+ * Nothing here converts to floating point. Vertices go in as s16 and come out
+ * of the GTE as integer screen positions. Retail's SortData stream supplies
+ * the world node order and bucket; its regional sorter later joins whole
+ * deferred/model/effect chains around those authored runs. The diagnostic
+ * fallback alone derives a bucket from projected depth. That is the point:
+ * the wobble and the sort artefacts are produced here, not simulated later.
  */
 #ifndef Q2PSX_WORLD_H
 #define Q2PSX_WORLD_H
@@ -79,18 +81,19 @@ typedef struct q2_world_zone {
      * the stream instead — which is what the console does, and the difference is
      * not cosmetic: the original's world is not depth-sorted at all (sortdata.h).
      *
-     * It is opt-in because of open question 7a. A chunk holds many streams and
-     * which one a viewport uses comes from a runtime record at its `+28`, not
-     * from the disc, so the port can decode every stream but cannot yet say
-     * which is the right one.
+     * The viewport's PrimaryColl cell record carries this stream's exact byte
+     * offset at +28 (read by retail at 0x80066AFC). The client installs that
+     * authored stream by default; NULL remains the diagnostic depth-sort
+     * fallback and the path used by zones with no usable stream.
      *
-     * `sort_offset` names it by BYTE offset. Prefer q2_sortdata_stream_offset()
-     * to turn a stream INDEX into one: the streams are self-delimiting and
-     * therefore enumerable, so an index is a stable disc-derived handle where a
-     * raw byte offset is not. Stream 0 is what a single-stream chunk holds.
+     * `sort_offset` names it by BYTE offset, exactly as the on-disc cell does.
      */
     const struct q2_sortdata *sort;
     u32                       sort_offset;
+
+    /* PrimaryColl cell byte +32. Retail registers this camera area at bucket
+     * 45 before decoding the stream at bucket 43. */
+    u8                        sort_area;
 
     /*
      * Brush geometry that TURNS — ROTHATCH, SIMROT, SIMROT2, ROTBUTTON.
@@ -119,6 +122,10 @@ typedef struct q2_world_zone {
 /* Load "<map>/ZONE<index>.DAT" from the disc. */
 q2_result q2_world_load_zone(q2_world_zone *out, const disc *d,
                              const char *map, int zone_index);
+/* Transfer a loaded zone into `dst`, freeing the previous destination. A
+ * q2_world_zone cannot be assigned by value because q2_zone_file.chunk points
+ * into its archive's inline directory (level.h). */
+q2_result q2_world_move_zone(q2_world_zone *dst, q2_world_zone *src);
 void      q2_world_free_zone(q2_world_zone *z);
 
 /* Where the camera is and which way it faces. Angles use the 4096-step circle. */
@@ -258,6 +265,35 @@ typedef struct q2_camera {
  */
 void q2_camera_default(q2_camera *cam, int screen_w, int screen_h);
 
+/* Retail 0x8006582C/0x80065840 collapses a screen-change rectangle to zero
+ * when either dimension is zero. This result controls a variable-width
+ * SortData branch, so a line is not a visible region even though its packed
+ * min and max words differ. Kept inline so the codec-critical predicate can
+ * be regression-tested without exposing the rest of the screen-state walker. */
+Q2PSX_INLINE bool q2_world_sort_region_visible(
+    const psx_ot_area_screen *region)
+{
+    return region &&
+           region->min_x != region->max_x &&
+           region->min_y != region->max_y;
+}
+
+/* Retail 0x80065684 selects the screen-change record attached to an area's
+ * current viewport before it projects a model or effect. A negative `area`
+ * returns without touching the GTE; 0 and 1 select their full-screen/full-view
+ * special cases. With no authored area routing, or a stale ordinary record,
+ * the caller's existing GTE projection is likewise left untouched. */
+Q2PSX_INLINE void q2_camera_apply_area_projection(const q2_camera *cam,
+                                                   const psx_ot *ot,
+                                                   s32 area,
+                                                   gte_state *gte)
+{
+    s32 x, y;
+
+    if (cam && gte && psx_ot_area_projection(ot, area, &x, &y))
+        gte_set_projection(gte, cam->projection, x, y);
+}
+
 /*
  * BACKFACE REJECTION — the NCLIP pair every world quad goes through.
  *
@@ -306,6 +342,13 @@ typedef struct q2_world_stats {
     u32 quads_no_uv;           /* UV lookup failed; drawn untextured */
     u32 ot_overflow;           /* primitive pool was full         */
 
+    /* SortData opcode 1 calls 0x80065D08, which projects the named Scene
+     * node's Points group and branches on whether its rectangle has area. */
+    u32 sort_entities;
+    u32 sort_entities_visible;
+    u32 sort_entities_degenerate;
+    u32 sort_areas_registered;
+
     /* The depth range the frame actually covered, in GTE SZ units, and how many
      * distinct ordering-table buckets it reached. A sort that collapses into
      * one bucket draws in emission order, which looks like a texture or
@@ -317,6 +360,7 @@ typedef struct q2_world_stats {
     u32 nodes_hidden;          /* flags08 bit 15, or draw variant 3       */
     u32 nodes_sealing;         /* all-CLUT-0 node, never in a draw stream */
     u32 nodes_deferred;        /* flags08 bit 14                          */
+    u32 nodes_deferred_culled; /* its +0x0E area has no live screen record */
     u32 quads_semi;            /* clut & 3 non-zero: drawn with ABE       */
     u32 quads_rejected_flat;   /* variant 1's zero-depth corner rejection */
     u32 quads_subdivided;      /* replaced by a 4x4 mesh                  */

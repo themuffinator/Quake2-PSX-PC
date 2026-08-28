@@ -21,11 +21,24 @@
  * That `- R.p + p` is the giveaway, and it is why `obj+0x18` is a pivot rather
  * than the "second independent displacement" an earlier reading of this file
  * called it: rotating a point v about p is `R.(v - p) + p = R.v - R.p + p`, so
- * the vertices go through R and the translation carries the rest. `ROTHATCH`
- * confirms it from the other side — its constructor fills `obj+0x18`/`+0x1A`
- * with the item's pivot at `+10`/`+12` MINUS the node's own origin at `+0x28`
- * and `+0x2C` (0x8002B7B4 - 0x8002B808), i.e. a pivot expressed relative to the
- * node.
+ * the vertices go through R and the translation carries the rest.
+ *
+ * All four constructors write that pivot; leaving the zero from the object's
+ * memset makes an otherwise-correct matrix orbit the brush around local zero:
+ *
+ *   SIMROT/SIMROT2  0x800284C8..0x80028548 / 0x800286C0..0x80028740
+ *   ROTBUTTON       0x8002C210..0x8002C288
+ *       p = midpoint(node.bbox_min, node.bbox_max) - node.origin
+ *
+ *   ROTHATCH        0x8002B798..0x8002B830
+ *       p.x = midpoint_x - origin_x - item.s16(+10)
+ *       p.y = midpoint_y - origin_y + item.s16(+12)
+ *       p.z = midpoint_z - origin_z + item.s16(+14)
+ *
+ * The midpoint is the raw Scene box, without the renderer's culling slop, and
+ * the `srl 31; addu; sra 1` sequence rounds an odd negative sum toward zero.
+ * Each result is stored with `sh`, so `p` is an s16 local coordinate exactly as
+ * the draw expects.
  *
  * ---------------------------------------------------------------------------
  * The integrator (0x8002F1A8), reached from the 48-object sweep at 0x8002DC04
@@ -59,7 +72,8 @@
  *
  * `ROTHATCH` constructor, 0x8002B634, shares every field: the same axis bits,
  * the same `obj+0x3A` from its own `item+4`, the same `obj+0x38` node, plus the
- * pivot described above. Its two time operands are already in userfuncs.c.
+ * three hinge adjustments described above. Its two time operands are already
+ * in userfuncs.c.
  *
  * `ROTBUTTON` is the one with a target: its rotation stops at a fixed 0x800
  * (half a turn), which userfuncs.c records.
@@ -231,6 +245,7 @@ void q2_rotators_set_operand_source(q2_rotator_set *set,
  *              positive when target < 2048, negative otherwise (0x8002B70C)
  *     item+6   s16  target       -> obj+0x44
  *     item+8   u8   axis & 3     -> obj+0x50 bits 14-15   (a BYTE, unlike SIMROT)
+ *     item+10  s16[3] hinge adjustment -> obj+0x18 after the node-centre rule
  *     item+18  s16  object
  *
  *   ROTBUTTON          0x8002C150
@@ -240,10 +255,12 @@ void q2_rotators_set_operand_source(q2_rotator_set *set,
  *
  * Like the mover builder, this reads the DISC values — the slots are Scene node
  * indices before the load-time pre-pass rewrites them — so no rewrite is
- * performed and none is needed.
+ * performed and none is needed. `scene` supplies the raw boxes and origins for
+ * the retail obj+0x18 pivot writes. Analysis-only callers may pass NULL when
+ * they need the rotator census but will never draw the resulting set.
  */
 q2_result q2_rotators_build(q2_rotator_set *out, const q2_events *events,
-                            const q2_userfuncs *uf);
+                            const q2_userfuncs *uf, const q2_scene *scene);
 void      q2_rotators_free(q2_rotator_set *set);
 
 /* Append one rotator directly. For callers that drive rotation from something

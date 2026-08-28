@@ -126,7 +126,8 @@ static void build_hull(bool mark_solid)
 
         wr16(rec + 24, first);
         wr16(rec + 26, (u32)(i == 0 ? 0 : (i == 1 ? 1 : 2)));
-        wr32(rec + 28, 0);
+        wr16(rec + 28, (u32)(100 + i * 7)); /* PrimaryColl SortData offset */
+        wr16(rec + 30, (u32)(20 + i * 3));  /* SecondaryCol light start   */
         rec[32] = (u8)(i == 1 ? 7 : 0);     /* node 1 carries a contents id */
 
         write_box_planes(planes + i * 6 * Q2_COLL_PLANE_SIZE,
@@ -186,6 +187,8 @@ static void test_parse(void)
 
     check(q2_collision_get_node(&c, 1, &n), "node 1 reads back");
     check_eq_i(n.bbox_min[0], 1000, "node 1 min x");
+    check_eq_i(n.sort_offset, 107, "SortData offset is halfword +28");
+    check_eq_i(n.first_light, 23, "SpaceLights offset is halfword +30");
     check_eq_i(n.contents, 7, "the contents id is byte +32");
     check_eq_i(q2_collision_node_plane_count(&c, 1), 6, "planes per node");
     check_eq_i(q2_collision_node_link_count(&c, 1), 1, "links per node");

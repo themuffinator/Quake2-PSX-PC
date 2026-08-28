@@ -11,7 +11,8 @@
 #include <string.h>
 
 /* Byte offset of the SpaceLights start index within a 36-byte collision node.
- * The low halfword at +28 stays unknown; nothing in the image reads it. */
+ * The low halfword at +28 is PrimaryColl's SortData byte offset; this reader is
+ * on the SecondaryCol context and deliberately uses the other half. */
 #define Q2_COLL_NODE_LIGHT_FIRST 30
 
 static u32 node_light_first(const q2_collision *c, u32 index)

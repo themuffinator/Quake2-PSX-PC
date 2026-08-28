@@ -53,7 +53,27 @@ q2_result q2_menu_font_upload(q2_menu_font *out, const q2_hud_tables *tab,
     memset(out, 0, sizeof(*out));
     out->tab = tab;
 
-    /* The atlases, each into the cell its registration slot names. */
+    /*
+     * Keep 0x8003FE20's registration order. The 256-byte-wide 8bpp image in
+     * slot 12 spans VRAM x 832..959, while frontend.lbm occupies x 896..959.
+     * This is intentional page aliasing: the final two previews sample only
+     * the left half of their page, then the later font upload replaces its
+     * unused right half. Uploading the preview after the font turns every
+     * 16/32-pixel glyph into its vertical byte pattern.
+     *
+     * QFRONT module+0x2AD4: the first ten previews use the sheet in slot 8;
+     * the final two use slot 12. They are optional on a normal map, just like
+     * every other front-end-only image.
+     */
+    if (q2_vram_upload_named(section, Q2_MENU_ARENA_NAME_0,
+                             Q2_MENU_ARENA_SLOT_0, 0, vram, NULL) == Q2_OK)
+        out->arena_resident[0] = true;
+    if (q2_vram_upload_named(section, Q2_MENU_ARENA_NAME_1,
+                             Q2_MENU_ARENA_SLOT_1, 0, vram, NULL) == Q2_OK)
+        out->arena_resident[1] = true;
+
+    /* The font atlas follows both preview registrations in retail, which is
+     * semantically significant because of the slot-12 alias above. */
     if (q2_vram_upload_named(section, Q2_MENU_ATLAS_NAME, Q2_MENU_ATLAS_SLOT,
                              Q2_MENU_ATLAS_V_OFS, vram, NULL) == Q2_OK)
         out->item_resident = true;
@@ -83,11 +103,19 @@ q2_result q2_menu_font_upload(q2_menu_font *out, const q2_hud_tables *tab,
     out->tpage_icons = psx_make_tpage(Q2_MENU_ICONS_PAGE_X,
                                       Q2_MENU_ICONS_PAGE_Y,
                                       PSX_BLEND_HALF, PSX_TEX_4BIT);
+    out->arena_tpage[0] = psx_make_tpage(Q2_MENU_ARENA_PAGE_X_0,
+                                         Q2_MENU_ARENA_PAGE_Y,
+                                         PSX_BLEND_HALF, PSX_TEX_8BIT);
+    out->arena_tpage[1] = psx_make_tpage(Q2_MENU_ARENA_PAGE_X_1,
+                                         Q2_MENU_ARENA_PAGE_Y,
+                                         PSX_BLEND_HALF, PSX_TEX_8BIT);
 
     out->clut_text     = q2_hud_palette_clut(tab, Q2_MENU_PALETTE_TEXT);
     out->clut_item_hi  = q2_hud_palette_clut(tab, Q2_MENU_PALETTE_ITEM_HI);
     out->clut_title_hi = q2_hud_palette_clut(tab, Q2_MENU_PALETTE_TITLE_HI);
     out->clut_small    = q2_hud_palette_clut(tab, Q2_MENU_PALETTE_SMALL);
+    out->arena_clut[0] = tab->palette256_id;
+    out->arena_clut[1] = q2_hud_palette_clut(tab, Q2_MENU_ARENA_PALETTE_1);
 
     if (!out->item_resident && !out->small_resident)
         return Q2_ERR_NOT_FOUND;

@@ -42,6 +42,18 @@ static void check_eq_i(s64 got, s64 want, const char *what)
     }
 }
 
+static void check_vec3(const s32 got[3], s32 x, s32 y, s32 z,
+                       const char *what)
+{
+    g_checks++;
+    if (got[0] != x || got[1] != y || got[2] != z) {
+        printf("  FAIL  %s: got {%d, %d, %d}, want {%d, %d, %d}\n",
+               what, (int)got[0], (int)got[1], (int)got[2],
+               (int)x, (int)y, (int)z);
+        g_failures++;
+    }
+}
+
 static void place(q2_monster *m, s32 x, s32 z, s32 yaw)
 {
     q2_monster_init(m);
@@ -210,6 +222,115 @@ static bool floor_bottom(void *user, const q2_monster *m)
 static const q2_ai_world g_floor_world = {
     NULL, floor_trace, walled_los, floor_bottom
 };
+
+/* ------------------------------------------------------------------------- */
+/* A scripted trace world for SV_movestep's retail start-solid recovery.      */
+/* ------------------------------------------------------------------------- */
+#define RECOVERY_TRACE_MAX 4
+#define RECOVERY_EVENT_MAX 8
+
+enum recovery_event {
+    RECOVERY_EV_TRACE = 1,
+    RECOVERY_EV_BOTTOM,
+    RECOVERY_EV_LINK,
+    RECOVERY_EV_TOUCH
+};
+
+typedef struct recovery_trace_call {
+    s32 start[3];
+    s32 end[3];
+    const q2_monster *ignore;
+    u32 mask;
+} recovery_trace_call;
+
+typedef struct recovery_spy {
+    q2_ai_trace response[RECOVERY_TRACE_MAX];
+    recovery_trace_call call[RECOVERY_TRACE_MAX];
+    int response_count;
+    int trace_count;
+    int bottom_count;
+    int link_count;
+    int touch_count;
+    int events[RECOVERY_EVENT_MAX];
+    int event_count;
+    bool bottom_answer;
+    s32 bottom_pos[3];
+    q2_monster *linked;
+    u32 link_what;
+} recovery_spy;
+
+static recovery_spy g_recovery;
+
+static void recovery_event_push(recovery_spy *s, enum recovery_event event)
+{
+    if (s->event_count < RECOVERY_EVENT_MAX)
+        s->events[s->event_count++] = event;
+}
+
+static void recovery_trace(void *user, const s32 start[3], const s16 mins[3],
+                           const s16 maxs[3], const s32 end[3],
+                           const q2_monster *ignore, u32 mask,
+                           q2_ai_trace *out)
+{
+    recovery_spy *s = (recovery_spy *)user;
+    int n = s->trace_count++;
+
+    (void)mins;
+    (void)maxs;
+    recovery_event_push(s, RECOVERY_EV_TRACE);
+
+    if (n < RECOVERY_TRACE_MAX) {
+        memcpy(s->call[n].start, start, sizeof(s->call[n].start));
+        memcpy(s->call[n].end, end, sizeof(s->call[n].end));
+        s->call[n].ignore = ignore;
+        s->call[n].mask = mask;
+    }
+
+    memset(out, 0, sizeof(*out));
+    if (n < s->response_count) {
+        *out = s->response[n];
+    } else {
+        out->fraction = Q2_TRACE_ONE;
+        memcpy(out->endpos, end, sizeof(out->endpos));
+    }
+}
+
+static bool recovery_bottom(void *user, const q2_monster *m)
+{
+    recovery_spy *s = (recovery_spy *)user;
+    s->bottom_count++;
+    memcpy(s->bottom_pos, m->pos, sizeof(s->bottom_pos));
+    recovery_event_push(s, RECOVERY_EV_BOTTOM);
+    return s->bottom_answer;
+}
+
+static void recovery_link(q2_monster *m, u32 what, void *user)
+{
+    recovery_spy *s = (recovery_spy *)user;
+    s->link_count++;
+    s->linked = m;
+    s->link_what = what;
+    recovery_event_push(s, RECOVERY_EV_LINK);
+}
+
+static void recovery_touch(q2_monster *m, void *user)
+{
+    recovery_spy *s = (recovery_spy *)user;
+    (void)m;
+    s->touch_count++;
+    recovery_event_push(s, RECOVERY_EV_TOUCH);
+}
+
+static const q2_ai_world g_recovery_world = {
+    &g_recovery, recovery_trace, walled_los, recovery_bottom
+};
+
+static void recovery_reset(int responses)
+{
+    memset(&g_recovery, 0, sizeof(g_recovery));
+    g_recovery.response_count = responses;
+    g_recovery.bottom_answer = true;
+}
 
 /* ------------------------------------------------------------------------- */
 static void test_constants(void)
@@ -897,6 +1018,286 @@ static void test_movement_verbs(void)
 }
 
 /* ------------------------------------------------------------------------- */
+static void test_movestep_trace_paths(void)
+{
+    q2_monster m;
+    s32 move[3];
+    bool moved;
+    int i;
+
+    printf("SV_movestep ordinary and start-solid trace paths\n");
+    q2_ai_set_world(&g_recovery_world);
+    q2_ai_set_link_hooks(recovery_link, recovery_touch, &g_recovery);
+
+    /*
+     * The ordinary arm carries the ACTUAL lift delta into origin+move at
+     * 0x8005FFCC..0x8005FFE0. Its drop still ends at original-Y + stepsize,
+     * and 0x800600D8..0x800600E8 decrements the accepted trace endpoint.
+     */
+    recovery_reset(3);
+    g_recovery.response[0].fraction = Q2_TRACE_ONE / 2;
+    g_recovery.response[0].endpos[0] = 100;
+    g_recovery.response[0].endpos[1] = 100;
+    g_recovery.response[0].endpos[2] = 300;
+    g_recovery.response[1].fraction = Q2_TRACE_ONE;
+    g_recovery.response[1].endpos[0] = 500;
+    g_recovery.response[1].endpos[1] = 124;
+    g_recovery.response[1].endpos[2] = 800;
+    g_recovery.response[2].fraction = Q2_TRACE_ONE / 2;
+    g_recovery.response[2].endpos[0] = 500;
+    g_recovery.response[2].endpos[1] = 300;
+    g_recovery.response[2].endpos[2] = 800;
+
+    place(&m, 100, 300, 0);
+    m.pos[1] = 200;
+    move[0] = 400;
+    move[1] = 24;
+    move[2] = 500;
+    moved = q2_SV_movestep(&m, move, false);
+
+    check(moved, "ordinary step succeeds after a partial lift");
+    check_eq_i(g_recovery.trace_count, 3,
+               "ordinary step makes lift, move and drop traces");
+    check_vec3(g_recovery.call[0].start, 100, 200, 300,
+               "ordinary lift starts at origin");
+    check_vec3(g_recovery.call[0].end, 100, 200 - Q2_STEPSIZE, 300,
+               "ordinary lift requests one full stepsize");
+    check_vec3(g_recovery.call[1].start, 100, 100, 300,
+               "ordinary move starts at the actual partial-lift endpoint");
+    check_vec3(g_recovery.call[1].end, 500, 124, 800,
+               "ordinary wish Y combines move[1] with the lift delta");
+    check_vec3(g_recovery.call[2].start, 500, 124, 800,
+               "ordinary drop starts at the carried wish position");
+    check_vec3(g_recovery.call[2].end, 500, 200 + Q2_STEPSIZE, 800,
+               "ordinary drop excludes move[1] from its end Y");
+    check_vec3(m.pos, 500, 299, 800,
+               "ordinary landing stores trace end Y minus one");
+    check_vec3(g_recovery.bottom_pos, 500, 299, 800,
+               "bottom check observes the decremented landing position");
+    check(m.on_ground, "ordinary accepted landing sets on-ground state");
+    check_eq_i(g_recovery.event_count, 4,
+               "ordinary path traces three times then checks support");
+    check_eq_i(g_recovery.events[0], RECOVERY_EV_TRACE,
+               "ordinary event 1 is lift");
+    check_eq_i(g_recovery.events[1], RECOVERY_EV_TRACE,
+               "ordinary event 2 is move");
+    check_eq_i(g_recovery.events[2], RECOVERY_EV_TRACE,
+               "ordinary event 3 is drop");
+    check_eq_i(g_recovery.events[3], RECOVERY_EV_BOTTOM,
+               "ordinary support check follows the decremented landing");
+    check_eq_i(g_recovery.link_count + g_recovery.touch_count, 0,
+               "relink=false keeps ordinary path side-effect free");
+
+    /* 0x8005FFE4..0x80060010 bypass the middle trace when move is all zero,
+     * leaving the lift result in `tr` for the exact-fraction gate. A partial
+     * lift must therefore fail immediately rather than being hidden by a
+     * synthetic zero-length trace that reports 4096. */
+    recovery_reset(1);
+    g_recovery.response[0].fraction = Q2_TRACE_ONE / 2;
+    g_recovery.response[0].endpos[0] = 10;
+    g_recovery.response[0].endpos[1] = -88;
+    g_recovery.response[0].endpos[2] = 30;
+
+    place(&m, 10, 30, 0);
+    m.pos[1] = 20;
+    move[0] = move[1] = move[2] = 0;
+    moved = q2_SV_movestep(&m, move, false);
+
+    check(!moved, "ordinary zero move preserves a partial-lift rejection");
+    check_eq_i(g_recovery.trace_count, 1,
+               "partial zero move stops after the lift trace");
+    check_vec3(m.pos, 10, 20, 30,
+               "rejected zero move leaves the origin unchanged");
+    check_eq_i(g_recovery.bottom_count, 0,
+               "rejected zero move never checks a landing");
+
+    /* A fully clear lift does proceed, but directly to the drop: exactly two
+     * traces and no lifted->lifted middle query. */
+    recovery_reset(2);
+    g_recovery.response[0].fraction = Q2_TRACE_ONE;
+    g_recovery.response[0].endpos[0] = 10;
+    g_recovery.response[0].endpos[1] = 20 - Q2_STEPSIZE;
+    g_recovery.response[0].endpos[2] = 30;
+    g_recovery.response[1].fraction = Q2_TRACE_ONE / 2;
+    g_recovery.response[1].endpos[0] = 10;
+    g_recovery.response[1].endpos[1] = 80;
+    g_recovery.response[1].endpos[2] = 30;
+
+    place(&m, 10, 30, 0);
+    m.pos[1] = 20;
+    moved = q2_SV_movestep(&m, move, false);
+
+    check(moved, "ordinary clear zero move reaches its drop");
+    check_eq_i(g_recovery.trace_count, 2,
+               "clear zero move makes lift and drop traces only");
+    check_vec3(g_recovery.call[1].start,
+               10, 20 - Q2_STEPSIZE, 30,
+               "zero-move drop starts at the lifted endpoint");
+    check_vec3(g_recovery.call[1].end,
+               10, 20 + Q2_STEPSIZE, 30,
+               "zero-move drop ends below the original position");
+    check_vec3(m.pos, 10, 79, 30,
+               "zero-move landing keeps the ordinary minus-one bias");
+    check_eq_i(g_recovery.bottom_count, 1,
+               "accepted zero move checks supporting corners once");
+
+    /*
+     * 0x8005FFC4 branches on the FIRST (lift) trace's startsolid flag. The
+     * retail arm retries origin -> origin+move, then traces downward from that
+     * unstepped wish position. Keep move[1] non-zero: the end built at
+     * 0x8005FF58..0x8005FF5C remains original-Y + stepsize when reused by the
+     * recovery trace at 0x80060214, not wish-Y + stepsize.
+     */
+    recovery_reset(3);
+    g_recovery.response[0].startsolid = true;
+    g_recovery.response[0].allsolid = true;
+    g_recovery.response[1].fraction = Q2_TRACE_ONE;
+    g_recovery.response[1].endpos[0] = 500;
+    g_recovery.response[1].endpos[1] = 224;
+    g_recovery.response[1].endpos[2] = 800;
+    g_recovery.response[2].fraction = Q2_TRACE_ONE / 2;
+    g_recovery.response[2].endpos[0] = 500;
+    g_recovery.response[2].endpos[1] = 320;
+    g_recovery.response[2].endpos[2] = 800;
+
+    place(&m, 100, 300, 0);
+    m.pos[1] = 200;
+    move[0] = 400;
+    move[1] = 24;
+    move[2] = 500;
+    moved = q2_SV_movestep(&m, move, true);
+
+    check(moved, "a clear retail retry recovers an initial start-solid lift");
+    check_eq_i(g_recovery.trace_count, 3,
+               "recovery makes lift, direct-move and descent traces");
+    check_vec3(g_recovery.call[0].start, 100, 200, 300,
+               "lift starts at the unchanged origin");
+    check_vec3(g_recovery.call[0].end, 100, 200 - Q2_STEPSIZE, 300,
+               "lift probes one retail step upward");
+    check_vec3(g_recovery.call[1].start, 100, 200, 300,
+               "direct retry starts at the unchanged origin");
+    check_vec3(g_recovery.call[1].end, 500, 224, 800,
+               "direct retry includes all three move components");
+    check_vec3(g_recovery.call[2].start, 500, 224, 800,
+               "recovery descent starts at the unstepped wish position");
+    check_vec3(g_recovery.call[2].end, 500, 200 + Q2_STEPSIZE, 800,
+               "recovery descent ends at original-Y plus stepsize");
+    check_vec3(m.pos, 500, 320, 800,
+               "successful recovery installs the descent endpoint");
+    check(m.on_ground, "successful recovery restores on-ground state");
+    check_eq_i(g_recovery.bottom_count, 1,
+               "recovered position is checked for supporting corners");
+    check_eq_i(g_recovery.link_count, 1,
+               "successful relink recovery links exactly once");
+    check_eq_i(g_recovery.touch_count, 1,
+               "successful relink recovery touches triggers exactly once");
+    check(g_recovery.linked == &m, "the recovered monster is the linked entity");
+    check_eq_i(g_recovery.link_what, 0x81,
+               "recovery uses retail origin/relink flags");
+    check_eq_i(g_recovery.event_count, 6,
+               "clear recovery has six ordered world events");
+    check_eq_i(g_recovery.events[0], RECOVERY_EV_TRACE,
+               "event 1 is the lift trace");
+    check_eq_i(g_recovery.events[1], RECOVERY_EV_TRACE,
+               "event 2 is the direct retry trace");
+    check_eq_i(g_recovery.events[2], RECOVERY_EV_TRACE,
+               "event 3 is the recovery descent");
+    check_eq_i(g_recovery.events[3], RECOVERY_EV_BOTTOM,
+               "support is checked after all traces");
+    check_eq_i(g_recovery.events[4], RECOVERY_EV_LINK,
+               "link follows the support check");
+    check_eq_i(g_recovery.events[5], RECOVERY_EV_TOUCH,
+               "trigger touching is last");
+    for (i = 0; i < 3; i++) {
+        check(g_recovery.call[i].ignore == &m,
+              "every recovery trace ignores the moving monster");
+        check_eq_i(g_recovery.call[i].mask, Q2_MASK_MONSTERSOLID,
+                   "every recovery trace uses MASK_MONSTERSOLID");
+    }
+
+    /* 0x800601B0 rejects a direct retry one fraction unit short of clear. */
+    recovery_reset(2);
+    g_recovery.response[0].startsolid = true;
+    g_recovery.response[1].fraction = Q2_TRACE_ONE - 1;
+    g_recovery.response[1].endpos[0] = 109;
+    g_recovery.response[1].endpos[1] = 20;
+    g_recovery.response[1].endpos[2] = 229;
+
+    place(&m, 10, 30, 0);
+    m.pos[1] = 20;
+    move[0] = 100;
+    move[1] = 0;
+    move[2] = 200;
+    moved = q2_SV_movestep(&m, move, true);
+
+    check(!moved, "a clipped direct retry cannot recover start-solid");
+    check_eq_i(g_recovery.trace_count, 2,
+               "a clipped retry stops before the recovery descent");
+    check_vec3(m.pos, 10, 20, 30,
+               "a clipped retry leaves origin byte-for-byte unchanged");
+    check(!m.on_ground, "a failed retry does not change ground state");
+    check_eq_i(g_recovery.bottom_count, 0,
+               "a clipped retry never checks the rejected destination");
+    check_eq_i(g_recovery.link_count, 0,
+               "a clipped retry is never linked");
+    check_eq_i(g_recovery.touch_count, 0,
+               "a clipped retry never touches triggers");
+    check_eq_i(g_recovery.event_count, 2,
+               "clipped retry has exactly two trace events");
+
+    /* A clear direct retry can still be rejected by a start-solid descent. */
+    recovery_reset(3);
+    g_recovery.response[0].startsolid = true;
+    g_recovery.response[1].fraction = Q2_TRACE_ONE;
+    g_recovery.response[2].startsolid = true;
+    g_recovery.response[2].allsolid = true;
+
+    place(&m, 10, 30, 0);
+    m.pos[1] = 20;
+    moved = q2_SV_movestep(&m, move, true);
+
+    check(!moved, "a start-solid recovery descent rejects the move");
+    check_eq_i(g_recovery.trace_count, 3,
+               "blocked descent happens after the clear direct retry");
+    check_vec3(m.pos, 10, 20, 30,
+               "a blocked descent also preserves the original position");
+    check_eq_i(g_recovery.bottom_count, 0,
+               "a blocked descent does not run the bottom check");
+    check_eq_i(g_recovery.link_count + g_recovery.touch_count, 0,
+               "a blocked descent has no relink side effects");
+
+    /* 0x80060128..0x80060150 skip the direct retry for an all-zero move. */
+    recovery_reset(2);
+    g_recovery.response[0].startsolid = true;
+    g_recovery.response[1].fraction = Q2_TRACE_ONE / 2;
+    g_recovery.response[1].endpos[0] = 10;
+    g_recovery.response[1].endpos[1] = 80;
+    g_recovery.response[1].endpos[2] = 30;
+
+    place(&m, 10, 30, 0);
+    m.pos[1] = 20;
+    move[0] = move[1] = move[2] = 0;
+    moved = q2_SV_movestep(&m, move, false);
+
+    check(moved, "a zero move can recover through its descent alone");
+    check_eq_i(g_recovery.trace_count, 2,
+               "zero move makes only the lift and descent traces");
+    check_vec3(g_recovery.call[1].start, 10, 20, 30,
+               "zero-move recovery descent starts at origin");
+    check_vec3(g_recovery.call[1].end, 10, 20 + Q2_STEPSIZE, 30,
+               "zero-move recovery still descends one stepsize");
+    check_eq_i(g_recovery.event_count, 3,
+               "zero-move recovery traces twice then checks support");
+    check_eq_i(g_recovery.events[2], RECOVERY_EV_BOTTOM,
+               "zero-move support check follows both traces");
+    check_eq_i(g_recovery.link_count + g_recovery.touch_count, 0,
+               "relink=false suppresses zero-move link side effects");
+
+    q2_ai_set_link_hooks(NULL, NULL, NULL);
+    q2_ai_set_world(NULL);
+}
+
+/* ------------------------------------------------------------------------- */
 static void test_chase_directions(void)
 {
     q2_monster m, goal;
@@ -1470,6 +1871,7 @@ int main(void)
     test_checkattack();
     test_stand_and_walk();
     test_movement_verbs();
+    test_movestep_trace_paths();
     test_chase_directions();
     test_lost_sight();
     test_frame_driver();

@@ -52,7 +52,11 @@ project casts a pointer into disc data to a wider type.
 Turns "a thing the user pointed at" into a flat file namespace plus a track list.
 Handles `.cue`/`.bin`, `.iso`, and bare images; understands Mode 1, Mode 2 Form 1
 and Mode 2 Form 2 sectors, which matters because ordinary files are Form 1 while
-streamed audio and video are Form 2 with a different payload size.
+streamed audio and video are Form 2 with a different payload size. Multi-file
+CUE sheets are laid out as a single disc: each FILE-local INDEX is rebased after
+the complete preceding backing file, while reads still seek to INDEX 01 inside
+their own file. Raw reads inside a physically stored INDEX 00 range seek
+backwards from that INDEX 01 offset into the upcoming track's backing file.
 
 The public surface is deliberately small — `disc_find`, `disc_read_file`,
 `disc_read_raw_sector` — so that adding CHD support or a physical CD backend

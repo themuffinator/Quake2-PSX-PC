@@ -225,6 +225,25 @@ typedef struct client_voice {
     s32          pan_l, pan_r;
 } client_voice;
 
+/* One render-clock cursor per articulated world model. `frame_stamp` prevents
+ * split-screen from advancing it once per viewport instead of once per frame. */
+typedef struct client_model_anim {
+    q2_model_cursor cursor;
+    const q2_mmove *move;
+    long             frame_stamp;
+    u8               source;
+    bool             stamped;
+} client_model_anim;
+
+typedef struct client_player_anim {
+    q2_model_cursor cursor;
+    q2_player_move  move;
+    long            frame_stamp;
+    u32             shot_serial;
+    bool            stamped;
+    bool            attack_latched;
+} client_player_anim;
+
 typedef struct client {
     disc            *disc;
     q2_build_id      build;
@@ -429,7 +448,7 @@ typedef struct client {
      */
     q2_icon_tables   icons;
     bool             icons_ready;
-    q2_statusbar     sbar;
+    q2_statusbar     sbar[Q2_MP_MAX_PLAYERS];
 
     /*
      * The memory-card front end. Its screens and its release-gated state
@@ -452,6 +471,7 @@ typedef struct client {
     q2_save_ui_mode  card_mode;
     q2_menu          card_menu;
     q2_mcard_screen  card_screen;
+    int              card_return_page; /* front-end page restored on close */
 
     /* What a save writes. Held here rather than built inside the front end
      * because q2_save_ui borrows it and the capture needs the whole client —
@@ -484,6 +504,14 @@ typedef struct client {
     bool             vw_model_ready;
     int              vw_last_weapon;
 
+    /* Multiplayer bodies. Male2 owns the ten animation clips; the three
+     * colour variants carry matching geometry/palettes and consume its
+     * eighteen-part pose, as retail's four player identities do. */
+    q2_model          player_model[Q2_MP_MAX_PLAYERS];
+    bool              player_model_ok[Q2_MP_MAX_PLAYERS];
+    bool              player_anim_base_ok;
+    client_player_anim player_anim[Q2_MP_MAX_PLAYERS];
+
     /*
      * The things in the level that are trying to kill you.
      *
@@ -504,6 +532,7 @@ typedef struct client {
     bool              zone_bank_ready;
     q2_model         *cre_model;      /* one per monster, NULL when unresolved */
     bool             *cre_model_ok;
+    client_model_anim *cre_anim;
     q2_actor         *cre_actor;      /* what combat shoots at                 */
     q2_actor        **cre_target;
     /*
@@ -654,6 +683,19 @@ typedef struct client {
     bool              carry_pos_valid;
 
     /*
+     * A zone seam does not spawn a new player. Keep the complete client-side
+     * movement/view state so the first frame in the destination continues the
+     * same bob, lean, crouch, kick, look rate and pending impulse. Only the
+     * collision cache (`q2_player.ent`) belongs to the zone and is retained
+     * from the freshly attached destination hull when this snapshot is put
+     * back. The scalar fields above remain useful to the trace log and to the
+     * new-map carry path, where a full movement-state restore would be wrong.
+     */
+    q2_player         carry_motion;
+    s32               carry_next_fire;
+    s16               carry_fire_kick[3];
+
+    /*
      * THE MISSION SCREEN'S TWO COUNTERS, which mission.h names as the reason
      * it stayed unimplemented long after the machinery to draw it existed:
      * "Kills and Secrets are simulation state, and the sim did not tally
@@ -739,7 +781,7 @@ typedef struct client {
      */
     q2_sortdata       sortdata;
     bool              sort_ready;
-    bool              use_sort;     /* --sort-data: the authored draw order */
+    bool              use_sort;     /* authored SortData; --depth-sort opts out */
     /* --no-autoswitch: keep the disc's rule, which only leaves the blaster. */
     bool              no_autoswitch;
     bool              god;          /* --god: capture aid, no damage  */
@@ -997,6 +1039,7 @@ typedef struct client {
     u32               train_stop_calls;
     u32               mover_triggers;   /* items the script reached */
     u32               mover_moved;      /* ticks on which one moved */
+    u32               conveyor_steps;   /* BASE0 DOCRATES object writes */
     u32               mover_sounds;     /* transitions that made a noise */
     u32               rot_sounds;       /* ...and the hatches' own       */
     /* Transitions whose voice did NOT start: no audio device, or the name is
@@ -1031,6 +1074,7 @@ typedef struct client {
     u32               ent_drawn;      /* entity draws the OT accepted   */
     u32               ent_no_model;   /* ...and ones the bank could not resolve */
     u32               ent_faces;
+    u32               ent_shadows;    /* retail posed-footprint FT4s emitted */
     u32               explosive_sounds;
     u32               explosive_sounds_missed;
     bool              mission_after_map; /* the screen is holding a LOADMAP */
@@ -1171,6 +1215,8 @@ typedef struct client {
     u32               cre_bodies;     /* deaths that found a death move        */
     u32               cre_drawn;      /* creatures with faces in the last view */
     u32               cre_faces;
+    u32               player_drawn;
+    u32               player_faces;
     s32              *cre_home;      /* where each creature spawned          */
 
     /* The map's CLUT split. A model face's palette index is offset by it —
@@ -1321,6 +1367,7 @@ typedef struct client {
 } client;
 
 static void client_bind_view_model(client *c);
+static void client_bind_player_models(client *c);
 
 /* Defined with the movie player, and called from the zone load that finds a
  * QENDMIS map naming a film. */
@@ -1606,12 +1653,14 @@ static void client_free_creatures(client *c)
 {
     free(c->cre_model);
     free(c->cre_model_ok);
+    free(c->cre_anim);
     free(c->cre_actor);
     free(c->cre_target);
     free(c->cre_home);
     c->cre_home     = NULL;
     c->cre_model    = NULL;
     c->cre_model_ok = NULL;
+    c->cre_anim     = NULL;
     c->cre_actor    = NULL;
     c->cre_target   = NULL;
 
@@ -1648,13 +1697,16 @@ static void client_load_creatures(client *c, const s32 eye[3])
                                              sizeof(*c->cre_model));
         c->cre_model_ok = (bool *)calloc(c->creatures.set.count,
                                          sizeof(*c->cre_model_ok));
+        c->cre_anim     = (client_model_anim *)calloc(c->creatures.set.count,
+                                                       sizeof(*c->cre_anim));
         c->cre_actor    = (q2_actor *)calloc(c->creatures.set.count,
                                              sizeof(*c->cre_actor));
         c->cre_target   = (q2_actor **)calloc(c->creatures.set.count,
                                               sizeof(*c->cre_target));
     }
 
-    if (!c->cre_model || !c->cre_model_ok || !c->cre_actor || !c->cre_target) {
+    if (!c->cre_model || !c->cre_model_ok || !c->cre_anim ||
+        !c->cre_actor || !c->cre_target) {
         if (c->creatures.set.count)
             Q2_WARN("no memory for %u creatures", c->creatures.set.count);
         client_free_creatures(c);
@@ -2043,13 +2095,15 @@ static void client_cre_fire(q2_monster *m, int flash, void *user)
      * fire sound at all, because the bolt it throws carries its own.
      */
     if (c->lights_ready) {
-        static const u8 flash[3] = { Q2_MUZZLE_LIGHT_R, Q2_MUZZLE_LIGHT_G,
-                                     Q2_MUZZLE_LIGHT_B };
+        static const u8 muzzle_colour[3] = {
+            Q2_MUZZLE_LIGHT_R, Q2_MUZZLE_LIGHT_G, Q2_MUZZLE_LIGHT_B
+        };
         s32 inner, outer;
 
         q2_weapon_muzzle_light(q2_rng_next(&c->sim[0].combat.rng),
                                &inner, &outer);
-        q2_light_add_dynamic(&c->light_world, m->pos, flash, inner, outer, 0, 0);
+        q2_light_add_dynamic(&c->light_world, m->pos, muzzle_colour,
+                             inner, outer, 0, 0);
     }
 
     {
@@ -2338,6 +2392,135 @@ static void client_creatures_tick(client *c, float dt, const s32 eye[3])
     }
     if (c->ai_accum > 0.5)
         c->ai_accum = 0.0;
+}
+
+/*
+ * Advance an animation once per DISPLAY frame, however many viewports ask for
+ * its pose. `source` distinguishes an absolute named timeline from the one
+ * unnamed-move fallback; changing either the move or the source is a rebase,
+ * exactly where retail installs a new runtime animation record.
+ */
+static s32 client_model_anim_sample(client_model_anim *a,
+                                    const q2_mmove *move, u8 source,
+                                    s32 target, s32 dt, long frame)
+{
+    bool rebased = false;
+
+    if (!a)
+        return target;
+
+    if (!a->cursor.ready || a->move != move || a->source != source) {
+        q2_model_cursor_reset(&a->cursor, target);
+        a->move   = move;
+        a->source = source;
+        rebased   = true;
+    }
+
+    /* A newly installed record starts at phase zero. Subsequent display frames
+     * add phase while its AI base is unchanged; a new base resets it. */
+    if (rebased) {
+        a->frame_stamp = frame;
+        a->stamped     = true;
+    } else if (!a->stamped || a->frame_stamp != frame) {
+        q2_model_cursor_phase(&a->cursor, target, dt);
+        a->frame_stamp = frame;
+        a->stamped     = true;
+    }
+    return a->cursor.position;
+}
+
+static q2_player_move client_player_visual_move(client *c, int pi)
+{
+    client_player_anim *a = &c->player_anim[pi];
+    const q2_player *p = &c->sim[0].player[pi];
+    const q2_player_death *d = &c->death[pi];
+    u32 serial = pi == 0 ? c->sim[0].combat.shot_serial
+                         : c->sim[0].pcombat[pi].shot_serial;
+
+    if (d->stage != Q2_PDEATH_ALIVE)
+        return d->move != Q2_PMOVE_NONE ? d->move : Q2_PMOVE_DEATH1;
+
+    if (serial != a->shot_serial) {
+        a->shot_serial    = serial;
+        a->attack_latched = true;
+    }
+    if (a->attack_latched)
+        return Q2_PMOVE_ATTAK;
+    if (!p->on_ground)
+        return Q2_PMOVE_JUMP;
+    if (abs(p->vel[0]) + abs(p->vel[2]) > 8)
+        return Q2_PMOVE_RUN;
+    return Q2_PMOVE_STAND;
+}
+
+/* Build a player pose from Male2's ten named retail moves. The coloured body
+ * models have the same eighteen-part geometry but only a rest clip; they use
+ * this pose exactly so colour selection does not throw animation away. */
+static bool client_player_pose(client *c, int pi, q2_model_pose *pose)
+{
+    client_player_anim *a = &c->player_anim[pi];
+    q2_player_death *d = &c->death[pi];
+    q2_player_move move = client_player_visual_move(c, pi);
+    q2_model_move mv;
+    q2_model_anim clip;
+    s32 first, limit;
+    u32 within;
+    bool rebased = false;
+
+    if (!c->player_anim_base_ok || !pose || move == Q2_PMOVE_NONE ||
+        !q2_model_move_by_name(&c->player_model[0],
+                               q2_player_move_name(move), &mv))
+        return false;
+
+    first = (s32)mv.start * 5;
+    limit = first + (s32)q2_model_move_frames(&mv) *
+                          Q2_MODEL_TICKS_PER_FRAME;
+    if (limit <= first)
+        return false;
+
+    if (!a->cursor.ready || a->move != move) {
+        q2_model_cursor_reset(&a->cursor, first);
+        a->move    = move;
+        rebased    = true;
+    }
+
+    /* Installing a retail runtime move exposes its first key for one display
+     * frame. Advancing in the same call skipped that key entirely at 30 Hz. */
+    if (rebased) {
+        a->frame_stamp = c->frame_index;
+        a->stamped     = true;
+    } else if (!a->stamped || a->frame_stamp != c->frame_index) {
+        s32 next = a->cursor.position + c->screen.dt;
+        bool terminal = q2_player_move_is_death(move);
+
+        if (next >= limit) {
+            if (terminal) {
+                /* The final key starts ten position units before the end. */
+                a->cursor.position = limit - Q2_MODEL_TICKS_PER_FRAME;
+                a->cursor.target   = a->cursor.position;
+                q2_player_death_anim_ended(d);
+            } else {
+                s32 span = limit - first;
+                a->cursor.position = first + (next - first) % span;
+                a->cursor.target   = a->cursor.position;
+                if (move == Q2_PMOVE_ATTAK)
+                    a->attack_latched = false;
+            }
+        } else {
+            a->cursor.position = next;
+            a->cursor.target   = next;
+        }
+        a->frame_stamp = c->frame_index;
+        a->stamped     = true;
+    }
+
+    if (a->cursor.position < 0 ||
+        !q2_model_anim_at_position(&c->player_model[0],
+                                   (u32)a->cursor.position,
+                                   &clip, &within))
+        return false;
+
+    return q2_model_pose_at(&c->player_model[0], &clip, within, pose) == Q2_OK;
 }
 
 /*
@@ -3182,11 +3365,13 @@ static void client_event_call(void *user, const q2_event_item *item,
 {
     client *c = (client *)user;
 
-    if (!c || !c->rotators_ready || !c->sim[0].userfuncs_ready)
+    if (!c || !c->sim[0].userfuncs_ready)
         return;
 
-    c->rot_steps += q2_rotators_call(&c->rotators, &c->sim[0].userfuncs,
-                                     item, call_index);
+    if (c->rotators_ready)
+        c->rot_steps += q2_rotators_call(&c->rotators,
+                                         &c->sim[0].userfuncs,
+                                         item, call_index);
 
     /*
      * ONKEYDO — the key gate, and the reason it matters more now than it did
@@ -3517,23 +3702,26 @@ static void client_event_call(void *user, const q2_event_item *item,
      *
      * 89 of the disc's 92 calls name a group that exists and 58 of those name a
      * group claiming no zone, which is a batch rather than a level's own
-     * population. Every one of them used to be standing in the room from the
-     * moment the level loaded.
+     * population. Every one of their creatures AND place records used to be
+     * standing in the room from the moment the level loaded. The two halves
+     * share the Population group name and their own one-shot latches.
      */
     {
         q2_uf_call call;
         char group[Q2_UF_NAME_LEN + 1];
 
-        if (c->creatures_ready &&
-            q2_uf_decode_call(&call, &c->sim[0].userfuncs, item) == Q2_OK &&
+        if (q2_uf_decode_call(&call, &c->sim[0].userfuncs, item) == Q2_OK &&
             call.prim == Q2_UF_CREBATCH &&
             q2_uf_operand_name(&call, 0, group) && group[0]) {
-            u32 woke = q2_creature_world_summon(&c->creatures, group);
+            u32 woke = c->creatures_ready
+                     ? q2_creature_world_summon(&c->creatures, group) : 0;
+            u32 placed = q2_sim_activate_item_group(&c->sim[0], group);
 
-            if (woke) {
+            if (woke)
                 c->script_summoned += woke;
-                Q2_INFO("CREBATCH '%s' woke %u", group, woke);
-            }
+            if (woke || placed)
+                Q2_INFO("CREBATCH '%s' woke %u, placed %u",
+                        group, woke, placed);
         }
     }
 
@@ -3651,11 +3839,10 @@ static void client_event_call(void *user, const q2_event_item *item,
      * and the map's own, recovered from its LevelBin (levelbin.h) — and 20 of
      * the disc's 20 keys resolve in one or the other.
      *
-     * The handler is where it stops. It is MIPS in the module and this port
-     * does not run modules, so what a mission event DOES is not reproduced; the
-     * event is named, attributed to its table, and counted. Saying so is the
-     * point — a MISEVENT that silently did nothing would look like the script
-     * working.
+     * Most handlers are still MIPS in the module and are named/countable rather
+     * than executable here. BASE0's DOCRATES is reconstructed below: it is the
+     * crate conveyor, not a generic train, and its four runtime-object writes
+     * now have an exact native counterpart in mover.c.
      */
     {
         q2_uf_call call;
@@ -3680,6 +3867,15 @@ static void client_event_call(void *user, const q2_event_item *item,
                     }
                 if (k == c->misevent_count)
                     c->misevent_unknown++;
+            }
+
+            if (c->movers_ready && strcmp(key, "DOCRATES") == 0) {
+                u32 moved = q2_movers_step_crates(&c->movers,
+                                                   &c->sim[0].events,
+                                                   &c->zone.scene,
+                                                   c->sim[0].cur_dt);
+                c->conveyor_steps += moved;
+                c->mover_moved    += moved;
             }
         }
     }
@@ -3866,6 +4062,8 @@ static bool client_load_zone(client *c, const char *map, int index)
     q2_world_zone loaded;
     s32 wmin[3], wmax[3];
     bool placed = false;
+    bool same_map_transition = c->carry_player && c->carry_same_map &&
+                               c->map[0] && client_name_eq(c->map, map);
 
     /*
      * EVERY load announces itself, because a load is the only thing that can
@@ -3882,14 +4080,16 @@ static bool client_load_zone(client *c, const char *map, int index)
                 c->move_reason ? c->move_reason : "(unclaimed)");
 
     /* Nothing of this level is on screen yet — see the field's note. */
-    c->level_frames_drawn = false;
+    if (!same_map_transition)
+        c->level_frames_drawn = false;
 
     /*
      * And no mission row until this map claims one. A map with no unit of its
      * own — QENDMIS, QFMV, the front end — must not keep writing the counters
      * of the level it came from into that level's row.
      */
-    c->mission_row = -1;
+    if (!same_map_transition)
+        c->mission_row = -1;
 
     if (q2_world_load_zone(&loaded, c->disc, map, index) != Q2_OK) {
         /* The client counts a map's zones by probing until one is absent, so
@@ -3909,7 +4109,7 @@ static bool client_load_zone(client *c, const char *map, int index)
          */
         c->carry_player   = false;
         c->carry_same_map = false;
-        c->gate_name[0]   = ' ';
+        c->gate_name[0]   = '\0';
         return false;
     }
 
@@ -3950,10 +4150,24 @@ static bool client_load_zone(client *c, const char *map, int index)
         c->carry_ground_y   = pl->ground_y;
         c->carry_on_ground  = pl->on_ground;
         c->carry_pos_valid  = c->carry_same_map;
+        c->carry_motion     = *pl;
+        c->carry_next_fire  = c->sim[0].combat.next_fire;
+        c->carry_fire_kick[0] = c->sim[0].combat.kick[0];
+        c->carry_fire_kick[1] = c->sim[0].combat.kick[1];
+        c->carry_fire_kick[2] = c->sim[0].combat.kick[2];
     }
 
-    q2_world_free_zone(&c->zone);
-    c->zone = loaded;
+    /* MOVE, never assign: q2_zone_file.chunk points into the archive directory
+     * stored inline in `loaded`. A struct copy leaves every pointer aimed at
+     * this function's stack frame and made later chunk reads (including
+     * --zone-probe) intermittent use-after-return accesses. */
+    if (q2_world_move_zone(&c->zone, &loaded) != Q2_OK) {
+        Q2_ERROR("cannot take ownership of %s zone %d", map, index);
+        c->carry_player   = false;
+        c->carry_same_map = false;
+        c->gate_name[0]   = '\0';
+        return false;
+    }
 
     /*
      * The zone's draw order. Borrowed from the zone file, so it is taken after
@@ -4324,9 +4538,10 @@ static bool client_load_zone(client *c, const char *map, int index)
         c->cam.pos[2] = (wmin[2] + wmax[2]) / 2;
     }
 
-    /* Upload this map's texture pages and palettes. Each map has its own bank,
-     * so this must happen per zone load, not once at startup. */
-    if (c->vram) {
+    /* Upload this MAP's texture pages and palettes. A streamed zone of the
+     * same map names the same bank, so replacing it here only stalls the seam
+     * and briefly discards already resident pixels. */
+    if (!same_map_transition && c->vram) {
         q2_vram_section vs;
         memset(c->vram, 0, sizeof(*c->vram));
         if (q2_vram_load(&vs, c->disc, map) == Q2_OK) {
@@ -4441,18 +4656,20 @@ static bool client_load_zone(client *c, const char *map, int index)
      * under one would have it reading freed memory — and a zone load is exactly
      * when something is mid-play, because the door that triggered it just made
      * a noise. */
-    client_voices_stop(c);
-    c->bed_frames = 0;
-    c->bed_pos    = 0;
-    if (c->sfx_ready) {
-        q2_sound_bank_free(&c->sfx);
-        c->sfx_ready = false;
-    }
-    c->sfx_ready = (q2_sound_bank_load(&c->sfx, c->disc, map) == Q2_OK);
-    if (c->sfx_ready)
-        Q2_INFO("sound bank: %u effects", c->sfx.count);
+    if (!same_map_transition) {
+        client_voices_stop(c);
+        c->bed_frames = 0;
+        c->bed_pos    = 0;
+        if (c->sfx_ready) {
+            q2_sound_bank_free(&c->sfx);
+            c->sfx_ready = false;
+        }
+        c->sfx_ready = (q2_sound_bank_load(&c->sfx, c->disc, map) == Q2_OK);
+        if (c->sfx_ready)
+            Q2_INFO("sound bank: %u effects", c->sfx.count);
 
-    client_item_sounds_resolve(c);
+        client_item_sounds_resolve(c);
+    }
 
     /* q2_sim_init memsets the struct, so the previous zone's trigger bitmap and
      * event runtime have to be released first or they leak on every zone
@@ -4480,6 +4697,7 @@ static bool client_load_zone(client *c, const char *map, int index)
          */
         c->model_bank_ready =
             (q2_model_bank_from_common(&c->model_bank, &c->common) == Q2_OK);
+        client_bind_player_models(c);
 
         /*
          * The things standing in the room when you arrive.
@@ -4566,8 +4784,32 @@ static bool client_load_zone(client *c, const char *map, int index)
         }
 
         if (c->vm_ready) {
-            q2_vw_init(&c->vw, &c->vm_tables, c->sim[0].combat.weapon_id);
-            c->vw_last_weapon = c->sim[0].combat.weapon_id;
+            /*
+             * A zone/map transition does NOT create the weapon in the
+             * player's hands again. `carry_player` means this load came from
+             * a live session, and the entire view-weapon machine — state,
+             * key/frame clocks, current transform, old model and pending
+             * selection — belongs to that player just as much as the weapon
+             * id does.
+             *
+             * Re-running q2_vw_init here reset it to the level-start LOWER
+             * state on every streamed zone and every LOADMAP. The carry block
+             * below then restored the selected weapon after this had recorded
+             * the temporary spawn blaster in `vw_last_weapon`, so the first
+             * new-zone frame selected the carried gun again and played a full
+             * lower/raise. Retail keeps the existing machine across these
+             * loads; only its CastList model pointer has to be rebound to the
+             * newly loaded bank.
+             *
+             * A genuine fresh load — new game, restart or save restore — still
+             * takes the init arm. Save restore applies its selected weapon and
+             * initialises once more after the save body is read, below.
+             */
+            if (!c->carry_player) {
+                q2_vw_init(&c->vw, &c->vm_tables,
+                           c->sim[0].combat.weapon_id);
+                c->vw_last_weapon = c->sim[0].combat.weapon_id;
+            }
             client_bind_view_model(c);
         }
         /* The zone number seeds the effect generator, so re-entering a zone
@@ -5101,9 +5343,13 @@ static bool client_load_zone(client *c, const char *map, int index)
                                         mt->min[2], mt->max[2]);
                             }
                         }
+                        /* `volume_count` is the TOTAL: mover parts first, then
+                         * authored volumes (sim.h). Treating it as the latter
+                         * count walked `mover_count` entries past the allocation
+                         * whenever --zone-trace was enabled and printed heap
+                         * bytes as bogus inactive clip boxes. */
                         for (t = c->sim[0].mover_count;
-                             t < c->sim[0].mover_count +
-                                 c->sim[0].volume_count; t++) {
+                             t < c->sim[0].volume_count; t++) {
                             const q2_move_target *mt = &c->sim[0].volumes[t];
                             Q2_INFO("[clip] %2u  volume mask %04X %s"
                                     "  box (%d..%d, %d..%d, %d..%d)",
@@ -5115,7 +5361,8 @@ static bool client_load_zone(client *c, const char *map, int index)
                     }
                 }
 
-                if (q2_rotators_build(&c->rotators, &ev, &uf) == Q2_OK) {
+                if (q2_rotators_build(&c->rotators, &ev, &uf,
+                                      &c->zone.scene) == Q2_OK) {
                     c->rotators_ready = true;
                     c->zone.rotators  = &c->rotators;
                     Q2_INFO("rotators: %u (operands from %s)",
@@ -5163,13 +5410,18 @@ static bool client_load_zone(client *c, const char *map, int index)
          */
         if (c->carry_pos_valid) {
             q2_player *pl = &c->sim[0].player[0];
+            q2_move_ent destination_ent = pl->ent;
 
-            pl->pitch     = c->carry_pitch;
-            pl->vel[0]    = c->carry_vel[0];
-            pl->vel[1]    = c->carry_vel[1];
-            pl->vel[2]    = c->carry_vel[2];
-            pl->ground_y  = c->carry_ground_y;
-            pl->on_ground = c->carry_on_ground;
+            /* The player object itself survives a retail zone stream. Restore
+             * it wholesale, then keep the one field family that genuinely was
+             * rebuilt: the cached cell/contact state of the destination hull. */
+            *pl     = c->carry_motion;
+            pl->ent = destination_ent;
+
+            c->sim[0].combat.next_fire = c->carry_next_fire;
+            c->sim[0].combat.kick[0]   = c->carry_fire_kick[0];
+            c->sim[0].combat.kick[1]   = c->carry_fire_kick[1];
+            c->sim[0].combat.kick[2]   = c->carry_fire_kick[2];
 
             c->carry_pos_valid = false;          /* one-shot, like the rest */
 
@@ -5365,7 +5617,7 @@ static bool client_load_zone(client *c, const char *map, int index)
      * installed. A zone load is that for all four, and a respawn hands the
      * loadout captured here back out.
      */
-    {
+    if (!same_map_transition) {
         int pi;
 
         for (pi = 0; pi < Q2_MP_MAX_PLAYERS; pi++)
@@ -5386,6 +5638,25 @@ static bool client_load_zone(client *c, const char *map, int index)
      * record and is left alone — see client_music_for_level.
      */
     client_music_for_level(c, false);
+
+    /* `client_input_simulated` normally publishes the eye and composed view
+     * after a player tick. A gate is processed later in that same frame, so a
+     * load that leaves `cam.pos` at the carried FEET renders one transition
+     * frame Q2_EYE_BASE units too low before the next tick repairs it. Publish
+     * the rebuilt player's current eye immediately; no synthetic tick and no
+     * one-frame camera drop. */
+    {
+        s32 eye[3], view[3];
+
+        q2_sim_eye(&c->sim[0], eye);
+        q2_sim_view_angles(&c->sim[0], view);
+        c->cam.pos[0] = eye[0];
+        c->cam.pos[1] = eye[1];
+        c->cam.pos[2] = eye[2];
+        c->cam.pitch  = view[0];
+        c->cam.yaw    = view[1];
+        c->cam.roll   = view[2];
+    }
 
     return true;
 }
@@ -6408,6 +6679,16 @@ static void client_input_simulated(client *c, float dt)
      * the nominal 25 Hz is most frames — and on those frames nothing in the sim
      * changed, including its event queue.
      */
+    /*
+     * A directory entry literally named ALWAYS is the level module's per-tick
+     * hook. BASE0's runs DOCRATES; several other maps keep rotators and mission
+     * checks there. Queue it only when the sim is about to take a logic tick —
+     * at higher render rates q2_sim_advance legitimately does nothing on the
+     * intervening frames.
+     */
+    if (q2_sim_next_dt(&c->sim[0], (double)dt) != 0)
+        q2_event_rt_trigger_named(&c->sim[0].event_rt, "ALWAYS");
+
     ticked = (q2_sim_advance(&c->sim[0], &in, (double)dt) != 0);
     q2_combat_scan_who = Q2_COMBAT_SCAN_OTHER;
     client_sync_parked_health(c);
@@ -6675,6 +6956,36 @@ static void client_input_simulated(client *c, float dt)
         if (swapped)
             client_bind_view_model(c);
 
+        /* Grenade3 is a hidden entity attached to the view weapon until the
+         * model timeline crosses 411. Retail copies viewmodel+0xA4 every think
+         * (0x8004A414), charges only while position 380 is pinned, and lets an
+         * elapsed fuse force fire frame 2. Feed that entity after advancing the
+         * model so both the attachment and its crossing are from this frame. */
+        if (c->vw.weapon == Q2_WID_HAND_GRENADE ||
+            q2_projectile_hand_held_index(&c->sim[0].combat.projectiles, 0) >= 0) {
+            s16 aim[3], kick[3];
+            s32 summed[3], attached[3];
+            s32 cook_ticks = q2_vw_take_hand_grenade_cook(&c->vw);
+            bool release = q2_vw_take_hand_grenade_release(&c->vw);
+            q2_hand_grenade_update state;
+
+            q2_sim_view_angles(&c->sim[0], summed);
+            aim[0]  = (s16)c->sim[0].player[0].pitch;
+            aim[1]  = (s16)c->sim[0].player[0].yaw;
+            aim[2]  = (s16)c->sim[0].player[0].roll;
+            kick[0] = (s16)(summed[0] - c->sim[0].player[0].pitch);
+            kick[1] = (s16)(summed[1] - c->sim[0].player[0].yaw);
+            kick[2] = (s16)(summed[2] - c->sim[0].player[0].roll);
+
+            q2_vw_place(&c->vw, c->sim[0].player[0].pos,
+                        c->sim[0].player[0].view_height,
+                        aim, kick, attached, NULL);
+            state = q2_sim_hand_grenade_update(&c->sim[0], attached,
+                                                cook_ticks, release);
+            if (state == Q2_HAND_GRENADE_EXPIRED)
+                q2_vw_hand_grenade_expired(&c->vw);
+        }
+
         /*
          * AND THE SHOTS THE FIRE-STATE DRIVER ASKED FOR.
          *
@@ -6688,8 +6999,8 @@ static void client_input_simulated(client *c, float dt)
          * have an arm the console has no gate but the animation, so the two
          * agree as long as the clip is slower than 30 ticks; where they do not,
          * the gate wins and the shot is skipped, which is the conservative
-         * half. Weapon 6, the hand grenade, raises none of these — its arm is
-         * the cook, and the throw is the clip ending.
+         * half. Weapon 6 raises no frame fire: its arm feeds the held entity
+         * above, and its model-timeline crossing at 411 performs the throw.
          */
         {
             u32 n = q2_vw_take_frame_fires(&c->vw);
@@ -7336,18 +7647,11 @@ static void client_input_simulated(client *c, float dt)
                 if (ev.abandon_armed)
                     c->death_abandon = Q2_PDEATH_ABANDON_TICKS;
 
-                /*
-                 * 0x8003DF90 raises "the move ran past its end" when the frame
-                 * cursor walks past it, and 0x80039618 waits for that before it
-                 * lets the body settle. THIS PORT DRAWS NO PLAYER MODEL, so
-                 * there is no cursor to walk and nothing would ever raise it —
-                 * the body would hold its first dying tick for ever. It is
-                 * raised here instead, which makes the deathmatch body settle
-                 * on the next tick rather than at the end of its death move.
-                 * STATED as the port's approximation: when a player model is
-                 * drawn, this call belongs on the animation advance.
-                 */
-                q2_player_death_anim_ended(d);
+                /* The rendered Male2 cursor raises ANIM_WRAPPED at the last
+                 * death key. A map with no player model still needs the old
+                 * fail-safe or a deathmatch corpse could never settle. */
+                if (c->mp_enabled && !c->player_anim_base_ok)
+                    q2_player_death_anim_ended(d);
                 continue;          /* the killing tick is not a body tick */
             }
 
@@ -7900,8 +8204,27 @@ static void client_apply_input(client *c)
 
     /* 0x800B3342. The AUTOCENTRE row has been on this page since the menu was
      * transcribed and had nothing on the other end of it; the sim reads it now.
-     * See the timer at 0x8003A4AC. */
-    c->sim[0].autocentre_setting = c->settings.v[Q2_SET_AUTOCENTRE] != 0;
+     * See the timer at 0x8003A4AC.
+     *
+     * Keep that retail pad behaviour, but do not let it fight the PC port's
+     * continuous mouse-look mode.  The retail timer arms after walking for 200
+     * ticks and sets `recentring`; vertical mouse motion merely pauses that
+     * latch, so the pitch used to spring back as soon as the mouse stopped.  A
+     * PlayStation mouse is a selectable controller style.  Here USE MOUSE means
+     * the pointer is permanently captured as the view, which has the same
+     * semantics as holding mlook in the PC game.
+     *
+     * Clear both pieces of retained state as well as gating the timer.  Without
+     * that, switching USE MOUSE on while a pad recenter was already armed would
+     * allow one last delayed spring. */
+    c->sim[0].autocentre_setting =
+        !want_mouse && c->settings.v[Q2_SET_AUTOCENTRE] != 0;
+    if (want_mouse) {
+        for (i = 0; i < Q2_SIM_MAX_PLAYERS; i++) {
+            c->sim[0].player[i].autocentre = 0;
+            c->sim[0].player[i].recentring = false;
+        }
+    }
 
     /* A scripted run has no mouse to grab, and its pad script is STANDARD A's. */
     c->mouse_look = want_mouse && !c->headless && !c->demo;
@@ -7969,6 +8292,134 @@ static void client_update_grab(client *c)
         c->pointer_valid = false;
 }
 
+/* A menu owns the shared retail prompt bar while it is open. Keep the close
+ * operation paired with parking that bar so a later mission/briefing prompt
+ * cannot inherit SELECT, BACK or RULES from the last menu page. */
+static void client_menu_close(client *c)
+{
+    q2_menu_close(&c->menu);
+    q2_prompt_hide_all(&c->prompts);
+}
+
+/* Defined with the front-end state machines below; their menu requests reach
+ * them here, before their full definitions in this translation unit. */
+static void client_card_open(client *c, q2_save_ui_mode mode);
+static void client_enter_front_end(client *c);
+
+_Static_assert(Q2_MENU_MP_TIME_OPTIONS == Q2_MP_TIME_OPTION_COUNT,
+               "QFRONT time-option count drifted from QMULTI");
+_Static_assert(Q2_MENU_MP_FRAG_OPTIONS == Q2_MP_FRAG_OPTION_COUNT,
+               "QFRONT frag-option count drifted from QMULTI");
+_Static_assert(Q2_MENU_MP_ROUND_OPTIONS == Q2_MP_ROUND_OPTION_COUNT,
+               "QFRONT round-option count drifted from QMULTI");
+
+/*
+ * Install the session globals QFRONT hands to QMULTI before an arena loads.
+ * Both the command-line harness and the live front end use this path, so a
+ * menu-started match cannot quietly differ in layout, clocks or stale scores.
+ */
+static void client_mp_configure(client *c, q2_mp_mode mode, int players,
+                                s16 frag_limit, s16 time_limit,
+                                s16 round_limit)
+{
+    q2_screen_layout layout = Q2_SCREEN_LAYOUT_ONE;
+    int views;
+    int pi;
+
+    if ((u32)mode >= Q2_MP_MODE_COUNT)
+        mode = Q2_MP_DEATHMATCH;
+    if (players < 2) players = 2;
+    if (players > Q2_MP_MAX_PLAYERS) players = Q2_MP_MAX_PLAYERS;
+
+    c->mp_enabled = true;
+    q2_menu_set_multiplayer(&c->menu, true);
+    q2_mp_session_init(&c->mp, mode, players);
+    c->mp.frag_limit  = frag_limit;
+    c->mp.time_limit  = time_limit;
+    c->mp.round_limit = round_limit;
+
+    c->mp_spawn_count    = 0;
+    c->mp_rng_state      = 0x13572468u;
+    c->mp_level_time     = 0;
+    c->mp_last_request   = Q2_MP_REQ_NONE;
+    c->mp_reported       = false;
+    c->mp_deaths         = 0;
+    c->mp_scoreboard     = false;
+    c->mp_targets_logged = false;
+    memset(c->sim_ready,     0, sizeof(c->sim_ready));
+    memset(c->mp_pad,        0, sizeof(c->mp_pad));
+    memset(c->mp_spawns,     0, sizeof(c->mp_spawns));
+    memset(c->mp_view_pos,   0, sizeof(c->mp_view_pos));
+    memset(c->mp_view_yaw,   0, sizeof(c->mp_view_yaw));
+    memset(c->mp_view_valid, 0, sizeof(c->mp_view_valid));
+    memset(c->mp_shots,      0, sizeof(c->mp_shots));
+    memset(c->mp_dry,        0, sizeof(c->mp_dry));
+    memset(c->mp_dead,       0, sizeof(c->mp_dead));
+    for (pi = 0; pi < Q2_MP_MAX_PLAYERS; pi++)
+        q2_player_death_init(&c->death[pi]);
+
+    views = c->mp.player_count;
+    if (views == 2)
+        layout = c->settings.v[Q2_SET_HORIZONTAL_SPLIT]
+                     ? Q2_SCREEN_LAYOUT_TWO_H : Q2_SCREEN_LAYOUT_TWO_V;
+    else if (views >= 3)
+        layout = Q2_SCREEN_LAYOUT_QUAD;
+    q2_screen_set_layout(&c->screen, layout, views);
+
+    Q2_INFO("multiplayer: %s, %d viewport%s", q2_screen_layout_name(layout),
+            c->screen.view_count, c->screen.view_count == 1 ? "" : "s");
+    Q2_INFO("multiplayer: %s, %d players, frag limit %d, time limit %d min, "
+            "round limit %d%s", q2_mp_mode_name(mode), c->mp.player_count,
+            c->mp.frag_limit, c->mp.time_limit, c->mp.round_limit,
+            q2_mp_mode_selectable(mode) ? ""
+                : "  (this mode is CUT — the front end cannot select it)");
+}
+
+static bool client_mp_start_from_menu(client *c)
+{
+    q2_menu_mp_setup *setup = &c->menu.mp_setup;
+    q2_mp_mode mode = (q2_mp_mode)setup->mode;
+    int ti = setup->time_option;
+    int fi = setup->frag_option;
+    int ri = setup->round_option;
+    const char *arena;
+
+    if (!q2_mp_mode_selectable(mode)) mode = Q2_MP_DEATHMATCH;
+    if (ti < 0 || ti >= Q2_MP_TIME_OPTION_COUNT) ti = Q2_MP_TIME_OPTION_DEFAULT;
+    if (fi < 0 || fi >= Q2_MP_FRAG_OPTION_COUNT) fi = Q2_MP_FRAG_OPTION_DEFAULT;
+    if (ri < 0 || ri >= Q2_MP_ROUND_OPTION_COUNT) ri = Q2_MP_ROUND_OPTION_DEFAULT;
+    if (setup->arena < 0 || setup->arena >= Q2_MENU_MP_ARENA_COUNT)
+        setup->arena = 0;
+
+    arena = q2_menu_mp_arena_directory(setup->arena);
+    client_mp_configure(c, mode, setup->players,
+                        q2_mp_frag_options[fi],
+                        mode == Q2_MP_VERSUS ? Q2_MP_NO_LIMIT
+                                             : q2_mp_time_options[ti],
+                        q2_mp_round_options[ri]);
+
+    c->in_front_end   = false;
+    c->carry_player   = false;
+    c->carry_same_map = false;
+    c->mission_open   = false;
+    c->briefing_open  = false;
+    c->credits_open   = false;
+    client_menu_close(c);
+
+    Q2_INFO("front end: PROCEED — %s on %s (%s)", q2_mp_mode_name(mode),
+            q2_menu_mp_arena_name(setup->arena), arena);
+    if (!client_load_zone(c, arena, 0)) {
+        Q2_ERROR("front end: cannot load arena %s", arena);
+        c->mp_enabled = false;
+        q2_menu_set_multiplayer(&c->menu, false);
+        client_enter_front_end(c);
+        return false;
+    }
+
+    c->sim_enabled = true;
+    return true;
+}
+
 static void client_menu_requests(client *c)
 {
     switch (q2_menu_take_request(&c->menu)) {
@@ -8006,7 +8457,7 @@ static void client_menu_requests(client *c)
         c->mission_open   = false;
         c->briefing_open  = false;
         client_load_zone(c, c->map, c->zone_index);
-        q2_menu_close(&c->menu);
+        client_menu_close(c);
         break;
     case Q2_MREQ_QUIT:
         c->running = false;
@@ -8037,7 +8488,7 @@ static void client_menu_requests(client *c)
         /* A new game carries nothing either. */
         c->carry_player   = false;
         c->carry_same_map = false;
-        q2_menu_close(&c->menu);
+        client_menu_close(c);
         /*
          * And the title goes with the page. 0x80101E4C sets bit 0x80 in four
          * fields of each of the five objects `module+0x12B20` names before it
@@ -8064,7 +8515,7 @@ static void client_menu_requests(client *c)
         if (c->credits_count) {
             c->credits_open   = true;
             c->credits_scroll = 0;
-            q2_menu_close(&c->menu);
+            client_menu_close(c);
             Q2_INFO("front end: credits, %u lines", c->credits_count);
         } else {
             Q2_INFO("front end: this module carries no credit roll");
@@ -8073,12 +8524,17 @@ static void client_menu_requests(client *c)
         }
         break;
     }
-    case Q2_MREQ_NOT_BUILT:
-        /* A real page of the front end's module that the port has not built.
-         * Going back to the title is visible; doing nothing would not be. */
-        Q2_INFO("front end: that page is not reconstructed yet");
-        q2_menu_open(&c->menu);
-        q2_menu_goto(&c->menu, Q2_PAGE_FRONT_TITLE);
+    case Q2_MREQ_LOAD_GAME:
+        client_card_open(c, Q2_SAVE_UI_LOAD);
+        break;
+    case Q2_MREQ_MP_PROCEED:
+        (void)client_mp_start_from_menu(c);
+        break;
+    case Q2_MREQ_MP_LOAD_SETTINGS:
+        client_card_open(c, Q2_SAVE_UI_SETTINGS_LOAD);
+        break;
+    case Q2_MREQ_MP_SAVE_SETTINGS:
+        client_card_open(c, Q2_SAVE_UI_SETTINGS_SAVE);
         break;
     case Q2_MREQ_MISSION:
         /*
@@ -8100,7 +8556,7 @@ static void client_menu_requests(client *c)
                                 c->sim[0].level_time, c->sim[0].cur_dt);
         c->popup_raises++;
         client_play_sound(c, "msc_comp_up");
-        q2_menu_close(&c->menu);
+        client_menu_close(c);
         break;
     default:
         break;
@@ -8262,13 +8718,13 @@ static bool client_play_sound(client *c, const char *want)
      * 1.09375, about one and a half semitones. Playing at the bare header rate
      * makes every effect in the game 9.375% flat.
      *
-     * Q2_SFX_PITCH_DEFAULT is the default only. Individual sounds push their
-     * own, and the weapon path draws a fresh one per shot from a small range,
-     * which is what stops two shots being bit-identical clips — that per-sound
-     * table is not transcribed yet and is the remaining half of this.
+     * Q2_SFX_PITCH_DEFAULT is the default only. Individual retail request
+     * records can carry ranges and choose a randomising or direct start. Those
+     * byte-state primitives are transcribed in vag.c; this generic name-based
+     * caller cannot select a request role safely yet, so it uses the default.
      */
-    v->step   = (u32)(((u64)rate * Q2_SFX_PITCH_DEFAULT << 16) /
-                      (Q2_SFX_PITCH_UNITY * (u64)XA_SAMPLE_RATE));
+    v->step   = q2_sfx_step_16_16(rate, Q2_SFX_PITCH_DEFAULT,
+                                  XA_SAMPLE_RATE);
     v->vol    = vol;
     v->active = true;
     c->voice_started++;
@@ -8786,10 +9242,20 @@ static bool client_apply_save(client *c, const q2_save *s)
 {
     q2_result rc;
     s32 eye[3];
+    bool was_front_end = c->in_front_end;
+
+    /* Game saves are single-player. LOAD GAME can be entered from QFRONT, so
+     * clear that screen's state before the map load chooses fonts, HUD and
+     * input policy for the restored level. */
+    c->in_front_end = false;
+    c->mp_enabled   = false;
+    q2_menu_set_multiplayer(&c->menu, false);
+    q2_screen_set_layout(&c->screen, Q2_SCREEN_LAYOUT_ONE, 1);
 
     if (!client_load_zone(c, s->map, s->zone)) {
         Q2_ERROR("the save names %s zone %d, which will not load",
                  s->map, (int)s->zone);
+        c->in_front_end = was_front_end;
         return false;
     }
 
@@ -8862,18 +9328,127 @@ static void client_notify(client *c, const char *text)
 /* ------------------------------------------------------------------------- */
 /* The front end                                                              */
 /* ------------------------------------------------------------------------- */
+#define Q2_MP_SETTINGS_SCHEMA 1
+#define Q2_MP_SETTINGS_HEADER_WORDS 2
+#define Q2_MP_SETTINGS_SETUP_WORDS  6
+_Static_assert(Q2_MP_SETTINGS_HEADER_WORDS + Q2_SET_COUNT +
+                   Q2_MP_SETTINGS_SETUP_WORDS <= Q2_SETTINGS_VALUE_MAX,
+               "menu settings no longer fit the card settings payload");
+
+static void client_settings_pack(const client *c, q2_settings_blob *out)
+{
+    u32 i, at;
+
+    memset(out, 0, sizeof(*out));
+    out->value[0] = Q2_MP_SETTINGS_SCHEMA;
+    out->value[1] = Q2_SET_COUNT;
+    for (i = 0; i < Q2_SET_COUNT; i++)
+        out->value[Q2_MP_SETTINGS_HEADER_WORDS + i] = c->settings.v[i];
+
+    at = Q2_MP_SETTINGS_HEADER_WORDS + Q2_SET_COUNT;
+    out->value[at++] = c->menu.mp_setup.mode;
+    out->value[at++] = c->menu.mp_setup.players;
+    out->value[at++] = c->menu.mp_setup.arena;
+    out->value[at++] = c->menu.mp_setup.time_option;
+    out->value[at++] = c->menu.mp_setup.frag_option;
+    out->value[at++] = c->menu.mp_setup.round_option;
+    out->count = at;
+}
+
+static bool client_settings_unpack(client *c, const q2_settings_blob *in)
+{
+    q2_menu_mp_setup setup;
+    u32 stored, copy, at, i;
+
+    if (!in || in->count < Q2_MP_SETTINGS_HEADER_WORDS ||
+        in->value[0] != Q2_MP_SETTINGS_SCHEMA || in->value[1] < 0)
+        return false;
+
+    stored = (u32)in->value[1];
+    if (stored > Q2_SETTINGS_VALUE_MAX ||
+        in->count < Q2_MP_SETTINGS_HEADER_WORDS + stored +
+                    Q2_MP_SETTINGS_SETUP_WORDS)
+        return false;
+
+    copy = stored < Q2_SET_COUNT ? stored : Q2_SET_COUNT;
+    for (i = 0; i < copy; i++)
+        c->settings.v[i] = in->value[Q2_MP_SETTINGS_HEADER_WORDS + i];
+
+    at = Q2_MP_SETTINGS_HEADER_WORDS + stored;
+    setup.mode         = in->value[at++];
+    setup.players      = in->value[at++];
+    setup.arena        = in->value[at++];
+    setup.time_option  = in->value[at++];
+    setup.frag_option  = in->value[at++];
+    setup.round_option = in->value[at++];
+
+    if (setup.mode != Q2_MENU_MP_DEATHMATCH &&
+        setup.mode != Q2_MENU_MP_TEAM_DEATHMATCH &&
+        setup.mode != Q2_MENU_MP_VERSUS)
+        setup.mode = Q2_MENU_MP_DEATHMATCH;
+    if (setup.players < 2) setup.players = 2;
+    if (setup.players > Q2_MENU_MP_MAX_PLAYERS)
+        setup.players = Q2_MENU_MP_MAX_PLAYERS;
+    if (setup.arena < 0 || setup.arena >= Q2_MENU_MP_ARENA_COUNT)
+        setup.arena = 0;
+    if (setup.time_option < 0 ||
+        setup.time_option >= Q2_MENU_MP_TIME_OPTIONS)
+        setup.time_option = Q2_MENU_MP_TIME_DEFAULT;
+    if (setup.frag_option < 0 ||
+        setup.frag_option >= Q2_MENU_MP_FRAG_OPTIONS)
+        setup.frag_option = Q2_MENU_MP_FRAG_DEFAULT;
+    if (setup.round_option < 0 ||
+        setup.round_option >= Q2_MENU_MP_ROUND_OPTIONS)
+        setup.round_option = Q2_MENU_MP_ROUND_DEFAULT;
+
+    c->menu.mp_setup = setup;
+    client_apply_settings(c);
+    return true;
+}
+
+static void client_card_return(client *c)
+{
+    int page = c->card_return_page;
+
+    c->card_return_page = Q2_PAGE_NONE;
+    if (!c->in_front_end || page == Q2_PAGE_NONE)
+        return;
+
+    q2_menu_open(&c->menu);
+    q2_menu_goto(&c->menu, page);
+}
+
 static void client_card_open(client *c, q2_save_ui_mode mode)
 {
+    q2_settings_blob settings;
+
     if (mode == Q2_SAVE_UI_SAVE && !client_capture(c)) {
         client_notify(c, "CANNOT SAVE");
         return;
     }
 
+    c->card_return_page = Q2_PAGE_NONE;
+    if (c->in_front_end) {
+        if (mode == Q2_SAVE_UI_SETTINGS_SAVE ||
+            mode == Q2_SAVE_UI_SETTINGS_LOAD)
+            c->card_return_page = Q2_PAGE_FRONT_MULTI;
+        else if (mode == Q2_SAVE_UI_LOAD)
+            c->card_return_page = Q2_PAGE_FRONT_NEWLOAD;
+        else if (c->menu.open)
+            c->card_return_page = c->menu.page_id;
+    }
+
     c->card_mode = mode;
     if (mode == Q2_SAVE_UI_SAVE)
         q2_save_ui_open_save(&c->save_ui, &c->snapshot);
-    else
+    else if (mode == Q2_SAVE_UI_LOAD)
         q2_save_ui_open_load(&c->save_ui);
+    else if (mode == Q2_SAVE_UI_SETTINGS_SAVE) {
+        client_settings_pack(c, &settings);
+        q2_save_ui_open_settings_save(&c->save_ui, &settings);
+    } else {
+        q2_save_ui_open_settings_load(&c->save_ui);
+    }
 
     /* A fresh session: the cursor, the pad edge and the screen all start
      * clean, so the button that opened the front end cannot also pick a row. */
@@ -8882,7 +9457,7 @@ static void client_card_open(client *c, q2_save_ui_mode mode)
     c->card_menu.page = NULL;
     c->mcard_open   = true;
 
-    q2_menu_close(&c->menu);
+    client_menu_close(c);
     c->mission_open = false;
 }
 
@@ -8890,6 +9465,7 @@ static void client_card_close(client *c)
 {
     q2_save_ui_close(&c->save_ui);
     c->mcard_open = false;
+    client_card_return(c);
 }
 
 /*
@@ -8914,7 +9490,8 @@ static void client_card_rows(client *c)
         if (info->used) {
             snprintf(dst, Q2_MENU_TEXT_MAX, "%s", q2_save_ui_row(&c->save_ui, i));
             c->card_menu.disabled[i + 1] = 0;
-        } else if (c->card_mode == Q2_SAVE_UI_SAVE) {
+        } else if (c->card_mode == Q2_SAVE_UI_SAVE ||
+                   c->card_mode == Q2_SAVE_UI_SETTINGS_SAVE) {
             snprintf(dst, Q2_MENU_TEXT_MAX, "%d", i + 1);
             c->card_menu.disabled[i + 1] = 0;
         } else {
@@ -8968,14 +9545,22 @@ static void client_card_sync(client *c)
 static void client_card_finish(client *c)
 {
     q2_save loaded;
+    q2_settings_blob settings;
+    bool settings_mode = c->card_mode == Q2_SAVE_UI_SETTINGS_SAVE ||
+                         c->card_mode == Q2_SAVE_UI_SETTINGS_LOAD;
 
     switch (c->save_ui.status) {
     case Q2_SAVE_UI_SAVED:
-        client_notify(c, "GAME SAVED");
+        client_notify(c, settings_mode ? "SETTINGS SAVED" : "GAME SAVED");
         break;
 
     case Q2_SAVE_UI_LOADED:
-        if (q2_save_ui_take_loaded(&c->save_ui, &loaded)) {
+        if (settings_mode &&
+            q2_save_ui_take_settings(&c->save_ui, &settings)) {
+            bool ok = client_settings_unpack(c, &settings);
+            client_notify(c, ok ? "SETTINGS LOADED" : "LOAD FAILED");
+        } else if (!settings_mode &&
+                   q2_save_ui_take_loaded(&c->save_ui, &loaded)) {
             bool ok = client_apply_save(c, &loaded);
             q2_save_free(&loaded);
             client_notify(c, ok ? "GAME LOADED" : "LOAD FAILED");
@@ -8992,6 +9577,7 @@ static void client_card_finish(client *c)
     }
 
     c->mcard_open = false;
+    client_card_return(c);
 }
 
 static void client_card_frame(client *c)
@@ -9181,12 +9767,15 @@ static void client_write_shot(client *c, bool numbered)
     c->shots_written++;
     Q2_INFO("frame %ld -> %s", c->frame_index, path);
     Q2_INFO("  eye %d %d %d  yaw %d pitch %d roll %d  cell %d  "
-            "%u/%u quads, %u nodes, near %u back %u bounds %u flat %u"
-            " depth %u..%u ot %u",
+            "%u/%u quads, %u nodes, sort entities %u/%u (%u collapsed), "
+            "near %u back %u bounds %u flat %u depth %u..%u ot %u",
             c->cam.pos[0], c->cam.pos[1], c->cam.pos[2],
             c->cam.yaw, c->cam.pitch, c->cam.roll, c->sim[0].current_node,
             c->shot_stats.quads_emitted, c->shot_stats.quads_total,
             c->shot_stats.nodes_visited,
+            c->shot_stats.sort_entities_visible,
+            c->shot_stats.sort_entities,
+            c->shot_stats.sort_entities_degenerate,
             c->shot_stats.quads_rejected_near,
             c->shot_stats.quads_rejected_back,
             c->shot_stats.quads_rejected_bounds,
@@ -9369,8 +9958,10 @@ static void client_write_shot(client *c, bool numbered)
                 c->explosive_vis, c->explosive_sounds,
                 c->explosive_sounds_missed,
                 c->sim[0].explosive_models);
-        Q2_INFO("  entities  %u drawn (%u faces), %u could not resolve a model",
-                c->ent_drawn, c->ent_faces, c->ent_no_model);
+        Q2_INFO("  entities  %u drawn (%u faces, %u shadows),"
+                " %u could not resolve a model",
+                c->ent_drawn, c->ent_faces, c->ent_shadows,
+                c->ent_no_model);
         Q2_INFO("  script    %u strings, %u sounds, %u gated by ONKEYDO, "
                 "%u nodes hidden, %u summoned, %u teleports, %u timers, %u resumed,"
                 " %u records retired",
@@ -9383,7 +9974,7 @@ static void client_write_shot(client *c, bool numbered)
             char kinds[256];
             size_t at = 0;
 
-            kinds[0] = ' ';
+            kinds[0] = '\0';
             for (mi = 0; c->movers_ready && mi < c->movers.count; mi++) {
                 u8 pr = c->movers.movers[mi].prim;
                 const q2_uf_prim_info *pi =
@@ -9441,10 +10032,11 @@ static void client_write_shot(client *c, bool numbered)
                 if (c->movers.movers[mi].sealed)                 sealed++;
             }
             Q2_INFO("  movers    %u built, %u triggered by the script, "
-                    "%u tick-moves, %u sounds (%u hatch, %u not started), %u shot open",
+                    "%u tick-moves (%u conveyor writes), %u sounds "
+                    "(%u hatch, %u not started), %u shot open",
                     c->movers_ready ? c->movers.count : 0,
-                    c->mover_triggers, c->mover_moved, c->mover_sounds,
-                    c->rot_sounds, c->mover_sounds_missed,
+                    c->mover_triggers, c->mover_moved, c->conveyor_steps,
+                    c->mover_sounds, c->rot_sounds, c->mover_sounds_missed,
                     c->breakable_opened);
             Q2_INFO("  movers    %u part boxes solid, %u blocked now, "
                     "%u sealing their portal",
@@ -9517,13 +10109,13 @@ static void client_write_shot(client *c, bool numbered)
          * `by a door` figures are all zero is the entity pass not being
          * reached.
          */
-        Q2_INFO("  ai doors  %u sight lines blocked by a door, "
+        Q2_INFO("  ai solids %u sight lines blocked by a runtime solid, "
                 "%u steps stopped by one, %u corners standing on one; "
                 "%u projectiles stopped by one",
                 c->ai_world.stats.los_blocked_ent,
                 c->ai_world.stats.trace_blocked_ent,
                 c->ai_world.stats.bottom_on_ent,
-                q2_sim_proj_scan.stopped_on_mover);
+                q2_sim_proj_scan.stopped_on_entity);
     }
 }
 
@@ -9563,6 +10155,42 @@ static void client_bind_view_model(client *c)
     c->vw_model_ready = true;
     q2_vw_set_model(&c->vw, &c->vw_model);
     Q2_INFO("view weapon: %s", name);
+}
+
+static void client_bind_player_models(client *c)
+{
+    static const char *const name[Q2_MP_MAX_PLAYERS] = {
+        "Male2", "Male2red", "Male2purple", "Male2aqua"
+    };
+    int i;
+
+    memset(c->player_model_ok, 0, sizeof(c->player_model_ok));
+    memset(c->player_anim, 0, sizeof(c->player_anim));
+    c->player_anim_base_ok = false;
+    for (i = 0; i < Q2_MP_MAX_PLAYERS; i++)
+        c->player_anim[i].move = Q2_PMOVE_NONE;
+
+    if (!c->model_bank_ready)
+        return;
+
+    for (i = 0; i < Q2_MP_MAX_PLAYERS; i++) {
+        s32 index = q2_model_bank_find(&c->model_bank, name[i]);
+
+        if (index < 0 || q2_model_get(&c->model_bank, (u32)index,
+                                      &c->player_model[i]) != Q2_OK)
+            continue;
+        c->player_model_ok[i] = true;
+    }
+
+    c->player_anim_base_ok = c->player_model_ok[0] &&
+        c->player_model[0].hdr.num_parts <= 64;
+    if (c->mp_enabled && c->player_anim_base_ok) {
+        u32 n = 0;
+        for (i = 0; i < Q2_MP_MAX_PLAYERS; i++)
+            if (c->player_model_ok[i]) n++;
+        Q2_INFO("player models: animated Male2 plus %u colour bod%s",
+                n > 0 ? n - 1 : 0, n == 2 ? "y" : "ies");
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -9860,10 +10488,14 @@ static bool client_boot_load(client *c, const q2_boot_screen *s)
  */
 static void client_enter_front_end(client *c)
 {
+    c->mp_enabled   = false;
     c->in_front_end  = true;
     c->film_to_front = false;
     c->film_is_start = false;
     c->start_beat    = 0.0;
+    c->mp_scoreboard = false;
+    q2_menu_set_multiplayer(&c->menu, false);
+    q2_screen_set_layout(&c->screen, Q2_SCREEN_LAYOUT_ONE, 1);
 
     if (!client_name_eq(c->map, "QFRONT") &&
         !client_load_zone(c, "QFRONT", 0)) {
@@ -10353,7 +10985,7 @@ static void client_menu_frame(client *c)
     if (c->mouse_right && !c->mouse_right_prev && c->menu.depth == 0 &&
         (c->menu.page_id == Q2_PAGE_PAUSE_SP ||
          c->menu.page_id == Q2_PAGE_PAUSE_MP)) {
-        q2_menu_close(&c->menu);
+        client_menu_close(c);
         client_play_menu_sound(c, Q2_MSND_BACK);
         return;
     }
@@ -10382,6 +11014,7 @@ static void client_menu_frame(client *c)
                           c->menu.page_id == Q2_PAGE_FRONT_TITLE, true);
 
     client_menu_requests(c);
+    q2_prompt_sync_menu(&c->prompts, &c->menu, c->in_front_end);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -10429,12 +11062,15 @@ static s32 client_light_node(const client *c, int p)
 }
 
 /*
- * Which SortData stream this viewport reads — the camera's PrimaryColl cell.
+ * Which SortData stream this viewport reads — the byte offset carried by the
+ * camera's PrimaryColl cell.
  *
  * `current_node` cannot serve: it is the SECONDARY hull's cell, the movement
  * one, and the two hulls have different node counts in every zone (BASE1 zone 1
- * is 290 against 191). The stream count matches the PRIMARY hull exactly, so
- * the primary is what indexes the chunk.
+ * is 290 against 191). More importantly, the renderer itself indexes the
+ * PrimaryColl node array and loads `lh +28` at 0x80066AFC. That halfword is the
+ * exact byte offset into SortData; no reconstructed stream enumeration belongs
+ * in the live path.
  *
  * Resolved from the eye rather than kept on the player, because the free-fly
  * camera has no player and still has to draw the world in some order. The
@@ -10448,25 +11084,34 @@ static s32 client_sort_cell(client *c, int p)
     if (c->in_front_end || !c->sim[0].coll_primary_ready)
         return -1;
 
-    if (c->mp_enabled && p > 0 && p < Q2_MP_MAX_PLAYERS && c->sim_ready[p]) {
-        const q2_player *pl = &c->sim[0].player[p];
-        at[0] = pl->pos[0];
-        at[1] = q2_sim_origin_y(pl->pos[1]);
-        at[2] = pl->pos[2];
-    } else if (c->sim_enabled) {
-        const q2_player *pl = &c->sim[0].player[0];
-        at[0] = pl->pos[0];
-        at[1] = q2_sim_origin_y(pl->pos[1]);
-        at[2] = pl->pos[2];
-    } else {
-        at[0] = c->cam.pos[0];
-        at[1] = c->cam.pos[1];
-        at[2] = c->cam.pos[2];
-    }
+    /* 0x80038578 maps the owning entity's SecondaryCol cell into PrimaryColl,
+     * then traces from entity+0x54 to view+0. The result is therefore the cell
+     * containing the CAMERA, not the player's collision origin. At this point
+     * client_draw_view has already installed this viewport's camera (including
+     * the independent split-screen views), so query that position directly. */
+    (void)p;
+    at[0] = c->cam.pos[0];
+    at[1] = c->cam.pos[1];
+    at[2] = c->cam.pos[2];
 
     c->sort_cell = q2_coll_find_node(&c->sim[0].coll_primary, at,
                                      c->sort_cell, true);
     return c->sort_cell;
+}
+
+static bool client_sort_context(client *c, int p, u32 *out, u8 *area)
+{
+    q2_coll_node node;
+    s32 cell = client_sort_cell(c, p);
+
+    if (!out || !area || cell < 0 ||
+        !q2_collision_get_node(&c->sim[0].coll_primary, (u32)cell, &node) ||
+        node.sort_offset < 0)
+        return false;
+
+    *out = (u32)(u16)node.sort_offset;
+    *area = node.contents;
+    return true;
 }
 
 /*
@@ -10503,8 +11148,8 @@ static void client_draw_view(void *user, q2_screen *s, int p,
     c->cam.sort_range = c->ot_range > 0 ? c->ot_range : Q2_CAMERA_SORT_RANGE;
     /* The clip extent the linkers test every projected corner against —
      * 0x800B2C20's packed (clip_h << 16) | clip_w. */
-    c->cam.clip_w     = s->view[p].w;
-    c->cam.clip_h     = s->view[p].h;
+    c->cam.clip_w     = s->ctx.clip_w;
+    c->cam.clip_h     = s->ctx.clip_h;
 
     /*
      * In a split, each viewport is a different PLAYER, and until now every one
@@ -10568,22 +11213,21 @@ static void client_draw_view(void *user, q2_screen *s, int p,
      * culling": geometry does not vanish, it is painted in an arbitrary order
      * and the wrong surfaces win.
      *
-     * WHICH STREAM a viewport uses was open question 7a. It is the camera's
-     * cell — view+146, read at 0x80066AD4 — and the hull is PrimaryColl, which
-     * the disc settles outright: across BASE1, BASE2, BASE3, LAB, SECURITY,
-     * POWER2 and JAIL5, every zone carrying a SortData chunk holds EXACTLY as
-     * many streams as that zone's PrimaryColl has cells. Twenty of twenty, no
-     * near misses. `--zone-probe` prints the two counts side by side.
+     * WHICH STREAM a viewport uses is explicit. The camera cell at view+146 is
+     * read at 0x80066AD4, indexes the PrimaryColl 36-byte node records, and the
+     * following `lh +28` at 0x80066AFC supplies the SortData BYTE offset. The
+     * old equal-count observation was real but insufficient: enumerating the
+     * variable streams and assuming cell i meant stream i threw away the map's
+     * actual lookup table.
      *
      * A zone with no chunk keeps the depth fallback; several zone 0s ship an
      * empty one.
      */
     {
-        s32 cell = client_sort_cell(c, p);
-
-        if (c->sort_ready && c->use_sort && cell >= 0 &&
-            q2_sortdata_stream_offset(&c->sortdata, (u32)cell,
-                                      &c->zone.sort_offset)) {
+        if (c->sort_ready && c->use_sort &&
+            client_sort_context(c, p, &c->zone.sort_offset,
+                                &c->zone.sort_area) &&
+            c->zone.sort_offset < c->sortdata.size) {
             c->zone.sort = &c->sortdata;
         } else {
             c->zone.sort = NULL;
@@ -10595,6 +11239,8 @@ static void client_draw_view(void *user, q2_screen *s, int p,
     c->shot_stats = stats;
     c->cre_drawn  = 0;
     c->cre_faces  = 0;
+    c->player_drawn = 0;
+    c->player_faces = 0;
 
     /*
      * The map's items, into the table the world has just been built into — the
@@ -10653,6 +11299,7 @@ static void client_draw_view(void *user, q2_screen *s, int p,
         c->ent_drawn    += estats.drawn;
         c->ent_no_model += estats.no_model;
         c->ent_faces    += estats.faces_emitted;
+        c->ent_shadows  += estats.shadows_emitted;
     }
 
     /*
@@ -10683,6 +11330,8 @@ static void client_draw_view(void *user, q2_screen *s, int p,
             q2_model_pose pose[64];
             q2_model_anim clip;
             q2_light_env  cre_env;
+            q2_coll_node  area_node;
+            s32 cell = -1;
             bool posed = false;
 
             if (!m->in_use || !c->cre_model_ok[i])
@@ -10691,7 +11340,7 @@ static void client_draw_view(void *user, q2_screen *s, int p,
             {
                 const q2_model *mdl = &c->cre_model[i];
                 s32 frame = m->frame;
-                u32 within = 0;
+                u32 pose_tick = 0;
                 bool have_clip = false;
 
                 if (frame < 0)
@@ -10781,17 +11430,23 @@ static void client_draw_view(void *user, q2_screen *s, int p,
                             /*
                              * `pos` is in TENTHS of an animation frame, which
                              * is the engine's unit (0x8006B5D8 divides it by
-                             * ten). q2_model_anim_at walks in whole model
-                             * frames — the fallback below passes
-                             * `frame * Q2_CRE_TICKS_PER_FRAME`, three model
-                             * frames per AI frame — so the position has to come
-                             * down by ten. Passing tenths straight in overruns
-                             * the timeline and the walk fails on every creature,
-                             * silently, back to the length path.
+                             * ten). Keep it in that unit through the cursor and
+                             * the position-aware timeline walk: dividing here
+                             * used to discard exactly the remainder retail
+                             * supplies to its pose interpolator.
                              */
-                            have_clip = q2_model_anim_at_held(
-                                mdl, pos / Q2_MODEL_TICKS_PER_FRAME,
-                                &clip, &within, &pose_held);
+                        {
+                            s32 sample = client_model_anim_sample(
+                                &c->cre_anim[i], mv, 1u, (s32)pos,
+                                c->screen.dt, c->frame_index);
+
+                            if (sample < 0)
+                                sample = 0;
+                            if (mname)
+                                have_clip = q2_model_anim_at_position_held(
+                                    mdl, (u32)sample, &clip, &pose_tick,
+                                    &pose_held);
+                        }
                         if (have_clip && pose_held) c->pose_held++;
                         if (have_clip)      c->pose_by_name++;
                         else if (mname)     c->pose_name_no_pos++;
@@ -10811,68 +11466,69 @@ static void client_draw_view(void *user, q2_screen *s, int p,
                             have_clip = q2_model_anim_by_length(
                                 mdl, (u32)len * Q2_CRE_TICKS_PER_FRAME,
                                 client_move_ordinal(m, mv), &clip);
-                            within = (u32)into * Q2_CRE_TICKS_PER_FRAME;
-                            if (have_clip && within >= clip.frames)
-                                within = clip.frames ? clip.frames - 1 : 0;
+                            if (have_clip) {
+                                s32 sample = client_model_anim_sample(
+                                    &c->cre_anim[i], mv, 2u,
+                                    into * Q2_MODEL_POS_PER_MOVE_FRAME,
+                                    c->screen.dt, c->frame_index);
+                                u32 last = clip.frames
+                                    ? ((u32)clip.frames - 1u) *
+                                      Q2_MODEL_TICKS_PER_FRAME
+                                    : 0u;
+
+                                pose_tick = sample > 0 ? (u32)sample : 0u;
+                                if (pose_tick > last)
+                                    pose_tick = last;
+                            }
                         }
                     }
                 }
 
                 /* No move installed, or no clip of that length: the timeline
                  * walk, which is what every creature used before this. */
-                if (!have_clip && mdl->hdr.num_parts <= Q2PSX_ARRAY_COUNT(pose))
-                    have_clip = q2_model_anim_at(
-                        mdl, (u32)frame * Q2_CRE_TICKS_PER_FRAME,
-                        &clip, &within);
+                if (!have_clip && mdl->hdr.num_parts <= Q2PSX_ARRAY_COUNT(pose)) {
+                    s32 sample = client_model_anim_sample(
+                        &c->cre_anim[i], NULL, 3u,
+                        frame * Q2_MODEL_POS_PER_MOVE_FRAME,
+                        c->screen.dt, c->frame_index);
 
-                /*
-                 * AND `within` IS IN FRAMES WHERE `q2_model_pose_at` WANTS
-                 * TENTHS. Passing it straight through ran every creature's
-                 * animation at a TENTH of its extent.
-                 *
-                 * `q2_model_anim_at` and `_at_held` walk the clip chain in
-                 * whole model frames and hand back the offset in the same unit
-                 * (model.c: `if (tick < out->frames) *within = tick`). The
-                 * position that reaches them has already been divided by ten
-                 * above, for exactly that reason. `q2_model_pose_at` is the
-                 * other unit: it computes `duration = clip->frames * 10`,
-                 * clamps to `duration - 10`, and indexes `clip->offset + 8 +
-                 * (tick / 10) * 4`. The console agrees — 0x8006B520 clamps the
-                 * incoming position to `clip[0] - 10`, and the uniform path at
-                 * 0x8006BA70 is a magic divide by ten before a 4-byte index.
-                 * Ten position units are one model frame on both sides.
-                 *
-                 * So the Soldier's Death6 was asking for `within` 0, 3, 6 … 27
-                 * across its ten AI frames and being posed at model frames
-                 * 0, 0, 0, 0, 1, 1, 1, 2, 2, 2 — 2.7 of the clip's thirty. The
-                 * move still took exactly one second, which is why the AI trace
-                 * looked correct; what was wrong was how far through the
-                 * animation that second got. A body barely left its first pose
-                 * before the move ended and it froze there.
-                 *
-                 * NOT a death bug. The Soldier's Walk is a 21-frame clip over
-                 * seven AI frames and was getting 1.8 of them, so every
-                 * creature on the disc was near-frozen in every animation.
-                 *
-                 * This is the console's own arithmetic rather than a scale
-                 * factor: the console computes `within` in tenths directly, and
-                 * `(pos/10 - sum(frames)) * 10` equals `pos - 10*sum(frames)`
-                 * whenever `pos` is a multiple of ten — which it always is here,
-                 * because `pos = start*5 + 30*into` and every block-D start is
-                 * even. The port's own inspector has had it right all along
-                 * (tools/q2psx-inspect/main.c multiplies by
-                 * Q2_MODEL_TICKS_PER_FRAME), which is what made the two
-                 * disagree about the same model.
-                 */
+                    if (sample < 0)
+                        sample = 0;
+                    have_clip = q2_model_anim_at_position(
+                        mdl, (u32)sample, &clip, &pose_tick);
+                }
+
+                /* `pose_tick` remains in retail's 1/10-frame unit all the way
+                 * into q2_model_pose_at. At a 30 Hz render clock the targets
+                 * are 0,30,60… while the samples are 0,10,20,30…; variable-rate
+                 * translations and rotations therefore receive the same 0..9
+                 * interpolation remainder the executable retains at
+                 * 0x8006B5D8. */
                 if (have_clip)
                     posed = (q2_model_pose_at(mdl, &clip,
-                                              within * Q2_MODEL_TICKS_PER_FRAME,
+                                              pose_tick,
                                               pose) == Q2_OK);
             }
 
             q2_model_instance_init(&inst);
             inst.model         = &c->cre_model[i];
             inst.pose          = posed ? pose : NULL;
+
+            if (c->sim[0].coll_ready)
+                cell = q2_coll_find_node(&c->sim[0].coll,
+                                         m->pos, -1, true);
+            if (cell >= 0 &&
+                q2_collision_get_node(&c->sim[0].coll,
+                                      (u32)cell, &area_node))
+                inst.sort_area = area_node.contents & 0x7F;
+            {
+                int axis;
+                for (axis = 0; axis < 3; axis++) {
+                    inst.sort_bounds_min[axis] = m->pos[axis] + m->mins[axis];
+                    inst.sort_bounds_max[axis] = m->pos[axis] + m->maxs[axis];
+                }
+                inst.sort_bounds_valid = true;
+            }
 
             /*
              * The lights reaching this creature. The item draw gets these
@@ -10882,7 +11538,6 @@ static void client_draw_view(void *user, q2_screen *s, int p,
              */
             if (c->lights_ready) {
                 q2_light_set  set;
-                s32 cell = q2_coll_find_node(&c->sim[0].coll, m->pos, -1, true);
                 /*
                  * The ambient the entity carries, which used to be NULL — so a
                  * vertex none of the three gathered lights reached came out
@@ -10892,7 +11547,7 @@ static void client_draw_view(void *user, q2_screen *s, int p,
                  */
                 static const u8 cre_glow[3] = { 0x30, 0x30, 0x30 };
 
-                q2_light_gather(&set, &c->light_world, m->pos, cell, false);
+                q2_light_gather(&set, &c->light_world, m->pos, cell, 0);
                 q2_light_env_build(&cre_env, &set, Q2_LIGHT_ONE,
                                    Q2_LIGHT_ONE, cre_glow);
                 inst.light = &cre_env;
@@ -11004,6 +11659,94 @@ static void client_draw_view(void *user, q2_screen *s, int p,
     }
 
     /*
+     * The other players — actual articulated world bodies, not only combat
+     * spheres. Retail's Male2 has ten named moves and the same model position
+     * path creatures use, including the sub-frame remainder. Each viewport
+     * omits its own first-person body and sees everybody else's.
+     */
+    if (c->mp_enabled && c->player_anim_base_ok) {
+        int pi;
+
+        for (pi = 0; pi < c->mp.player_count && pi < Q2_MP_MAX_PLAYERS; pi++) {
+            const q2_player *pl = &c->sim[0].player[pi];
+            const q2_player_death *death = &c->death[pi];
+            const q2_model *body;
+            q2_model_pose pose[64];
+            q2_model_instance inst;
+            q2_model_draw_stats st;
+            q2_light_env env;
+            q2_coll_node area_node;
+            s32 at[3];
+            s32 cell = -1;
+            bool posed;
+
+            if (pi == p || (pi > 0 && !c->sim_ready[pi]) ||
+                death->stage == Q2_PDEATH_GIBBED ||
+                death->stage == Q2_PDEATH_GONE)
+                continue;
+
+            body = c->player_model_ok[pi] ? &c->player_model[pi]
+                                          : &c->player_model[0];
+            if (body->hdr.num_parts > Q2PSX_ARRAY_COUNT(pose))
+                continue;
+
+            posed = client_player_pose(c, pi, pose);
+
+            q2_model_instance_init(&inst);
+            inst.model  = body;
+            inst.pose   = posed ? pose : NULL;
+            inst.origin[0] = pl->pos[0];
+            inst.origin[1] = pl->pos[1] - body->hdr.ext2;
+            inst.origin[2] = pl->pos[2];
+            inst.yaw       = pl->yaw;
+            /* body_fade spends retail entity+0xFC, which is a lighting
+             * intensity rather than a geometric transform. */
+            inst.scale     = Q2_ONE_12;
+            inst.clut4_count_a = c->clut4_count_a;
+            inst.tpage         = &c->render.tpage;
+
+            at[0] = pl->pos[0];
+            at[1] = q2_sim_origin_y(pl->pos[1]);
+            at[2] = pl->pos[2];
+            if (c->sim[0].coll_ready)
+                cell = q2_coll_find_node(&c->sim[0].coll,
+                                         at, -1, true);
+            if (cell >= 0 &&
+                q2_collision_get_node(&c->sim[0].coll,
+                                      (u32)cell, &area_node))
+                inst.sort_area = area_node.contents & 0x7F;
+            {
+                int axis;
+                for (axis = 0; axis < 3; axis++) {
+                    inst.sort_bounds_min[axis] =
+                        at[axis] - Q2_SWEEP_HALF_EXTENT;
+                    inst.sort_bounds_max[axis] =
+                        at[axis] + Q2_SWEEP_HALF_EXTENT;
+                }
+                inst.sort_bounds_valid = true;
+            }
+
+            if (c->lights_ready) {
+                q2_light_set set;
+                static const u8 glow[3] = { 0x30, 0x30, 0x30 };
+
+                q2_light_gather(&set, &c->light_world, at, cell, 0);
+                q2_light_env_build(&env, &set,
+                                   death->stage == Q2_PDEATH_FADING
+                                       ? death->scale : Q2_LIGHT_ONE,
+                                   Q2_LIGHT_ONE, glow);
+                inst.light = &env;
+            }
+
+            q2_model_build_ot(&inst, &c->cam, ot, gte, &st);
+            if (st.faces_emitted) {
+                c->player_drawn++;
+                c->player_faces += st.faces_emitted;
+            }
+        }
+    }
+
+    /*
      * Effects go into the SAME table as the world, which is the whole point of
      * an ordering table: a spark behind a crate sorts behind it because both
      * are in one list, not because anything tested them against each other.
@@ -11026,6 +11769,10 @@ static void client_draw_view(void *user, q2_screen *s, int p,
      * is inference rather than transcription.
      */
     c->proj_prims += q2_projectiles_build_ot(&c->sim[0].combat.projectiles,
+                                             c->sim[0].coll_primary_ready
+                                                 ? &c->sim[0].coll_primary
+                                                 : (c->sim[0].coll_ready
+                                                     ? &c->sim[0].coll : NULL),
                                              &c->cam, ot, gte);
 
     /*
@@ -11051,10 +11798,22 @@ static void client_draw_view(void *user, q2_screen *s, int p,
     if (c->icons_ready && c->menu_font_ready && c->menu_font.icons_resident &&
         !c->mission_open && !c->endmis_open && !c->credits_open &&
         !c->mcard_open) {
-        const q2_inventory *inv = &c->sim[0].combat.inv;
-        /* The LIVE weapon, which combat owns — 1-based, 0 for none. */
-        int weapon = c->sim[0].combat.weapon_id;
+        q2_statusbar *bar = &c->sbar[(p >= 0 && p < Q2_MP_MAX_PLAYERS) ? p : 0];
+        q2_inventory *inv;
+        q2_sbar_layout bar_layout;
+        int weapon;
         int ammo = 0;
+
+        /* Multiplayer parks every non-current player's combat half in its own
+         * slot. The old bar always read the live slot, so every viewport showed
+         * player zero's health and weapon. Read the owner of this viewport. */
+        if (p == c->sim[0].cur_player) {
+            inv = &c->sim[0].combat.inv;
+            weapon = c->sim[0].combat.weapon_id;
+        } else {
+            inv = &c->sim[0].pcombat[p].inv;
+            weapon = c->sim[0].pcombat[p].weapon_id;
+        }
 
         if (weapon > 0 && weapon < Q2_WEAPON_COUNT) {
             s8 kind = q2_weapon_ammo[weapon];
@@ -11062,12 +11821,22 @@ static void client_draw_view(void *user, q2_screen *s, int p,
                 ammo = inv->ammo[kind];
         }
 
-        q2_statusbar_anchor(&c->sbar, s->view[p].sbar_x, s->view[p].sbar_y);
-        c->sbar.players = s->view_count > 0 ? s->view_count : 1;
-        c->sbar.health  = inv->health;
-        c->sbar.armour  = inv->armour;
-        c->sbar.ammo    = (s16)ammo;
-        c->sbar.weapon  = weapon;
+        switch (s->layout) {
+        case Q2_SCREEN_LAYOUT_TWO_H: bar_layout = Q2_SBAR_LAYOUT_TWO_H; break;
+        case Q2_SCREEN_LAYOUT_TWO_V: bar_layout = Q2_SBAR_LAYOUT_TWO_V; break;
+        case Q2_SCREEN_LAYOUT_QUAD:  bar_layout = Q2_SBAR_LAYOUT_QUAD;  break;
+        default:                     bar_layout = Q2_SBAR_LAYOUT_ONE;  break;
+        }
+
+        q2_statusbar_anchor(bar, s->view[p].sbar_x, s->view[p].sbar_y);
+        q2_statusbar_layout(bar, bar_layout, p, s->disp.height);
+        bar->players = s->view_count > 0 ? s->view_count : 1;
+        bar->health  = inv->health;
+        bar->armour  = inv->armour;
+        bar->ammo    = (s16)ammo;
+        bar->frags   = (c->mp_enabled && p < c->mp.player_count)
+                           ? c->mp.frags[p] : 0;
+        bar->weapon  = weapon;
 
         /*
          * The weapon strip's two slots. The console reads them out of a record
@@ -11091,8 +11860,8 @@ static void client_draw_view(void *user, q2_screen *s, int p,
                 if (next == cur && (inv->weapons & (1u << hi)))
                     next = hi;
             }
-            c->sbar.strip[0] = (u8)(prev > 0 ? prev : 0);
-            c->sbar.strip[1] = (u8)(next > 0 ? next : 0);
+            bar->strip[0] = (u8)(prev > 0 ? prev : 0);
+            bar->strip[1] = (u8)(next > 0 ? next : 0);
         }
 
         /*
@@ -11113,11 +11882,11 @@ static void client_draw_view(void *user, q2_screen *s, int p,
          * rendered-frame count at 30 Hz, which made the low-value blink and
          * the armour alternation ten times too slow.
          */
-        c->sbar.health_icon = Q2_SBAR_ICON_HEALTH;
-        c->sbar.cells       = inv->ammo[Q2_AMMO_CELLS];
-        c->sbar.ticks       = (u32)c->sim[0].level_time;
-        q2_statusbar_armour_state(&c->sbar, inv->flags);
-        q2_statusbar_powerup_state(&c->sbar, inv);
+        bar->health_icon = Q2_SBAR_ICON_HEALTH;
+        bar->cells       = inv->ammo[Q2_AMMO_CELLS];
+        bar->ticks       = (u32)c->sim[0].level_time;
+        q2_statusbar_armour_state(bar, inv->flags);
+        q2_statusbar_powerup_state(bar, inv);
 
         /*
          * WHAT WAS JUST PICKED UP, which nothing has ever drawn.
@@ -11136,18 +11905,14 @@ static void client_draw_view(void *user, q2_screen *s, int p,
          * field walk that draws every icon.
          *
          * `q2_item_pickup_caption` mutates — the expiry clears `last_item` in
-         * place, which is where the console does it too. This port has ONE
-         * inventory behind every viewport, so in a split the first viewport
-         * drawn does that clearing and the others see it already done; that
-         * costs the caption a single frame in the other panes on the tick it
-         * dies, and is the same single-inventory limitation the counters above
-         * already have.
+         * place, which is where the console does it too. Only the one-player
+         * hook calls this sub-draw; all three split hooks omit it.
          */
-        {
+        if (bar_layout == Q2_SBAR_LAYOUT_ONE) {
             const char *pickup_name = NULL;
             u8          pickup_icon = 0;
 
-            if (q2_item_pickup_caption(&c->sim[0].combat.inv,
+            if (q2_item_pickup_caption(inv,
                                        c->sim[0].level_time,
                                        c->item_table_ready ? &c->item_table
                                                            : NULL,
@@ -11156,7 +11921,7 @@ static void client_draw_view(void *user, q2_screen *s, int p,
             else
                 q2_hud_pickup(&c->hud, NULL);
 
-            c->sbar.pickup_icon = pickup_icon;
+            bar->pickup_icon = pickup_icon;
 
             if (c->hud_font_ready) {
                 q2_hud_ctx pctx;
@@ -11181,9 +11946,12 @@ static void client_draw_view(void *user, q2_screen *s, int p,
                  */
                 q2_hud_pickup_build_ot(&c->hud, &c->hud_font, &pctx, ot, 0);
             }
+        } else {
+            bar->pickup_icon = 0;
+            q2_hud_pickup(&c->hud, NULL);
         }
 
-        q2_statusbar_build_ot(&c->sbar, c->menu_font.tpage_icons,
+        q2_statusbar_build_ot(bar, c->menu_font.tpage_icons,
                               c->menu_font.clut_text, ot,
                               q2_screen_view_otz(s, p, 0), 0, 0);
     }
@@ -11252,23 +12020,19 @@ static void client_draw_view(void *user, q2_screen *s, int p,
         proto.bucket_override = (s32)q2_screen_view_otz(s, p, 1);
 
         /*
-         * AND THE WORLD LIGHTS IT, which nothing did.
+         * THE WORLD LIGHT BRANCH, selected by a SIGNED test.
          *
-         * The gun in the hands is a model in the world's own table — that is
-         * the whole reason it is a model and not a blit — but it was the only
-         * one drawn with no light attached, so it kept `q2_model_instance`'s
-         * neutral 128 tint and came out flat: the same brightness in a dark
-         * corridor as under a lamp, while every creature and item beside it
-         * shaded. It is gathered exactly as a creature is, at the player's own
-         * position and in the cell the player stands in, so the gun and the
-         * monster three feet in front of it are lit by the same three lamps.
+         * 0x8004F750 writes 1 to the viewmodel entity's +0xF4, and 0x8006B040
+         * tests it with `bgez`: non-negative takes the ordinary world dynamic
+         * list and static lamps; negative alone reaches the alternate list.
+         * Reading the halfword as a boolean inverted the branch and produced a
+         * dark grey gun that the retail capture immediately falsified.
          *
-         * The glow is the spawn default the entity path uses (0x80058944 stores
-         * "000", 0x30 a component), so an unlit vertex lands on a dim grey
-         * rather than pure black — the same floor creatures get.
+         * That colour is 0x40 per component, copied into +0x2AC by the entity
+         * allocator at 0x8006C1D8..0x8006C1FC.  The old gather mechanism was
+         * right; its guessed 0x30 floor was not.
          */
         if (c->lights_ready) {
-            static const u8 vw_glow[3] = { 0x30, 0x30, 0x30 };
             q2_light_set set;
             s32 at[3];
 
@@ -11277,9 +12041,9 @@ static void client_draw_view(void *user, q2_screen *s, int p,
             at[2] = c->sim[0].player[0].pos[2];
 
             q2_light_gather(&set, &c->light_world, at,
-                            client_light_node(c, p), false);
-            q2_light_env_build(&vw_env, &set, Q2_LIGHT_ONE, Q2_LIGHT_ONE,
-                               vw_glow);
+                            client_light_node(c, p), c->vw.light_selector);
+            q2_light_env_build(&vw_env, &set, c->vw.scale, c->vw.fade,
+                               c->vw.glow);
             proto.light = &vw_env;
         }
 
@@ -11434,6 +12198,7 @@ static void client_frame(client *c)
         mo.view_w   = c->width < Q2_MENU_SCREEN_W ? c->width
                                                   : Q2_MENU_SCREEN_W;
         q2_menu_build_ot(&c->menu, &c->ot, &mo);
+        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot, mo.bucket);
     }
 
     /*
@@ -11602,7 +12367,8 @@ static void client_frame(client *c)
                             &c->ot, 0);
         /* And the press that leaves it, on the same bar the briefing and the
          * placard use. See where the board is raised. */
-        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot, 1);
+        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot,
+                           psx_ot_depth_bucket(&c->ot, 0));
     }
 
     /*
@@ -11623,7 +12389,8 @@ static void client_frame(client *c)
         q2_hud_pen_default(&pen);
         q2_endmission_build_ot(&c->endmis, &c->hud_font, &c->menu_font,
                                &ctx, &pen, &c->ot, 2, 1, 0);
-        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot, 1);
+        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot,
+                           psx_ot_depth_bucket(&c->ot, 0));
     }
 
     if (c->briefing_open && !c->endmis_open &&
@@ -11635,7 +12402,8 @@ static void client_frame(client *c)
         q2_hud_pen_default(&pen);
         q2_briefing_build_ot(&c->briefing, &c->hud_font, &c->menu_font,
                              &ctx, &pen, &c->ot, 2, 1, 0);
-        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot, 1);
+        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot,
+                           psx_ot_depth_bucket(&c->ot, 0));
     }
 
     /*
@@ -11663,7 +12431,8 @@ static void client_frame(client *c)
         q2_hud_pen_default(&pen);
         q2_briefing_build_ot(&view, &c->hud_font, &c->menu_font,
                              &ctx, &pen, &c->ot, 2, 1, 0);
-        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot, 1);
+        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot,
+                           psx_ot_depth_bucket(&c->ot, 0));
     }
 
     /* The prompts animate whether or not anything is showing them, which is
@@ -11821,8 +12590,8 @@ static void usage(void)
            "                zone gates leads and whether it lands anywhere\n");
     printf("  --ot-range N  how far the depth sort reaches, in world units\n"
            "                (default %d)\n", Q2_CAMERA_SORT_RANGE);
-    printf("  --sort-data   order the world from the zone's authored SortData\n"
-           "                stream instead of from depth (experimental)\n");
+    printf("  --sort-data   use the zone's authored SortData (the default)\n");
+    printf("  --depth-sort  diagnostic fallback: derive world order from depth\n");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -12060,11 +12829,10 @@ static void client_zone_probe(client *c, const char *map)
         }
 
         /*
-         * The SortData stream count against the two things that could be
-         * indexing it. The console picks a viewport's stream from the camera's
-         * CELL (view+146, 0x80066AD4), so if the count matches the collision
-         * hull's node count the mapping is settled and the chunk stops being
-         * opt-in — see open question 7a.
+         * SortData census beside both hulls. This no longer infers a mapping:
+         * the renderer loads the PrimaryColl cell selected by view+146 and
+         * reads that on-disc record's exact byte offset at +28. Tiled stream
+         * count remains useful here only as a format diagnostic.
          */
         {
             q2_sortdata sd;
@@ -12141,6 +12909,10 @@ int main(int argc, char **argv)
     u64 last;
 
     memset(&c, 0, sizeof(c));
+    /* PrimaryColl cell +28 carries the exact SortData byte offset used by the
+     * retail renderer. Keeping the authored order on is therefore the parity
+     * path; the old depth mapping remains an explicit diagnostic. */
+    c.use_sort = true;
     /* Deathmatch settings, applied after the map loads. -1 keeps the
      * shipped default the session initialiser installs. */
     q2_mp_mode mp_mode    = Q2_MP_DEATHMATCH;
@@ -12176,6 +12948,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--watch"))                 c.watch = true;
         else if (!strcmp(argv[i], "--zone-probe"))            zone_probe = true;
         else if (!strcmp(argv[i], "--sort-data"))             c.use_sort = true;
+        else if (!strcmp(argv[i], "--depth-sort"))            c.use_sort = false;
         else if (!strcmp(argv[i], "--no-autoswitch"))         c.no_autoswitch = true;
         else if (!strcmp(argv[i], "--god"))                   c.god = true;
         else if (!strcmp(argv[i], "--continues") && i + 1 < argc)
@@ -12641,14 +13414,16 @@ no_window:
     /* The status bar's tables, from the same executable. */
     c.icons_ready = (q2_icon_tables_load(&c.icons, c.disc, &c.build) == Q2_OK);
     if (c.icons_ready)
-        q2_statusbar_init(&c.sbar, &c.icons, 1);
+        for (i = 0; i < Q2_MP_MAX_PLAYERS; i++)
+            q2_statusbar_init(&c.sbar[i], &c.icons, 1);
     /*
      * The palette bank, so the bar draws each sprite in its own colours. The
      * bank is already in VRAM by this point — the menu font uploads it — so
      * this hands over the clut ids, not the pixels.
      */
     if (c.icons_ready && c.hud_tables_ready)
-        q2_statusbar_set_palettes(&c.sbar, &c.hud_tables);
+        for (i = 0; i < Q2_MP_MAX_PLAYERS; i++)
+            q2_statusbar_set_palettes(&c.sbar[i], &c.hud_tables);
     else
         Q2_WARN("no status-bar tables for this build");
     if (!c.hud_tables_ready)
@@ -12742,45 +13517,17 @@ no_window:
      * the test suite and nowhere else.
      */
     if (c.mp_enabled) {
-        q2_mp_session_init(&c.mp, mp_mode, mp_players);
-        if (mp_frags != -2)
-            c.mp.frag_limit = mp_frags;
-        if (mp_minutes != -2)
-            c.mp.time_limit = mp_minutes;
-        c.mp_rng_state = 0x13572468u;
+        s16 frag = (mp_frags != -2)
+                       ? mp_frags
+                       : q2_mp_frag_options[Q2_MP_FRAG_OPTION_DEFAULT];
+        s16 time = (mp_minutes != -2)
+                       ? mp_minutes
+                       : (mp_mode == Q2_MP_VERSUS
+                              ? Q2_MP_NO_LIMIT
+                              : q2_mp_time_options[Q2_MP_TIME_OPTION_DEFAULT]);
 
-        /*
-         * The split the session implies. The layout is chosen by the PLAYER
-         * COUNT at 0x800B3356 through the jump table at 0x800AC90C: one or none
-         * is full screen, two is a split whose axis is the HORIZONTAL SPLIT
-         * setting, three is the quad layout with the view count forced to three
-         * (0x8003FAE4), and four is the quad. Until now the client installed
-         * ONE and left every other layout to an F5 debug cycle.
-         */
-        {
-            q2_screen_layout lay = Q2_SCREEN_LAYOUT_ONE;
-            int views = c.mp.player_count;
-
-            if (views < 1)
-                views = 1;
-
-            if (views == 2)
-                lay = c.settings.v[Q2_SET_HORIZONTAL_SPLIT]
-                          ? Q2_SCREEN_LAYOUT_TWO_H : Q2_SCREEN_LAYOUT_TWO_V;
-            else if (views >= 3)
-                lay = Q2_SCREEN_LAYOUT_QUAD;
-
-            q2_screen_set_layout(&c.screen, lay, views);
-            Q2_INFO("multiplayer: %s, %d viewport%s",
-                    q2_screen_layout_name(lay), c.screen.view_count,
-                    c.screen.view_count == 1 ? "" : "s");
-        }
-
-        Q2_INFO("multiplayer: %s, %d players, frag limit %d, time limit %d min"
-                "%s", q2_mp_mode_name(mp_mode), c.mp.player_count,
-                c.mp.frag_limit, c.mp.time_limit,
-                q2_mp_mode_selectable(mp_mode) ? ""
-                    : "  (this mode is CUT — the front end cannot select it)");
+        client_mp_configure(&c, mp_mode, mp_players, frag, time,
+                            q2_mp_round_options[Q2_MP_ROUND_OPTION_DEFAULT]);
     }
 
     /*
@@ -12861,7 +13608,7 @@ no_window:
      * front end so nothing is drawn on top of it. */
     if (c.film_arg) {
         if (client_film_start(&c, c.film_arg)) {
-            q2_menu_close(&c.menu);
+            client_menu_close(&c);
             c.in_front_end = false;
         } else {
             fprintf(stderr, "no such movie: %s\n", c.film_arg);
@@ -12893,7 +13640,7 @@ no_window:
                                                       Q2_LB_CREDITS_MAX);
             c.credits_open = c.credits_count > 0;
             if (c.credits_open)
-                q2_menu_close(&c.menu);
+                client_menu_close(&c);
             Q2_INFO("credits: %u lines", c.credits_count);
         }
     }
@@ -12985,7 +13732,7 @@ no_window:
                         q2_menu_open(&c.menu);
                     }
                     else if (c.menu.depth == 0)
-                        q2_menu_close(&c.menu);
+                        client_menu_close(&c);
                     break;
                 case SDLK_F12:
                     /*
@@ -12996,7 +13743,7 @@ no_window:
                      */
                     c.briefing_open = !c.briefing_open;
                     if (c.briefing_open) {
-                        c.menu.open = false;
+                        client_menu_close(&c);
                         c.mission_open = false;
                         q2_prompt_show(&c.prompts, Q2_PROMPT_BACK, 216);
                     } else {
@@ -13311,7 +14058,7 @@ no_window:
         if (c.death_abandoned) {
             c.death_abandoned = false;
             c.death_abandon   = 0;
-            q2_menu_close(&c.menu);
+            client_menu_close(&c);
             client_enter_front_end(&c);
         }
 
@@ -13435,7 +14182,7 @@ no_window:
              * the board's prompt down with it if the player reached the exit
              * while it was still up. */
             c.briefing_open     = false;
-            q2_menu_close(&c.menu);
+            client_menu_close(&c);
             {
                 int rs = 0, rst = 0, rk = 0, rkt = 0, rw, rows = 0;
 
@@ -13565,13 +14312,15 @@ no_window:
 
         if (c.fire_triggers && c.sim[0].triggers.count &&
             (long)c.frame_index >= c.fire_at_frame) {
-            u32 i, fired = 0;
+            u32 trigger_index, fired = 0;
 
             c.fire_triggers = false;
-            for (i = 0; i < c.sim[0].triggers.count; i++) {
+            for (trigger_index = 0;
+                 trigger_index < c.sim[0].triggers.count;
+                 trigger_index++) {
                 q2_trigger tr;
 
-                if (!q2_trigger_get(&c.sim[0].triggers, i, &tr))
+                if (!q2_trigger_get(&c.sim[0].triggers, trigger_index, &tr))
                     continue;
                 if (tr.event_offset == Q2_TRIGGER_NO_EVENT)
                     continue;

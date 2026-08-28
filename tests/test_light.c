@@ -191,6 +191,42 @@ static void test_ranking(void)
 }
 
 /* ------------------------------------------------------------------------- */
+static void test_signed_f4_branch(void)
+{
+    q2_light_world world;
+    q2_light_set set;
+    const q2_light_slot *slot;
+    s32 origin[3] = { 0, 0, 0 };
+
+    printf("the +0xF4 lighting branch is signed\n");
+
+    memset(&world, 0, sizeof(world));
+    make_light(&world.dynamic_world[0], 0, 0, 100,
+               255, 0, 0, 1000);
+    make_light(&world.dynamic_view[0], 0, 0, 100,
+               0, 0, 255, 1000);
+    world.dynamic_world_count = 1;
+    world.dynamic_view_count  = 1;
+
+    /* The viewmodel constructor writes literal +1.  0x8006B040 is `bgez`, so
+     * +1 must retain the world light rather than behaving like a true flag. */
+    q2_light_gather(&set, &world, origin, 0, 1);
+    slot = &set.slot[set.rank[0]];
+    check(slot->rgb[0] > 0 && slot->rgb[2] == 0,
+          "+1 takes the red world list");
+
+    q2_light_gather(&set, &world, origin, 0, 0);
+    slot = &set.slot[set.rank[0]];
+    check(slot->rgb[0] > 0 && slot->rgb[2] == 0,
+          "zero also takes the world list");
+
+    q2_light_gather(&set, &world, origin, 0, -1);
+    slot = &set.slot[set.rank[0]];
+    check(slot->rgb[0] == 0 && slot->rgb[2] > 0,
+          "only a negative value takes the blue alternate list");
+}
+
+/* ------------------------------------------------------------------------- */
 static void test_env(void)
 {
     q2_light_set set;
@@ -239,6 +275,29 @@ static void test_env(void)
         check(len > 6000 * 6000 && len < 10000 * 10000,
               "the light direction is scaled unit length");
     }
+
+    /* +0xFC/+0xFE are lighting factors, not a model transform. Halving either
+     * one halves both the directional rows and the ambient back colour. The
+     * geometry path has no reader of either field. */
+    q2_light_env_build(&env, &set, Q2_LIGHT_ONE / 2, Q2_LIGHT_ONE, glow);
+    check_eq_i(env.back[0], glow[0] / 2,
+               "half +0xFC halves the ambient red");
+    check_eq_i(env.back[1], glow[1] / 2,
+               "half +0xFC halves the ambient green");
+    {
+        s32 len = 0;
+        int c;
+        for (c = 0; c < 3; c++)
+            len += (s32)env.dir[0][c] * env.dir[0][c];
+        check(len > 3000 * 3000 && len < 5000 * 5000,
+              "half +0xFC halves the light-matrix row");
+    }
+
+    q2_light_env_build(&env, &set, Q2_LIGHT_ONE, 0, glow);
+    check_eq_i(env.back[0], 0, "zero +0xFE blackens the ambient");
+    check_eq_i(env.dir[0][0], 0, "zero +0xFE clears light row x");
+    check_eq_i(env.dir[0][1], 0, "zero +0xFE clears light row y");
+    check_eq_i(env.dir[0][2], 0, "zero +0xFE clears light row z");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -887,6 +946,7 @@ int main(void)
     test_attenuation();
     test_wrapping_delta();
     test_ranking();
+    test_signed_f4_branch();
     test_env();
     test_normalise();
     test_ncs();

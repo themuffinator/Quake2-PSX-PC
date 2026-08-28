@@ -40,6 +40,7 @@ typedef enum psx_prim_kind {
     PSX_PRIM_TILE,     /* untextured rectangle              */
     PSX_PRIM_TPAGE,    /* draw-mode change                  */
     PSX_PRIM_MOVE,     /* VRAM -> VRAM rectangle copy       */
+    PSX_PRIM_DRAW_ENV, /* clipped-region draw environment   */
     PSX_PRIM_KIND_COUNT
 } psx_prim_kind;
 
@@ -160,13 +161,14 @@ typedef struct psx_prim {
 /* ------------------------------------------------------------------------- */
 /* Ordering table                                                             */
 /*                                                                            */
-/* The PlayStation has no depth buffer. Instead, each primitive is appended to */
-/* a bucket indexed by its average Z, and the buckets are walked from far to   */
-/* near. Two consequences the port must preserve:                             */
+/* The PlayStation has no depth buffer. Instead, each emitter links packets to */
+/* an ordering-table bucket, and the buckets are walked from far to near. Two  */
+/* consequences the port must preserve:                                       */
 /*                                                                            */
-/*   - Per-polygon sorting only. Intersecting polygons pop, and long polygons  */
-/*     sort by their average depth, so they can incorrectly occlude. This is   */
-/*     visible in the original and must remain visible.                       */
+/*   - There is no per-pixel visibility. Fallback polygons may use average Z,  */
+/*     authored world runs use SortData buckets, and retail's regional sorter  */
+/*     keeps each model or deferred object chain atomic. Intersections can pop */
+/*     at whichever granularity that emitter supplies.                        */
 /*   - Within one bucket, order is defined by insertion (the hardware walks a  */
 /*     singly-linked list built by prepending, so *last in draws first*).      */
 /*                                                                            */
@@ -186,6 +188,44 @@ typedef struct psx_prim {
 /* from the GTE — and the table inverts it. `psx_ot_add_bucket` is the escape  */
 /* hatch for the few packets that know which bucket they want.                 */
 /* ------------------------------------------------------------------------- */
+/* The retail world sorter addresses draw areas with a seven-bit name. */
+#define PSX_OT_AREA_COUNT 128
+
+/*
+ * A private primitive chain waiting for retail's screen-area drain.
+ *
+ * The console record is 20 bytes and points at external point/bounds storage.
+ * The port owns its memory, so it keeps copies of the spatial data and camera
+ * alongside the equivalent fields. `head`/`tail` are indices into psx_ot's
+ * primitive pool; an empty batch has both set to -1.
+ */
+typedef struct psx_ot_batch {
+    s32 head;
+    s32 tail;
+    s16 order;          /* record +4: signed depth used by the Quick merge */
+    u8  area;           /* seven-bit screen-area name                      */
+    u8  point;          /* record +6 bit 0: point rather than an AABB       */
+    u8  quick;          /* area +12 list; otherwise the Standard +8 list   */
+    u8  pad[3];
+    s32 spatial[6];     /* point[3], or min[3] followed by max[3]           */
+    s32 camera[3];      /* retail reads the current camera at 0x800B2B24   */
+} psx_ot_batch;
+
+/*
+ * One of 0x80065804's 20-byte screen-change records, reduced to the fields
+ * which affect rendering.  Coordinates are relative to the viewport.  `add`
+ * is the inherited draw offset (normally the water/shake displacement), while
+ * min/max are the projected region in the unshifted viewport.
+ */
+typedef struct psx_ot_area_screen {
+    s16 min_x, min_y;
+    s16 max_x, max_y;
+    s16 add_x, add_y;
+} psx_ot_area_screen;
+
+/* The executable allocates records 0..95; 3..95 are the ordinary area walk. */
+#define PSX_OT_AREA_RETAIL_COUNT 96
+
 typedef struct psx_ot {
     psx_prim *prims;       /* flat pool of all primitives this frame     */
     u32       prim_count;
@@ -206,12 +246,76 @@ typedef struct psx_ot {
      */
     u32       window_base;
     u32       window_len;
+
+    /* SortData buckets are relative to the WHOLE 51-entry console slice,
+     * while the ordinary geometry window begins two entries into it. */
+    u32       authored_base;
+    u32       authored_len;
+
+    /* Named insertion points for the current viewport. */
+    u32       area_bucket[PSX_OT_AREA_COUNT];
+    u8        area_valid[PSX_OT_AREA_COUNT];
+    psx_ot_area_screen area_screen[PSX_OT_AREA_COUNT];
+    u8        area_screen_valid[PSX_OT_AREA_COUNT];
+    s16       area_view_ofs_x, area_view_ofs_y;
+    bool      area_routing;
+
+    /* Private chains drained through the named insertion points. */
+    psx_ot_batch *batch;
+    u32           batch_count;
+    u32           batch_capacity;
 } psx_ot;
 
 /* Constrain subsequent psx_ot_add calls to [base, base+len). len == 0 releases
  * the window. psx_ot_clear releases it too, so a window never outlives a frame
  * by accident. */
 void psx_ot_set_window(psx_ot *ot, u32 base, u32 len);
+
+/* Install the complete console slice which authored bucket numbers address.
+ * `psx_ot_set_window` may name a smaller depth-sortable subset of the same
+ * slice.  Both arguments are in console buckets. */
+void psx_ot_set_authored_window(psx_ot *ot, u32 base, u32 len);
+u32  psx_ot_authored_bucket(const psx_ot *ot, u32 console_bucket);
+
+/*
+ * Register and resolve the current viewport's named insertion points.
+ * `console_bucket` is relative to the viewport slice and is scaled by
+ * PSX_OT_SUBDIV. The map can be cleared without discarding primitives, which
+ * is required when a split-screen frame advances to its next viewport.
+ */
+void psx_ot_area_clear(psx_ot *ot);
+void psx_ot_area_prepare(psx_ot *ot, s16 view_w, s16 view_h,
+                         s16 add_x, s16 add_y,
+                         s16 view_ofs_x, s16 view_ofs_y);
+bool psx_ot_area_register(psx_ot *ot, u32 area, u32 console_bucket);
+bool psx_ot_area_register_screen(psx_ot *ot, u32 area, u32 console_bucket,
+                                 const psx_ot_area_screen *screen);
+bool psx_ot_area_bucket(const psx_ot *ot, u32 area, u32 *bucket);
+bool psx_ot_area_get_screen(const psx_ot *ot, u32 area,
+                            psx_ot_area_screen *screen);
+bool psx_ot_area_projection(const psx_ot *ot, s32 area,
+                            s32 *centre_x, s32 *centre_y);
+bool psx_ot_area_active(const psx_ot *ot);
+
+/*
+ * Retail's per-area painter sorter (0x80046E14 / 0x80047080).
+ *
+ * Standard batches participate in the bounds dependency graph (maximum 32 per
+ * area). Quick batches depend on Standard batches but not on one another
+ * (maximum 128), and are stably merged by signed `order`. Both begin calls copy
+ * their spatial data, so stack-backed mover bounds are safe. A batch is one
+ * atomic GPU chain: use psx_ot_batch_add for a new primitive or
+ * psx_ot_batch_link_prim for a primitive already built with psx_ot_alloc.
+ */
+#define PSX_OT_BATCH_INVALID (-1)
+s32 psx_ot_batch_begin_box(psx_ot *ot, u32 area, bool quick, s16 order,
+                           const s32 min[3], const s32 max[3],
+                           const s32 camera[3]);
+s32 psx_ot_batch_begin_point(psx_ot *ot, u32 area, bool quick, s16 order,
+                             const s32 point[3], const s32 camera[3]);
+psx_prim *psx_ot_batch_add(psx_ot *ot, s32 batch);
+bool psx_ot_batch_link_prim(psx_ot *ot, s32 batch, psx_prim *prim);
+void psx_ot_flush_batches(psx_ot *ot);
 
 /* How many buckets an emitter may address right now — the window if one is
  * installed, the whole table otherwise. */
@@ -325,6 +429,13 @@ psx_prim *psx_ot_add(psx_ot *ot, u16 otz);
 
 psx_prim *psx_ot_add_depth(psx_ot *ot, u16 otz, u32 key);
 
+/* Use a live named insertion point, falling back to ordinary depth when the
+ * current viewport did not register `area`. */
+psx_prim *psx_ot_add_area_depth(psx_ot *ot, u32 area, u16 otz, u32 key);
+
+/* Add to an already-resolved absolute bucket while retaining a sort key. */
+psx_prim *psx_ot_add_bucket_depth(psx_ot *ot, u32 bucket, u16 otz, u32 key);
+
 /*
  * Add a primitive at an ABSOLUTE bucket index, ignoring the window and the
  * depth inversion. This is what a packet whose place in the table is structural
@@ -353,7 +464,7 @@ u32 psx_ot_depth_bucket(const psx_ot *ot, u32 otz);
  * falling back to the most recently added where the keys are equal or absent.
  * `fn` is called once per primitive. */
 typedef void (*psx_ot_visit_fn)(const psx_prim *prim, void *user);
-void psx_ot_walk(const psx_ot *ot, psx_ot_visit_fn fn, void *user);
+void psx_ot_walk(psx_ot *ot, psx_ot_visit_fn fn, void *user);
 
 /* ------------------------------------------------------------------------- */
 /* Draw-mode helpers                                                          */

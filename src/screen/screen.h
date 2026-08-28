@@ -209,10 +209,11 @@ typedef struct q2_screen_display {
 /*
  * One bucket below the flash, and the only other structural bucket in a slice:
  * the water effect links its strip copies and its tint here (0x80062E64 builds
- * `db + 11180 + 204*p`, and 11180 == 10984 + 4*49). So a viewport's slice ends
- * with the world, then the water, then the flash.
+ * `db + 11180 + 204*p`, and 11180 == 10984 + 4*49). Global OT entry 49 is
+ * slice entry 47 because the first viewport slice begins at global entry 2.
+ * So a viewport's slice ends with the world, then the water, then the flash.
  */
-#define Q2_SCREEN_OT_VIEW_WATER      49
+#define Q2_SCREEN_OT_VIEW_WATER      47
 
 /* The absolute bucket the performance meter links into: viewport 0's front. */
 #define Q2_SCREEN_OT_METER \
@@ -1026,7 +1027,7 @@ u16 q2_screen_overlay_otz(const q2_screen *s, u32 z);
  * so this one walk produces the background, every viewport and the overlay,
  * each correctly clipped, with no second pass.
  */
-void q2_screen_compose(q2_screen *s, const psx_ot *ot,
+void q2_screen_compose(q2_screen *s, psx_ot *ot,
                        const psx_vram *vram, const psx_raster_opts *opts);
 
 /* Flip: the buffer just drawn becomes the buffer being shown. */

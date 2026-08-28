@@ -42,7 +42,21 @@ typedef struct q2_model_draw_stats {
     u32 faces_rejected_back;   /* both NCLIP halves faced away                */
     u32 ot_overflow;
     u32 faces_semi;            /* blend selector 1..4: drawn with ABE         */
+    u32 shadows_emitted;       /* 0x800784CC floor-shadow POLY_FT4            */
 } q2_model_draw_stats;
+
+/* The packet template built at 0x800783B8. It samples the lower-right 16x16
+ * tile of chars.lbm from texture-page slot 15 and palette id 1 from the
+ * executable's built-in bank. UV endpoints are the packet's exact inclusive
+ * values, not atlas dimensions. */
+#define Q2_MODEL_SHADOW_VERTEX_MAX 4
+#define Q2_MODEL_SHADOW_U0       224
+#define Q2_MODEL_SHADOW_V0       224
+#define Q2_MODEL_SHADOW_U1       239
+#define Q2_MODEL_SHADOW_V1       239
+#define Q2_MODEL_SHADOW_FADE     600
+#define Q2_MODEL_SHADOW_CLUT_X     0
+#define Q2_MODEL_SHADOW_CLUT_Y   248
 
 /*
  * BACKFACE REJECTION for a model face, and why its sign is the WORLD'S
@@ -132,22 +146,17 @@ typedef struct q2_model_instance {
     u32                  clut4_count_a;
 
     /*
-     * Uniform scale, 1.0.12 — entity+0xFC. The engine applies it by scaling the
-     * rows of the entity's own rotation matrix before handing them to the GTE
-     * (0x8006B298: `ScaleMatrix(m, (a * b) >> 11)` three times), so it is a
-     * property of the transform rather than of the vertices, and it is how an
-     * item grows out of nothing when it materialises.
-     *
-     * Q2_ONE_12 is unscaled. Use q2_model_instance_init to get that default.
+     * Optional port-side uniform transform, 1.0.12. This is not an entity
+     * field: retail entity+0xFC/+0xFE affect only the GTE light matrix and back
+     * colour. Q2_ONE_12 is unscaled; use q2_model_instance_init for it.
      */
     s32                  scale;
 
     /*
-     * Per-vertex colour, entity+0x2AC. The world and model renderers both drive
-     * the GPU's modulate path, and 128 is neutral — which is what every caller
-     * used before items needed a tint, and what the engine writes at spawn
-     * (0x80058944 stores the three bytes of "000", i.e. 0x30, and the
-     * materialise ramp resets them to 127 at full size).
+     * Per-vertex colour for an explicitly unlit instance. The ordinary entity
+     * path instead feeds entity+0x2AC to the back colour below. On retail the
+     * pool allocator starts that triplet at 0x40, the item spawner replaces it
+     * with 0x30, and a materialise ramp can drive it to 127.
      */
     u8                   tint[3];
 
@@ -175,6 +184,53 @@ typedef struct q2_model_instance {
      * own blend selector is OR-ed on top without writing back (0x8006DE50).
      */
     const q2_tpage_table *tpage;
+
+    /*
+     * Entity +0x9E: the live draw area selected from collision-cell byte +32.
+     * Retail routes the model's private face chain through this area's
+     * authored insertion point. Negative means no area information, preserving
+     * the ordinary depth path used by offline renders and the view weapon.
+     */
+    s32                  sort_area;
+
+    /*
+     * Entity +0x78..+0x8F: the absolute AABB retail puts at batch record +8.
+     * A live entity always supplies it. `sort_bounds_valid` is false for
+     * structural/offline models; if such a caller nevertheless selects an
+     * area, a degenerate box at `origin` is used rather than changing the
+     * record to point type.
+     *
+     * Entity render flag 0x00800000 selects the area's Quick (+12) list. It
+     * does NOT set record flag bit 0: models stay bounds records on either
+     * list (0x8006DCD0..0x8006DD28).
+     */
+    s32                  sort_bounds_min[3];
+    s32                  sort_bounds_max[3];
+    bool                 sort_bounds_valid;
+    bool                 sort_quick;
+
+    /*
+     * The floor shadow drawn immediately after this model's face chain.
+     *
+     * Retail starts the local X/Z footprint at +/- `shadow_radius`, then poses
+     * up to four GLOBAL STORAGE vertex indices from the model wrapper's +4
+     * list and expands the extrema with them. The result shrinks linearly to
+     * zero at `shadow_height == 600`, is yawed, based at `shadow_origin`, and
+     * textured with the packet template above. A zero radius is meaningful:
+     * item spawns leave +0x94 at zero and rely entirely on their table list,
+     * which is why only twelve item records cast a non-degenerate shadow.
+     *
+     * `shadow_enabled` mirrors entity render-flag bit 0. `shadow_clut` may be
+     * overridden for another executable build; q2_model_instance_init selects
+     * the catalogued PAL build's palette-1 location at (0,248).
+     */
+    bool                 shadow_enabled;
+    const u16           *shadow_vertex;
+    u32                  shadow_vertex_count;
+    s32                  shadow_radius;
+    s32                  shadow_height;
+    s32                  shadow_origin[3];
+    u16                  shadow_clut;
 
     /*
      * NAME THE BUCKET OUTRIGHT, or < 0 to take it from the model's own origin.

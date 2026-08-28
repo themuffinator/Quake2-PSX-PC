@@ -97,7 +97,11 @@
  * 0x8004510C reads it into the point-query result. The other three bytes of `d`
  * are zero on the whole disc.
  *
- * `c` (+28) has no reader anywhere in the image. It stays unknown.
+ * **The halfword at +28 is the SortData byte offset.** The world draw reads it
+ * with `lh` at 0x80066AFC after indexing the PrimaryColl node array through
+ * the viewport's cell at +146. The other halfword at +30 is the SpaceLights
+ * partition offset used from SecondaryCol. The shared record therefore carries
+ * two hull-specific render indices alongside its collision data.
  *
  * ---------------------------------------------------------------------------
  * The arithmetic is 16-BIT, and that is load-bearing
@@ -186,7 +190,8 @@ typedef struct q2_coll_node {
     s32 bbox_max[3];
     u16 first_plane;  /* RAW: bit 15 is Q2_COLL_SOLID, bits 0..14 the index */
     u16 first_link;
-    u32 unk_c;        /* 0..65,077,433 — no reader anywhere in the image     */
+    s16 sort_offset;  /* +28: SortData byte offset when this is PrimaryColl  */
+    u16 first_light;  /* +30: SpaceLights first index for SecondaryCol       */
     u8  contents;     /* byte +32: the node's contents id (0..75)            */
     u8  pad[3];       /* bytes +33..35: zero on the whole disc               */
 } q2_coll_node;

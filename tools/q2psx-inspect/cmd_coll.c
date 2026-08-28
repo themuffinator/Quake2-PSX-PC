@@ -56,8 +56,11 @@ typedef struct coll_stats {
     unsigned long long contents_nonzero;
     unsigned long long contents_max;
     unsigned long long pad_nonzero;
-    unsigned long long unk_c_nonzero;
-    unsigned long long unk_c_max;
+    unsigned long long sort_offset_nonzero;
+    unsigned long long sort_offset_negative;
+    unsigned long long sort_offset_max;
+    unsigned long long first_light_nonzero;
+    unsigned long long first_light_max;
 
     /* Normals. */
     unsigned long long normals_unit;
@@ -290,10 +293,17 @@ static void census_hull(q2_collision *c, coll_stats *st, u8 *seen, u32 *queue,
         }
         if (n.pad[0] || n.pad[1] || n.pad[2])
             st->pad_nonzero++;
-        if (n.unk_c != 0) {
-            st->unk_c_nonzero++;
-            if (n.unk_c > st->unk_c_max)
-                st->unk_c_max = n.unk_c;
+        if (n.sort_offset != 0) {
+            st->sort_offset_nonzero++;
+            if (n.sort_offset < 0)
+                st->sort_offset_negative++;
+            else if ((unsigned long long)n.sort_offset > st->sort_offset_max)
+                st->sort_offset_max = (unsigned long long)n.sort_offset;
+        }
+        if (n.first_light != 0) {
+            st->first_light_nonzero++;
+            if (n.first_light > st->first_light_max)
+                st->first_light_max = n.first_light;
         }
 
         /* The relative frame is 16-bit, so a node wider than 65535 on any axis
@@ -496,8 +506,11 @@ int cmd_coll(disc *d, const char *map, int zone_index)
     printf("  contents != 0              : %llu  (max %llu)\n",
            st.contents_nonzero, st.contents_max);
     printf("  bytes +33..35 non-zero     : %llu\n", st.pad_nonzero);
-    printf("  unk_c != 0                 : %llu  (max %llu)\n",
-           st.unk_c_nonzero, st.unk_c_max);
+    printf("  SortData offset (+28) != 0 : %llu  (max %llu, %llu negative)\n",
+           st.sort_offset_nonzero, st.sort_offset_max,
+           st.sort_offset_negative);
+    printf("  firstLight (+30) != 0      : %llu  (max %llu)\n",
+           st.first_light_nonzero, st.first_light_max);
     printf("\n");
 
     printf("The link encoding's own limits\n");

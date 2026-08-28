@@ -78,16 +78,13 @@
  *
  * This file used to say "there is no rotation anywhere in the engine". The zone
  * draw refutes it: at 0x800678B4 it calls `RotMatrix` on three s16 Euler angles
- * at the node's runtime object +0x0C, and then adds TWO independent s16 triples,
- * +0x12 and +0x18, to the node's camera-space position. So a node carries a full
- * rotation and two translations, and `ROTHATCH`, `SIMROT`, `SIMROT2` and
- * `ROTBUTTON` — which userfuncs.c has always listed as rotating movers — drive
- * the rotation slots of the same object this module writes the translation of.
+ * at the node's runtime object +0x0C. The +0x12 triple is linear displacement;
+ * +0x18 is a pivot used as `-R.p+p`, not another independent translation.
+ * `ROTHATCH`, `SIMROT`, `SIMROT2` and `ROTBUTTON` drive those rotation slots.
  *
  * What is implemented here is the linear family and its +0x12 triple. The
- * rotation slots and the second triple are decoded (see surface.h, which maps
- * the whole object binding out of Scene.flags08 bits 0-9) but no integrator
- * fills them yet, so rotating brush geometry stands still rather than turning.
+ * rotating family, its pivot constructors and its integrators live in
+ * rotator.[ch]; surface.h maps the shared object binding out of Scene.flags08.
  *
  * ---------------------------------------------------------------------------
  * Why this port does not reproduce the load-time pre-pass
@@ -311,6 +308,18 @@ typedef struct q2_mover {
     s32 dir[3];
 
     /*
+     * A zero-speed LIFT1 can be an object BINDING rather than a broken lift.
+     * BASE0's named CRATES record is the concrete case: its four slots allocate
+     * four ordinary 92-byte objects, then the map's DOCRATES handler clears
+     * each obj+0x2C tick callback and writes obj+0x14 itself. `external` keeps
+     * the generic seven-state mover from consuming that object; `external_part`
+     * is the original slot index, because the handler gives slots 0/1 and 2/3
+     * different speeds.
+     */
+    u8  external;
+    u8  external_part;
+
+    /*
      * The sound this tick asked for from 0x80040800's numeric table, or 0.
      *
      * Q2_MOVER_TRAVEL_MOVE_ID while it is moving, Q2_MOVER_TRAVEL_STOP_ID on
@@ -463,6 +472,13 @@ u32 q2_movers_trigger_item(q2_mover_set *set, u32 item_offset);
  *     +16 u8  time_a       delay,  x300 (obj+0x4C)
  *     +17 u8  time_b       wait,   x300 (obj+0x4E); 0xFF means never
  *
+ *     CAGELIFT1, len 20
+ *     +4..+15              target, speed and objects exactly as LIFT1
+ *     +16 u8 bottom        bottom collision-slab thickness
+ *     +17 u8 top           top collision-slab thickness
+ *     +18 u8 time_a        delay,  x300 (obj+0x4C)
+ *     +19 u8 time_b        wait,   x300 (obj+0x4E); 0xFF means never
+ *
  * The axis is Y, as `MOVER_A`'s is: these are lifts. The object slots are
  * OBJSLOTs and therefore subject to the two-buffer rebase (#56), so an `ops` is
  * taken; pass NULL to read them in place.
@@ -485,9 +501,9 @@ u32 q2_movers_trigger_item(q2_mover_set *set, u32 item_offset);
  * constructor at 0x80029794 calls the slot allocator twice (0x80029A78 and
  * 0x80029B1C) and chains them through +0x3C — a top slab whose max[1] is
  * min[1] + item[+17] and a bottom slab whose min[1] is max[1] - item[+16]. It
- * is a cage with a floor and a ceiling. The collision registration in
- * q2_sim_attach_movers gives every part one box, so a cage lift is currently
- * solid through its middle. Written down rather than approximated.
+ * is a cage with a floor and a ceiling. `q2_sim_attach_movers` preserves those
+ * two slabs through `cage_top` and `cage_bottom` rather than registering the
+ * whole airy Scene-node bounds as solid.
  *
  * PLATFORM has the same shape of problem and the console has it too: its
  * constructor registers ONE box per part, the whole Scene node bounding box,
@@ -602,5 +618,16 @@ u32 q2_movers_tick_blocked(q2_mover_set *set, s32 dt, u16 player_keys,
  * once per node per frame.
  */
 void q2_movers_node_offset(const q2_mover_set *set, u32 scene_node, s32 out[3]);
+
+/*
+ * BASE0 LevelBin +0x0094, the DOCRATES mission-event handler.
+ *
+ * The named CRATES record is a zero-speed LIFT1 whose four Scene slots exist
+ * only to allocate runtime objects. Every call advances slots 0/1 by
+ * (16*dt)/8, slots 2/3 by (20*dt)/8, then wraps an object 3500 units backward
+ * when its translated Scene-box centre reaches -1044. Returns objects moved.
+ */
+u32 q2_movers_step_crates(q2_mover_set *set, const q2_events *events,
+                          const q2_scene *scene, s32 dt);
 
 #endif /* Q2PSX_MOVER_H */

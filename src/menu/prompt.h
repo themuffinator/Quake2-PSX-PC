@@ -57,19 +57,24 @@
  * rather than sliding away from a position they never occupied.
  *
  * ---------------------------------------------------------------------------
- * What is not reconstructed
+ * The ordinary-menu rules
  * ---------------------------------------------------------------------------
- * Which screen asks for which prompt at which y. The only direct caller of the
- * setter is the page-open above; everything else reaches it through the front
- * end's function-pointer table at `0x80079ECC`, and the front end's own page
- * set is still open (#44). The one placement that is readable is a special case
- * in the drawer: on page 11, record 1 is drawn at a hard-coded (230, 114)
- * rather than from the table.
+ * The core loop at 0x8001A280..0x8001A348 asks for SELECT when the current
+ * object's +0x4C action is non-NULL, and BACK when the page's +0x28C back
+ * handler is non-NULL. QFRONT uses caller y = 216; an in-game menu uses 220.
+ * QFRONT's multiplayer hook at module+0x459C adds RULES at y = 220 while one
+ * of the first three mode rows is selected, and parks it on the two settings
+ * rows. `q2_prompt_sync_menu` is that per-frame policy in port terms.
+ *
+ * The one unrelated placement special case is still in the retail drawer: on
+ * page 11, record 1 is drawn at a hard-coded (230, 114) rather than from the
+ * table. Page 11 is not one of the ordinary menu pages reconstructed here.
  */
 #ifndef Q2PSX_MENU_PROMPT_H
 #define Q2PSX_MENU_PROMPT_H
 
 #include "menufont.h"
+#include "menu.h"
 #include "gpu.h"
 #include "q2psx.h"
 
@@ -128,6 +133,14 @@ void q2_prompt_snap(q2_prompt_bar *b);
 
 /* One frame of travel, at most Q2_PROMPT_SPEED pixels each. */
 void q2_prompt_step(q2_prompt_bar *b);
+
+/*
+ * Apply the retail ordinary-menu prompt policy for this frame. A closed or
+ * incomplete menu parks the whole bar. `front_end` selects QFRONT's y = 216;
+ * in-game pages use y = 220. This changes targets only — `q2_prompt_step`
+ * remains the sole owner of the three-pixel slide.
+ */
+void q2_prompt_sync_menu(q2_prompt_bar *b, const q2_menu *m, bool front_end);
 
 /*
  * Draw whatever is currently on screen. Steps nothing — call q2_prompt_step

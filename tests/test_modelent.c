@@ -10,10 +10,10 @@
  *   - it does NOT wrap against the clip length the way an item's does — it runs
  *     past the end and the entity dies instead;
  *   - the lifetime is clip_length x 10, not clip_length (0x8005A630);
- *   - the scale ramp holds at the ceiling before it falls, because the clamp is
+ *   - the light ramp holds at the ceiling before it falls, because the clamp is
  *     applied to `25 * (320 - t)` and that starts at 8000;
- *   - `fade` defaults to Q2_ONE_12 and not to zero, because the draw MULTIPLIES
- *     it by `scale` (0x8006B298) and the allocator seeds both with 4096.
+ *   - `fade` defaults to Q2_ONE_12 and not to zero, because the lighting setup
+ *     MULTIPLIES it by `scale` (0x8006B298) and seeds both with 4096.
  *
  * The model bank is a real one only in `q2psx-inspect modelents`; here the
  * entity is driven directly so the file needs no disc.
@@ -72,7 +72,7 @@ static void test_lifetime(void)
 
 static void test_scale_ramp(void)
 {
-    puts("the scale ramp holds full and then falls to nothing (0x8005A65C)");
+    puts("the light ramp holds full and then falls to nothing (0x8005A65C)");
 
     /* 25 * (320 - 0) == 8000, clamped to the ceiling. */
     check_eq(q2_model_ent_scale(0), Q2_ONE_12, "full size at t = 0");
@@ -90,7 +90,7 @@ static void test_scale_ramp(void)
 
 static void test_flash_ramp(void)
 {
-    puts("the quad's ramp is a different multiplier (0x8005A69C)");
+    puts("the dynamic light's radius ramp is a different multiplier (0x8005A69C)");
 
     /* 51 * (320 - t) clamped, then * 1300 >> 12. */
     check_eq(q2_model_ent_flash(0), (Q2_ONE_12 * 1300) >> 12,
@@ -99,12 +99,60 @@ static void test_flash_ramp(void)
           "and it falls as the clock runs");
     check_eq(q2_model_ent_flash(320), 0, "to nothing at t = 320");
 
-    /* The two ramps are NOT the same curve: 51 vs 25 means the quad leaves the
+    /* The two ramps are NOT the same curve: 51 vs 25 means the light leaves the
      * ceiling later than the model does. */
     check(q2_model_ent_scale(200) < Q2_ONE_12,
           "the model is shrinking at t = 200");
     check_eq(q2_model_ent_flash(200), (Q2_ONE_12 * 1300) >> 12,
-             "while the quad is still at full size");
+             "while the light is still at full radius");
+}
+
+static void test_think_emits_retail_light(void)
+{
+    q2_entity e;
+    q2_entity_world w;
+    const q2_ent_event *ev;
+
+    puts("the think appends retail's orange-red dynamic light (0x80075C34)");
+
+    memset(&w, 0, sizeof(w));
+    w.dt = 6;
+
+    q2_entity_init(&e);
+    e.in_use = true;
+    e.clip_length = 40;
+    e.origin[0] = 101;
+    e.origin[1] = 202;
+    e.origin[2] = 303;
+
+    q2_model_ent_think(&e, &w);
+
+    check_eq(w.events.count, 1, "one runtime light is raised per live tick");
+    ev = &w.events.e[0];
+    check_eq(ev->kind, Q2_ENT_EVENT_LIGHT, "the event is a dynamic light");
+    check_eq(ev->pos[0], 101, "light x is the model entity origin");
+    check_eq(ev->pos[1], 202, "light y is the model entity origin");
+    check_eq(ev->pos[2], 303, "light z is the model entity origin");
+    check_eq(ev->glow[0], 0xC0, "red comes from 0x800AEAD4");
+    check_eq(ev->glow[1], 0x40, "green comes from 0x800AEAD5");
+    check_eq(ev->glow[2], 0x31, "blue comes from 0x800AEAD6");
+    check_eq(ev->radius, 1300, "the full outer radius is 1300");
+    check_eq(ev->inner_radius, 975, "the inner radius is three quarters");
+}
+
+static void test_allocator_and_explosion_ambient(void)
+{
+    q2_entity e;
+
+    puts("allocator and explosion model retain retail's 0x40 ambient floor");
+
+    q2_entity_init(&e);
+    check_eq(e.glow[0], Q2_MODEL_ENT_AMBIENT,
+             "allocator ambient red is 0x40 (0x800AEB84)");
+    check_eq(e.glow[1], Q2_MODEL_ENT_AMBIENT,
+             "allocator ambient green is 0x40");
+    check_eq(e.glow[2], Q2_MODEL_ENT_AMBIENT,
+             "allocator ambient blue is 0x40");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -124,7 +172,7 @@ static void test_think_clock(void)
     e.clip_length = 40;          /* -> a 400-unit life */
 
     check_eq(e.fade, Q2_ONE_12,
-             "a fresh entity starts at full second-scale (0x8006C1B8)");
+             "a fresh entity starts at full second intensity (0x8006C1B8)");
 
     q2_model_ent_think(&e, &w);
     check_eq(e.frame, 12, "one think of dt 6 advances the clock by 12, not 6");
@@ -139,7 +187,7 @@ static void test_think_clock(void)
     check(e.in_use, "still alive at t = 380");
     check(e.frame >= 380,
           "the clock ran past the clip length instead of wrapping");
-    check_eq(e.fade, 0, "and it has shrunk to nothing");
+    check_eq(e.fade, 0, "and its lighting has faded to nothing");
 
     /* And the next few finish it. */
     while (e.in_use && e.frame < 500)
@@ -192,6 +240,8 @@ int main(void)
     test_lifetime();
     test_scale_ramp();
     test_flash_ramp();
+    test_think_emits_retail_light();
+    test_allocator_and_explosion_ambient();
     test_think_clock();
     test_think_removes_unanimated();
     test_spawn_needs_a_bank();

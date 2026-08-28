@@ -201,6 +201,26 @@ bool q2_event_rt_trigger(q2_event_rt *rt, u32 offset);
 bool q2_event_rt_trigger_named(q2_event_rt *rt, const char *name);
 
 /*
+ * Feed one frame of trigger-volume contact into the record flags.
+ *
+ * The three authored category bits are now decoded from 0x80027E64:
+ *
+ *   CAT_A (0x08)  run on the first frame inside
+ *   CAT_B (0x10)  run on every frame inside
+ *   CAT_C (0x20)  run on the first frame outside after being inside
+ *
+ * RT1/RT2 are the current/previous-contact bits the retail dispatcher uses to
+ * make those edges. Begin clears the current bit, contact ORs it into the
+ * named record and queues any enter/stay run, and end queues exits before
+ * shifting current into previous. Several volumes may name one record; doing
+ * this on the record rather than on a volume bitmap preserves retail's "inside
+ * any of them" behaviour.
+ */
+void q2_event_rt_contacts_begin(q2_event_rt *rt);
+bool q2_event_rt_contact(q2_event_rt *rt, u32 offset);
+void q2_event_rt_contacts_end(q2_event_rt *rt);
+
+/*
  * Run everything queued, which may queue more. Returns what happened.
  *
  * Bounded rather than run-to-empty: a script that triggers itself would

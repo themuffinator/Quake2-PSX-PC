@@ -158,9 +158,9 @@ void q2_sort_entity_resolve(q2_sort_reader *r, bool drawn)
     r->pending_entity = false;
 
     /*
-     * 0x800674D8. An entity the draw declined leaves its payload in the stream
-     * for this to step over; one that was drawn has consumed it, and a non-zero
-     * payload length then means a new windowed-mode base follows.
+     * 0x800674D8. A projected rectangle with no area takes the skip arm; an
+     * accepted rectangle takes the continuation arm, where non-zero f2 means
+     * that a new windowed-mode base follows.
      */
     if (!drawn)
         skip_bits(r, r->pending_f2);

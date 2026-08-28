@@ -263,14 +263,14 @@ q2_result q2_item_table_load(q2_item_table *out, const disc *d,
         memcpy(e->model, rec + 0x04, Q2_ITEM_MODEL_LEN);
         e->model[Q2_ITEM_MODEL_LEN] = '\0';
 
-        for (k = 0; k < Q2_ITEM_EXTRA_MAX; k++)
-            e->extra[k] = q2_rd_u16(rec + 0x10 + k * 2);
+        for (k = 0; k < Q2_ITEM_SHADOW_VERTEX_MAX; k++)
+            e->shadow_vertex[k] = q2_rd_u16(rec + 0x10 + k * 2);
 
-        e->extra_count = 0;
-        for (k = 0; k < Q2_ITEM_EXTRA_MAX; k++) {
-            if (e->extra[k] == 0xFFFFu)
+        e->shadow_vertex_count = 0;
+        for (k = 0; k < Q2_ITEM_SHADOW_VERTEX_MAX; k++) {
+            if (e->shadow_vertex[k] == 0xFFFFu)
                 break;
-            e->extra_count++;
+            e->shadow_vertex_count++;
         }
     }
     out->count = i;
@@ -412,8 +412,8 @@ u32 q2_item_table_diff(const q2_item_table *a, const q2_item_table *b,
         CMP(what, x->effect, y->effect);
         snprintf(what, sizeof(what), "def[%u].flags", i);
         CMP(what, x->flags, y->flags);
-        snprintf(what, sizeof(what), "def[%u].extra_count", i);
-        CMP(what, x->extra_count, y->extra_count);
+        snprintf(what, sizeof(what), "def[%u].shadow_vertex_count", i);
+        CMP(what, x->shadow_vertex_count, y->shadow_vertex_count);
 
         if (memcmp(x->model, y->model, Q2_ITEM_MODEL_LEN) != 0) {
             bad++;
@@ -425,9 +425,9 @@ u32 q2_item_table_diff(const q2_item_table *a, const q2_item_table *b,
         }
         {
             u32 k;
-            for (k = 0; k < x->extra_count; k++) {
-                snprintf(what, sizeof(what), "def[%u].extra[%u]", i, k);
-                CMP(what, x->extra[k], y->extra[k]);
+            for (k = 0; k < x->shadow_vertex_count; k++) {
+                snprintf(what, sizeof(what), "def[%u].shadow_vertex[%u]", i, k);
+                CMP(what, x->shadow_vertex[k], y->shadow_vertex[k]);
             }
         }
     }

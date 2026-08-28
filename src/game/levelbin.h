@@ -350,7 +350,7 @@ typedef struct q2_lb_scene {
 #define Q2_LB_SCENE_SPIN       4     /* module+0x9D24: yaw -= 4 * dt        */
 #define Q2_LB_SCENE_SCALE_STEP 256   /* per FRAME, not per tick             */
 #define Q2_LB_SCENE_SCALE_FULL 4096  /* the title screen's size             */
-#define Q2_LB_SCENE_SCALE_SUB  1024  /* what a sub-page shrinks it to       */
+#define Q2_LB_SCENE_SCALE_SUB  1024  /* sub-page light-intensity floor      */
 
 /*
  * ---------------------------------------------------------------------------

@@ -35,6 +35,135 @@ static void check_eq(s64 got, s64 want, const char *what)
     }
 }
 
+static void write_scene_node(u8 *raw, u32 index,
+                             const s32 bmin[3], const s32 bmax[3],
+                             const s32 origin[3])
+{
+    u8 *p = raw + (size_t)index * Q2_SCENE_NODE_SIZE;
+    int c;
+
+    for (c = 0; c < 3; c++) {
+        q2_wr_u32(p + 0x10 + 4 * c, (u32)bmin[c]);
+        q2_wr_u32(p + 0x1C + 4 * c, (u32)bmax[c]);
+        q2_wr_u32(p + 0x28 + 4 * c, (u32)origin[c]);
+    }
+}
+
+/*
+ * The load-time constructors write obj+0x18 before a rotator ever moves. The
+ * renderer already knew how to use that field; this pins where retail obtains
+ * it, including the asymmetrical ROTHATCH hinge adjustment.
+ */
+static void test_constructor_pivots(void)
+{
+    u8 scene_raw[3 * Q2_SCENE_NODE_SIZE];
+    u8 event_raw[68];
+    u8 uf_raw[4 + 3 * Q2_UF_RECORD_SIZE];
+    q2_scene scene;
+    q2_events events;
+    q2_userfuncs uf;
+    q2_rotator_set set;
+    const s32 min0[3] = { -101, -201, 1000 };
+    const s32 max0[3] = {  100,  200, 1003 };
+    const s32 org0[3] = { -1000, 400, 900 };
+    const s32 min1[3] = { 100, 200, 300 };
+    const s32 max1[3] = { 300, 600, 900 };
+    const s32 org1[3] = {  50,  60,  70 };
+    const s32 min2[3] = { -701, -301, -101 };
+    const s32 max2[3] = { -500, -100,  100 };
+    const s32 org2[3] = { -700, -200,    0 };
+
+    puts("constructors derive each rotational origin from the raw Scene box");
+
+    memset(scene_raw, 0, sizeof(scene_raw));
+    write_scene_node(scene_raw, 0, min0, max0, org0);
+    write_scene_node(scene_raw, 1, min1, max1, org1);
+    write_scene_node(scene_raw, 2, min2, max2, org2);
+    memset(&scene, 0, sizeof(scene));
+    scene.nodes = scene_raw;
+    scene.node_count = 3;
+
+    /* Per-map function indices 0..2. */
+    memset(uf_raw, 0, sizeof(uf_raw));
+    q2_wr_u16(uf_raw, 3);
+    memcpy(uf_raw + 4 + 0 * Q2_UF_RECORD_SIZE, "SIMROT", 6);
+    memcpy(uf_raw + 4 + 1 * Q2_UF_RECORD_SIZE, "ROTHATCH", 8);
+    memcpy(uf_raw + 4 + 2 * Q2_UF_RECORD_SIZE, "ROTBUTTON", 9);
+    uf.data = uf_raw;
+    uf.size = sizeof(uf_raw);
+    uf.count = 3;
+
+    memset(event_raw, 0, sizeof(event_raw));
+
+    /* Record 0, SIMROT: item +12 names node 0. */
+    q2_wr_u16(event_raw + 0, 28);
+    event_raw[2] = 1;
+    event_raw[4] = Q2_EVOP_CALL;
+    event_raw[5] = 24;
+    event_raw[6] = 0;
+    q2_wr_u16(event_raw + 8, 256);
+    q2_wr_u16(event_raw + 16, 0);
+    q2_wr_u16(event_raw + 18, (u16)-1);
+    q2_wr_u16(event_raw + 20, (u16)-1);
+    q2_wr_u16(event_raw + 22, (u16)-1);
+    q2_wr_u16(event_raw + 24, 1);
+
+    /* Record 1, ROTHATCH: base pivot {150,340,530}, then {-20,-30,+40}. */
+    q2_wr_u16(event_raw + 28, 24);
+    event_raw[30] = 1;
+    event_raw[32] = Q2_EVOP_CALL;
+    event_raw[33] = 20;
+    event_raw[34] = 1;
+    q2_wr_u16(event_raw + 36, 64);
+    q2_wr_u16(event_raw + 38, 1024);
+    event_raw[40] = 2;
+    q2_wr_u16(event_raw + 42, 20);
+    q2_wr_u16(event_raw + 44, (u16)-30);
+    q2_wr_u16(event_raw + 46, 40);
+    q2_wr_u16(event_raw + 50, 1);
+
+    /* Record 2, ROTBUTTON: item +10 names node 2. */
+    q2_wr_u16(event_raw + 52, 16);
+    event_raw[54] = 1;
+    event_raw[56] = Q2_EVOP_CALL;
+    event_raw[57] = 12;
+    event_raw[58] = 2;
+    q2_wr_u16(event_raw + 62, 1);
+    q2_wr_u16(event_raw + 66, 2);
+
+    memset(&events, 0, sizeof(events));
+    events.data = event_raw;
+    events.size = sizeof(event_raw);
+    events.record_count = 3;
+    events.first_record = 0;
+
+    memset(&set, 0, sizeof(set));
+    check_eq(q2_rotators_build(&set, &events, &uf, &scene), Q2_OK,
+             "the synthetic constructor stream builds");
+    check_eq(set.count, 3, "all three rotating constructor families build");
+
+    if (set.count == 3) {
+        /* (-101 + 100) / 2 and (-201 + 200) / 2 are zero, not -1:
+         * the retail correction rounds odd negative sums toward zero. */
+        check_eq(set.rotators[0].pivot[0], 1000, "SIMROT pivot x");
+        check_eq(set.rotators[0].pivot[1], -400, "SIMROT pivot y");
+        check_eq(set.rotators[0].pivot[2], 101, "SIMROT pivot z");
+
+        check_eq(set.rotators[1].pivot[0], 130,
+                 "ROTHATCH subtracts the authored X hinge adjustment");
+        check_eq(set.rotators[1].pivot[1], 310,
+                 "ROTHATCH adds the authored Y hinge adjustment");
+        check_eq(set.rotators[1].pivot[2], 570,
+                 "ROTHATCH adds the authored Z hinge adjustment");
+
+        check_eq(set.rotators[2].pivot[0], 100, "ROTBUTTON pivot x");
+        check_eq(set.rotators[2].pivot[1], 0, "ROTBUTTON pivot y");
+        check_eq(set.rotators[2].pivot[2], 0, "ROTBUTTON pivot z");
+    }
+
+    q2_rotators_free(&set);
+}
+
 /* ------------------------------------------------------------------------- */
 static void test_one_step_per_request(void)
 {
@@ -402,6 +531,7 @@ int main(void)
     test_target_sweep();
     test_snap_button();
     test_angle_wrap();
+    test_constructor_pivots();
     test_axis_and_transform();
     test_pivot_is_fixed();
     test_euler_single_axis();

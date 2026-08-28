@@ -58,18 +58,28 @@
  * `aim >> 7` gives 32, so the hyperblaster's bolt is half the speed of the
  * blaster's. Nothing normalises, and nothing needs to.
  *
- * The grenade and the rocket are different: their spawners take an explicit
- * speed (900 and 20000) and the direction only points. Those two numbers are
- * READ; what is NOT established is the unit they are in, so the port treats
- * them as world units per second and says so.
+ * The grenade and rocket use the shared entity mover instead. Their direction
+ * arguments are raw velocities: movement is componentwise `vel * dt / 320`,
+ * and gravity on a grenade is capped at the shared mover's +8192 terminal Y.
+ * The apparent speeds once assigned to them are timers. Grenade2 copies its
+ * 900 argument to +0xF4 and counts it down; Rocket writes 20000 to the same
+ * field and counts it down. BFGBlast is different again: it fixed-multiplies
+ * the view matrix's forward column by the raw local vector {0,0,768}, with no
+ * normalisation, and its private think advances it with a divisor of 64 while
+ * its +0xF4 timer starts at 2400.
  *
  * ---------------------------------------------------------------------------
  * What is transcribed and what is modelled
  * ---------------------------------------------------------------------------
- * The speeds, lifetimes, radii, damage and means of death above are read. The
- * per-tick INTEGRATION is not: the spawners hand their entities to the shared
- * mover and this module runs them through the caller's own trace instead.
- * Where a constant is modelled rather than read it says so at its definition.
+ * The velocities, divisors, lifetimes, radii, damage and means of death above
+ * are read. Collision is still delegated to the caller's trace, but per-tick
+ * integration now follows the console's componentwise integer divides.
+ *
+ * Grenade3 uses the same record without widening it: while held, `node` is the
+ * dedicated Q2_PROJ_NODE_HELD sentinel and `vel[2]` carries the raw charge at
+ * entity+0x4C. That preserves the save record byte-for-byte. Release replaces
+ * the charge with the rotated velocity and restores the ordinary unknown-cell
+ * sentinel before the first move.
  */
 #ifndef Q2PSX_PROJECTILE_H
 #define Q2PSX_PROJECTILE_H
@@ -94,20 +104,8 @@ typedef enum q2_proj_kind {
 #define Q2_SPLASH_RADIUS_BFG     1300
 
 /*
- * Fuses, in level ticks (300 to the second).
- *
- * The hand grenade's 1650 is READ — it is argument 3 at 0x8004EC3C. The
- * launcher's is not: its spawner stores 380 into the entity at +0x4C
- * (0x8004A430) alongside a second timer, and which of the two is the fuse was
- * not established, so the value is used as one and marked.
- */
-#define Q2_FUSE_HAND_GRENADE 1650   /* READ     */
-#define Q2_FUSE_GRENADE       380   /* INFERRED */
-
-/*
  * A bolt's lifetime, entity +0x1A written by 0x8004D764 and counted down by
- * the sweep at 0x80047D08. READ. Nothing else in this module has one — a
- * rocket flies until it meets something.
+ * the sweep at 0x80047D08. READ.
  */
 #define Q2_LIFETIME_BOLT     2560
 
@@ -194,7 +192,7 @@ typedef struct q2_projectile {
     q2_proj_kind kind;
 
     s32  pos[3];
-    s32  vel[3];        /* world units per tick, pre-divided by 4096         */
+    s32  vel[3];        /* 1.0.12 velocity; held Grenade3 uses vel[2]=charge */
     s16  damage;
     s16  mod;
     s16  splash_radius;
@@ -208,11 +206,16 @@ typedef struct q2_projectile {
      * the mover carries the player's. A rocket that has flown across the map is
      * nowhere near the shooter's cell, so tracing it from the shooter's would
      * ask the hull the wrong question and the rocket would sail through walls.
-     * -1 means "unknown", which costs one brute-force sweep and self-corrects,
-     * the same contract a freshly spawned entity has (0x80044C74).
+     * Q2_PROJ_NODE_UNKNOWN means "unknown", which costs one brute-force sweep
+     * and self-corrects, the same contract a freshly spawned entity has
+     * (0x80044C74). Q2_PROJ_NODE_HELD is Grenade3 state 1: hidden, attached to
+     * the owner and not participating in movement or collision.
      */
     s32  node;
 } q2_projectile;
+
+#define Q2_PROJ_NODE_UNKNOWN (-1)
+#define Q2_PROJ_NODE_HELD    (-2)
 
 #define Q2_PROJ_MAX 32
 
@@ -231,6 +234,20 @@ void q2_projectiles_init(q2_projectiles *list);
 s32 q2_projectile_launch(q2_projectiles *list, const q2_fire_result_v2 *fire,
                          s32 owner, s32 now);
 
+/* Grenade3 state 1, 0x8004A414..0x8004A470. The index query returns -1 when
+ * this owner has no live held grenade. `cook_dt` is added as 6*dt to the raw
+ * charge after copying the view weapon's world position. */
+s32 q2_projectile_hand_held_index(const q2_projectiles *list, s32 owner);
+s32 q2_projectile_hand_charge(const q2_projectiles *list, s32 owner);
+bool q2_projectile_hand_update(q2_projectiles *list, s32 owner,
+                               const s32 attached_pos[3], s32 cook_dt);
+
+/* Grenade3 state 2 -> 3. `raw_dir` is the already-rotated shared-mover vector;
+ * release converts it to the list's common fixed representation and makes the
+ * entity visible/moving. */
+bool q2_projectile_hand_release(q2_projectiles *list, s32 owner,
+                                const s32 origin[3], const s32 raw_dir[3]);
+
 /*
  * What a projectile did on one tick. The caller supplies the trace and applies
  * the outcome, so this module never needs to know about collision hulls.
@@ -238,7 +255,7 @@ s32 q2_projectile_launch(q2_projectiles *list, const q2_fire_result_v2 *fire,
 typedef struct q2_proj_step {
     s32  from[3];
     s32  to[3];         /* where it wants to be                              */
-    bool expired;       /* the fuse ran out this tick                        */
+    bool expired;       /* the fuse or safety lifetime ran out this tick     */
 } q2_proj_step;
 
 /*
@@ -286,5 +303,13 @@ bool q2_projectile_impact(q2_projectiles *list, u32 index,
 u32 q2_projectile_detonate(q2_projectiles *list, u32 index,
                            q2_actor *attacker, q2_actor **targets, u32 count,
                            const q2_combat_rules *rules);
+
+/*
+ * Remove a projectile whose safety lifetime elapsed, without applying splash
+ * damage. The rocket at 0x8004ADB0 and BFG blast at 0x8004B8E4 both call the
+ * entity free path when +0xF4 reaches zero; only the grenade fuse detonates.
+ * Bolts use the same quiet expiry. Returns false for an invalid or free slot.
+ */
+bool q2_projectile_expire(q2_projectiles *list, u32 index);
 
 #endif /* Q2PSX_PROJECTILE_H */

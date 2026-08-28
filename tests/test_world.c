@@ -120,6 +120,49 @@ static void test_sealing(void)
     }
 }
 
+static void test_scene_area(void)
+{
+    u8 raw[Q2_SCENE_NODE_SIZE];
+    q2_scene scene;
+    q2_scene_node node;
+
+    puts("\nscene draw area");
+    memset(raw, 0, sizeof(raw));
+    memset(&scene, 0, sizeof(scene));
+    raw[0x0E] = 0xA7;
+    scene.nodes = raw;
+    scene.node_count = 1;
+
+    check(q2_scene_get_node(&scene, 0, &node),
+          "a Scene record decodes");
+    check(node.area == 0xA7,
+          "Scene byte +0x0E is retained as the deferred draw area");
+    check((node.area & 0x7F) == 0x27,
+          "the area table uses its low seven bits");
+}
+
+static void test_sort_region_visibility(void)
+{
+    psx_ot_area_screen r;
+
+    puts("\nSortData screen-region visibility");
+    memset(&r, 0, sizeof(r));
+    r.max_x = 64;
+    r.max_y = 32;
+    check(q2_world_sort_region_visible(&r),
+          "a rectangle with two non-zero dimensions is visible");
+
+    r.max_x = 0;
+    check(!q2_world_sort_region_visible(&r),
+          "a vertical-axis line takes retail's false stream arm");
+    r.max_x = 64;
+    r.max_y = 0;
+    check(!q2_world_sort_region_visible(&r),
+          "a horizontal-axis line takes retail's false stream arm");
+    check(!q2_world_sort_region_visible(NULL),
+          "a missing region is not visible");
+}
+
 /* ------------------------------------------------------------------------- */
 /* Backface rejection                                                         */
 /* ------------------------------------------------------------------------- */
@@ -262,6 +305,8 @@ int main(void)
     puts("================");
 
     test_sealing();
+    test_scene_area();
+    test_sort_region_visibility();
     test_backface();
     test_model_backface();
 

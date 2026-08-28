@@ -1267,14 +1267,21 @@ bool q2_screen_view_begin(q2_screen *s, int p, psx_ot *ot, gte_state *gte)
      * the world adds to the same bucket afterwards. */
     flash_emit(v, p, ot);
 
-    /* Geometry starts one bucket past the slice's draw env. */
-    if (ot)
+    /* Geometry starts one bucket past the slice's draw env.  SortData's
+     * authored buckets still address the complete 51-entry slice. */
+    if (ot) {
+        psx_ot_set_authored_window(
+            ot,
+            (u32)Q2_SCREEN_OT_VIEW_BASE
+                + (u32)p * Q2_SCREEN_OT_VIEW_STRIDE,
+            Q2_SCREEN_OT_VIEW_STRIDE);
         psx_ot_set_window(ot,
                           (u32)Q2_SCREEN_OT_VIEW_BASE
                               + (u32)p * Q2_SCREEN_OT_VIEW_STRIDE
                               + Q2_SCREEN_OT_VIEW_ENV + 1u,
                           (u32)Q2_SCREEN_OT_VIEW_STRIDE
                               - (Q2_SCREEN_OT_VIEW_ENV + 1u));
+    }
 
     return true;
 }
@@ -1297,8 +1304,10 @@ void q2_screen_view_end(q2_screen *s, psx_ot *ot)
     if (s->ctx.index >= 0 && s->ctx.index < Q2_SCREEN_MAX_VIEWS)
         s->env_linked[s->ctx.index] = true;
 
-    if (ot)
+    if (ot) {
         psx_ot_set_window(ot, 0, 0);
+        psx_ot_set_authored_window(ot, 0, 0);
+    }
 }
 
 void q2_screen_overlay_begin(q2_screen *s, psx_ot *ot, gte_state *gte)
@@ -1337,11 +1346,14 @@ void q2_screen_overlay_begin(q2_screen *s, psx_ot *ot, gte_state *gte)
         gte_set_projection(gte, (u16)s->overlay.proj,
                            s->overlay.ofs_x, s->overlay.ofs_y);
 
-    if (ot)
+    if (ot) {
+        psx_ot_set_authored_window(ot, Q2_SCREEN_OT_OVERLAY,
+                                   Q2_SCREEN_OT_OVERLAY_LEN);
         psx_ot_set_window(ot,
                           (u32)Q2_SCREEN_OT_OVERLAY + Q2_SCREEN_OT_VIEW_ENV + 1u,
                           (u32)Q2_SCREEN_OT_OVERLAY_LEN
                               - (Q2_SCREEN_OT_VIEW_ENV + 1u));
+    }
 }
 
 void q2_screen_overlay_end(q2_screen *s, psx_ot *ot)
@@ -1351,8 +1363,10 @@ void q2_screen_overlay_end(q2_screen *s, psx_ot *ot)
 
     /* `overlay_armed` is the equivalent flag; it is set when the camera comes
      * up because the original links this env unconditionally. */
-    if (ot)
+    if (ot) {
         psx_ot_set_window(ot, 0, 0);
+        psx_ot_set_authored_window(ot, 0, 0);
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1497,12 +1511,12 @@ static void env_apply(psx_framebuffer *fb, const screen_env *e,
 {
     opts->clip_x = e->x;
     opts->clip_y = e->y;
-    opts->clip_w = e->w;
-    opts->clip_h = e->h;
+    opts->clip_w = e->w > 0 ? e->w : -1;
+    opts->clip_h = e->h > 0 ? e->h : -1;
     opts->ofs_x  = e->x;
     opts->ofs_y  = e->y;
 
-    if (e->clear) {
+    if (e->clear && e->w > 0 && e->h > 0) {
         int py, px;
         int x1 = e->x + e->w;
         int y1 = e->y + e->h;
@@ -1517,7 +1531,7 @@ static void env_apply(psx_framebuffer *fb, const screen_env *e,
     }
 }
 
-void q2_screen_compose(q2_screen *s, const psx_ot *ot,
+void q2_screen_compose(q2_screen *s, psx_ot *ot,
                        const psx_vram *vram, const psx_raster_opts *opts)
 {
     psx_framebuffer *fb;
@@ -1527,6 +1541,10 @@ void q2_screen_compose(q2_screen *s, const psx_ot *ot,
 
     if (!s || !ot || !opts)
         return;
+
+    /* The last viewport has no following psx_ot_area_clear to trigger retail's
+     * final screen-area drain. DrawOTag is the other natural boundary. */
+    psx_ot_flush_batches(ot);
 
     fb = &s->buf[s->disp.draw_buffer];
     if (!fb->px)
@@ -1588,8 +1606,36 @@ void q2_screen_compose(q2_screen *s, const psx_ot *ot,
             env_apply(fb, &e, &local);
         }
 
-        for (idx = ot->bucket_head[b]; idx >= 0; idx = ot->next[idx])
-            psx_raster_prim(fb, &ot->prims[idx], vram, &local);
+        for (idx = ot->bucket_head[b]; idx >= 0; idx = ot->next[idx]) {
+            const psx_prim *prim = &ot->prims[idx];
+
+            if (prim->kind == PSX_PRIM_DRAW_ENV) {
+                int ep;
+
+                /* The packet is inside one viewport slice. Its coordinates
+                 * are relative to the unshaken viewport origin. */
+                for (ep = 0; ep < s->view_count; ep++) {
+                    u32 first = ((u32)Q2_SCREEN_OT_VIEW_BASE
+                               + (u32)ep * Q2_SCREEN_OT_VIEW_STRIDE)
+                              * PSX_OT_SUBDIV;
+                    u32 last = first
+                             + (u32)Q2_SCREEN_OT_VIEW_STRIDE * PSX_OT_SUBDIV;
+                    if (b >= first && b < last) {
+                        screen_env e;
+                        e.x = (s16)(s->view[ep].x + prim->xy[0].x);
+                        e.y = (s16)(s->view[ep].y + prim->xy[0].y);
+                        e.w = prim->xy[1].x;
+                        e.h = prim->xy[1].y;
+                        e.clear = false; /* packet+24 is explicitly zero */
+                        e.rgb[0] = e.rgb[1] = e.rgb[2] = 0;
+                        env_apply(fb, &e, &local);
+                        break;
+                    }
+                }
+                continue;
+            }
+            psx_raster_prim(fb, prim, vram, &local);
+        }
     }
 }
 

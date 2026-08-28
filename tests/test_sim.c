@@ -35,6 +35,122 @@ static void check_eq_i(s64 got, s64 want, const char *what)
     }
 }
 
+/* ------------------------------------------------------------------------- */
+/* Item attachment consumes the map module's Population selections. */
+static void item_put_u32(u8 *p, u32 v)
+{
+    p[0] = (u8)v;
+    p[1] = (u8)(v >> 8);
+    p[2] = (u8)(v >> 16);
+    p[3] = (u8)(v >> 24);
+}
+
+static void item_put_group(u8 *buf, u32 at, const char *name, u32 places)
+{
+    memset(buf + at, 0, Q2_POP_GROUP_SIZE);
+    memcpy(buf + at, name, strlen(name));
+    item_put_u32(buf + at + 0x10, places);
+}
+
+static void item_put_place(u8 *buf, u32 at, u16 id)
+{
+    memset(buf + at, 0, Q2_POP_PLACE_SIZE);
+    buf[at + 14] = (u8)id;
+    buf[at + 15] = (u8)(id >> 8);
+    item_put_u32(buf + at + Q2_POP_PLACE_SIZE, Q2_POP_TERM_FFFF);
+}
+
+static void item_put_select(u8 *buf, u32 name_at, const char *name)
+{
+    memset(buf + name_at, 0, 12);
+    memcpy(buf + name_at, name, strlen(name));
+    item_put_u32(buf + 0, 0x24040000u | name_at); /* addiu a0,zero,name */
+    item_put_u32(buf + 4,
+                 0x8C620000u | Q2_LEVELBIN_SLOT_SELECT); /* lw v0,+36(v1) */
+    item_put_u32(buf + 8, 0x00400009u);          /* jalr v0            */
+    item_put_u32(buf + 12, 0);                   /* delay slot          */
+}
+
+static void test_item_group_selection(void)
+{
+    enum { ZONE_PLACES = 80,
+           BATCH_PLACES = ZONE_PLACES + Q2_POP_PLACE_SIZE + 4,
+           SECOND_PLACES = BATCH_PLACES + Q2_POP_PLACE_SIZE + 4,
+           POP_SIZE = SECOND_PLACES + Q2_POP_PLACE_SIZE + 4 };
+    u8 population[POP_SIZE];
+    u8 levelbin[64];
+    dat_chunk pop_chunk, levelbin_chunk;
+    q2_common_file common;
+    q2_sim sim;
+
+    printf("item LevelBin selections\n");
+
+    memset(population, 0, sizeof(population));
+    item_put_group(population, 0,  "Zone0", ZONE_PLACES);
+    item_put_group(population, 24, "Weapons", BATCH_PLACES);
+    item_put_group(population, 48, "Ammo", SECOND_PLACES);
+    item_put_u32(population + 72, 0);            /* group terminator */
+    item_put_place(population, ZONE_PLACES, 27); /* Shells P */
+    item_put_place(population, BATCH_PLACES, 27);
+    item_put_place(population, SECOND_PLACES, 27);
+
+    memset(levelbin, 0, sizeof(levelbin));
+    item_put_select(levelbin, 48, "Weapons");
+
+    memset(&pop_chunk, 0, sizeof(pop_chunk));
+    pop_chunk.data = population;
+    pop_chunk.size = sizeof(population);
+    memset(&levelbin_chunk, 0, sizeof(levelbin_chunk));
+    levelbin_chunk.data = levelbin;
+    levelbin_chunk.size = sizeof(levelbin);
+
+    memset(&common, 0, sizeof(common));
+    common.chunk[Q2_COMMON_POPULATION] = &pop_chunk;
+    common.chunk[Q2_COMMON_LEVEL_BIN]  = &levelbin_chunk;
+
+    q2_sim_init(&sim, NULL, 50);
+    check_eq_i(q2_sim_attach_items(&sim, &common, 0, NULL, NULL), Q2_OK,
+               "item attachment accepts the synthetic map");
+    check_eq_i(sim.entities.count, 2,
+               "attachment spawns resident Zone0 and selected Weapons");
+    check_eq_i(sim.item_group_order_count, 2,
+               "startup records both groups that ran");
+    check_eq_i(sim.item_group_order[0], 0,
+               "resident Zone0 is first in startup order");
+    check_eq_i(sim.item_group_order[1], 1,
+               "selected Weapons follows in Population order");
+    check_eq_i(q2_sim_activate_item_group(&sim, "Weapons"), 0,
+               "CREBATCH cannot repeat a LevelBin-selected item group");
+    check_eq_i(sim.entities.count, 2,
+               "the selected group remains one copy after activation");
+
+    /* The fallback must not restore the old over-population: with no module,
+     * only the resident zone group is known to be live. */
+    common.chunk[Q2_COMMON_LEVEL_BIN] = NULL;
+    check_eq_i(q2_sim_attach_items(&sim, &common, 0, NULL, NULL), Q2_OK,
+               "item attachment also accepts a missing LevelBin");
+    check_eq_i(sim.entities.count, 1,
+               "without LevelBin the unzoned batch is not guessed live");
+    check_eq_i(q2_sim_activate_item_group(&sim, "Ammo"), 1,
+               "a later group can activate before an earlier Population row");
+    check_eq_i(sim.item_group_order[1], 2,
+               "the runtime order records Ammo's actual first call");
+    check_eq_i(q2_sim_activate_item_group(&sim, "Weapons"), 1,
+               "CREBATCH spawns the deferred item's group");
+    check_eq_i(sim.entities.count, 3,
+               "both deferred items join the live entity set");
+    check_eq_i(sim.item_group_order_count, 3,
+               "each group appears in the first-run order once");
+    check_eq_i(sim.item_group_order[2], 1,
+               "Weapons remains after Ammo rather than sorting by index");
+    check_eq_i(q2_sim_activate_item_group(&sim, "Weapons"), 0,
+               "the retail group latch makes CREBATCH one-shot");
+    check_eq_i(sim.entities.count, 3,
+               "repeated CREBATCH cannot duplicate the deferred item");
+
+    q2_sim_free(&sim);
+}
+
 /*
  * Did the tick just past put this sound on the queue? The queue is cleared at
  * the top of every world tick, so this only ever answers for the most recent
@@ -131,6 +247,65 @@ static void test_script_fx_damage(void)
           "a non-retail FX length is rejected before it can damage");
     check_eq_i(sim.combat.inv.health, health - 65,
                "the rejected FX leaves health unchanged");
+}
+
+/* ------------------------------------------------------------------------- */
+/* 0x80027E64: record categories are enter/stay/leave, not three unknown bits
+ * flattened into one edge-triggered volume rule. */
+static void test_event_contact_categories(void)
+{
+    static const u8 raw[] = {
+        4, 0, 0, Q2_EVREC_CAT_A,
+        4, 0, 0, Q2_EVREC_CAT_B,
+        4, 0, 0, Q2_EVREC_CAT_C
+    };
+    q2_events events;
+    q2_event_rt rt;
+
+    printf("event contact categories\n");
+
+    memset(&events, 0, sizeof(events));
+    events.data         = raw;
+    events.size         = sizeof(raw);
+    events.record_count = 3;
+    events.first_record = 0;
+
+    check(q2_event_rt_init(&rt, &events) == Q2_OK,
+          "three category records start a runtime");
+
+    q2_event_rt_contacts_begin(&rt);
+    check(q2_event_rt_contact(&rt, 0), "enter record accepts contact");
+    check(q2_event_rt_contact(&rt, 4), "stay record accepts contact");
+    check(q2_event_rt_contact(&rt, 8), "leave record accepts contact");
+    q2_event_rt_contacts_end(&rt);
+    q2_event_rt_update(&rt);
+    check_eq_i(rt.ran_count, 2,
+               "first inside frame runs enter and stay, not leave");
+
+    q2_event_rt_contacts_begin(&rt);
+    /* Two volumes may name one record; it still runs only once this tick. */
+    q2_event_rt_contact(&rt, 0);
+    q2_event_rt_contact(&rt, 4);
+    q2_event_rt_contact(&rt, 4);
+    q2_event_rt_contact(&rt, 8);
+    q2_event_rt_contacts_end(&rt);
+    q2_event_rt_update(&rt);
+    check_eq_i(rt.ran_count, 3,
+               "second inside frame repeats stay only once");
+
+    q2_event_rt_contacts_begin(&rt);
+    q2_event_rt_contacts_end(&rt);
+    q2_event_rt_update(&rt);
+    check_eq_i(rt.ran_count, 4,
+               "first outside frame runs the leave category");
+
+    q2_event_rt_contacts_begin(&rt);
+    q2_event_rt_contacts_end(&rt);
+    q2_event_rt_update(&rt);
+    check_eq_i(rt.ran_count, 4,
+               "remaining outside does not repeat leave");
+
+    q2_event_rt_free(&rt);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1195,6 +1370,159 @@ static void test_piston_decode(void)
     q2_movers_free(&set);
 }
 
+/* BASE2 Events+888: the cage at the level start drops once and stays there. */
+static void test_cagelift_timers(void)
+{
+    static const u8 funcs[16] = {
+        1, 0, 0, 0, 'C', 'A', 'G', 'E', 'L', 'I', 'F', 'T', '1', 0, 0, 0
+    };
+    u8 raw[32];
+    q2_userfuncs uf;
+    q2_events events;
+    q2_mover_set set;
+    u32 tick;
+
+    printf("BASE2 cage-lift timers\n");
+
+    memset(raw, 0, sizeof(raw));
+    hwr16(raw + 8, 24);              /* one 24-byte record */
+    raw[10] = 1;
+    raw[12] = Q2_EVOP_CALL;
+    raw[13] = 20;
+    hwr16(raw + 16, (u16)-1491);     /* item +4: BASE2's travel */
+    hwr16(raw + 18, (u16)-3);        /* item +6: speed */
+    hwr16(raw + 20, 23);             /* item +8/+10: cage slabs */
+    hwr16(raw + 22, 24);
+    hwr16(raw + 24, (u16)-1);
+    hwr16(raw + 26, (u16)-1);
+    raw[28] = 32;                    /* item +16: bottom thickness */
+    raw[29] = 32;                    /* item +17: top thickness */
+    raw[30] = 0;                     /* item +18: no delay */
+    raw[31] = 0xFF;                  /* item +19: never return */
+
+    memset(&uf, 0, sizeof(uf));
+    uf.data = funcs;
+    uf.size = (u32)sizeof(funcs);
+    uf.count = 1;
+    memset(&events, 0, sizeof(events));
+    events.data = raw;
+    events.size = (u32)sizeof(raw);
+    events.record_count = 1;
+    events.first_record = 8;
+    memset(&set, 0, sizeof(set));
+
+    check(q2_movers_build_calls(&set, &events, &uf, NULL, NULL) == Q2_OK,
+          "BASE2's CAGELIFT1 record decodes");
+    check_eq_i(set.count, 1, "and builds one cage mover");
+    if (set.count) {
+        q2_mover *m = &set.movers[0];
+
+        check_eq_i(m->delay_reset, 0, "+18 is the zero pre-move delay");
+        check_eq_i(m->wait_reset, Q2_MOVER_WAIT_NEVER,
+                   "+19 is the 0xFF never-return wait");
+        check_eq_i(m->cage_bottom, 32, "+16 remains the bottom slab");
+        check_eq_i(m->cage_top, 32, "+17 remains the top slab");
+
+        q2_mover_trigger(&set, 0);
+        for (tick = 0; tick < 200; tick++)
+            q2_movers_tick(&set, 12, 0);
+
+        check_eq_i(m->offset, 1491, "the cage reaches its lower stop");
+        check_eq_i(m->state, Q2_MV_OPEN,
+                   "and remains there instead of immediately rising");
+    }
+
+    q2_movers_free(&set);
+}
+
+/* BASE0 Events named CRATES plus LevelBin +0x0094 (DOCRATES). The LIFT1 is a
+ * four-object binding with zero target/speed; the module writes each object's
+ * Y displacement itself. */
+static void test_crate_conveyor(void)
+{
+    static const u8 funcs[16] = {
+        1, 0, 0, 0, 'L', 'I', 'F', 'T', '1', 0, 0, 0, 0, 0, 0, 0
+    };
+    u8 raw[48];
+    u8 nodes[4 * Q2_SCENE_NODE_SIZE];
+    q2_userfuncs uf;
+    q2_events events;
+    q2_mover_set set;
+    q2_scene scene;
+    s32 shift[3];
+
+    printf("BASE0 crate conveyor\n");
+
+    memset(raw, 0, sizeof(raw));
+    hwr32(raw + 0, 1);                 /* one record */
+    memcpy(raw + 4, "CRATES", 6);
+    hwr32(raw + 16, 24);               /* named record at +24 */
+    /* raw+20 is the directory terminator. */
+    hwr16(raw + 24, 24);
+    raw[26] = 1;
+    raw[27] = Q2_EVREC_CAT_B;
+    raw[28] = Q2_EVOP_CALL;
+    raw[29] = 20;
+    /* +2 is UserFuncs index zero; target/speed at +4/+6 remain zero. */
+    hwr16(raw + 36, 0);                /* item +8: slots 0..3 */
+    hwr16(raw + 38, 1);
+    hwr16(raw + 40, 2);
+    hwr16(raw + 42, 3);
+
+    memset(&uf, 0, sizeof(uf));
+    uf.data  = funcs;
+    uf.size  = sizeof(funcs);
+    uf.count = 1;
+
+    memset(&events, 0, sizeof(events));
+    events.data         = raw;
+    events.size         = sizeof(raw);
+    events.record_count = 1;
+    events.dir_count    = 1;
+    events.dir_offset   = 4;
+    events.first_record = 24;
+
+    memset(nodes, 0, sizeof(nodes));
+    /* Scene +20/+32 are bbox min/max Y. The last centre crosses -1044 on its
+     * first 30-unit step and therefore takes the -3500 wrap arm. */
+    hwr32(nodes + 0 * Q2_SCENE_NODE_SIZE + 20, (u32)-2000);
+    hwr32(nodes + 0 * Q2_SCENE_NODE_SIZE + 32, (u32)-1800);
+    hwr32(nodes + 1 * Q2_SCENE_NODE_SIZE + 20, (u32)-2200);
+    hwr32(nodes + 1 * Q2_SCENE_NODE_SIZE + 32, (u32)-2000);
+    hwr32(nodes + 2 * Q2_SCENE_NODE_SIZE + 20, (u32)-1600);
+    hwr32(nodes + 2 * Q2_SCENE_NODE_SIZE + 32, (u32)-1400);
+    hwr32(nodes + 3 * Q2_SCENE_NODE_SIZE + 20, (u32)-1100);
+    hwr32(nodes + 3 * Q2_SCENE_NODE_SIZE + 32, (u32)-1000);
+    memset(&scene, 0, sizeof(scene));
+    scene.nodes      = nodes;
+    scene.node_count = 4;
+
+    memset(&set, 0, sizeof(set));
+    check(q2_movers_build_calls(&set, &events, &uf, NULL, &scene) == Q2_OK,
+          "the zero-speed CRATES binding decodes");
+    check_eq_i(set.count, 4,
+               "its four slots become four independent runtime objects");
+    if (set.count == 4) {
+        check(set.movers[0].external && set.movers[3].external,
+              "the generic lift state machine leaves the objects to LevelBin");
+        check_eq_i(q2_movers_step_crates(&set, &events, &scene, 12), 4,
+                   "DOCRATES writes all four objects");
+        check_eq_i(set.movers[0].offset, 24,
+                   "slot 0 advances by (16*12)/8");
+        check_eq_i(set.movers[1].offset, 24,
+                   "slot 1 uses the same conveyor speed");
+        check_eq_i(set.movers[2].offset, 30,
+                   "slot 2 advances by (20*12)/8");
+        check_eq_i(set.movers[3].offset, -3470,
+                   "slot 3 wraps 3500 back after crossing -1044");
+
+        q2_movers_node_offset(&set, 2, shift);
+        check(shift[0] == 0 && shift[1] == 30 && shift[2] == 0,
+              "the authored object displacement reaches Scene rendering");
+    }
+    q2_movers_free(&set);
+}
+
 static void test_hull_movement(void)
 {
     q2_sim sim;
@@ -1646,6 +1974,103 @@ static void test_autoswitch(void)
                "on: a grenade never arms itself in your hand");
 }
 
+/* Grenade3's state lives across the weapon, view-model and projectile layers.
+ * This pins the sim-side join: prime is free, cook follows the attached hand,
+ * release spends one grenade, and a fuse that wins detonates without spending
+ * it or leaving an invisible projectile behind. */
+static void test_held_hand_grenade(void)
+{
+    const q2_weapon_tables *wt = q2_weapon_tables_builtin();
+    q2_sim sim;
+    q2_fire_result_v2 fire;
+    s32 spawn[3] = { 0, 0, 0 };
+    s32 attached[3] = { 100, -200, 300 };
+    s32 eye[3];
+    s32 h;
+
+    printf("held hand grenade\n");
+
+    q2_sim_init(&sim, NULL, 50);
+    q2_sim_spawn(&sim, spawn, 0);
+    sim.fire_from_input = false;
+    sim.combat.weapon_id = Q2_WID_HAND_GRENADE;
+    sim.combat.inv.weapons |= wt->owned_bit[Q2_WID_HAND_GRENADE];
+    sim.combat.inv.ammo[Q2_AMMO_GRENADES] = 3;
+
+    fire = q2_sim_fire(&sim);
+    check(fire.fired, "the view-model path primes Grenade3");
+    check_eq_i(sim.combat.inv.ammo[Q2_AMMO_GRENADES], 3,
+               "without spending ammo at prime");
+    h = q2_projectile_hand_held_index(&sim.combat.projectiles, 0);
+    check(h >= 0, "and leaves a hidden owner-attached entity");
+
+    check_eq_i(q2_sim_hand_grenade_update(&sim, attached, 20, false),
+               Q2_HAND_GRENADE_HELD,
+               "the model update keeps it held");
+    check_eq_i(sim.combat.projectiles.p[h].pos[0], attached[0],
+               "at the view weapon's X");
+    check_eq_i(sim.combat.projectiles.p[h].pos[1], attached[1],
+               "at the view weapon's Y");
+    check_eq_i(sim.combat.projectiles.p[h].pos[2], attached[2],
+               "at the view weapon's Z");
+    check_eq_i(q2_projectile_hand_charge(&sim.combat.projectiles, 0),
+               Q2_HAND_GRENADE_CHARGE_START + 120,
+               "with charge advanced by 6*dt");
+
+    q2_sim_eye(&sim, eye);
+    check_eq_i(q2_sim_hand_grenade_update(&sim, attached, 0, true),
+               Q2_HAND_GRENADE_RELEASED,
+               "the 411 signal releases it");
+    check_eq_i(sim.combat.inv.ammo[Q2_AMMO_GRENADES], 2,
+               "and only then spends one grenade");
+    check_eq_i(q2_projectile_hand_held_index(&sim.combat.projectiles, 0), -1,
+               "the entity is now in flight");
+    check_eq_i(sim.combat.projectiles.p[h].pos[0] - eye[0],
+               Q2_HAND_GRENADE_RELEASE_RIGHT,
+               "from the read +80 right offset at yaw zero");
+    check_eq_i(sim.combat.projectiles.p[h].pos[1] - eye[1],
+               Q2_HAND_GRENADE_RELEASE_DOWN,
+               "and the read -50 vertical offset");
+    check_eq_i(sim.combat.projectiles.p[h].pos[2] - eye[2],
+               Q2_HAND_GRENADE_RELEASE_FORWARD,
+               "and the read +200 forward offset");
+
+    /* No-view-model callers still get an immediate minimum-charge throw. */
+    q2_sim_init(&sim, NULL, 50);
+    q2_sim_spawn(&sim, spawn, 0);
+    sim.combat.weapon_id = Q2_WID_HAND_GRENADE;
+    sim.combat.inv.weapons |= wt->owned_bit[Q2_WID_HAND_GRENADE];
+    sim.combat.inv.ammo[Q2_AMMO_GRENADES] = 3;
+    fire = q2_sim_fire(&sim);
+    check(fire.fired && fire.sound == Q2_WSND_HANDGREN_THROW,
+          "a harness without a view model throws immediately and audibly");
+    check_eq_i(sim.combat.inv.ammo[Q2_AMMO_GRENADES], 2,
+               "that compatibility throw still spends one grenade");
+    check_eq_i(q2_projectile_hand_held_index(&sim.combat.projectiles, 0), -1,
+               "rather than orphaning a held state no model can drive");
+
+    /* Fuse expiry wins over release and hurts the owner at the hand. */
+    q2_sim_init(&sim, NULL, 50);
+    q2_sim_spawn(&sim, spawn, 0);
+    sim.fire_from_input = false;
+    sim.combat.weapon_id = Q2_WID_HAND_GRENADE;
+    sim.combat.inv.weapons |= wt->owned_bit[Q2_WID_HAND_GRENADE];
+    sim.combat.inv.ammo[Q2_AMMO_GRENADES] = 3;
+    fire = q2_sim_fire(&sim);
+    h = q2_projectile_hand_held_index(&sim.combat.projectiles, 0);
+    check(h >= 0, "a second held grenade exists for the fuse test");
+    sim.level_time = sim.combat.projectiles.p[h].expires;
+    check_eq_i(q2_sim_hand_grenade_update(&sim, attached, 0, true),
+               Q2_HAND_GRENADE_EXPIRED,
+               "an elapsed held fuse wins over release");
+    check_eq_i(sim.combat.projectiles.live, 0,
+               "and consumes the hidden projectile");
+    check_eq_i(sim.combat.inv.ammo[Q2_AMMO_GRENADES], 3,
+               "without charging ammo for a grenade never thrown");
+    check(sim.combat.inv.health < 100,
+          "the in-hand blast damages its owner");
+}
+
 
 /* ------------------------------------------------------------------------- */
 /* Every step is in the way. */
@@ -1900,13 +2325,118 @@ static void test_movers_block_sight_and_shots(void)
 }
 
 /* ------------------------------------------------------------------------- */
+/* GLASS owns a normal entity box until the fatal hit frees that box. */
+static void test_glass_solidity_lifetime(void)
+{
+    u8 raw[Q2_SCENE_NODE_SIZE];
+    q2_scene scene;
+    q2_sim sim;
+    q2_move_target pane;
+    q2_move_contact hit;
+    q2_trace tr;
+    q2_breakable *b;
+    s32 from[3] = { 2000, 300,  500 };
+    s32 to[3]   = { 2000, 300, 3500 };
+    const s32 bmin[3] = { 1900,   0, 2000 };
+    const s32 bmax[3] = { 2100, 600, 2100 };
+    int k;
+
+    printf("breakable glass solidity lifetime\n");
+
+    memset(raw, 0, sizeof(raw));
+    for (k = 0; k < 3; k++) {
+        hwr32(raw + 0x10 + k * 4, (u32)bmin[k]);
+        hwr32(raw + 0x1C + k * 4, (u32)bmax[k]);
+    }
+    memset(&scene, 0, sizeof(scene));
+    scene.nodes      = raw;
+    scene.node_count = 1;
+
+    q2_sim_init(&sim, NULL, 50);
+    check(open_box_hull(&sim.coll), "the glass test's open hull parses");
+    sim.coll_ready = true;
+    memset(&pane, 0, sizeof(pane));
+    for (k = 0; k < 3; k++) {
+        pane.min[k] = pane.env_min[k] = bmin[k];
+        pane.max[k] = pane.env_max[k] = bmax[k];
+    }
+    pane.kind   = Q2_MOVE_KIND_ENTITY;
+    pane.id     = 0;
+    pane.active = true;
+
+    sim.volumes               = &pane; /* borrowed for this synthetic case */
+    sim.volume_count          = 1;
+    sim.breakable_solid_count = 1;
+    sim.move_world.targets    = &pane;
+    sim.move_world.count      = 1;
+    sim.move_world.half_extent = 0;
+    sim.breakable_scene       = &scene;
+    sim.breakable_count       = 1;
+
+    b = &sim.breakable[0];
+    memset(b, 0, sizeof(*b));
+    b->scene_node   = 0;
+    b->health       = 10;
+    b->kind         = Q2_BREAKABLE_GLASS;
+    b->solid_target = 0;
+    for (k = 0; k < 3; k++) {
+        b->bmin[k] = bmin[k];
+        b->bmax[k] = bmax[k];
+    }
+
+    check(!q2_move_sweep_world(&sim.move_world, from, to, &hit),
+          "an intact pane blocks movement");
+    check_eq_i(hit.kind, Q2_MOVE_KIND_ENTITY,
+               "the pane is an entity solid, not a trigger volume");
+    q2_sim_trace(&sim, from, to, &tr);
+    check(tr.hit, "an intact pane also stops a point trace");
+    check_eq_i(tr.ent, 0,
+               "even when the map has zero movers to arm the entity pass");
+    check_eq_i(tr.end[2], bmin[2], "the trace stops at the pane's near face");
+
+    (void)q2_sim_breakable_shot(&sim, from, to, 9);
+    check(!b->broken, "a surviving hit leaves the pane intact");
+    check(pane.active, "and leaves its solid box active");
+
+    (void)q2_sim_breakable_shot(&sim, from, to, 1);
+    check(b->broken, "the fatal hit shatters the pane");
+    check_eq_i(sim.breakable_hits, 2,
+               "each shot reaching the pane is counted exactly once");
+    check(!pane.active, "and frees its solid box in the same call");
+    check(q2_move_sweep_world(&sim.move_world, from, to, &hit),
+          "movement passes through the broken pane");
+    q2_sim_trace(&sim, from, to, &tr);
+    check(!tr.hit, "a point trace also passes after the pane is broken");
+
+    /* Save restore changes `broken` in bulk; the public sync is its bridge to
+     * the runtime box table. Exercise both directions so loading an old save
+     * cannot resurrect an invisible wall or remove an intact one. */
+    b->broken = false;
+    q2_sim_breakables_sync_solidity(&sim);
+    check(pane.active, "restoring intact state restores solidity");
+    b->broken = true;
+    q2_sim_breakables_sync_solidity(&sim);
+    check(!pane.active, "restoring broken state removes solidity");
+
+    /* The local target is borrowed, whereas q2_sim_free owns normal arrays. */
+    sim.volumes = NULL;
+    sim.volume_count = 0;
+    sim.move_world.targets = NULL;
+    sim.move_world.count = 0;
+    q2_sim_free(&sim);
+}
+
+/* ------------------------------------------------------------------------- */
 int main(void)
 {
     printf("Q2PSX-PC simulation tests\n\n");
 
+    test_item_group_selection();
     test_script_fx_damage();
+    test_event_contact_categories();
     test_underwater_air();
     test_autoswitch();
+    test_held_hand_grenade();
     test_tick_rate();
     test_gravity();
     test_scene_lights();
@@ -1919,6 +2449,8 @@ int main(void)
     test_liquid();
     test_fall_damage();
     test_piston_decode();
+    test_cagelift_timers();
+    test_crate_conveyor();
     test_hull_movement();
     test_mover_push();
     test_ease_boundary();
@@ -1927,6 +2459,7 @@ int main(void)
     test_melee_point();
     test_train();
     test_movers_block_sight_and_shots();
+    test_glass_solidity_lifetime();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     printf("%s\n", g_failures == 0 ? "PASS" : "FAIL");

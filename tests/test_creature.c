@@ -15,6 +15,7 @@
 
 #include "ai.h"
 #include "crebind.h"
+#include "creworld.h"
 #include "creature.h"
 #include "spawn.h"
 
@@ -52,6 +53,55 @@ static void put_u32(u8 *p, u32 v)
     p[1] = (u8)(v >> 8);
     p[2] = (u8)(v >> 16);
     p[3] = (u8)(v >> 24);
+}
+
+/* ------------------------------------------------------------------------- */
+static int g_batch_stands;
+
+static void batch_stand(q2_monster *m)
+{
+    g_batch_stands++;
+    m->frame = 123;
+}
+
+static void test_summoned_batch_is_started(void)
+{
+    q2_creature_world w;
+    q2_monster monster;
+    u8 population[28];
+
+    puts("a CREBATCH wake starts its formerly dormant monsters");
+
+    memset(&w, 0, sizeof(w));
+    memset(population, 0, sizeof(population));
+    memcpy(population, "LiftRoom", 8);
+    w.pop.data = population;
+    w.pop.size = sizeof(population);
+    w.pop.group_count = 1;
+    w.pop_ready = true;
+
+    q2_monster_init(&monster);
+    monster.group = 0;
+    monster.health = 20;
+    monster.in_use = false;       /* held by q2_creature_world_hold_batches */
+    monster.spawnflags |= Q2_SVFLAG_INUSE;
+    monster.stand = batch_stand;
+    w.set.monsters = &monster;
+    w.set.count = 1;
+
+    q2_level_reset();
+    g_batch_stands = 0;
+    check_eq_i(q2_creature_world_summon(&w, "LiftRoom"), 1,
+               "the dormant record is selected");
+    check(monster.in_use, "its port-side in-use latch is raised");
+    check_eq_i(g_batch_stands, 1,
+               "monster_start_go installs the creature's standing move");
+    check(monster.think == q2_M_MoveFrame,
+          "and installs the retail frame driver");
+    check_eq_i(monster.next_think, 1,
+               "with a live next-think deadline");
+    check_eq_i(q2_creature_world_summon(&w, "LiftRoom"), 0,
+               "a second selection does not restart an active creature");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -584,6 +634,7 @@ int main(void)
 {
     printf("Q2PSX-PC creature tests\n\n");
 
+    test_summoned_batch_is_started();
     test_bind();
     test_population_spawn_flags();
     test_move_lookup();

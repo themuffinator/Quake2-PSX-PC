@@ -24,7 +24,8 @@ static void read_node(const u8 *rec, q2_coll_node *out)
     }
     out->first_plane = q2_rd_u16(rec + 24);
     out->first_link  = q2_rd_u16(rec + 26);
-    out->unk_c       = q2_rd_u32(rec + 28);
+    out->sort_offset = q2_rd_s16(rec + 28);
+    out->first_light = q2_rd_u16(rec + 30);
     out->contents    = q2_rd_u8(rec + 32);
     out->pad[0]      = q2_rd_u8(rec + 33);
     out->pad[1]      = q2_rd_u8(rec + 34);

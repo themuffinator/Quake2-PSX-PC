@@ -171,17 +171,28 @@ static const q2_uf_prim_info uf_table[Q2_UF_PRIM_COUNT] = {
  *     800298D4  bgez / subu       ; abs()
  *     800298E0  sh  v0, 2(s0)     ; -> obj+0x3A, the SPEED
  *
- * The omission is why `q2_movers_build_calls` could not build one and said so:
- * "a mover with speed zero is triggered, ticks and never arrives". It has a
- * speed; the table was short an entry.
+ * Its exec at `0x8002DFF4` also settles the four tail bytes. +16/+17 are used
+ * only by the constructor to cut the cage's bottom/top slabs; +18 is the delay
+ * (`lbu` at 0x8002E058) and +19 is the wait (`lbu` at 0x8002E078), with 0xFF
+ * written as 0xFFFF. BASE2 authors 32,32,0,255: full-size slabs, no pre-delay,
+ * and no automatic return.
  */
-{Q2_UF_CAGELIFT1, "CAGELIFT1", 20, true, true, 4, {
+{Q2_UF_CAGELIFT1, "CAGELIFT1", 20, true, true, 7, {
     {4,  1, Q2_UF_OP_U16,     "param_a", "negated into obj+0x44 (0x800298C4)"},
     {6,  1, Q2_UF_OP_S16,     "param_b", "abs() into obj+0x3A (0x800298DC)"},
     {8,  4, Q2_UF_OP_OBJSLOT, "objects", "up to four"},
-    {18, 1, Q2_UF_OP_U8,      "time_b",  "* 300; 0xFF => never"}}},
+    {16, 1, Q2_UF_OP_U8,      "bottom",  "bottom collision-slab thickness"},
+    {17, 1, Q2_UF_OP_U8,      "top",     "top collision-slab thickness"},
+    {18, 1, Q2_UF_OP_U8,      "time_a",  "* 300 into obj+0x4C"},
+    {19, 1, Q2_UF_OP_U8,      "time_b",  "* 300 into obj+0x4E; 0xFF => never"}}},
 
-{Q2_UF_ROTHATCH, "ROTHATCH", 20, true, true, 3, {
+{Q2_UF_ROTHATCH, "ROTHATCH", 20, true, true, 7, {
+    {4,  1, Q2_UF_OP_S16,     "speed", "absolute value; sign chosen from target"},
+    {6,  1, Q2_UF_OP_S16,     "target", "obj+0x44, on the 4096-step circle"},
+    {8,  1, Q2_UF_OP_U8,      "axis", "low two bits -> obj+0x50 bits 14..15"},
+    {10, 3, Q2_UF_OP_S16,     "hinge",
+     "adjusts the raw Scene-box centre: subtract X, add Y and Z, then make it "
+     "relative to Scene.origin (0x8002B798..0x8002B830)"},
     {16, 1, Q2_UF_OP_U8,      "time_a", "* 300 into obj+0x4C"},
     {17, 1, Q2_UF_OP_U8,      "time_b", "* 300; 0xFF => never"},
     {18, 1, Q2_UF_OP_OBJSLOT, "object", NULL}}},

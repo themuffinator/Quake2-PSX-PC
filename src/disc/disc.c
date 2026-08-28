@@ -169,6 +169,25 @@ static int disc_add_backing(disc *d, const char *path)
     return d->backing_count++;
 }
 
+/* Return an opened disc object to its allocation-only state.  In particular,
+ * this is used when a sibling CUE was found but could not be completed: the
+ * parser may already have opened one or more FILE entries before a later one
+ * fails, and erasing the structure without closing them leaks those handles. */
+static void disc_reset_loaded(disc *d)
+{
+    int i;
+
+    if (!d)
+        return;
+
+    for (i = 0; i < d->backing_count; i++) {
+        if (d->backing[i].fp)
+            fclose(d->backing[i].fp);
+    }
+    free(d->files);
+    memset(d, 0, sizeof(*d));
+}
+
 /* ------------------------------------------------------------------------- */
 /* Sector reading                                                             */
 /* ------------------------------------------------------------------------- */
@@ -176,9 +195,23 @@ static const cd_track *disc_track_for_lba(const disc *d, u32 lba)
 {
     int i;
 
+    /* Prefer INDEX 01 ranges. In a one-FILE mixed-mode image the previous
+     * track traditionally owns the same physical sectors as the next track's
+     * INDEX 00 range, and preserving that choice keeps existing addressing
+     * unchanged. */
     for (i = 0; i < d->track_count; i++) {
         const cd_track *t = &d->tracks[i];
         if (lba >= t->start_lba && lba < t->start_lba + t->length_sectors)
+            return t;
+    }
+
+    /* A separately backed track can expose a physically stored INDEX 00 gap
+     * which no preceding INDEX 01 range covers. It belongs to the upcoming
+     * track and must remain raw-readable (CD players may seek or scan it). */
+    for (i = 0; i < d->track_count; i++) {
+        const cd_track *t = &d->tracks[i];
+        if (t->pregap_lba != UINT32_MAX &&
+            lba >= t->pregap_lba && lba < t->start_lba)
             return t;
     }
     /* Images often declare a volume larger than the physical data track (the
@@ -204,7 +237,16 @@ q2_result disc_read_raw_sector(const disc *d, u32 lba, u8 *out)
         return Q2_ERR_IO;
 
     bf = &d->backing[t->file_index];
-    offset = t->file_offset + (u64)(lba - t->start_lba) * (u64)t->sector_size;
+    if (lba < t->start_lba) {
+        u64 before = (u64)(t->start_lba - lba) * (u64)t->sector_size;
+
+        if (before > t->file_offset)
+            return Q2_ERR_RANGE;
+        offset = t->file_offset - before;
+    } else {
+        offset = t->file_offset +
+                 (u64)(lba - t->start_lba) * (u64)t->sector_size;
+    }
 
     if (offset + (u64)t->sector_size > bf->size)
         return Q2_ERR_RANGE;
@@ -304,6 +346,130 @@ static int cue_sector_size_for_mode(const char *mode)
     return CD_SECTOR_RAW;
 }
 
+/*
+ * Turn the INDEX positions parsed from a CUE sheet into the two coordinate
+ * systems the rest of the disc layer needs:
+ *
+ *   file_offset  byte position within the track's backing FILE
+ *   start_lba    absolute sector position on the complete disc
+ *
+ * INDEX positions restart at zero for every FILE.  A one-FILE sheet needs no
+ * rebasing; retain its established layout exactly.  With multiple FILEs, each
+ * backing starts after all sectors in the preceding backing, while INDEX 00/01
+ * remain offsets into the current file.  This matters for the common layout in
+ * which a separate audio file contains its own 150-sector INDEX 00 pregap.
+ */
+static q2_result cue_layout_tracks(disc *d)
+{
+    int i;
+
+    if (d->backing_count == 1) {
+        /* Existing single-file behaviour: offsets are measured from the first
+         * track represented by the shared backing file. */
+        for (i = 0; i < d->track_count; i++) {
+            cd_track *t = &d->tracks[i];
+            u32 base_lba = t->start_lba;
+            int j;
+
+            for (j = 0; j < i; j++) {
+                if (d->tracks[j].file_index == t->file_index) {
+                    base_lba = d->tracks[j].pregap_lba != UINT32_MAX
+                             ? d->tracks[j].pregap_lba
+                             : d->tracks[j].start_lba;
+                    break;
+                }
+            }
+
+            if (t->start_lba < base_lba)
+                return Q2_ERR_BAD_FORMAT;
+
+            t->file_offset = (u64)(t->start_lba - base_lba) *
+                             (u64)t->sector_size;
+
+            if (t->file_index >= 0 && t->file_index < d->backing_count) {
+                const u64 size = d->backing[t->file_index].size;
+
+                if (t->file_offset > size)
+                    return Q2_ERR_BAD_FORMAT;
+                t->length_sectors = (u32)((size - t->file_offset) /
+                                          (u64)t->sector_size);
+            }
+        }
+    } else {
+        u64 file_base = 0;
+        int file_index;
+
+        for (file_index = 0; file_index < d->backing_count; file_index++) {
+            const backing_file *bf = &d->backing[file_index];
+            u64 file_sectors;
+            int sector_size = 0;
+
+            /* All tracks sharing a binary file necessarily share its physical
+             * sector size.  Besides rejecting an ambiguous layout, finding it
+             * here lets the complete size of this FILE advance the next one's
+             * absolute base. */
+            for (i = 0; i < d->track_count; i++) {
+                const cd_track *t = &d->tracks[i];
+
+                if (t->file_index != file_index)
+                    continue;
+                if (sector_size == 0)
+                    sector_size = t->sector_size;
+                else if (sector_size != t->sector_size)
+                    return Q2_ERR_BAD_FORMAT;
+            }
+
+            if (sector_size == 0)
+                return Q2_ERR_BAD_FORMAT;
+
+            file_sectors = bf->size / (u64)sector_size;
+            if (file_sectors > UINT32_MAX ||
+                file_base + file_sectors > UINT32_MAX)
+                return Q2_ERR_RANGE;
+
+            for (i = 0; i < d->track_count; i++) {
+                cd_track *t = &d->tracks[i];
+                u32 local_start;
+                u32 local_pregap;
+
+                if (t->file_index != file_index)
+                    continue;
+
+                local_start  = t->start_lba;
+                local_pregap = t->pregap_lba;
+                if ((u64)local_start > file_sectors ||
+                    (local_pregap != UINT32_MAX &&
+                     (u64)local_pregap > file_sectors))
+                    return Q2_ERR_BAD_FORMAT;
+
+                t->file_offset = (u64)local_start * (u64)sector_size;
+                t->start_lba = (u32)(file_base + local_start);
+                if (local_pregap != UINT32_MAX)
+                    t->pregap_lba = (u32)(file_base + local_pregap);
+                t->length_sectors = (u32)(file_sectors - local_start);
+            }
+
+            file_base += file_sectors;
+        }
+    }
+
+    /* Stop a track where the next INDEX 01 in the same FILE begins.  Keeping
+     * this rule unchanged preserves the treatment of an in-file pregap in
+     * existing single-file images. */
+    for (i = 0; i + 1 < d->track_count; i++) {
+        cd_track *t = &d->tracks[i];
+        const cd_track *n = &d->tracks[i + 1];
+
+        if (t->file_index == n->file_index && n->start_lba > t->start_lba) {
+            u32 len = n->start_lba - t->start_lba;
+            if (len < t->length_sectors)
+                t->length_sectors = len;
+        }
+    }
+
+    return Q2_OK;
+}
+
 static q2_result disc_load_cue(disc *d, const char *cue_path)
 {
     FILE *fp;
@@ -383,43 +549,10 @@ static q2_result disc_load_cue(disc *d, const char *cue_path)
     if (d->track_count == 0)
         return Q2_ERR_BAD_FORMAT;
 
-    /* Each FILE restarts the byte offset, so a track's offset within its own
-     * backing file is measured from the first track that shares that file. */
     {
-        int i;
-        for (i = 0; i < d->track_count; i++) {
-            cd_track *t = &d->tracks[i];
-            u32 base_lba = t->start_lba;
-            int j;
-
-            for (j = 0; j < i; j++) {
-                if (d->tracks[j].file_index == t->file_index) {
-                    base_lba = d->tracks[j].pregap_lba != UINT32_MAX
-                             ? d->tracks[j].pregap_lba
-                             : d->tracks[j].start_lba;
-                    break;
-                }
-            }
-
-            t->file_offset = (u64)(t->start_lba - base_lba) * (u64)t->sector_size;
-
-            if (t->file_index >= 0 && t->file_index < d->backing_count) {
-                u64 remaining = d->backing[t->file_index].size - t->file_offset;
-                t->length_sectors = (u32)(remaining / (u64)t->sector_size);
-            }
-        }
-
-        /* Trim each track's length so it stops where the next one in the same
-         * file begins. */
-        for (i = 0; i + 1 < d->track_count; i++) {
-            cd_track *t = &d->tracks[i];
-            const cd_track *n = &d->tracks[i + 1];
-            if (t->file_index == n->file_index && n->start_lba > t->start_lba) {
-                u32 len = n->start_lba - t->start_lba;
-                if (len < t->length_sectors)
-                    t->length_sectors = len;
-            }
-        }
+        q2_result r = cue_layout_tracks(d);
+        if (r != Q2_OK)
+            return r;
     }
 
     /* Pick the first data track as the filesystem source. */
@@ -449,6 +582,9 @@ static q2_result disc_load_bare_image(disc *d, const char *path, int forced_sect
         return Q2_ERR_NOT_FOUND;
 
     size = d->backing[idx].size;
+
+    if (sector_size != 0 && size % (u64)sector_size != 0)
+        return Q2_ERR_BAD_FORMAT;
 
     if (sector_size == 0) {
         if (size % CD_SECTOR_RAW == 0)
@@ -481,6 +617,29 @@ static q2_result disc_load_bare_image(disc *d, const char *path, int forced_sect
 /* ------------------------------------------------------------------------- */
 #define ISO_PVD_LBA 16
 
+/* ISO9660 logical block numbers are relative to the volume, while the public
+ * track and raw-sector APIs use absolute disc LBAs.  They are identical on a
+ * normal PSX data-first disc, but differ for a valid mixed-mode layout whose
+ * data FILE follows one or more audio FILEs. */
+static q2_result iso_absolute_lba(const disc *d, u32 volume_lba,
+                                 u32 *out_lba)
+{
+    const cd_track *data;
+    u64 absolute;
+
+    if (!d || !out_lba || d->data_track < 0 ||
+        d->data_track >= d->track_count)
+        return Q2_ERR_BAD_FORMAT;
+
+    data = &d->tracks[d->data_track];
+    absolute = (u64)data->start_lba + (u64)volume_lba;
+    if (absolute > UINT32_MAX)
+        return Q2_ERR_RANGE;
+
+    *out_lba = (u32)absolute;
+    return Q2_OK;
+}
+
 static void iso_copy_field(char *dst, size_t cap, const u8 *src, size_t len)
 {
     size_t n = len < cap - 1 ? len : cap - 1;
@@ -509,18 +668,23 @@ static q2_result iso_walk_dir(disc *d, u32 lba, u32 length, const char *prefix, 
 {
     q2_buf dir;
     q2_result r;
+    u32 absolute_lba;
     u32 sectors;
     size_t off = 0;
 
     if (depth > 8)
         return Q2_OK;   /* ISO9660 permits 8 levels; deeper means corruption */
 
+    r = iso_absolute_lba(d, lba, &absolute_lba);
+    if (r != Q2_OK)
+        return r;
+
     sectors = (length + CD_SECTOR_FORM1 - 1) / CD_SECTOR_FORM1;
     r = q2_buf_alloc(&dir, (size_t)sectors * CD_SECTOR_FORM1);
     if (r != Q2_OK)
         return r;
 
-    r = disc_read_form1_run(d, lba, sectors, dir.data);
+    r = disc_read_form1_run(d, absolute_lba, sectors, dir.data);
     if (r != Q2_OK) {
         q2_buf_free(&dir);
         return r;
@@ -564,13 +728,24 @@ static q2_result iso_walk_dir(disc *d, u32 lba, u32 length, const char *prefix, 
         snprintf(full, sizeof(full), "%s/%s", prefix, name);
 
         if (flags & 0x02) {
-            iso_walk_dir(d, ext_lba, ext_len, full, depth + 1);
+            r = iso_walk_dir(d, ext_lba, ext_len, full, depth + 1);
+            if (r != Q2_OK) {
+                q2_buf_free(&dir);
+                return r;
+            }
         } else if (d->file_count < DISC_MAX_FILES) {
             disc_file *f = &d->files[d->file_count++];
+            u32 file_lba;
+
+            r = iso_absolute_lba(d, ext_lba, &file_lba);
+            if (r != Q2_OK) {
+                q2_buf_free(&dir);
+                return r;
+            }
             str_copy(f->path, sizeof(f->path), full);
-            f->lba   = ext_lba;
+            f->lba   = file_lba;
             f->size  = ext_len;
-            f->form2 = disc_sector_is_form2(d, ext_lba);
+            f->form2 = disc_sector_is_form2(d, file_lba);
         }
 
         off += rec_len;
@@ -580,18 +755,24 @@ static q2_result iso_walk_dir(disc *d, u32 lba, u32 length, const char *prefix, 
     return Q2_OK;
 }
 
-static q2_result disc_load_iso9660(disc *d)
+static q2_result disc_load_iso9660(disc *d, bool report_error)
 {
     u8 pvd[CD_SECTOR_FORM1];
     q2_result r;
+    u32 pvd_lba;
     u32 root_lba, root_len;
 
-    r = disc_read_form1_run(d, ISO_PVD_LBA, 1, pvd);
+    r = iso_absolute_lba(d, ISO_PVD_LBA, &pvd_lba);
+    if (r != Q2_OK)
+        return r;
+
+    r = disc_read_form1_run(d, pvd_lba, 1, pvd);
     if (r != Q2_OK)
         return r;
 
     if (pvd[0] != 1 || memcmp(pvd + 1, "CD001", 5) != 0) {
-        Q2_ERROR("no ISO9660 primary volume descriptor at LBA %d", ISO_PVD_LBA);
+        if (report_error)
+            Q2_ERROR("no ISO9660 primary volume descriptor at LBA %u", pvd_lba);
         return Q2_ERR_BAD_FORMAT;
     }
 
@@ -612,6 +793,35 @@ static q2_result disc_load_iso9660(disc *d)
     return iso_walk_dir(d, root_lba, root_len, "", 0);
 }
 
+/* A `.iso` suffix normally means cooked 2048-byte sectors, but raw dumps are
+ * commonly mislabeled that way.  File-size divisibility alone cannot decide:
+ * 128 raw sectors occupy exactly 147 cooked sectors.  Validate the cooked
+ * interpretation through ISO9660, then discard it completely and infer the
+ * physical sector size when that probe fails. */
+static q2_result disc_load_iso_path(disc *d, const char *path)
+{
+    q2_result r;
+
+    r = disc_load_bare_image(d, path, CD_SECTOR_MODE1);
+    if (r == Q2_OK) {
+        r = disc_load_iso9660(d, false);
+        if (r == Q2_OK)
+            return Q2_OK;
+    }
+
+    /* A missing/unreadable image or an allocation failure is not evidence of
+     * a different sector layout. Preserve that real error instead of masking
+     * it with a second open attempt. */
+    if (r != Q2_ERR_BAD_FORMAT)
+        return r;
+
+    disc_reset_loaded(d);
+    r = disc_load_bare_image(d, path, 0);
+    if (r != Q2_OK)
+        return r;
+    return disc_load_iso9660(d, true);
+}
+
 /* ------------------------------------------------------------------------- */
 /* Public API                                                                 */
 /* ------------------------------------------------------------------------- */
@@ -620,6 +830,7 @@ q2_result disc_open(disc **out, const char *path)
     disc *d;
     q2_result r;
     const char *ext;
+    bool iso_loaded = false;
 
     if (!out || !path)
         return Q2_ERR_INVALID_ARG;
@@ -634,9 +845,8 @@ q2_result disc_open(disc **out, const char *path)
     if (ascii_casecmp(ext, "cue") == 0) {
         r = disc_load_cue(d, path);
     } else if (ascii_casecmp(ext, "iso") == 0) {
-        r = disc_load_bare_image(d, path, CD_SECTOR_MODE1);
-        if (r != Q2_OK)                     /* some .iso files are really raw */
-            r = disc_load_bare_image(d, path, 0);
+        r = disc_load_iso_path(d, path);
+        iso_loaded = r == Q2_OK;
     } else if (ascii_casecmp(ext, "bin") == 0 || ascii_casecmp(ext, "img") == 0) {
         /* Prefer a sibling .cue so multi-track discs keep their audio. */
         char cue[512];
@@ -651,7 +861,7 @@ q2_result disc_open(disc **out, const char *path)
 
         r = disc_load_cue(d, cue);
         if (r != Q2_OK) {
-            memset(d, 0, sizeof(*d));
+            disc_reset_loaded(d);
             r = disc_load_bare_image(d, path, 0);
         } else {
             Q2_INFO("using sibling cue sheet: %s", cue);
@@ -672,10 +882,12 @@ q2_result disc_open(disc **out, const char *path)
         return r;
     }
 
-    r = disc_load_iso9660(d);
-    if (r != Q2_OK) {
-        disc_close(d);
-        return r;
+    if (!iso_loaded) {
+        r = disc_load_iso9660(d, true);
+        if (r != Q2_OK) {
+            disc_close(d);
+            return r;
+        }
     }
 
     snprintf(d->description, sizeof(d->description),
@@ -691,16 +903,10 @@ q2_result disc_open(disc **out, const char *path)
 
 void disc_close(disc *d)
 {
-    int i;
-
     if (!d)
         return;
 
-    for (i = 0; i < d->backing_count; i++) {
-        if (d->backing[i].fp)
-            fclose(d->backing[i].fp);
-    }
-    free(d->files);
+    disc_reset_loaded(d);
     free(d);
 }
 

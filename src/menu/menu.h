@@ -262,7 +262,8 @@ typedef enum q2_menu_page_id {
     Q2_PAGE_FRONT_NEWLOAD    = 202,   /* NEW GAME / LOAD GAME             */
     Q2_PAGE_FRONT_SKILL      = 203,   /* EASY / MEDIUM / HARD             */
     Q2_PAGE_FRONT_MULTI      = 204,   /* the five multiplayer rows        */
-    Q2_PAGE_FRONT_DMSETUP    = 205    /* the deathmatch setup             */
+    Q2_PAGE_FRONT_DMSETUP    = 205,   /* mode-specific match setup        */
+    Q2_PAGE_FRONT_VARIABLES  = 206    /* QFRONT's GAME VARIABLES layouts */
 } q2_menu_page_id;
 
 /*
@@ -292,9 +293,16 @@ typedef struct q2_menu_page {
 const q2_menu_page *q2_menu_pages(u32 *count);
 const q2_menu_page *q2_menu_page_find(int id);
 
-/* The two pages that exist in more than one form. */
+/* Pages whose installed table depends on live state. */
 const q2_menu_page *q2_menu_variables_page(int cheat_level); /* 0x8001D510 */
 const q2_menu_page *q2_menu_video_page(bool multiplayer);    /* 0x800202B0 */
+const q2_menu_page *q2_menu_front_setup_page(int mode);       /* QFRONT+4AD8 */
+const q2_menu_page *q2_menu_front_variables_page(int cheat_level); /* +49F8 */
+
+/* QFRONT's twelve selectable arenas, level-table records 13..24. */
+#define Q2_MENU_MP_ARENA_COUNT 12
+const char *q2_menu_mp_arena_name(int arena);
+const char *q2_menu_mp_arena_directory(int arena);
 
 const char *q2_menu_cheat_level_name(int level);  /* NONE/BRONZE/SILVER/GOLD */
 const char *q2_menu_difficulty_name(int level);   /* EASY/MEDIUM/HARD        */
@@ -346,11 +354,39 @@ typedef enum q2_menu_request {
     Q2_MREQ_NEW_GAME,    /* SINGLE PLAYER: begin the game         */
     Q2_MREQ_MULTIPLAYER, /* MULTI PLAYER                          */
     Q2_MREQ_CREDITS,     /* VIEW CREDITS                          */
-    Q2_MREQ_NOT_BUILT    /* a real front-end page the port lacks   */
+    Q2_MREQ_LOAD_GAME,   /* LOAD GAME: enter the card front end   */
+    Q2_MREQ_MP_LOAD_SETTINGS,
+    Q2_MREQ_MP_SAVE_SETTINGS,
+    Q2_MREQ_MP_PROCEED  /* begin the configured local match       */
 } q2_menu_request;
 
 #define Q2_MENU_MAX_ITEMS 12
 #define Q2_MENU_TEXT_MAX  40   /* the original's per-object text buffer is 32 */
+
+/*
+ * The front end stores option INDICES and converts them only when PROCEED is
+ * pressed (QFRONT+0x59CC). Mode values are QMULTI's own 0, 1 and 5; keeping
+ * them numeric here avoids making the menu library depend back on game code.
+ */
+#define Q2_MENU_MP_DEATHMATCH       0
+#define Q2_MENU_MP_TEAM_DEATHMATCH  1
+#define Q2_MENU_MP_VERSUS           5
+#define Q2_MENU_MP_MAX_PLAYERS      4
+#define Q2_MENU_MP_TIME_OPTIONS     12
+#define Q2_MENU_MP_FRAG_OPTIONS      9
+#define Q2_MENU_MP_ROUND_OPTIONS     5
+#define Q2_MENU_MP_TIME_DEFAULT      5
+#define Q2_MENU_MP_FRAG_DEFAULT      5
+#define Q2_MENU_MP_ROUND_DEFAULT     2
+
+typedef struct q2_menu_mp_setup {
+    s16 mode;          /* 0 DEATHMATCH, 1 TEAM DEATHMATCH, 5 VERSUS */
+    s16 players;       /* 2..connected controller count              */
+    s16 arena;         /* 0..11                                      */
+    s16 time_option;   /* index into QFRONT's twelve-value table     */
+    s16 frag_option;   /* index into its nine-value table            */
+    s16 round_option;  /* index into its five-value table            */
+} q2_menu_mp_setup;
 
 typedef struct q2_menu {
     q2_menu_settings   *set;          /* not owned                            */
@@ -374,7 +410,7 @@ typedef struct q2_menu {
 
     /* The engine keeps the cursor per page, so returning to a page puts you
      * back where you were (0x8001A3B0 saves it into 0x800C68A0). */
-    u8                  cursor_save[64];
+    u8                  cursor_save[256];
 
     /* Where the page graph came from, so BACK can retrace it. The original
      * stored one handler per page; a stack is the same thing said honestly. */
@@ -421,6 +457,10 @@ typedef struct q2_menu {
     /* What EASY / MEDIUM / HARD chose, 0..2, read alongside Q2_MREQ_NEW_GAME.
      * The AI's own `q2_cre_set_skill` is what consumes it. */
     int                 skill;
+
+    /* QFRONT's multiplayer globals at engine+866 and +874..+882. */
+    q2_menu_mp_setup    mp_setup;
+    int                 controller_count;
 } q2_menu;
 
 void q2_menu_init(q2_menu *m, q2_menu_settings *settings, int screen_h);
@@ -457,6 +497,7 @@ bool q2_menu_set_slider(q2_menu *m, int index, int value);
 
 /* Context the pages read. Set these before opening. */
 void q2_menu_set_multiplayer(q2_menu *m, bool on);
+void q2_menu_set_controller_count(q2_menu *m, int count);
 void q2_menu_set_cheat_level(q2_menu *m, int level);
 void q2_menu_set_resupplies(q2_menu *m, int n);
 void q2_menu_set_stats(q2_menu *m, int kills, int total_kills,

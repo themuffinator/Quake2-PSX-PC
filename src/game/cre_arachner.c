@@ -231,10 +231,14 @@
 #define ARA_SND_PAIN2       (Q2_CREWORLD_BASE + 0x19A0u)  /* ara_pain2      */
 /*
  * NOT A SAMPLE. module+0x19A4 is a runtime CLONE of module+0x19A0, made by the
- * init at module+0x870 with import +0x3C and then given volume 50 through
- * import +0x44 (pan 128 and pitch -1 are that call's "leave alone" sentinels).
- * So the Arachner's two pain sounds are one sample played loud or quiet, and
- * the coin in `arachner_pain` chooses the volume, not the voice.
+ * init at module+0x870 through import +0x3C, then changed through import +0x44.
+ * That setter is (handle, pitch, volume, priority): this call passes
+ * (clone, 50, 128, -1), so 50 replaces the clone's pitch modifier, while 128
+ * and -1 leave its volume and priority unchanged. Pitch 0 is the setter's
+ * unchanged sentinel, but this call does not pass it.
+ * So the Arachner's two pain sounds are one sample at the same volume and
+ * priority, played at the default 35/32 pitch or the clone's 50/32 pitch; the
+ * coin in `arachner_pain` chooses the pitch, not the sample or volume.
  */
 #define ARA_SND_PAIN2_QUIET (Q2_CREWORLD_BASE + 0x19A4u)
 #define ARA_SND_DEATH       (Q2_CREWORLD_BASE + 0x19A8u)  /* ara_deth1      */

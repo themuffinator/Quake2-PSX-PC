@@ -15,6 +15,7 @@
  * bullet fired flat along a wall stops 286 units early. It is called out here
  * rather than hidden because it is a real divergence, not a rounding one.
  */
+#include <stdlib.h>
 #include <string.h>
 
 #include "sim.h"
@@ -560,14 +561,28 @@ q2_fire_result_v2 q2_sim_fire(q2_sim *sim)
              * never terminated (they moved at a twentieth of their speed and
              * filled the pool); with the step fixed it is rare, and it is still
              * wrong to lose a rocket to it.
-             */
+            */
             q2_sim_proj_scan.dropped_full++;
-            q2_weapon_refund(&sim->combat.inv, sim->combat.weapon_id);
+            /* Grenade3 has only been primed here; its ammo is not charged
+             * until the 411 release crossing, so there is nothing to refund. */
+            if (r.kind != Q2_FK_HAND_GRENADE)
+                q2_weapon_refund(&sim->combat.inv, sim->combat.weapon_id);
             sim->combat.next_fire = prev_next_fire;
             r.fired = false;
             /* The same attempt amended, not a new one, so the serial stays
              * where the write above left it. */
             sim->combat.last_shot = r;
+        } else if (r.kind == Q2_FK_HAND_GRENADE && sim->fire_from_input) {
+            /* A harness with no view-model machine has no 261/380/411
+             * timeline to drive Grenade3. Preserve that API's historical
+             * "attack fires" contract by releasing at minimum charge in the
+             * same call. The playable client sets fire_from_input false and
+             * follows the retail held path below. */
+            if (q2_sim_hand_grenade_update(sim, eye, 0, true) ==
+                Q2_HAND_GRENADE_RELEASED) {
+                r.sound = Q2_WSND_HANDGREN_THROW;
+                sim->combat.last_shot = r;
+            }
         }
         break;
     }
@@ -697,6 +712,114 @@ static q2_actor *attacker_for(q2_sim *sim, s32 owner)
     return &sim->pcombat[owner].self;
 }
 
+/* The caller's target list normally excludes the shooter so a bolt cannot hit
+ * its own muzzle. Radius damage is different: the console deliberately lets a
+ * projectile hurt its owner (including the 3.2x self-knockback path). Add that
+ * one actor when the published list does not already contain it. */
+static void projectile_owner_splash(q2_sim *sim, const q2_projectile *p,
+                                    const s32 point[3],
+                                    q2_actor **targets, u32 count)
+{
+    q2_actor *owner;
+    q2_actor *one[1];
+    u32 i;
+
+    if (!sim || !p || p->owner < 0 || p->owner >= Q2_SIM_MAX_PLAYERS ||
+        p->splash_radius <= 0 || p->damage <= 0)
+        return;
+
+    owner = attacker_for(sim, p->owner);
+    for (i = 0; i < count; i++)
+        if (targets && targets[i] == owner)
+            return;
+
+    if (owner == &sim->combat.self && sim->invulnerable)
+        return;
+
+    if (owner == &sim->combat.self)
+        q2_actor_from_player(owner, &sim->combat.inv,
+                             sim->player[sim->cur_player].pos);
+
+    one[0] = owner;
+    q2_combat_radius_damage(owner, NULL, point ? point : p->pos, p->damage,
+                            p->splash_radius, p->mod, one, 1,
+                            &sim->combat.rules);
+
+    if (owner == &sim->combat.self)
+        q2_actor_to_player(owner, &sim->combat.inv);
+}
+
+q2_hand_grenade_update q2_sim_hand_grenade_update(
+    q2_sim *sim, const s32 attached_pos[3], s32 cook_dt, bool release)
+{
+    static const s16 release_offset[3] = {
+        Q2_HAND_GRENADE_RELEASE_RIGHT,
+        Q2_HAND_GRENADE_RELEASE_DOWN,
+        Q2_HAND_GRENADE_RELEASE_FORWARD
+    };
+    s32 index;
+    q2_projectile *p;
+
+    if (!sim || !attached_pos)
+        return Q2_HAND_GRENADE_NONE;
+
+    index = q2_projectile_hand_held_index(&sim->combat.projectiles,
+                                          sim->cur_player);
+    if (index < 0)
+        return Q2_HAND_GRENADE_NONE;
+
+    q2_projectile_hand_update(&sim->combat.projectiles, sim->cur_player,
+                              attached_pos, cook_dt);
+    p = &sim->combat.projectiles.p[index];
+
+    /* The fuse is decremented before Grenade3's state dispatch. A held expiry
+     * therefore wins over a 411 release reached on the same tick. */
+    if (p->expires && sim->level_time >= p->expires) {
+        q2_actor **targets = sim->world_targets ? sim->world_targets
+                                                : sim->combat.targets;
+        u32 count = sim->world_targets ? sim->world_target_count
+                                       : sim->combat.target_count;
+        s32 where[3];
+
+        memcpy(where, p->pos, sizeof(where));
+        projectile_owner_splash(sim, p, where, targets, count);
+        q2_projectile_detonate(&sim->combat.projectiles, (u32)index,
+                               attacker_for(sim, p->owner), targets, count,
+                               &sim->combat.rules);
+        fx_at(sim, Q2_FX_EXPLOSION, where);
+        return Q2_HAND_GRENADE_EXPIRED;
+    }
+
+    if (release) {
+        s16 local_dir[3];
+        s32 eye[3], origin[3], raw_dir[3];
+        static const s32 zero[3] = { 0, 0, 0 };
+        s32 charge = q2_projectile_hand_charge(&sim->combat.projectiles,
+                                                sim->cur_player);
+        q2_player *pl = &sim->player[sim->cur_player];
+
+        q2_sim_eye(sim, eye);
+        q2_weapon_muzzle_origin(release_offset, eye,
+                                pl->yaw, pl->pitch, pl->roll, origin);
+
+        local_dir[0] = 0;
+        local_dir[1] = -Q2_HAND_GRENADE_RELEASE_UP;
+        local_dir[2] = (s16)charge;
+        q2_weapon_muzzle_origin(local_dir, zero,
+                                pl->yaw, pl->pitch, pl->roll, raw_dir);
+
+        if (q2_projectile_hand_release(&sim->combat.projectiles,
+                                       sim->cur_player, origin, raw_dir)) {
+            /* 0x8004A7C0: after reveal, velocity and throw sound. */
+            (void)q2_weapon_consume(&sim->combat.inv,
+                                    Q2_WID_HAND_GRENADE);
+            return Q2_HAND_GRENADE_RELEASED;
+        }
+    }
+
+    return Q2_HAND_GRENADE_HELD;
+}
+
 /* ------------------------------------------------------------------------- */
 void q2_sim_combat_tick(q2_sim *sim)
 {
@@ -787,12 +910,15 @@ void q2_sim_combat_tick(q2_sim *sim)
         u32 hit_count;
         s32 hit_index;
         s32 dir[3];
+        bool held;
         int k;
 
         if (!p->in_use)
             continue;
 
         q2_sim_proj_scan.stepped++;
+        held = (p->kind == Q2_PROJ_HAND_GRENADE &&
+                p->node == Q2_PROJ_NODE_HELD);
 
         /*
          * Every live projectile lights the world, from the preset the sweep at
@@ -800,7 +926,7 @@ void q2_sim_combat_tick(q2_sim *sim)
          * Raised before the step so the light sits where the bolt was drawn
          * this frame rather than where it is about to be.
          */
-        {
+        if (!held) {
             static const u8 glow[3]     = { Q2_PROJ_LIGHT_R, Q2_PROJ_LIGHT_G,
                                             Q2_PROJ_LIGHT_B };
             static const u8 bfg_glow[3] = { Q2_PROJ_BFG_LIGHT_R,
@@ -819,20 +945,38 @@ void q2_sim_combat_tick(q2_sim *sim)
         q2_projectile_step(&sim->combat.projectiles, i, sim->gravity,
                            sim->cur_dt, sim->level_time, &step);
 
+        /* State 1 has no mover, collision body, light or visible model. The
+         * owner update after the view-model step attaches it and resolves an
+         * elapsed fuse at the current hand position. */
+        if (held)
+            continue;
+
         if (step.expired) {
             q2_sim_proj_scan.expired++;
-            /* The kind and the position have to be taken before the detonate,
-             * because it frees the slot. */
-            q2_fx_preset_id fx = fx_for_projectile(p->kind);
-            s32 where[3];
+            /* Grenade2's +0xF4 is a fuse and calls its explosion. Rocket and
+             * BFGBlast use the same-looking field only as a safety lifetime:
+             * 0x8004ADB0 / 0x8004B8E4 free them without damage or an effect.
+             * The bolt lifetime is quiet for the same reason. */
+            if (p->kind == Q2_PROJ_GRENADE ||
+                p->kind == Q2_PROJ_HAND_GRENADE) {
+                q2_fx_preset_id fx = fx_for_projectile(p->kind);
+                s32 where[3];
+                q2_actor **targets = sim->world_targets
+                                          ? sim->world_targets
+                                          : sim->combat.targets;
+                u32 count = sim->world_targets ? sim->world_target_count
+                                               : sim->combat.target_count;
 
-            memcpy(where, p->pos, sizeof(where));
-            q2_projectile_detonate(&sim->combat.projectiles, i,
-                                   attacker_for(sim, p->owner),
-                                   sim->combat.targets,
-                                   sim->combat.target_count,
-                                   &sim->combat.rules);
-            fx_at(sim, fx, where);
+                memcpy(where, p->pos, sizeof(where));
+                projectile_owner_splash(sim, p, where, targets, count);
+                q2_projectile_detonate(&sim->combat.projectiles, i,
+                                       attacker_for(sim, p->owner),
+                                       targets, count,
+                                       &sim->combat.rules);
+                fx_at(sim, fx, where);
+            } else {
+                q2_projectile_expire(&sim->combat.projectiles, i);
+            }
             continue;
         }
 
@@ -945,6 +1089,7 @@ void q2_sim_combat_tick(q2_sim *sim)
             q2_fx_preset_id fx = fx_for_projectile(p->kind);
             bool was_alive = victim && victim->health > 0;
 
+            projectile_owner_splash(sim, p, step.to, hit_list, hit_count);
             q2_projectile_impact(&sim->combat.projectiles, i, step.to, NULL,
                                  attacker_for(sim, p->owner), victim,
                                  hit_list, hit_count,
@@ -992,14 +1137,13 @@ void q2_sim_combat_tick(q2_sim *sim)
             p->node = node;
 
             /*
-             * AND THE DOORS. A mover is an entity, not hull, so the walk above
-             * flies a rocket through a shut door exactly as it used to fly a
-             * bullet through one. Clipped from the step's start to wherever
-             * the hull left it, so the nearer of the two wins; `complete` goes
-             * false because a bolt that met a door has met something, and the
-             * impact arm below is what turns that into a burst.
+             * AND THE ENTITY BOXES. Doors, lifts and intact panes are not hull,
+             * so the walk above otherwise flies a projectile through all of
+             * them. Clipped from the step's start to wherever the hull left it,
+             * so the nearer pass wins; `complete` goes false because a bolt
+             * that met any solid entity has met something.
              */
-            if (sim->mover_count && sim->move_world.count) {
+            if (sim->move_world.count) {
                 q2_move_seg_hit mh;
                 const s32 *stop = complete ? step.to : end;
 
@@ -1009,7 +1153,7 @@ void q2_sim_combat_tick(q2_sim *sim)
                     end[1]   = mh.pos[1];
                     end[2]   = mh.pos[2];
                     complete = false;
-                    q2_sim_proj_scan.stopped_on_mover++;
+                    q2_sim_proj_scan.stopped_on_entity++;
                 }
             }
 
@@ -1039,11 +1183,17 @@ void q2_sim_combat_tick(q2_sim *sim)
                  * one of the twenty-two and the behaviour certainly exists. */
                 bool consumed;
                 q2_fx_preset_id fx = fx_for_projectile(p->kind);
+                q2_actor **targets = sim->world_targets
+                                          ? sim->world_targets
+                                          : sim->combat.targets;
+                u32 count = sim->world_targets ? sim->world_target_count
+                                               : sim->combat.target_count;
 
+                projectile_owner_splash(sim, p, end, targets, count);
                 consumed = q2_projectile_impact(&sim->combat.projectiles, i,
-                                                end, NULL, &sim->combat.self,
-                                                NULL, sim->combat.targets,
-                                                sim->combat.target_count,
+                                                end, NULL,
+                                                attacker_for(sim, p->owner),
+                                                NULL, targets, count,
                                                 &sim->combat.rules);
                 /* A grenade that only bounced has not gone off, so it must not
                  * leave a fireball behind. */
@@ -1174,15 +1324,119 @@ u32 q2_sim_breakable_call(q2_sim *sim, const q2_scene *scene,
 /* ------------------------------------------------------------------------- */
 /* Shooting a breakable — the port's 0x80053AA4 sweep and 0x8002EF1C router    */
 /* ------------------------------------------------------------------------- */
+static void breakable_solids_drop(q2_sim *sim)
+{
+    u32 first, count, i;
+
+    if (!sim)
+        return;
+
+    first = sim->mover_count;
+    count = sim->breakable_solid_count;
+    if (count && sim->volumes && first <= sim->volume_count &&
+        count <= sim->volume_count - first) {
+        memmove(sim->volumes + first, sim->volumes + first + count,
+                (sim->volume_count - first - count) * sizeof(*sim->volumes));
+        sim->volume_count -= count;
+    }
+
+    for (i = 0; i < sim->breakable_count; i++)
+        sim->breakable[i].solid_target = -1;
+    sim->breakable_solid_count = 0;
+    sim->move_world.targets = sim->volumes;
+    sim->move_world.count   = sim->volume_count;
+}
+
+/*
+ * GLASS owns an ordinary entry in retail's 48-slot entity-box table.
+ * Insert those boxes after mover parts and before trigger volumes, preserving
+ * the same entity-then-volume walk that q2_move_sweep_world implements.
+ */
+static bool breakable_solids_add(q2_sim *sim)
+{
+    q2_move_target *grown;
+    u32 count = 0, first, out = 0, i;
+
+    for (i = 0; i < sim->breakable_count; i++)
+        if (sim->breakable[i].kind == Q2_BREAKABLE_GLASS)
+            count++;
+    if (!count)
+        return true;
+
+    first = sim->mover_count;
+    if (first > sim->volume_count)
+        return false;
+
+    grown = (q2_move_target *)calloc(sim->volume_count + count,
+                                     sizeof(*grown));
+    if (!grown)
+        return false;
+
+    if (sim->volumes && first)
+        memcpy(grown, sim->volumes, first * sizeof(*grown));
+    if (sim->volumes && sim->volume_count > first)
+        memcpy(grown + first + count, sim->volumes + first,
+               (sim->volume_count - first) * sizeof(*grown));
+
+    for (i = 0; i < sim->breakable_count; i++) {
+        q2_breakable *b = &sim->breakable[i];
+        q2_move_target *t;
+        int k;
+
+        if (b->kind != Q2_BREAKABLE_GLASS)
+            continue;
+
+        t = &grown[first + out];
+        for (k = 0; k < 3; k++) {
+            t->min[k] = t->env_min[k] = b->bmin[k];
+            t->max[k] = t->env_max[k] = b->bmax[k];
+        }
+        t->dy           = 0;
+        t->mask         = 0;
+        t->kind         = Q2_MOVE_KIND_ENTITY;
+        t->id           = (s32)i;
+        t->active       = !b->broken;
+        b->solid_target = (s32)(first + out);
+        out++;
+    }
+
+    free(sim->volumes);
+    sim->volumes                = grown;
+    sim->volume_count          += out;
+    sim->breakable_solid_count  = out;
+    sim->move_world.targets     = sim->volumes;
+    sim->move_world.count       = sim->volume_count;
+    return true;
+}
+
+void q2_sim_breakables_sync_solidity(q2_sim *sim)
+{
+    u32 i;
+
+    if (!sim || !sim->volumes)
+        return;
+
+    for (i = 0; i < sim->breakable_count; i++) {
+        q2_breakable *b = &sim->breakable[i];
+
+        if (b->kind != Q2_BREAKABLE_GLASS || b->solid_target < 0 ||
+            (u32)b->solid_target >= sim->volume_count)
+            continue;
+        sim->volumes[b->solid_target].active = !b->broken;
+    }
+}
+
 u32 q2_sim_attach_breakables(q2_sim *sim, const q2_scene *scene,
                              const q2_uf_operands *ops)
 {
     q2_event_record rec, prev;
     bool more;
+    u32 bi;
 
     if (!sim)
         return 0;
 
+    breakable_solids_drop(sim);
     sim->breakable_count  = 0;
     sim->breakable_hits   = 0;
     sim->breakable_pieces = 0;
@@ -1196,6 +1450,9 @@ u32 q2_sim_attach_breakables(q2_sim *sim, const q2_scene *scene,
     sim->blast_count          = 0;
     sim->explosive_destroyed  = 0;
     sim->explosive_blasts     = 0;
+
+    for (bi = 0; bi < Q2_SIM_MAX_BREAKABLES; bi++)
+        sim->breakable[bi].solid_target = -1;
 
     if (!scene || !sim->events_ready || !sim->userfuncs_ready)
         return 0;
@@ -1258,6 +1515,7 @@ u32 q2_sim_attach_breakables(q2_sim *sim, const q2_scene *scene,
 
                 b = &sim->breakable[sim->breakable_count];
                 memset(b, 0, sizeof(*b));
+                b->solid_target = -1;
                 b->scene_node = mslot;
                 for (k = 0; k < 3; k++) {
                     b->bmin[k] = node.bbox_min[k];
@@ -1300,6 +1558,7 @@ u32 q2_sim_attach_breakables(q2_sim *sim, const q2_scene *scene,
              */
             b = &sim->breakable[sim->breakable_count];
             memset(b, 0, sizeof(*b));
+            b->solid_target = -1;
             b->scene_node = slot;
             for (k = 0; k < 3; k++) {
                 b->bmin[k] = node.bbox_min[k];
@@ -1325,6 +1584,10 @@ u32 q2_sim_attach_breakables(q2_sim *sim, const q2_scene *scene,
         }
     }
 
+    /* Allocation failure leaves the pane shootable and visible, but cannot
+     * manufacture a valid solid target. The registry count is still the
+     * function's documented return value. */
+    (void)breakable_solids_add(sim);
     return sim->breakable_count;
 }
 
@@ -1373,6 +1636,7 @@ u32 q2_sim_attach_explosives(q2_sim *sim, q2_explosive_set *set,
 
             b = &sim->breakable[sim->breakable_count];
             memset(b, 0, sizeof(*b));
+            b->solid_target = -1;
             b->scene_node = e->node[k];
             for (c = 0; c < 3; c++) {
                 /* 0x800555D8 copies the node record's own six s32 from +16, so
@@ -1484,7 +1748,7 @@ static void explosive_apply(q2_sim *sim, const q2_explosive_result *res)
             if (sim->entities_ready &&
                 q2_model_ent_spawn(&sim->entities, sim->model_bank,
                                    Q2_MODEL_ENT_EXPLOSION, b->at,
-                                   (u8)b->scale))
+                                   (u8)b->area))
                 sim->explosive_models++;
 
             sim->explosive_blasts++;
@@ -1664,7 +1928,6 @@ u32 q2_sim_breakable_shot(q2_sim *sim, const s32 from[3], const s32 to[3],
         if (b->kind == Q2_BREAKABLE_MOVER) {
             if (damage == 0)
                 return 0;
-            sim->breakable_hits++;
             b->health = (s16)(b->health - damage);
             if (b->health > 0)
                 return 0;
@@ -1689,8 +1952,6 @@ u32 q2_sim_breakable_shot(q2_sim *sim, const s32 from[3], const s32 to[3],
 
             if (!sim->explosives || b->owner < 0)
                 return 0;
-
-            sim->breakable_hits++;
 
             if (!q2_explosive_damage(sim->explosives, (u32)b->owner,
                                      (int)b->part, damage, false,
@@ -1755,6 +2016,7 @@ u32 q2_sim_breakable_shot(q2_sim *sim, const s32 from[3], const s32 to[3],
         made += q2_sim_debris_burst(sim, node.bbox_min, node.bbox_max, NULL,
                                     b->count_b, 0);
         b->broken = true;
+        q2_sim_breakables_sync_solidity(sim);
     }
 
     sim->breakable_pieces += made;

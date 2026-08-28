@@ -522,7 +522,7 @@ static void lit_one_map(const disc *d, const char *map, u32 *tot_gathered,
         world.statics = &lights;
         world.space   = &sl;
 
-        q2_light_gather(&set, &world, feet, node, false);
+        q2_light_gather(&set, &world, feet, node, 0);
 
         (*tot_spawns)++;
         if (set.count == 0)

@@ -13,6 +13,105 @@ static const s32 SPU_F0[5] = { 0, 60, 115,  98, 122 };
 static const s32 SPU_F1[5] = { 0,  0, -52, -55, -60 };
 
 /* ------------------------------------------------------------------------- */
+/* Sound-request pitch and the SPU rate                                       */
+/* ------------------------------------------------------------------------- */
+void q2_sfx_pitch_init(q2_sfx_pitch *pitch)
+{
+    if (!pitch)
+        return;
+
+    pitch->current = Q2_SFX_PITCH_DEFAULT;
+    pitch->upper   = Q2_SFX_PITCH_DEFAULT;
+    pitch->lower   = Q2_SFX_PITCH_DEFAULT;
+    pitch->varying = false;
+}
+
+void q2_sfx_pitch_set(q2_sfx_pitch *pitch, s32 modifier)
+{
+    if (pitch && modifier != 0)
+        pitch->current = (u8)modifier;
+}
+
+void q2_sfx_pitch_add(q2_sfx_pitch *pitch, s32 delta)
+{
+    if (pitch && delta != 0)
+        pitch->current = (u8)((s64)pitch->current + delta);
+}
+
+bool q2_sfx_pitch_set_range(q2_sfx_pitch *pitch,
+                            s32 upper_delta, s32 lower_delta)
+{
+    s64 upper, lower;
+
+    if (!pitch)
+        return false;
+
+    upper = (s64)pitch->current + upper_delta;
+    lower = (s64)pitch->current + lower_delta;
+
+    /* Retail's callers all produce an ordered byte range. Rejecting a bad
+     * reconstruction here avoids both byte wrap and its MIPS divide-by-zero. */
+    if (lower < 0 || upper > 255 || upper <= lower)
+        return false;
+
+    pitch->upper   = (u8)upper;
+    pitch->lower   = (u8)lower;
+    pitch->varying = true;
+    return true;
+}
+
+bool q2_sfx_pitch_needs_random(const q2_sfx_pitch *pitch,
+                               bool randomising_path)
+{
+    return pitch && randomising_path && pitch->varying &&
+           pitch->upper > pitch->lower;
+}
+
+u8 q2_sfx_pitch_begin(q2_sfx_pitch *pitch, bool randomising_path,
+                      u32 random_value)
+{
+    u32 width;
+
+    if (!pitch)
+        return Q2_SFX_PITCH_DEFAULT;
+
+    if (!q2_sfx_pitch_needs_random(pitch, randomising_path))
+        return pitch->current;
+
+    width = (u32)pitch->upper - pitch->lower;
+    pitch->current = (u8)(pitch->lower + random_value % width);
+    return pitch->current;
+}
+
+u32 q2_sfx_spu_pitch(u32 sample_rate, u8 modifier)
+{
+    u64 base;
+
+    /* 0x800724EC performs this first division once, when the VAG is loaded.
+     * Keeping the intermediate truncation matters for rates other than the
+     * disc's exact 11025/22050 divisors of 44100. */
+    base = (u64)sample_rate * Q2_SPU_PITCH_ONE / Q2_SPU_OUTPUT_RATE;
+    return (u32)(base * modifier / Q2_SFX_PITCH_UNITY);
+}
+
+u32 q2_sfx_step_16_16(u32 sample_rate, u8 modifier, u32 output_rate)
+{
+    u64 step;
+
+    if (output_rate == 0)
+        return 0;
+
+    /* One SPU pitch unit advances the source by 1/4096 sample per 44100 Hz
+     * output frame. 65536/4096 reduces to 16 before multiplication. */
+    step = (u64)q2_sfx_spu_pitch(sample_rate, modifier) *
+           Q2_SPU_OUTPUT_RATE * 16u / output_rate;
+
+    if (step > 0xFFFFFFFFu)
+        return 0xFFFFFFFFu;
+    return (u32)step;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Bank loading                                                               */
 /* ------------------------------------------------------------------------- */
 q2_result q2_sound_bank_load(q2_sound_bank *out, const disc *d, const char *map)

@@ -98,8 +98,55 @@ static const u8 *operand_at(const q2_rotator_set *set, const u8 *p, u32 need)
     return q2_uf_operand_at(&src, p, need);
 }
 
+/*
+ * The constructor's obj+0x18 write, shared by SIMROT/SIMROT2 and ROTBUTTON
+ * and adjusted by ROTHATCH. This is deliberately based on the RAW Scene box:
+ * q2_scene_node_bounds() adds four units for conservative render culling, and
+ * retail reads +0x10/+0x1C directly.
+ *
+ * `midpoint` reproduces `addu; srl 31; addu; sra 1`: the add wraps to 32 bits
+ * and division rounds toward zero. `store_s16` reproduces the final `sh`
+ * without relying on an out-of-range signed cast on the host.
+ */
+static s32 midpoint(s32 a, s32 b)
+{
+    u32 raw = (u32)a + (u32)b;
+    s32 sum = (raw & 0x80000000u) ? -1 - (s32)~raw : (s32)raw;
+
+    return sum / 2;
+}
+
+static s16 store_s16(u32 raw)
+{
+    u16 low = (u16)raw;
+
+    if (low < 0x8000u)
+        return (s16)low;
+    return (s16)(-(s32)(0x10000u - low));
+}
+
+static void rotator_set_pivot(q2_rotator *r, const q2_scene *scene,
+                              const s32 adjustment[3])
+{
+    q2_scene_node node;
+    int c;
+
+    if (!r || !scene || r->node < 0 ||
+        !q2_scene_get_node(scene, (u32)r->node, &node))
+        return;
+
+    for (c = 0; c < 3; c++) {
+        s32 centre = midpoint(node.bbox_min[c], node.bbox_max[c]);
+        u32 value = (u32)centre - (u32)node.origin[c];
+
+        if (adjustment)
+            value += (u32)adjustment[c];
+        r->pivot[c] = store_s16(value);
+    }
+}
+
 q2_result q2_rotators_build(q2_rotator_set *out, const q2_events *events,
-                            const q2_userfuncs *uf)
+                            const q2_userfuncs *uf, const q2_scene *scene)
 {
     q2_event_record rec;
 
@@ -185,13 +232,19 @@ q2_result q2_rotators_build(q2_rotator_set *out, const q2_events *events,
                 for (slot = 0; slot < 4; slot++) {
                     const u8 *q = operand_at(out, p, 24);
                     s16 node = q2_rd_s16(q + 12 + 2 * (s32)slot);
+                    q2_rotator *r;
 
                     if (node < 0)
                         continue;
-                    if (!q2_rotators_add(out, Q2_ROT_ACCUM, node, axis, speed)) {
+                    r = q2_rotators_add(out, Q2_ROT_ACCUM, node, axis, speed);
+                    if (!r) {
                         q2_rotators_free(out);
                         return Q2_ERR_NO_MEMORY;
                     }
+                    /* 0x800284C8..0x80028548 and
+                     * 0x800286C0..0x80028740: both constructors rotate about
+                     * the raw Scene-box centre, relative to Scene.origin. */
+                    rotator_set_pivot(r, scene, NULL);
                 }
                 break;
 
@@ -229,6 +282,18 @@ q2_result q2_rotators_build(q2_rotator_set *out, const q2_events *events,
                     return Q2_ERR_NO_MEMORY;
                 }
                 r->target = target;
+                {
+                    /* The X adjustment is subtracted; Y and Z are added.
+                     * Loads are `lhu` in retail, but the result is stored by
+                     * `sh`, so reading these as authored s16 produces the same
+                     * low halfword without obscuring their meaning. */
+                    s32 hinge[3] = {
+                        -(s32)q2_rd_s16(p + 10),
+                         (s32)q2_rd_s16(p + 12),
+                         (s32)q2_rd_s16(p + 14)
+                    };
+                    rotator_set_pivot(r, scene, hinge);
+                }
                 break;
             }
 
@@ -254,6 +319,9 @@ q2_result q2_rotators_build(q2_rotator_set *out, const q2_events *events,
                     return Q2_ERR_NO_MEMORY;
                 }
                 r->target = Q2_ROT_BUTTON_TARGET;
+                /* 0x8002C210..0x8002C288: the button uses the same raw
+                 * Scene-box midpoint as SIMROT, with no authored adjustment. */
+                rotator_set_pivot(r, scene, NULL);
 
                 hold = q2_rd_s16(p + 6);
                 r->hold_reset = (hold < 0) ? Q2_UF_TIME_NEVER

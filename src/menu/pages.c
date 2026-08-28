@@ -299,6 +299,57 @@ static const q2_menu_item k_front_dmsetup[] = {
     { "PROCEED",         256, 206, Q2_ACT_PROCEED,        Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
 };
 
+/* module+0x0F9BC — VERSUS replaces both timed limits with one round limit. */
+static const q2_menu_item k_front_versus_setup[] = {
+    { "2 3 4 PLAYERS", 256,  63, Q2_ACT_NONE,           Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+    { "",              256,  82, Q2_ACT_NONE,           Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+    { "ROUND LIMIT   3", 256, 153, Q2_ACT_NONE,         Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+    { "GAME VARIABLES", 256, 172, Q2_ACT_GAME_VARIABLES, Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+    { "PROCEED",        256, 191, Q2_ACT_PROCEED,        Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+};
+
+/*
+ * QFRONT+0x49F8, module page 12. These are NOT the in-game PAUSED layouts:
+ * the front end carries four separate arrays at +F194/+F1F4/+F284/+F344 and
+ * uses the GAME VARIABLES banner. The small coordinate differences are the
+ * bytes in those records, not layout adjustments made by the port.
+ */
+static const q2_menu_item k_front_vars_none[] = {
+    { "    GRAVITY",       168,  97, Q2_ACT_NONE,            Q2_SET_GRAVITY,        Q2_WIDGET_SLIDER, 0 },
+    { "FALLING DAMAGE",    256, 124, Q2_ACT_NONE,            Q2_SET_FALLING_DAMAGE, Q2_WIDGET_TOGGLE, 0 },
+    { "RESET TO DEFAULTS", 256, 151, Q2_ACT_RESET_VARIABLES, Q2_SET_NONE,           Q2_WIDGET_TEXT,   0 },
+};
+
+static const q2_menu_item k_front_vars_bronze[] = {
+    { "    GRAVITY",       168,  76, Q2_ACT_NONE,            Q2_SET_GRAVITY,        Q2_WIDGET_SLIDER, 0 },
+    { "WEAPON STAY",       256, 100, Q2_ACT_NONE,            Q2_SET_WEAPON_STAY,    Q2_WIDGET_TOGGLE, 0 },
+    { "FALLING DAMAGE",    256, 124, Q2_ACT_NONE,            Q2_SET_FALLING_DAMAGE, Q2_WIDGET_TOGGLE, 0 },
+    { "ONE SHOT KILL",     256, 148, Q2_ACT_NONE,            Q2_SET_ONE_SHOT_KILL,  Q2_WIDGET_TOGGLE, 0 },
+    { "RESET TO DEFAULTS", 256, 172, Q2_ACT_RESET_VARIABLES, Q2_SET_NONE,           Q2_WIDGET_TEXT,   0 },
+};
+
+static const q2_menu_item k_front_vars_silver[] = {
+    { "    GRAVITY",       168,  58, Q2_ACT_NONE,            Q2_SET_GRAVITY,        Q2_WIDGET_SLIDER, 0 },
+    { " GAME SPEED",       168,  80, Q2_ACT_NONE,            Q2_SET_GAME_SPEED,     Q2_WIDGET_SLIDER, 0 },
+    { "BLAST FORCE",       168, 102, Q2_ACT_NONE,            Q2_SET_BLAST_FORCE,    Q2_WIDGET_SLIDER, 0 },
+    { "WEAPON STAY",       256, 124, Q2_ACT_NONE,            Q2_SET_WEAPON_STAY,    Q2_WIDGET_TOGGLE, 0 },
+    { "FALLING DAMAGE",    256, 146, Q2_ACT_NONE,            Q2_SET_FALLING_DAMAGE, Q2_WIDGET_TOGGLE, 0 },
+    { "ONE SHOT KILL",     256, 168, Q2_ACT_NONE,            Q2_SET_ONE_SHOT_KILL,  Q2_WIDGET_TOGGLE, 0 },
+    { "RESET TO DEFAULTS", 256, 190, Q2_ACT_RESET_VARIABLES, Q2_SET_NONE,           Q2_WIDGET_TEXT,   0 },
+};
+
+static const q2_menu_item k_front_vars_gold[] = {
+    { "    GRAVITY",       168,  56, Q2_ACT_NONE,            Q2_SET_GRAVITY,        Q2_WIDGET_SLIDER, 0 },
+    { " GAME SPEED",       168,  73, Q2_ACT_NONE,            Q2_SET_GAME_SPEED,     Q2_WIDGET_SLIDER, 0 },
+    { "BLAST FORCE",       168,  90, Q2_ACT_NONE,            Q2_SET_BLAST_FORCE,    Q2_WIDGET_SLIDER, 0 },
+    { "WEAPON STAY",       256, 107, Q2_ACT_NONE,            Q2_SET_WEAPON_STAY,    Q2_WIDGET_TOGGLE, 0 },
+    { "INFINITE AMMO",     256, 124, Q2_ACT_NONE,            Q2_SET_INFINITE_AMMO,  Q2_WIDGET_TOGGLE, 0 },
+    { "ALL WEAPONS",       256, 141, Q2_ACT_NONE,            Q2_SET_ALL_WEAPONS,    Q2_WIDGET_TOGGLE, 0 },
+    { "FALLING DAMAGE",    256, 158, Q2_ACT_NONE,            Q2_SET_FALLING_DAMAGE, Q2_WIDGET_TOGGLE, 0 },
+    { "ONE SHOT KILL",     256, 175, Q2_ACT_NONE,            Q2_SET_ONE_SHOT_KILL,  Q2_WIDGET_TOGGLE, 0 },
+    { "RESET TO DEFAULTS", 256, 192, Q2_ACT_RESET_VARIABLES, Q2_SET_NONE,           Q2_WIDGET_TEXT,   0 },
+};
+
 /* module+0x0ED44 */
 static const q2_menu_item k_front_options[] = {
     { "PLAYER OPTIONS", 256,  85, Q2_ACT_PAGE_PLAYER, Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
@@ -346,7 +397,7 @@ static const q2_menu_page k_pages[] = {
     { Q2_PAGE_FRONT_NEWLOAD,    "SINGLE PLAYER", k_front_newload,    N(k_front_newload),    0,                  Q2_ACT_BACK,         0x8010EF9Cu, 0 },
     { Q2_PAGE_FRONT_SKILL,      "DIFFICULTY",    k_front_skill,      N(k_front_skill),      0,                  Q2_ACT_BACK,         0x8010EFE4u, 0 },
     { Q2_PAGE_FRONT_MULTI,      "MULTIPLAYER",   k_front_multi,      N(k_front_multi),      0,                  Q2_ACT_BACK,         0x8010F104u, 0 },
-    { Q2_PAGE_FRONT_DMSETUP,    NULL,            k_front_dmsetup,    N(k_front_dmsetup),    0,                  Q2_ACT_BACK,         0x8010F914u, 0 },
+    { Q2_PAGE_FRONT_DMSETUP,    "DEATHMATCH",   k_front_dmsetup,    N(k_front_dmsetup),    0,                  Q2_ACT_BACK,         0x8010F914u, 0 },
 };
 
 /* Variants, kept out of the main list so `q2_menu_pages` stays one page per
@@ -360,6 +411,40 @@ static const q2_menu_page k_vars_pages[4] = {
     { Q2_PAGE_VARIABLES, "PAUSED", k_vars_bronze, N(k_vars_bronze), 0, Q2_ACT_BACK, 0x8009A724u, 0 },
     { Q2_PAGE_VARIABLES, "PAUSED", k_vars_silver, N(k_vars_silver), 0, Q2_ACT_BACK, 0x8009A7B4u, 0 },
     { Q2_PAGE_VARIABLES, "PAUSED", k_vars_gold,   N(k_vars_gold),   0, Q2_ACT_BACK, 0x8009A874u, 0 },
+};
+
+static const q2_menu_page k_front_setup_pages[3] = {
+    { Q2_PAGE_FRONT_DMSETUP, "DEATHMATCH",      k_front_dmsetup,       N(k_front_dmsetup),       0, Q2_ACT_BACK, 0x8010F914u, 0 },
+    { Q2_PAGE_FRONT_DMSETUP, "TEAM DEATHMATCH", k_front_dmsetup,       N(k_front_dmsetup),       0, Q2_ACT_BACK, 0x8010F914u, 0 },
+    { Q2_PAGE_FRONT_DMSETUP, "VERSUS",          k_front_versus_setup, N(k_front_versus_setup), 0, Q2_ACT_BACK, 0x8010F9BCu, 0 },
+};
+
+static const q2_menu_page k_front_vars_pages[4] = {
+    { Q2_PAGE_FRONT_VARIABLES, "GAME VARIABLES", k_front_vars_none,   N(k_front_vars_none),   0, Q2_ACT_BACK, 0x8010F194u, 0 },
+    { Q2_PAGE_FRONT_VARIABLES, "GAME VARIABLES", k_front_vars_bronze, N(k_front_vars_bronze), 0, Q2_ACT_BACK, 0x8010F1F4u, 0 },
+    { Q2_PAGE_FRONT_VARIABLES, "GAME VARIABLES", k_front_vars_silver, N(k_front_vars_silver), 0, Q2_ACT_BACK, 0x8010F284u, 0 },
+    { Q2_PAGE_FRONT_VARIABLES, "GAME VARIABLES", k_front_vars_gold,   N(k_front_vars_gold),   0, Q2_ACT_BACK, 0x8010F344u, 0 },
+};
+
+typedef struct q2_front_arena {
+    const char *name;
+    const char *directory;
+} q2_front_arena;
+
+/* The contiguous arena run in the executable's level table, records 13..24. */
+static const q2_front_arena k_front_arenas[Q2_MENU_MP_ARENA_COUNT] = {
+    { "COLD STORAGE", "MATRIX6" },
+    { "WAREHOUSE",    "MATRIX7" },
+    { "AQUAPLEX",     "MATRIX2" },
+    { "COLOSSEUM",    "THEVAT"  },
+    { "MAINFRAME",    "MATRIX9" },
+    { "QUICKFIRE",    "TIMS"    },
+    { "CAPTIVITY",    "MATRIX1" },
+    { "THE SHAFT",    "PODCITY" },
+    { "HYDRAPHOBIA",  "MATRIX3" },
+    { "TOXIC VATS",   "MATRIX8" },
+    { "THE FORGE",    "MATRIX4" },
+    { "BADLANDS",     "MATRIX5" },
 };
 
 const q2_menu_page *q2_menu_pages(u32 *count)
@@ -389,6 +474,36 @@ const q2_menu_page *q2_menu_variables_page(int cheat_level)
 const q2_menu_page *q2_menu_video_page(bool multiplayer)
 {
     return multiplayer ? &k_video_mp_page : q2_menu_page_find(Q2_PAGE_VIDEO);
+}
+
+const q2_menu_page *q2_menu_front_setup_page(int mode)
+{
+    if (mode == Q2_MENU_MP_TEAM_DEATHMATCH)
+        return &k_front_setup_pages[1];
+    if (mode == Q2_MENU_MP_VERSUS)
+        return &k_front_setup_pages[2];
+    return &k_front_setup_pages[0];
+}
+
+const q2_menu_page *q2_menu_front_variables_page(int cheat_level)
+{
+    if (cheat_level < 0) cheat_level = 0;
+    if (cheat_level > 3) cheat_level = 3;
+    return &k_front_vars_pages[cheat_level];
+}
+
+const char *q2_menu_mp_arena_name(int arena)
+{
+    if (arena < 0 || arena >= Q2_MENU_MP_ARENA_COUNT)
+        return "";
+    return k_front_arenas[arena].name;
+}
+
+const char *q2_menu_mp_arena_directory(int arena)
+{
+    if (arena < 0 || arena >= Q2_MENU_MP_ARENA_COUNT)
+        return "";
+    return k_front_arenas[arena].directory;
 }
 
 /* 0x800AB4D8..0x800AB4F0 */

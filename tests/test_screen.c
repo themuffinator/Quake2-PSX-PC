@@ -353,6 +353,99 @@ static void test_compose_clip(void)
 }
 
 /*
+ * SortData screen changes are real DRAWENV packets inside a viewport's OT
+ * slice. The packet at bucket 1 establishes the last portal region for the
+ * low-numbered run; a later packet restores the full viewport before the run
+ * in its own bucket. Both the clip and the drawing offset are observable.
+ */
+static void test_sort_region_drawenv(void)
+{
+    q2_screen s;
+    psx_ot ot;
+    psx_raster_opts opts;
+    const psx_framebuffer *fb;
+    psx_prim *p;
+    u32 b;
+    u16 white = psx_rgb555(255, 255, 255);
+    u16 red = psx_rgb555(255, 0, 0);
+
+    q2_screen_init(&s, Q2_VIDEO_PAL);
+    q2_screen_set_layout(&s, Q2_SCREEN_LAYOUT_ONE, 1);
+    psx_ot_init(&ot, Q2_SCREEN_OT_ENTRIES, 16);
+    psx_raster_opts_default(&opts);
+    opts.textures = false;
+    opts.dither = false;
+
+    q2_screen_frame_begin(&s, &ot);
+    psx_fb_clear(q2_screen_back(&s), 0);
+    q2_screen_view_begin(&s, 0, &ot, NULL);
+
+    /* The structural full-view env is applied first at this same bucket. This
+     * packet follows it and installs a 40x30 local portal at (100,50). */
+    b = psx_ot_authored_bucket(&ot, 1);
+    p = psx_ot_add_bucket(&ot, b);
+    CHECK(p != NULL, "no room for the portal draw env");
+    if (p) {
+        p->kind = PSX_PRIM_DRAW_ENV;
+        p->xy[0].x = 100; p->xy[0].y = 50;
+        p->xy[1].x = 40;  p->xy[1].y = 30;
+        p->xy[2] = p->xy[0];
+    }
+
+    /* Coordinates are local to that portal. The 100x100 tile is clipped to
+     * 40x30 and displaced into the portal's framebuffer rectangle. */
+    b = psx_ot_authored_bucket(&ot, 10);
+    p = psx_ot_add_bucket(&ot, b);
+    CHECK(p != NULL, "no room for the portal-local tile");
+    if (p) {
+        p->kind = PSX_PRIM_TILE;
+        p->xy[0].x = 0;   p->xy[0].y = 0;
+        p->xy[2].x = 100; p->xy[2].y = 100;
+        p->rgb[0].r = p->rgb[0].g = p->rgb[0].b = 255;
+    }
+
+    /* Add the tile first and the restore second in the SAME bucket. AddPrim
+     * prepends, so retail executes the draw env before this bucket's tile. */
+    b = psx_ot_authored_bucket(&ot, 20);
+    p = psx_ot_add_bucket(&ot, b);
+    CHECK(p != NULL, "no room for the restored-view tile");
+    if (p) {
+        p->kind = PSX_PRIM_TILE;
+        p->xy[0].x = 0;  p->xy[0].y = 0;
+        p->xy[2].x = 20; p->xy[2].y = 20;
+        p->rgb[0].r = 255;
+    }
+    p = psx_ot_add_bucket(&ot, b);
+    CHECK(p != NULL, "no room for the full-view restore");
+    if (p) {
+        p->kind = PSX_PRIM_DRAW_ENV;
+        p->xy[0].x = 0; p->xy[0].y = 0;
+        p->xy[1].x = s.view[0].w;
+        p->xy[1].y = s.view[0].h;
+        p->xy[2] = p->xy[0];
+    }
+
+    q2_screen_view_end(&s, &ot);
+    q2_screen_compose(&s, &ot, NULL, &opts);
+    q2_screen_present(&s);
+    fb = q2_screen_front(&s);
+
+    CHECK(fb->px[5 * fb->width + 5] == red,
+          "same-bucket draw env did not restore the origin before its tile");
+    CHECK(fb->px[60 * fb->width + 110] == white,
+          "portal-local tile was not displaced into its screen region");
+    CHECK(fb->px[60 * fb->width + 50] == 0,
+          "portal draw env did not clip the tile's left side");
+    CHECK(fb->px[60 * fb->width + 140] == 0,
+          "portal draw env did not clip the tile's right boundary");
+    CHECK(fb->px[80 * fb->width + 110] == 0,
+          "portal draw env did not clip the tile's bottom boundary");
+
+    psx_ot_free(&ot);
+    q2_screen_free(&s);
+}
+
+/*
  * The background clear. Arming the full-screen one must turn every viewport's
  * own clear off, or the split-screen gutters — the only pixels the full-screen
  * clear owns — would be the only thing it painted.
@@ -1429,6 +1522,7 @@ int main(void)
     test_ot_window();
     test_layouts();
     test_compose_clip();
+    test_sort_region_drawenv();
     test_background();
     test_shake();
     test_depth_direction();

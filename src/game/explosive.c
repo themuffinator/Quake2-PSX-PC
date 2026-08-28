@@ -41,21 +41,20 @@ static void vis_add(s16 *list, u32 *count, s16 node)
 }
 
 /* ------------------------------------------------------------------------- */
-u16 q2_explosive_node_scale(const q2_scene *scene, s16 node)
+u16 q2_explosive_node_area(const q2_scene *scene, s16 node)
 {
-    const u8 *rec;
+    q2_scene_node n;
 
-    if (!scene || !scene->nodes || node < 0 ||
-        (u32)node >= scene->node_count)
+    if (!scene || node < 0 ||
+        !q2_scene_get_node(scene, (u32)node, &n))
         return 0;
 
     /*
      * `lhu a1, 14(a1)` at 0x80026948, masked with 0x7F at 0x80026954. The
-     * halfword spans scene.h's `unk0E` and the byte after it, which is zero on
+     * halfword spans scene.h's `area` and the byte after it, which is zero on
      * every node on the disc, so the mask makes the two readings agree.
      */
-    rec = scene->nodes + (size_t)node * Q2_SCENE_NODE_SIZE;
-    return (u16)(q2_rd_u16(rec + 14) & 0x7Fu);
+    return (u16)(n.area & 0x7Fu);
 }
 
 static bool node_ok(const q2_scene *scene, s16 node)
@@ -313,7 +312,7 @@ bool q2_explosive_damage(q2_explosive_set *set, u32 index, int part,
                 if (e->destroy < 0) {
                     b->explode = 1;
                     b->pieces  = (u8)(~e->destroy);
-                    b->scale   = q2_explosive_node_scale(scene, n);
+                    b->area    = q2_explosive_node_area(scene, n);
                 } else {
                     b->pieces  = (u8)e->destroy;
                 }

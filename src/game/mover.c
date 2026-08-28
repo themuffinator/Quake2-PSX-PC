@@ -559,13 +559,18 @@ q2_result q2_movers_build_calls(q2_mover_set *out, const q2_events *events,
 
             case Q2_UF_CAGELIFT1:
                 /* LIFT1's constructor operand for operand — see the correction
-                 * in userfuncs.c. Only the wait sits elsewhere. */
+                 * in userfuncs.c. Its two slab bytes move both timers two
+                 * bytes later than LIFT1's. The exec at 0x8002DFF4 reads +18
+                 * into obj+0x4C (delay), then +19 into obj+0x4E (wait), with
+                 * 0xFF taking the never-return arm at 0x8002E088. Reading +18
+                 * as the wait made BASE2's 0/0xFF pair return immediately. */
                 m->target      = (s16)-(s16)q2_rd_u16(p + 4);
                 m->speed       = (s16)abs(q2_rd_s16(p + 6));
                 collect_nodes(m, p, 8);
-                m->wait_timer  = (p[18] == 0xFF)
+                m->delay_timer = (u16)(p[18] * Q2_MOVER_TIMEBASE);
+                m->wait_timer  = (p[19] == 0xFF)
                                  ? Q2_MOVER_WAIT_NEVER
-                                 : (u16)(p[18] * Q2_MOVER_TIMEBASE);
+                                 : (u16)(p[19] * Q2_MOVER_TIMEBASE);
                 /*
                  * The two slab thicknesses, which nothing read. 0x80029A78 and
                  * 0x80029B1C build a ceiling of item[+17] and a floor of
@@ -669,6 +674,44 @@ q2_result q2_movers_build_calls(q2_mover_set *out, const q2_events *events,
 
             default:
                 break;
+            }
+
+            /*
+             * BASE0's CRATES is not a malformed lift. Its zero target/speed
+             * are deliberate because the LevelBin's DOCRATES handler owns the
+             * four obj+0x14 displacements. Keep one port object per authored
+             * slot — not one group — because the first pair moves at 16 and
+             * the second at 20. The retail constructor allocates four separate
+             * 92-byte objects too.
+             */
+            if (call.prim == Q2_UF_LIFT1 && m->target == 0 && m->speed == 0 &&
+                m->part_count != 0) {
+                q2_mover prototype = *m;
+                s16 nodes[Q2_MOVER_MAX_PARTS];
+                u32 parts = m->part_count;
+                u32 part;
+
+                memcpy(nodes, m->node, parts * sizeof(nodes[0]));
+                prototype.external   = 1;
+                prototype.part_count = 1;
+                prototype.sealed     = 0;
+
+                for (part = 0; part < parts; part++) {
+                    q2_mover *one;
+
+                    if (part == 0)
+                        one = &out->movers[out->count - 1];
+                    else {
+                        one = mover_push(out);
+                        if (!one)
+                            return Q2_ERR_NO_MEMORY;
+                    }
+
+                    *one = prototype;
+                    one->node[0]       = nodes[part];
+                    one->external_part = (u8)part;
+                }
+                continue;
             }
 
             /*
@@ -1027,6 +1070,11 @@ u32 q2_movers_tick_blocked(q2_mover_set *set, s32 dt, u16 player_keys,
 
         m->triggered = 0;
 
+        /* Its map handler writes the displacement directly. In retail that
+         * handler clears obj+0x2C before the generic object tick reaches it. */
+        if (m->external)
+            continue;
+
         switch (m->state) {
         case Q2_MV_IDLE:
             if (!trig) {
@@ -1188,4 +1236,84 @@ void q2_movers_node_offset(const q2_mover_set *set, u32 scene_node, s32 out[3])
             break;
         }
     }
+}
+
+/* Locate the first item in a named Events entry. CRATES is exactly one CALL,
+ * but walking it keeps this tied to the authored directory rather than to the
+ * PAL build's byte offset 488. */
+static bool named_item_offset(const q2_events *events, const char *name,
+                              u32 *out)
+{
+    u32 i;
+
+    if (!events || !name || !out)
+        return false;
+
+    for (i = 0; i < events->dir_count; i++) {
+        q2_event_dir_entry entry;
+        q2_event_record rec;
+        q2_event_item item;
+
+        if (!q2_events_get_dir_entry(events, i, &entry) ||
+            strcmp(entry.name, name) != 0)
+            continue;
+        if (!q2_events_record_at(events, entry.offset, &rec) ||
+            rec.n_items == 0 || !q2_events_get_item(events, &rec, 0, &item))
+            return false;
+
+        *out = item.offset;
+        return true;
+    }
+
+    return false;
+}
+
+u32 q2_movers_step_crates(q2_mover_set *set, const q2_events *events,
+                          const q2_scene *scene, s32 dt)
+{
+    u32 item_offset;
+    u32 i, moved = 0;
+
+    if (!set || !scene || dt <= 0 ||
+        !named_item_offset(events, "CRATES", &item_offset))
+        return 0;
+
+    for (i = 0; i < set->count; i++) {
+        q2_mover *m = &set->movers[i];
+        q2_scene_node node;
+        s32 factor, product, step, centre;
+        s32 before;
+
+        if (!m->external || m->item_offset != item_offset ||
+            m->part_count != 1 ||
+            !q2_scene_get_node(scene, (u32)m->node[0], &node))
+            continue;
+
+        factor  = m->external_part < 2 ? 16 : 20;
+        product = factor * dt;
+        /* The MIPS adds seven before sra 3 only on a negative product: signed
+         * division truncates toward zero. dt is positive in play, but retain
+         * the exact arithmetic rather than relying on that. */
+        if (product < 0)
+            product += 7;
+        step = product >> 3;
+
+        before    = m->offset;
+        m->offset = (s16)(m->offset + step);
+
+        /* `addu; srl sign; addu; sra 1` is a signed average rounded toward
+         * zero. The handler then sign-extends the translated centre to s16. */
+        centre = (s32)(((s64)node.bbox_min[1] + node.bbox_max[1]) / 2);
+        centre = (s16)(centre + m->offset);
+
+        /* slti centre,-1044; bne skips the wrap. In other words the subtract
+         * happens on >= -1044 — the inverse is an easy branch-reading trap. */
+        if (centre >= -1044)
+            m->offset = (s16)(m->offset - 3500);
+
+        if (m->offset != before)
+            moved++;
+    }
+
+    return moved;
 }

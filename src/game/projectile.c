@@ -39,6 +39,35 @@ static void release(q2_projectiles *list, u32 index)
         list->live--;
 }
 
+/* The runtime stores velocity in a common 1.0.12 representation so collision
+ * reflection is independent of projectile kind. Movement on the console is
+ * performed on each spawner's raw velocity, however: bolt /1, shared entities
+ * /320, BFG /64. The launch conversions have at least 12.8 fixed units per raw
+ * unit, so rounding the inverse to nearest recovers every original s16 exactly
+ * instead of introducing a one-unit error for negative components. */
+static s32 velocity_divisor(q2_proj_kind kind)
+{
+    if (kind == Q2_PROJ_BOLT)
+        return 1;
+    if (kind == Q2_PROJ_BFG)
+        return Q2_BFG_VEL_DIV;
+    return Q2_VEL_DIV;
+}
+
+static s32 fixed_to_raw(s32 fixed, s32 divisor)
+{
+    s64 scaled = (s64)fixed * divisor;
+
+    if (scaled >= 0)
+        return (s32)((scaled + 2048) / 4096);
+    return (s32)-(((-scaled) + 2048) / 4096);
+}
+
+static s32 raw_to_fixed(s32 raw, s32 divisor)
+{
+    return (s32)(((s64)raw * 4096) / divisor);
+}
+
 /* ------------------------------------------------------------------------- */
 s32 q2_projectile_launch(q2_projectiles *list, const q2_fire_result_v2 *fire,
                          s32 owner, s32 now)
@@ -46,8 +75,6 @@ s32 q2_projectile_launch(q2_projectiles *list, const q2_fire_result_v2 *fire,
     q2_projectile *p;
     s32 index = -1;
     const q2_shot *s;
-    s64 len2;
-    s32 len, speed;
     int k;
 
     if (!list || !fire || !fire->fired || fire->shot_count == 0)
@@ -73,7 +100,7 @@ s32 q2_projectile_launch(q2_projectiles *list, const q2_fire_result_v2 *fire,
     p->damage = s->damage;
     p->mod    = fire->mod;
     p->owner  = owner;
-    p->node   = -1;      /* found on the first move, as a fresh entity's is */
+    p->node   = Q2_PROJ_NODE_UNKNOWN; /* found on the first move */
 
     switch (fire->kind) {
     case Q2_FK_BOLT:
@@ -93,57 +120,115 @@ s32 q2_projectile_launch(q2_projectiles *list, const q2_fire_result_v2 *fire,
     case Q2_FK_GRENADE:
         p->kind = Q2_PROJ_GRENADE;
         p->splash_radius = Q2_SPLASH_RADIUS_GRENADE;
-        p->expires = now + Q2_FUSE_GRENADE;
-        speed = fire->projectile_speed ? fire->projectile_speed
-                                       : Q2_GRENADE_LAUNCH_SPEED;
+        p->expires = now + (fire->projectile_timer ? fire->projectile_timer
+                                                   : Q2_GRENADE_LAUNCH_FUSE);
         break;
     case Q2_FK_HAND_GRENADE:
         p->kind = Q2_PROJ_HAND_GRENADE;
         p->splash_radius = Q2_SPLASH_RADIUS_GRENADE;
         p->expires = now + (fire->projectile_timer ? fire->projectile_timer
-                                                   : Q2_FUSE_HAND_GRENADE);
-        speed = fire->projectile_speed ? fire->projectile_speed
-                                       : Q2_GRENADE_LAUNCH_SPEED;
-        break;
+                                                   : Q2_HAND_GRENADE_FUSE);
+        /* 0x8004ABC4 writes state 1 and 0x8004ABCC writes 4096 to +0x4C.
+         * There is deliberately no velocity until the 411 crossing. Keeping
+         * the raw charge in vel[2] avoids widening the save record. */
+        p->node   = Q2_PROJ_NODE_HELD;
+        p->vel[2] = Q2_HAND_GRENADE_CHARGE_START;
+        return index;
     case Q2_FK_ROCKET:
         p->kind = Q2_PROJ_ROCKET;
         p->splash_radius = Q2_SPLASH_RADIUS_ROCKET;
-        speed = fire->projectile_speed ? fire->projectile_speed
-                                       : Q2_ROCKET_SPEED;
+        p->expires = now + (fire->projectile_timer ? fire->projectile_timer
+                                                   : Q2_ROCKET_LIFETIME);
         break;
     default:
         p->kind = Q2_PROJ_BFG;
         p->splash_radius = Q2_SPLASH_RADIUS_BFG;
-        speed = fire->projectile_speed ? fire->projectile_speed
-                                       : Q2_BFG_SPEED_UNREAD;
+        p->expires = now + (fire->projectile_timer ? fire->projectile_timer
+                                                   : Q2_BFG_LIFETIME);
         break;
     }
 
-    /* The shot's direction carries the weapon's own scale, so normalise it and
-     * re-apply the projectile's speed. Speeds are per second on the 300 Hz
-     * level clock, so a tick's worth is speed/300 — kept as a 1.0.12 fraction
-     * to avoid losing the slow ones to integer truncation. */
-    len2 = (s64)s->dir[0] * s->dir[0] + (s64)s->dir[1] * s->dir[1] +
-           (s64)s->dir[2] * s->dir[2];
-    len = 0;
-    if (len2 > 0) {
-        s64 lo = 0, hi = 0x7FFFFFFF;
-        while (lo <= hi) {
-            s64 mid = lo + (hi - lo) / 2;
-            if (mid * mid <= len2) { len = (s32)mid; lo = mid + 1; }
-            else hi = mid - 1;
-        }
-    }
-    if (len <= 0) {
+    if (s->dir[0] == 0 && s->dir[1] == 0 && s->dir[2] == 0) {
         release(list, (u32)index);
         return -1;
     }
 
-    for (k = 0; k < 3; k++)
-        p->vel[k] = (s32)(((s64)s->dir[k] * speed * 4096) /
-                          ((s64)len * Q2_TICKS_PER_SECOND));
+    if (p->kind == Q2_PROJ_BFG) {
+        /* 0x8004B5F0 rotates literal {0,0,768}. q2_sim_aim is already the
+         * rotation matrix's forward column, so each raw component is the
+         * console's signed fixed multiply — there is no Euclidean normalise.
+         * The arithmetic shift matters for a negative, non-integral product. */
+        for (k = 0; k < 3; k++) {
+            s32 raw = (s32)(((s64)s->dir[k] * Q2_BFG_RAW_SPEED) >> 12);
+            p->vel[k] = raw_to_fixed(raw, Q2_BFG_VEL_DIV);
+        }
+    } else {
+        for (k = 0; k < 3; k++)
+            p->vel[k] = (s32)(((s64)s->dir[k] * 4096) / Q2_VEL_DIV);
+    }
 
     return index;
+}
+
+/* ------------------------------------------------------------------------- */
+s32 q2_projectile_hand_held_index(const q2_projectiles *list, s32 owner)
+{
+    u32 i;
+
+    if (!list)
+        return -1;
+
+    for (i = 0; i < Q2_PROJ_MAX; i++) {
+        const q2_projectile *p = &list->p[i];
+
+        if (p->in_use && p->kind == Q2_PROJ_HAND_GRENADE &&
+            p->node == Q2_PROJ_NODE_HELD && p->owner == owner)
+            return (s32)i;
+    }
+    return -1;
+}
+
+s32 q2_projectile_hand_charge(const q2_projectiles *list, s32 owner)
+{
+    s32 index = q2_projectile_hand_held_index(list, owner);
+
+    return index >= 0 ? list->p[index].vel[2] : 0;
+}
+
+bool q2_projectile_hand_update(q2_projectiles *list, s32 owner,
+                               const s32 attached_pos[3], s32 cook_dt)
+{
+    s32 index = q2_projectile_hand_held_index(list, owner);
+    q2_projectile *p;
+
+    if (index < 0 || !attached_pos)
+        return false;
+
+    p = &list->p[index];
+    memcpy(p->pos, attached_pos, sizeof(p->pos));
+    if (cook_dt > 0)
+        p->vel[2] += Q2_HAND_GRENADE_CHARGE_PER_DT * cook_dt;
+    return true;
+}
+
+bool q2_projectile_hand_release(q2_projectiles *list, s32 owner,
+                                const s32 origin[3], const s32 raw_dir[3])
+{
+    s32 index = q2_projectile_hand_held_index(list, owner);
+    q2_projectile *p;
+    int k;
+
+    if (index < 0 || !origin || !raw_dir)
+        return false;
+    if (raw_dir[0] == 0 && raw_dir[1] == 0 && raw_dir[2] == 0)
+        return false;
+
+    p = &list->p[index];
+    memcpy(p->pos, origin, sizeof(p->pos));
+    for (k = 0; k < 3; k++)
+        p->vel[k] = raw_to_fixed(raw_dir[k], Q2_VEL_DIV);
+    p->node = Q2_PROJ_NODE_UNKNOWN;
+    return true;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -151,6 +236,7 @@ void q2_projectile_step(q2_projectiles *list, u32 index, s32 gravity, s32 dt,
                         s32 now, q2_proj_step *out)
 {
     q2_projectile *p;
+    s32 divisor;
     int k;
 
     if (out)
@@ -162,6 +248,17 @@ void q2_projectile_step(q2_projectiles *list, u32 index, s32 gravity, s32 dt,
     if (!p->in_use)
         return;
 
+    /* Grenade3 state 1 is positioned by its owner and has no mover. Its fuse
+     * still runs: 0x8004A3DC subtracts dt before the state dispatch. */
+    if (p->kind == Q2_PROJ_HAND_GRENADE &&
+        p->node == Q2_PROJ_NODE_HELD) {
+        memcpy(out->from, p->pos, sizeof(out->from));
+        memcpy(out->to, p->pos, sizeof(out->to));
+        if (p->expires && now >= p->expires)
+            out->expired = true;
+        return;
+    }
+
     if (dt <= 0)
         dt = Q2_DT_NOMINAL;
 
@@ -171,9 +268,10 @@ void q2_projectile_step(q2_projectiles *list, u32 index, s32 gravity, s32 dt,
      *
      * THE SCALE. `gravity` is Q2_GRAVITY in the PLAYER's units, where a
      * position advances as `vel * dt / Q2_VEL_DIV` and the integrator adds
-     * `g * dt` to the velocity each tick (sim.c's integrate_vertical). A
-     * projectile's velocity is 1.0.12 and advances as `(vel * dt) >> 12`, so
-     * the same acceleration expressed in projectile units is
+     * `g * dt` to the velocity each tick (sim.c's integrate_vertical). The
+     * list keeps velocity in 1.0.12 for collision response, but this step
+     * recovers the original raw value before integrating it. Re-encoding the
+     * same acceleration in the stored representation changes it by
      *
      *     dv_p = g * dt * 4096 / Q2_VEL_DIV
      *
@@ -183,25 +281,35 @@ void q2_projectile_step(q2_projectiles *list, u32 index, s32 gravity, s32 dt,
      * 0.008 units a tick, about 600 times too small. Which is why the grenade
      * launcher and the hand grenade had no arc at all.
      */
-    if (p->kind == Q2_PROJ_GRENADE || p->kind == Q2_PROJ_HAND_GRENADE)
-        p->vel[1] += (s32)(((s64)gravity * dt * 4096) / Q2_VEL_DIV);
+    divisor = velocity_divisor(p->kind);
+
+    if (p->kind == Q2_PROJ_GRENADE || p->kind == Q2_PROJ_HAND_GRENADE) {
+        s32 raw_y = fixed_to_raw(p->vel[1], Q2_VEL_DIV);
+        raw_y += gravity * dt;
+        /* Shared mover 0x80046464..0x800464A0 uses the same one-sided
+         * terminal clamp as the player path. Upward velocity is unrestricted;
+         * only a fall past +8192 is capped. */
+        if (raw_y > Q2_TERMINAL_VY)
+            raw_y = Q2_TERMINAL_VY;
+        p->vel[1] = raw_to_fixed(raw_y, Q2_VEL_DIV);
+    }
 
     memcpy(out->from, p->pos, sizeof(out->from));
 
     /*
      * AND THE FRAME DELTA, which this step used to drop entirely.
      *
-     * The original's sweep at 0x80047D40 forms the destination as
-     * `pos += vel * dt`, dt being the global frame delta at 0x800B2DB4. Both
-     * sides' velocities are per-dt-UNIT: the bolt's is stored raw as `aim >> 6`
-     * and q2_projectile_launch divides every other kind by Q2_TICKS_PER_SECOND
-     * for exactly that reason. Advancing by one dt unit per FRAME instead of by
-     * dt made every projectile 12x too slow at the nominal tick and 20x too
-     * slow in the 1/30 s headless step — a blaster bolt crawling at 64 units a
-     * frame where it should cover 768.
+     * The bolt sweep at 0x80047D40 forms `pos += vel * dt`; the shared entity
+     * mover uses `pos += vel * dt / 320`; BFG's private mover uses `/64`.
+     * `velocity_divisor` selects those three instruction-level paths after the
+     * common fixed representation is converted back to raw velocity. Omitting
+     * dt made a bolt 12x too slow at the nominal tick and 20x too slow in the
+     * 1/30 s headless step — 64 units a frame where it should cover 768.
      */
-    for (k = 0; k < 3; k++)
-        out->to[k] = p->pos[k] + (s32)(((s64)p->vel[k] * dt) >> 12);
+    for (k = 0; k < 3; k++) {
+        s32 raw = fixed_to_raw(p->vel[k], divisor);
+        out->to[k] = p->pos[k] + (s32)(((s64)raw * dt) / divisor);
+    }
 
     if (p->expires && now >= p->expires)
         out->expired = true;
@@ -214,6 +322,15 @@ void q2_projectile_commit(q2_projectiles *list, u32 index, const s32 to[3])
     if (!list->p[index].in_use)
         return;
     memcpy(list->p[index].pos, to, sizeof(list->p[index].pos));
+}
+
+bool q2_projectile_expire(q2_projectiles *list, u32 index)
+{
+    if (!list || index >= Q2_PROJ_MAX || !list->p[index].in_use)
+        return false;
+
+    release(list, index);
+    return true;
 }
 
 /* ------------------------------------------------------------------------- */

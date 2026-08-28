@@ -28,6 +28,13 @@ static void raster_clip(const psx_framebuffer *fb, const psx_raster_opts *opts,
     *x1 = fb->width;
     *y1 = fb->height;
 
+    /* A negative extent is the composer's explicit EMPTY draw area.  Zero is
+     * retained as the historical "no draw env installed" sentinel. */
+    if (opts->clip_w < 0 || opts->clip_h < 0) {
+        *x0 = *y0 = *x1 = *y1 = 0;
+        return;
+    }
+
     if (opts->clip_w > 0 && opts->clip_h > 0) {
         if (opts->clip_x > *x0) *x0 = opts->clip_x;
         if (opts->clip_y > *y0) *y0 = opts->clip_y;
@@ -790,6 +797,10 @@ void psx_raster_prim(psx_framebuffer *fb,
         raster_move(fb, prim);
         break;
 
+    /* Consumed by q2_screen_compose while walking the ordering table. */
+    case PSX_PRIM_DRAW_ENV:
+        break;
+
     default:
         break;      /* mode-setting packets carry no pixels */
     }
@@ -808,7 +819,7 @@ static void walk_visit(const psx_prim *prim, void *user)
 }
 
 void psx_raster_ot(psx_framebuffer *fb,
-                   const psx_ot *ot,
+                   psx_ot *ot,
                    const psx_vram *vram,
                    const psx_raster_opts *opts)
 {

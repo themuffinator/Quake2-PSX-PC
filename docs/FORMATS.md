@@ -567,6 +567,19 @@ frame. Each names a stream of 4-bit durations in frames, eight to a word and rea
 that part's own key list. A part holds a key for as many frames as its nibble says; poses between keys are
 interpolated, translations linearly and rotations by the spherical interpolator at `0x80069C64`.
 
+**Retail supplies a continuous sub-frame clock to that interpolator for both creatures and players.** In the
+world-entity frame, `0x8007ED9C…0x8007F000` consumes elapsed time in 30-unit AI intervals and leaves `s3` as
+the 0…29 remainder; the only call to `0x8007EB10`, at `0x8007F158`, passes it as `a2`, and
+`0x8007ECAC…0x8007ECBC` writes `runtimeMove.base + a2` to `entity+0x100`. The pose walk at `0x8006B5D8`
+divides that position by ten and deliberately keeps the remainder for lerp/slerp. Player bodies have a
+separate, even plainer driver: `0x8003DF58…0x8003DF68` adds the frame delta to the same `entity+0x100`
+halfword, while `0x8003DF70…0x8003DFC0` compares the named move bounds and wraps or marks its end.
+
+The port mirrors both paths. Creature cursors expose `BASE + PHASE` (resetting phase when AI chooses a new
+base), and multiplayer Male2 bodies advance the disc's named Stand/Run/Attak/Jump/death moves on the render
+clock. Neither path rounds to an animation key before calling `q2_model_pose_at`, so translation lerp and
+quaternion slerp receive the same tenths-of-a-frame remainder retail did.
+
 That interpolator is worth following exactly rather than substituting a textbook slerp, because two of its
 details are observable: it negates the second quaternion when the dot product is negative, so it always takes
 the short way round, and once `1 − cos θ` falls below `0x80` it drops to a straight lerp — which is most
@@ -770,14 +783,18 @@ typedef struct {            /* 24 bytes */
 /* List B. Terminator: 0xFFFFFFFF (CONFIRMED 174/174 arrays), NOT zero. */
 typedef struct {            /* 16 bytes */
     int32_t  x, y, z;       /* CONFIRMED: 1009/1013 inside the map envelope         */
-    uint16_t unk;           /* UNKNOWN: NOT a 0..4095 angle — values include 4096,
-                             * 32768, 36864, 53248. Looks like flag bits OR'd with
-                             * an angle.                                            */
-    uint16_t id;            /* INFERRED: 0..56, 41 distinct — the same numeric range
-                             * as the EXE class-table id byte, so this is the most
-                             * likely link to the global pickup table.              */
+    uint16_t angleFlags;    /* CONFIRMED: yaw in bits 0..11; bit 12 is retail-unused;
+                             * 0x2000/0x4000/0x8000 exclude easy/medium/hard.       */
+    uint16_t id;            /* CONFIRMED: key into the 24-byte item table; all 1,013
+                             * records resolve and name a model their map ships.    */
 } q2p_place;
 ```
+
+The difficulty reader is the place-list walker at `0x8007F538`. It reads the skill halfword at
+`0x800B334A`; skill 0 rejects `0x2000`, skill 1 rejects `0x4000`, and skill 2 rejects `0x8000`, then the
+surviving record is passed to `0x800599DC`. A value outside 0…2 takes the unfiltered default arm. Bit
+`0x1000` is not tested by this walker or by the spawner: disc-wide it is set on every place in 22 maps and
+on none in the other 12, with zero mixed maps, identifying an authoring/export marker rather than gameplay.
 
 Alignment slack: a group table normally ends 4 bytes before the first list, but two maps leave a 4-byte gap,
 as do 18 list-A and 34 list-B arrays. Treat the region between a list's terminator and the next declared
@@ -923,6 +940,27 @@ This corroborates the port's mover model, which was derived independently from t
 seven states, same single axis-aligned translation, same absolute-valued speed, same blocked-retry. What it
 adds is the draw-time offset, which is now wired into `q2_world_build_ot`.
 
+### 2.9.3 `LIFT1`, `CAGELIFT1`, and BASE0's crate conveyor
+
+These are CALL primitives that allocate the same runtime mover object. Their item-relative layouts differ at
+the four timing bytes:
+
+| primitive | `+4..+15` | `+16` | `+17` | `+18` | `+19` |
+|---|---|---|---|---|---|
+| `LIFT1` | target, speed, four Scene slots | delay | wait | -- | -- |
+| `CAGELIFT1` | target, speed, four Scene slots | bottom slab | top slab | delay | wait |
+
+Delay and wait are multiplied by 300; wait `0xFF` becomes `0xFFFF` and never auto-closes. BASE2's start
+cage is the decisive vector: target -1491, speed -3, slab bytes 32/32, delay 0 and wait `0xFF`. Reading
+`+18` as wait makes the cage return immediately. Reading the actual `+19` makes it descend to displacement
+1491 and remain in state 2.
+
+BASE0's crates are **not PLATFORM/train geometry**. The named `CRATES` record is a zero-target, zero-speed
+`LIFT1` whose four Scene slots (197, 196, 198, 199) allocate four externally driven mover objects. The map's
+LevelBin `DOCRATES` mission-event handler advances slots 0/1 by `(16*dt)/8`, slots 2/3 by `(20*dt)/8`, all
+on Y, and subtracts 3500 when a translated box centre reaches -1044. The directory entry named `ALWAYS`
+runs once per simulation tick and calls `DOCRATES`; that is the crate conveyor seen in the first base map.
+
 ### 2.10 `Events` — compiled trigger scripts
 
 ```
@@ -976,9 +1014,9 @@ enum {                        /* q2p_event_rec.flags */
     Q2EV_REC_HASRUN   = 0x01, /* CONFIRMED, set by the run latch                   */
     Q2EV_REC_RT1      = 0x02, /* runtime-only, never set on disc                   */
     Q2EV_REC_RT2      = 0x04, /* runtime-only, never set on disc                   */
-    Q2EV_REC_CAT_A    = 0x08, /* INFERRED category bit                             */
-    Q2EV_REC_CAT_B    = 0x10, /* INFERRED; the loader's default                    */
-    Q2EV_REC_CAT_C    = 0x20, /* INFERRED category bit                             */
+    Q2EV_REC_CAT_A    = 0x08, /* CONFIRMED: first frame inside (enter)             */
+    Q2EV_REC_CAT_B    = 0x10, /* CONFIRMED: every frame inside (stay); default     */
+    Q2EV_REC_CAT_C    = 0x20, /* CONFIRMED: first frame outside after contact      */
     Q2EV_REC_ONESHOT  = 0x40, /* CONFIRMED: on run, DISABLED := ONESHOT            */
     Q2EV_REC_DISABLED = 0x80  /* CONFIRMED: record is skipped                      */
 };
@@ -987,6 +1025,11 @@ enum {                        /* q2p_event_rec.flags */
 On-disc `flags` values are exactly `{0x08, 0x10, 0x18, 0x20, 0x28, 0x48, 0x50, 0x58}` — note that `0x60` and
 `0x68` do **not** occur, so it is not "each of the first five, optionally `| 0x40`". Low 3 bits are 0 in
 4,179/4,179; bit 7 is never set on disc.
+
+The contact dispatcher at `0x80027E64` fixes the three category meanings. Runtime bits `0x02` and `0x04`
+are current and previous contact. Category A runs on `current && !previous`, B on `current`, and C on
+`!current && previous`. Contact is accumulated on the **record**, not per trigger volume, so several volumes
+naming one record mean "inside any of them" and only the final departure raises its exit edge.
 
 #### Opcode dispatch — CONFIRMED
 
@@ -1207,10 +1250,10 @@ typedef struct {                /* 52 bytes */
     uint16_t pad0A;             /* CONFIRMED: always 0 (upper half of the dword)     */
     uint8_t  unk0C;             /* UNKNOWN: 0..4, nonzero in 6 nodes                 */
     uint8_t  unk0D;             /* UNKNOWN: 0..3, nonzero in 5 nodes                 */
-    uint8_t  unk0E;             /* 0..197, 119 distinct; 3 nodes are 0. Read ONLY on
-                                 * the bit-14 deferred path: low 7 bits index a
-                                 * 64-byte-stride table at 0x800D8D78 (0x80066800).
-                                 * What that table holds is UNKNOWN.                 */
+    uint8_t  area;              /* 0..197, 119 distinct; low 7 bits name a 64-byte
+                                 * runtime screen-area record. Bit-14 nodes and
+                                 * dynamic packet chains route through its authored
+                                 * ordering-table insertion point.                    */
     uint8_t  unk0F;             /* Always 0 on disc; the zone draw uses it as scratch
                                  * for a per-frame counter (0x80067A34).            */
     int32_t  bboxMin[3];        /* CONFIRMED value, INFERRED semantics — see note    */
@@ -1241,9 +1284,16 @@ in `src/formats/surface.h`; `q2psx-inspect surfaces` checks it against all 17,03
 **Bits 0-9 are the node-to-mover binding.** The value scales by 92 and indexes the runtime object array whose
 first element is `0x800D6BB0`, so slot = value − 1. The loader clears them, which is why the field is empty on
 every disc node and why movers looked impossible to bind from the data alone. The object supplies a full
-transform, not just an offset: `0x800678B4` calls `RotMatrix` on three `int16_t` Euler angles at `obj+0x0C`,
-then adds **two** independent `int16_t` triples at `+0x12` and `+0x18` to the node's camera-space position. So
-rotating brush geometry (`ROTHATCH`, `SIMROT`, `ROTBUTTON`) is drawn by the same mechanism as a sliding door.
+transform, not just an offset: `0x800678B4` calls `RotMatrix` on three `int16_t` Euler angles at `obj+0x0C`;
+`obj+0x12` is the linear displacement and `obj+0x18` is a local rotational pivot, applied as `-R.p+p` at
+`0x800678E4..0x8006793C`.
+
+The constructors settle that pivot before motion begins. SIMROT/SIMROT2 (`0x800284C8..0x80028548` and
+`0x800286C0..0x80028740`) and ROTBUTTON (`0x8002C210..0x8002C288`) store the raw Scene AABB midpoint minus
+the Scene origin. ROTHATCH (`0x8002B798..0x8002B830`) starts from the same local midpoint, subtracts its
+signed `item+10` adjustment from X, and adds `item+12`/`item+14` to Y/Z. The midpoint sequence rounds odd
+negative sums toward zero. Omitting these constructor writes leaves the zero from the object's memset and
+makes a brush orbit the zone's local origin even though its rotation matrix is otherwise correct.
 
 **Bits 10-11 are the affine-warp control.** They dispatch to one of four quad linkers, and the difference
 between them is *when a near quad is subdivided*:
@@ -1441,8 +1491,9 @@ per node — **no node anywhere on the disc mixes index 0 with a real palette** 
 their `Scene.flags08` is the ordinary `0x0000` on 1,739 of 1,749, so the flags word carries no trace of it
 and cannot be used instead.
 
-A renderer that walks nodes in index order — which is what a port must do until it knows which stream a
-viewport wants (open question 7a) — has to apply this itself, or it draws black planes over half the level.
+A renderer that deliberately walks nodes in index order — this port's `--depth-sort` diagnostic — still has
+to apply this itself, or it draws black planes over half the level. The parity path now reads the camera
+cell's exact SortData byte offset from PrimaryColl.
 
 ### 3.4 `PrimaryColl` / `SecondaryCol` — collision hulls — **CONFIRMED, read from code**
 
@@ -1463,11 +1514,11 @@ typedef struct {                /* 36 bytes */
                                  * node outright. Every reader then masks 0x7FFF.
                                  * Per-node count = node[i+1] - node[i], masked.       */
     uint16_t firstLink;         /* CONFIRMED: same derivation. Was called `firstExtra`.*/
-    uint16_t unk1C;             /* UNKNOWN: 0..20,603, non-zero on 13,625 of 13,920
-                                 * secondary records and 8,968 of 9,083 primary ones.
-                                 * Nothing in the image loads offset +28. NOT a
-                                 * running offset: non-decreasing on only 15 and 30
-                                 * of 115 zones.                                       */
+    int16_t  sortOffset;        /* CONFIRMED on PrimaryColl: exact BYTE offset into
+                                 * SortData for this camera cell. The renderer indexes
+                                 * the PrimaryColl node through view+146 and reads
+                                 * `lh +28` at 0x80066AFC. SecondaryCol's copy is not
+                                 * used by this path.                                  */
     uint16_t firstLight;        /* CONFIRMED: first index into the zone's SpaceLights
                                  * array; the count is the successor's minus this, so
                                  * the sentinel terminates it. Read at 0x8006B0E4 as
@@ -1777,18 +1828,28 @@ adds `base`, absolute mode spends `w_op_long` and does not.
 | op | meaning |
 |---|---|
 | 0 | end of stream (`0x80067238`) |
-| 1 | entity draw record (`0x80067240`) |
+| 1 | screen-region change (historically named `ENTITY`; `0x80067240`) |
 | 2 | switch mode; the replacement opcode follows at the **other** mode's width (`0x8006718C`, `0x80067604`) |
 | ≥3 | scene node `op - 3`, plus `base` in windowed mode (`0x800676B4`) |
 
-An entity record is four fields in stream order — `f1` (signed, extended from **bit 15**, not from the field
-width), `f2`, `f3`, `f4` — handed to `0x80065D0C` as `(f1, f3 & 0xFF, f4 & 0xFF, bucket)`. What follows
-depends on that call's return: if the entity was **not** drawn the stream skips `f2` more **bits**
-(`0x800675A8`, word-stepping so it can cross any number of words); if it **was** and `f2` is non-zero, the
-next `w_base` bits are a **new base**.
+The screen-region record is four fields in stream order — `f1` (signed, extended from **bit 15**, not from
+the field width), `f2`, `f3`, `f4` — handed to `0x80065D0C` as
+`(f1, f3 & 0xFF, f4 & 0xFF, bucket)`. `f1` names a Scene/Points marker, `f3` names the parent screen record,
+and `f4` names the seven-bit draw area. `0x80065D08` transforms every marker point, separates zero-depth
+from positive-depth bounds, clips the result to the parent and returns true exactly when both projected
+width and height are non-zero. A rectangle collapsed on either axis is normalised to literal zero; hidden
+markers supply those zero bounds directly. Values below the
+parent clamp to its minimum while values above it clamp to its maximum (`0x8006637C…0x800663DC`); clamping
+both sides to the minimum collapses portals crossing the right or bottom edge and selects the wrong stream
+arm. What follows depends on that predicate: when false the
+stream skips `f2` more **bits** (`0x800675A8`, word-stepping so it can cross any number of words); when true
+and `f2` is non-zero, the next `w_base` bits are a **new base**. `f2` is branch data, not an entity payload;
+guessing the predicate changes the bitstream shape and corrupts every subsequent node reference.
 
-> **The world is not depth-sorted at all.** The ordering-table bucket starts at 45 (`0x80066978`) or 43
-> (`0x80066A3C`) and is decremented in exactly one place — after an entity record (`0x800675E0`). The node
+> **The world is not depth-sorted at all.** Bucket 45 and 43 are not alternatives: the renderer first seeds
+> the camera area's full-viewport record at 45 (`0x80066970`), then starts the SortData stream at 43
+> (`0x80066A34`). The stream bucket is decremented in exactly one place — after an entity record
+> (`0x800675E0`). The node
 > path never touches it: it draws a whole node into the current bucket and stops the stream once the bucket
 > falls below 4 (`0x80067B28`, `0x80067DF0`). So the world's order is **authored**, the ordering table merely
 > carries it, and buckets exist to interleave *entities* with the world at the right depth. A port that
@@ -1802,9 +1863,54 @@ overruns at chunk tails, 178,801 node references, ZERO out of range**, highest i
 scene node. A desynchronised bit reader does not land on a valid header 8,968 times in a row, which is what
 makes tiling a test rather than an illustration.
 
-*Open:* which stream a given viewport uses. The `+28` offset is runtime state, not on the disc, so the port
-can decode every stream but not yet choose one — the renderer takes it as an opt-in parameter
-(`q2_world_zone.sort_offset`).
+**Stream selection is now confirmed directly, and the earlier equal-index inference is withdrawn.** The
+pointer at `0x800C8E94` is the PrimaryColl node array itself. `0x80066AD4` takes the camera cell from
+`view+146`, multiplies it by the 36-byte node stride, and `0x80066AFC` loads signed halfword `+28`. That
+on-disc value is the exact **byte offset** into SortData. The renderer locates each viewport camera in
+PrimaryColl and uses `node.sortOffset` directly; tiled stream enumeration remains an offline format census,
+not a runtime lookup. `--depth-sort` retains the old derived-depth path only as a diagnostic comparison.
+
+**Screen areas and the final batch drain are now confirmed.** PrimaryColl byte `+32` names the camera area;
+opcode 1 registers field `f4` as another live area at its current authored bucket. The area table uses
+64-byte records (`0x800D8FE8` in the NTSC executable), split into 16-byte records per viewport: freshness at
+`+0`, ordinal at `+2`, screen-change record at `+4`, Standard batch list at `+8`, and Quick batch list at
+`+12`. A flags08 bit-14 Scene node uses `Scene.area & 0x7F`; movement writes the occupied collision node's
+byte `+32` to entity byte `+0x9E` (`0x80046B08`), which models and effects use in the same way.
+
+Opcode 1 also builds one of the renderer's 24 20-byte screen-change records: packed minimum at `+0`, packed
+maximum at `+4`, inherited draw offset at `+8`, area at `+12`, current authored bucket at `+14`, marker at
+`+16`, and parent at `+18`. Selecting an ordinary area subtracts its minimum from the viewport's GTE centre;
+the four world linkers simultaneously read the region-local width and height for their 2D reject. Whenever
+the state changes, a DRAWENV restoring the previous rectangle is `AddPrim`'d at the current authored bucket.
+The OT is walked opposite the stream's construction order, so these restores replay the region stack in the
+correct direction. The zone draw ends with the full-viewport call at bucket 1; this emits the last restore
+inside the list and does not replace the structural viewport DRAWENV linked later by the screen code.
+
+The selector at `0x80065684` is stateful: a negative area branches directly to
+its return and changes nothing, area 0 installs the global extent, area 1
+installs the viewport extent, and areas 2 and above select their screen record
+and subtract its minimum from the viewport GTE centre. The weapon entity writes
+area 1 at `0x8004EE58`, so the ordinary model call at `0x8006BEB0` restores the
+viewport projection before drawing it. `-1` is not a synonym for that restore.
+
+The 20-byte batch record is `next` at `+0`, signed projected-origin order at `+4`, flags at `+6` (bit 0 means
+point rather than AABB), spatial pointer at `+8`, and private-chain head/tail at `+12/+16`. `0x80047B98`
+flattens the newest-first lists to at most 32 Standard and 128 Quick records. `0x80047A10` builds a Standard-
+to-Standard dependency matrix with `0x80047598`, suppressing a reciprocal edge once the earlier comparison
+has established its direction; `0x80047AF0` builds Quick-to-Standard dependencies. For overlapping AABBs,
+`0x800473C4` splits the shallowest penetration at its midpoint before the camera-relative axis tests.
+Point records use the same relation with a ten-unit tolerance.
+
+Area 1 is concatenated without this sort at fixed slice bucket 46. Area 2 is sorted at fixed slice bucket 1
+without the ordinary freshness gate; areas 3…95 drain only when their screen record is fresh. `0x80047080`
+stable-sorts every currently unblocked Quick run by signed `+4`, then emits one unblocked
+Standard record while scanning cyclically. Emitting Standard clears its bit from every row. A genuine cycle
+is broken by clearing the remaining Standard row with the fewest bits (first wins a tie). `0x80046E14` then
+`CatPrim`s each complete private chain in that output order onto the area's authored bucket. This preserves
+packet order inside a model or wall feature while sorting objects against one another; a stale area has no
+final drain and is therefore culled. Models remain AABB records on either list; entity render flag
+`0x00800000` selects Quick. Deferred world nodes are Standard, while particle groups and beam sections are
+point/Quick records.
 
 ### 3.11.1 `SpaceLights` — which lights reach which cell — **CONFIRMED, read from code**
 
@@ -2111,6 +2217,14 @@ checked by decoding and looking, which is the test a wrong depth fails loudly:
 | `mouse.lbm` | 128 | 8bpp | the same pad over a mouse |
 | `background3.lbm` | 256 | — | neither 4 nor 8 fits one page; unsettled |
 
+The two 128-halfword preview sheets deliberately alias later slots. In
+particular, `multipic2.lbm` in slot 12 spans x 832…959, while
+`frontend.lbm` in slot 13 replaces x 896…959. This works because the final two
+previews sample only the left 128 texels of their 8bpp page. Registration order
+at `0x8003FE20` is therefore significant: both preview sheets are uploaded
+first, then the 4bpp font replaces the unused right half. Reversing those two
+uploads produces vertical preview-byte stripes in place of every menu glyph.
+
 The last four are in `QFRONT` alone and belong to the front end — the multiplayer map select and the
 controller page's diagram — not to anything drawn in a level. That retires the "split-screen overlay"
 question: `multipics.lbm` is not overlay art and there is no split-screen overlay to find.
@@ -2154,6 +2268,18 @@ typedef struct {                /* 48 bytes; INTEGER FIELDS ARE BIG ENDIAN */
 
 Big-endianness is proven by construction: the BE reading yields exactly two plausible sample rates and
 16-aligned sizes; the LE reading yields values in the hundreds of millions.
+
+The header rate is only the first half of playback pitch. At load time `0x800724EC` quantises it into the
+SPU domain as `floor(sample_rate * 4096 / 44100)`. Each **sound request** then carries a separate byte
+modifier whose default is 35, and `0x80071CA0` applies
+`floor(base_pitch * modifier / 32)`. Thus the ordinary default is 35/32 of the header rate, not unity.
+The randomising start at `0x8007270C` replaces the request's current byte with
+`lower + rand() % (upper-lower)` (exclusive upper bound), while the direct start at `0x80072A00` neither
+draws nor varies it. Core registrations prove that identity belongs to the request rather than the VAG
+name: gasp/drown use 30…38, burn1/burn2 33…34, and wade3 32…37, while two independent
+`wep_machgf1b` records have different ranges and start paths. `q2_sfx_pitch_*` reconstructs this state and
+the exact two-stage host-mixer step; event callers still need request-role wiring before non-default ranges
+can safely replace the client's default modifier.
 
 ```c
 typedef struct {                /* 16 bytes */
@@ -2631,6 +2757,13 @@ Using bytes 4…7 / 12…15 is the standard's rule. INFERRED.
 Raw CD-DA: 44100 Hz, 16-bit signed LE, 2 channels interleaved, 2352 bytes/sector = 588 stereo frames, no
 RIFF header. 32,104,800 bytes = 182.000 s including a 150-sector pregap; audible region 180.000 s.
 
+The European dump stores that track in a second CUE FILE, whose INDEX values restart at zero. Its absolute
+INDEX 01 is therefore `135245 + 150 = 135395`, not LBA 150: 135245 sectors in Track 1's backing followed by
+the audio file's 150-sector INDEX 00. The disc layer rebases FILE-local positions this way and exposes a
+playable length of 13500 sectors (3:00.00), while the backing remains 13650 sectors including pregap. Raw
+reads from LBA 135245…135394 address those stored pregap sectors in the audio backing rather than falling
+through to the exhausted data track.
+
 **Content is verified digital silence:** a full byte scan found **0 non-zero bytes** in all 13,650 sectors.
 A placeholder `.WAV` file sits in the ISO at exactly track 2's INDEX 01; its declared size is a count of
 2048-byte logical sectors (a disc-space reservation), not playable audio.
@@ -2801,20 +2934,35 @@ typedef struct {                /* 24 bytes */
     char      model[12];        /* CONFIRMED: CastList name, handed to the entity
                                  * spawner. Two names fill all 12 bytes with no
                                  * NUL.                                          */
-    uint16_t  clips[4];         /* CONFIRMED as a 0xFFFF-terminated CLIP LIST: a
-                                 * pointer to it is stored into the spawned
-                                 * entity's model state at +4, and the think
-                                 * wraps the frame counter against the clip's own
-                                 * length. Empty in 52 of 64, two entries in 12.  */
+    uint16_t  shadowVertex[4];  /* CONFIRMED: 0xFFFF-terminated GLOBAL MODEL-
+                                 * STORAGE VERTEX INDICES. A pointer is stored
+                                 * in the spawned model wrapper at +4. The draw
+                                 * path poses each listed vertex and grows a
+                                 * subtractive floor-shadow footprint from its
+                                 * X/Z extrema. Empty in 52 of 64 records; two
+                                 * entries in each of the other twelve.          */
 } Q2Item;
 ```
+
+The final eight bytes are not animation clips. `0x800599DC` stores `record + 0x10` in the model wrapper,
+and the sole consumer at `0x800784CC` runs after the model draw when render-flag bit 0 is set. It walks up
+to four halfwords until `0xFFFF`, resolves each through the global-storage vertex mapper at `0x8006D608`,
+poses it with `0x8006C6C8`, and expands X/Z extrema initially seeded from entity radius `+0x94`. Item spawn
+leaves that radius zero, so the twelve records carrying vertices are exactly the item classes that produce a
+non-degenerate shadow. Values such as Rocket launcher's `95` also exceed that model's clip count while naming
+a valid storage vertex; every shipped item model has exactly one animation clip and plays clip zero.
+
+The resulting packet is one modulated, semi-transparent `POLY_FT4`: RGB `(128,128,128)`, ABR 2 subtractive,
+CLUT `(0,248)`, and UVs `(224,224)`…`(239,239)`. Those UVs select the lower-right 16 × 16 shadow tile already
+present in `chars.lbm`; no new texture asset is involved. Its footprint shrinks by `(600-height)/600` and is
+suppressed at a height of 600 or more.
 
 **The flag bits, all nine of them.**
 
 | bit | name | what reads it |
 |---|---|---|
 | `0x0001` | spin | `0x8005945C` — yaw −= 3 per tick, then the entity matrix is rebuilt |
-| `0x0002` | materialise | `0x80059488` — scale ramps 0 → 4096 at +2/tick with `msc_tele1` and fifteen sparkles |
+| `0x0002` | materialise | `0x80059488` — light intensity ramps 0 → 4096 at +2/tick with `msc_tele1` and fifteen sparkles |
 | `0x0004` | timed | `0x800597C8` — a countdown at +0xF4, then shrink away and free. Never set on disc; the runtime sets it on a dropped item |
 | `0x0008` | objective | no reader located. Set on **exactly** the twelve key/objective records and nothing else, which is what names it |
 | `0x0010` | glow red | `0x800596F0` |
@@ -3887,6 +4035,8 @@ The face was the last thing about the menu that was not read, and it is in two f
 The cell sizes are `s6`/`s2` in the size switch at `0x8001AD6C`, and they are confirmed a second time by the
 selection bar at `0x8001A830`, which independently re-derives the same three heights. `frontend.lbm` is
 registered into VRAM slot 13 at `0x8003FE74` and lands at **(896, 256)** — a whole 4bpp texture page.
+It is registered after the slot-12 8bpp preview sheet, intentionally replacing that sheet's unused right
+half; §4.1 records the alias and why changing the upload order corrupts this face.
 
 **The 16- and 32-pixel faces are not indexed by a table.** `0x8001B494` computes the cell:
 
@@ -4078,31 +4228,29 @@ rows**:
 | row | field | x | y |
 | --- | --- | --- | --- |
 | main | health digits, icon | −71, −47, −23, icon +0 | +1, +0 |
-| main | ammo digits, icon | +64, +88, +112, icon +135 | +1 |
+| main | ammo digits, icon | +64, +88, +112, icon +135 | +1, +0 |
 | main | armour digits, icon | +179, +203, +227, icon +250 | +1, +0 |
-| main | the **frag count** | +330 | +0 |
+| main | auxiliary icon filled by `0x80037CAC` | +330 | +0 |
 | upper | an icon | −71 | −25 |
 | upper | two digits, icon | +256, +280, icon +330 | −24, −25 |
 
 **Three digits then an icon, three times**, with the digits 24 apart — the numeral cell's own width, read
 independently from `0x8009C598`. Capture confirms both rows: the main one is `100 ✚  2 🔥  50 🛡` along the
-bottom, the upper one carries a pickup caption's icon on the left and a two-digit counter with its own icon
-on the right, and in deathmatch the far-right main-row field is the player's frag count.
+bottom, and the upper one carries a pickup caption's icon on the left and a two-digit counter with its own
+icon on the right. Numeric frags belong to the split hooks' three-cell signed formatter, not field 12 here.
 
-Retail capture gives the counters' left-to-right order as health, ammo, armour; the three groups are
-structurally identical in the code, so that ordering is from the screenshot and is labelled as such.
+The three sub-draw calls prove the counter order: health (`0x80035178`) receives records 0…3, ammo
+(`0x800352C0`) 4…7 and armour (`0x80035554`) 8…11. Capture independently agrees.
 
-**There are THREE layouts, not one.** The three hooks build three different field tables. The two-player
-hook at `0x80033D30` has **two counters, not three, with its digits 20 apart** — +46/+66/+86 with its icon
-at +106, +170/+190/+210 with +230, and its frag field at +354. Split-screen capture agrees exactly: a
-half-height viewport shows health, ammo and a frag count, and no armour. The quad hook at `0x80034288` has
-not been read. A port that scales one table for all three is wrong twice over — the console changes the
-spacing *and* drops a counter.
+**There are FOUR layouts, not one.** Each installed hook constructs its own records; the exact identities,
+field counts and split-only omissions are transcribed below. A port that scales the one-player table is
+wrong: the console changes spacing, row placement and which sub-draws run.
 
 **The numerals — `0x8009C598`.** Ten four-byte {u, v, w, h} records, all **24 x 24 at v = 168**, with
-`u = 24 * digit`. They are the row below the icon grid in the same sheet, which is exactly why decoding that
-sheet produced "32 x 24 item icons followed by a set of large digits" — the tell that went unread. The 24
-matches the field table's own stride, and those are two independent reads that had to agree.
+`u = 24 * digit`. Glyph 10 is the 24 x 24 minus sign at (0,192), and glyph 11 is the 1 x 1 blank. They are
+the rows below the icon grid in the same sheet, which is exactly why decoding that sheet produced "32 x 24
+item icons followed by a set of large digits" — the tell that went unread. The 24 matches the one-player
+field table's own stride, and those are two independent reads that had to agree.
 
 **The rect table is 57 records, not 96.** The run of valid rectangles ends at `0x8009C595`; what follows is
 not rectangles. Its geometry is a 32 x 24 grid, eight per row, seven rows — **and the rightmost cell of each
@@ -4182,21 +4330,33 @@ emitter reproduce it; this timer is independent of the upper-left pickup caption
 armour icons are named constants (`Q2_SBAR_ICON_MEDIKIT`, `_ARMOUR_JACKET`) rather than caller-supplied
 indices.
 
-**All three layouts are read.** None of them is a table in the data segment: the one-player builder at
-`0x800337D0`, the two-player one at `0x80033D30` and the quad one at `0x80034288` each construct their
-ten-byte field records **inline on the stack** and copy them into the view record, which is why searching
-the data segment for arrays of them never found any.
+**All four installed layouts are read.** The selector, not the apparent shape of a field list, fixes their
+identities:
 
-The quad layout is **sixteen** fields and its shape says what it is: four counters of three digits and an
-icon, in **two rows**. In four-player split the bar is not drawn per viewport — it carries every player's
-counters at once, two along the top and two along the bottom. The lower row's `dy` is `40 - screen_height`,
-taken from the live framebuffer height at `0x800B2DA2` rather than from a constant, so it follows the
-display mode. Digit pitch is 20, the two-player table's rather than the one-player 24.
+| hook | screen constructor | fields | contents |
+| --- | --- | ---: | --- |
+| `0x800337D0` | one player | 17 | health, ammo, armour, auxiliary/pickup/powerup fields |
+| `0x80033D30` | two stacked | 16 | health, ammo, armour, signed frags |
+| `0x80034288` | two side-by-side | 16 | health/ammo below, armour/frags above |
+| `0x80034830` | three/four | 11 per viewport | health, ammo, signed frags; no armour |
 
-Evaluating the one-player builder the same way re-derives the transcription in `q2_sbar_fields` byte for
-byte, which confirms it from a second direction. The four trailing bytes of every record are identical
-across all three layouts — a source rect of (255, 255) sized 1 x 1, the blank — and are initial values the
-draw overwrites rather than layout.
+The old text called `0x80034288` the quad hook. It is not: the layout selector passes it only to
+`0x80077AEC`, the side-by-side two-player constructor. Its upper fields use the live expression
+`anchor_y + 40 - *(u16 *)0x800B2DA2`, which is why the previously observed “second row” spans the top of
+each tall half-screen viewport.
+
+The actual quad hook, `0x80034830`, derives the viewport index from the 784-byte view-record stride. It
+reads 11 x offsets per viewport from the 44-halfword table at `0x8009C600` and one y from the four-halfword
+table at `0x800AE808`, whose values are `{110, 110, 1, 1}`. The top viewports therefore put their bars
+against their lower edge and the bottom viewports against their upper edge. Views 1 and 3 additionally
+slide a one- or two-character frag value to x 6/20; three characters retain x 6/20/34. The signed formatter
+at `0x80037DA4` clamps the negative end to -99, uses glyph 10 at `(0,192)` as minus and glyph 11 as blank,
+and paints negative scores with palette 7.
+
+The client selects all four exact layouts and reads each viewport owner's combat state rather than showing
+player zero in every pane. The split hooks omit the one-player pickup, powerup-timer and weapon-strip
+sub-draws because their retail call graphs omit them. The four trailing bytes of every constructed field
+still initialise to the 1 x 1 blank at (255,255); the sub-draws overwrite them before the final walk.
 
 > The rest of this section describes the **overlay** — the notification ring, the centre line, the crosshair
 > and the damage flash — which is correct as written and is a different subsystem from the bar. Both are on
@@ -4497,10 +4657,15 @@ Measured against the decoded sheet, the art is:
 - a 16 x 16 glyph, a 4-pixel gap, then the word centred on the glyph. The 76-wide cell covers all of it with
 room to spare. `RETRY` is a fourth word on the same strip that no record addresses.
 
-**Still open:** which screen asks for which prompt, at which y. The only direct caller of the setter is the
-page open; everything else reaches it through the front end's function-pointer table at `0x80079ECC`, and
-the front end's page set is #44. The one placement that is readable is a special case in the drawer: on page
-11, record 1 is drawn at a hard-coded (230, 114).
+The ordinary-menu policy is now read too. `0x8001A280..0x8001A348` calls the setter every frame: SELECT is
+at caller y 216 in QFRONT (220 in an in-game menu) exactly when the current object's `+0x4C` action is
+non-NULL; BACK uses the same y exactly when the page's `+0x28C` back handler is non-NULL. QFRONT's hook at
+module+`0x459C` adds RULES at caller y 220 while the cursor is on one of MULTIPLAYER's first three mode rows,
+and parks it on LOAD SETTINGS / SAVE SETTINGS. This is why the title capture has SELECT alone while START,
+SINGLE PLAYER and DIFFICULTY have BACK and SELECT.
+
+**Still open outside the ordinary menu:** the drawer special-cases page 11 record 1 at a hard-coded
+(230, 114); that page is not in the reconstructed ordinary page set.
 
 Reconstructed in `src/menu/prompt.[ch]`.
 
@@ -5038,11 +5203,10 @@ lurch.
   the callers pass function addresses, so it is a per-view callback rather than a number. What calls it was
   not followed; the port expresses it as the `view` hook rather than guessing.
 * **The two `0x800689F4(p, 1)` calls that open the viewport draw are identical and idempotent.** The function
-  stores the halfword at `0x800B2DE4` — a tick counter with readers all over the game — into
-  `0x800D8D78 + (p << 4) + 64`, so calling it twice writes the same value to the same address. That table has
-  eleven other materialisations across the world and model draw and looks like a per-viewport freshness stamp,
-  but nothing here identifies it, so the port does not reproduce it and this entry is the record that it
-  exists.
+  stores the halfword at `0x800B2DE4` — a tick counter with readers all over the game — into area 1's
+  per-viewport freshness field: `0x800D8D78 + (p << 4) + 64` in that executable (`0x800D8FE8` table base in
+  NTSC). The table is now identified: 64 bytes per area, 16 per viewport, with screen record and deferred/
+  dynamic batch heads following the tick and ordinal. Calling it twice simply refreshes the same area.
 * **The MISSION item is a menu action, not a screen.** The label at `0x800AE624` is record 1 of the
   single-player pause table, at (256, 96), whose action `0x8002033C` applies the game variables, clears four
   halfwords at `0x800B3290`, restores the music volume and calls `0x800213B0(1, 15)` — i.e. it leaves the
@@ -5176,6 +5340,13 @@ world was hit (`0x8002EF1C`, guarded by bit 2 of a 64-byte surface record's `+0x
 entities and damages the first with mod 18. The rail (`0x8004917C`) is the same shape with mod 3 and does
 not stop at the first target.
 
+The entity narrow phase at `0x800544EC` is a **vertical cylinder**, not a sphere or an expanded AABB. After
+a swept-box reject and the positive along-ray dot gate, X/Z solve the quadratic against candidate
+`entity+0x94`; a tangent is rejected. Y independently clips the interval
+`[origin.y + 286 - entity+0x96, origin.y + 286]`. Intersecting those intervals gives the first surface-entry
+fraction, so world occlusion is tested against the near face rather than the actor's centre. The corpse
+resize therefore becomes the executable's wider, shorter radius 429 / height 143 volume as well.
+
 Radius damage is `0x80050810`: sweep a box of the blast radius, reject anything further than
 `radius + its own radius`, apply `damage − dist*170/4096`. The falloff is a length constant and was retuned —
 PC Quake II loses half a point per unit, which at this scale would be 0.05 against the console's 0.0415.
@@ -5200,15 +5371,55 @@ which settles two fields the bolt spawner writes:
 
 So the direction argument the bolt spawner receives *is* its velocity, and the hyperblaster's bolt is
 exactly half the speed of the blaster's because its shift is one bit deeper (`aim >> 7` against `aim >> 6`).
-The grenade and rocket are different: their spawners take an explicit speed (900 and 20000) and the
-direction only points.
+The other three paths are now read too:
+
+* **Grenade2:** the fire function rotates the fixed raw velocity `{0,2048,6144}`. The shared entity mover
+  at `0x800464D4` advances it componentwise as `vel * dt / 320`; its gravity arm at
+  `0x80046464..0x800464A0` also caps falling Y velocity at **8192**. The apparent speed **900** is argument
+  5 at `0x8004CF9C`; the spawner copies it to entity `+0xF4` at `0x8004A2F8`, and `0x80049FE8` subtracts
+  dt from that field until detonation. It is a three-second fuse.
+* **Rocket:** the fire function doubles the player's aim and stores that raw vector unchanged. It uses the
+  same `/320` mover. The spawner's **20000** at `0x8004B030` is likewise entity `+0xF4`; the rocket think
+  subtracts dt at `0x8004AD74` and frees it at zero **without exploding**. It is a roughly 66.7-second safety
+  lifetime, not speed.
+* **BFGBlast:** the spawner rotates the literal s16 `{0,0,768}` at `0x800AE9B4`. The rotate at
+  `0x8006FC1C..0x8006FD2C` is a componentwise matrix dot product followed by arithmetic `>>12`; the view
+  aim is already that matrix's forward column, so there is **no Euclidean normalisation**. Its private think
+  advances each component as `vel * dt / 64` at `0x8004B90C..0x8004B9DC`, and independently counts **2400**
+  down from `+0xF4` at `0x8004B8C0`; expiry calls the free path at `0x8004B8E4`, not the impact arm. A full
+  forward component is 12 world units per dt unit, or 3600 per second, for eight seconds.
+
+**Grenade3 (hand grenade)** is a held state machine, not Grenade2 with a different timer. The spawner at
+`0x8004AA6C` stores owner at `+0x2E4`, state **1** at `+0x48`, raw forward charge **4096** at `+0x4C`,
+fuse **1650** at `+0xF4`, and hides all four model parts with flag `0x80`. Its think at `0x8004A368`
+subtracts dt from that fuse before dispatching the state, then while held:
+
+* copies the owner's view-weapon world position `+0xA4..+0xAC` to the hidden entity;
+* plays `wep_hgrenc1b` when the model animation crosses position **261**;
+* at position **380**, adds exactly **`6 * dt`** to the raw charge at `+0x4C`; and
+* on crossing **411**, enters state 2 and runs the release arm.
+
+The release-origin literal at `0x800AE980` is s16 `{80,-50,200}`. The executable negates the middle
+component before rotation and negates rotated world Y afterwards, producing that same triple in the
+port's `(right, down, forward)` convention. Release rotates raw `{0,2048,charge}`, reveals the four parts,
+plays `wep_hgrent1a`, decrements grenade ammo at `0x8004A7C0`, and enters moving state 3. If the fuse reaches
+zero in state 1, the explosion happens at the attached hand instead and the owner view model is forced to
+fire frame **2**, animation position **0**, with **150** key ticks remaining; its playing flag clears and
+its played flag sets (`0x8004AA1C..0x8004AA40`). No ammo is deducted for that in-hand detonation.
+
+The native representation does not widen the version-5 save record. A held Grenade3 uses collision-node
+sentinel `-2` (ordinary unknown is `-1`) and temporarily stores its raw charge in `vel[2]`; release replaces
+that with the common 1.0.12 velocity and restores `-1`. Held records still count down their fuse but skip
+gravity, collision, light gathering and projectile-body drawing.
 
 ### 13.8 Creature attacks
 
 Creatures reach the same damage function; what is theirs is which mod and which projectile. A contact hit is
 **mod 7** (`0x800612F0`), which is not in the knockback set, so claws move nothing. A thrown grenade is the
-same spawner the launcher uses, at speed **600** rather than 900 (`0x80061724`). A rocket is `0x8004AF28`
-from `0x80062164` with the aim scaled by 3/2. A BFG blast is a two-line wrapper at `0x800621BC`.
+same spawner the launcher uses. Its wrapper uses the module's **600** in the ballistic solve and also passes
+that value as the spawner's `+0xF4` timer (`0x80061724`), rather than the player's 900. A rocket is
+`0x8004AF28` from `0x80062164` with the aim scaled by 3/2. A BFG blast is a two-line wrapper at
+`0x800621BC`.
 
 Per-creature damage figures are **not** here: they are in the relocated modules, which is open question #6.
 
@@ -5422,11 +5633,14 @@ then the two axes in an order a coin flip and the larger delta decide, then ever
 randomly chosen rotation, and only then the way it came. Because yaw 0 faces +Z, the axis constants are
 1024/3072 for ±X and 0/2048 for ±Z rather than id's 0/180 and 90/270.
 
-`SV_movestep` (`0x8005FC78`) has two entirely different bodies. Walkers push down from **216** above the
-wished position and take the trace's landing point, which is how a creature climbs stairs without ever
-computing a slope; `AI_NOSTEP` drops that to 12. Flyers and swimmers get two attempts at a direct move, the
-first with a height correction toward the goal, and simply do not move if both are blocked. Both use
-**`MASK_MONSTERSOLID` = 0x02020003** (`0x8005FE7C`).
+`SV_movestep` (`0x8005FC78`) has two entirely different bodies. A walker traces a **lift** in place, the
+horizontal move from that actual lift endpoint, then a **drop** to original Y + 216 (or +12 under
+`AI_NOSTEP`); the landing endpoint is biased one unit upward. An all-zero move skips the middle trace and
+uses the lift's own fraction gate. A start-solid lift or drop takes the separate unstepped recovery arm:
+origin-to-wish must be exactly 4096 clear (skipped when the move is zero), followed by a fresh descent.
+Flyers and swimmers instead get two attempts at a direct move, the first with a height correction toward
+the goal, and simply do not move if both are blocked. Both use **`MASK_MONSTERSOLID` = 0x02020003**
+(`0x8005FE7C`).
 
 `M_ChangeYaw` (`0x80060964`) clamps to `yaw_speed` (`ent+0x8C`) and takes the short way round — plus one
 thing the PC lineage does not have: when the turn it was about to make exceeds a per-creature threshold at
@@ -5729,7 +5943,8 @@ pass.
 | `+0xE6` | angles, an `SVECTOR`; the yaw at `+0xE8` is what spins | `0x8005947C` |
 | `+0xF4` | the `timed` countdown | `0x800597D4` |
 | `+0xF8` | the model's own height bias, `lh model[+0x1C]` | `0x8006D118` |
-| `+0xFC` | scale, 4096 == 1.0 | `0x800595B0`; the renderer scales the entity matrix by it at `0x8006B298` |
+| `+0xFC` | first light-intensity factor, 4096 == 1.0 | item/logo/corpse writers; multiplied into the GTE light matrix at `0x8006B298` and back colour at `0x8006B468` |
+| `+0xFE` | second light-intensity factor, 4096 == 1.0 | allocator writes 4096; explosion think writes its fade at `0x8005A68C` |
 | `+0x100` | animation frame, wrapped by the clip length | `0x80059414` |
 | `+0x108` | health | `0x8005983C` tests it before letting a player touch anything |
 | `+0x10C` | render flags; `0x08000001` at spawn | `0x800587CC`, and bit 1 comes off when the record does not spin |
@@ -5742,13 +5957,14 @@ pass.
 Reached from the relocatable level modules through import slot 11 (§15.5). It scans the item table for the
 place record's id, and on a miss **spawns nothing at all** — a place id the table does not name is silently
 skipped. On a hit it calls the generic entity spawner `0x80058788` with the record's model name, installs the
-item think, copies `flags`, `effect` and the clip list, sets the scale to 0 or 4096 depending on the
+item think, copies `flags`, `effect` and the shadow-vertex list, sets light intensity to 0 or 4096 depending on the
 materialise bit, and primes the drop countdown to 1500.
 
 The generic spawner is where three long-standing questions are answered:
 
-* **`place->unk` is an angle.** `0x80058930` does `lhu place[+0x0C]`, `andi 0xFFF`, `sh` into the entity's
-  yaw. Bits 12…15 are something else — 627 of 1,013 records set at least one, and all four values occur.
+* **`place->angleFlags` packs yaw and skill exclusions.** `0x80058930` does `lhu place[+0x0C]`,
+  `andi 0xFFF`, `sh` into the entity's yaw. Before that call, `0x8007F538` tests bits 13/14/15 as
+  NOT_EASY/NOT_MEDIUM/NOT_HARD. Bit 12 is not read and is map-uniform authoring provenance, as §2.7 shows.
 * **An item does not sit where its place record says.** The placement call `0x80050FA0` copies the record's
   xyz in and then raises y twice — `-= 286` at `0x80051068` and `-= 30` at `0x800510A4`, +Y being down — so
   the stored position is **316 units above the record**. `0x800588F8` then lowers the draw origin by 286 and
@@ -6173,12 +6389,32 @@ fourth slot is scratch.
 | colour matrix **columns** | the three lights' colours — row 0 is the three reds | `0x8006B1E0` onward |
 | back colour | the entity's own glow at `+0x2AC`, times the same product `>> 24` | `0x8006B468` → `SetBackColor` |
 
+**The two intensity halfwords do not scale model geometry.** The three
+`ScaleMatrix` destinations at `0x8006B298` are rows of the buffer at
+`0x800DDD1C`, which is installed by `SetLightMatrix` at `0x8006BBD4`. The
+geometric rotation installed immediately afterwards is composed independently
+from entity `+0x2C0`. An executable-wide access sweep finds no other draw-time
+reader of `+0xFC` or `+0xFE`. Consequently a materialising item brightens at a
+fixed size, an explosion darkens at a fixed size, and `body_fade` dims a corpse
+before releasing it; none shrinks toward its origin.
+
 With both intensity fields at 4096 the back colour comes out as exactly the glow bytes, which is what makes
 4096 the neutral value for each.
 
 Vertices then shade through **`NCT`** (`0x800B23F0`) — normal, colour matrix, back colour, and *nothing* from
 the primitive colour. So a model's texture is modulated purely by the light reaching it, and the ambient
 arrives through the back colour rather than through a vertex tint.
+
+The allocator seeds that ambient to `0x40/0x40/0x40`. Ordinary item spawn overwrites it from the constant
+at `0x800AEABC`, `0x30/0x30/0x30`; explosion model-entity spawn explicitly copies the separate constant at
+`0x800AEAC8`, `0x40/0x40/0x40`, to `+0x2AC`. This distinction is visible: using the item's 0x30 or leaving
+the field zero turns the otherwise correct explosion texture into a dark brown/black ball.
+
+**Retail explosions do cast a dynamic light.** The model entity's think calls the runtime-light appender
+with colour `0xC0/0x40/0x31`. Its outer radius is
+`clamp(51 * (320 - t), 0, 4096) * 1300 / 4096`, with inner radius three quarters of outer. This light is
+independent of the model's 0x40 ambient: the latter lights the explosion mesh, while the former lights nearby
+world entities and participates in the dynamic-light/flare pass.
 
 `VectorNormal` (`0x8008A5E8`) is reproduced exactly: `SQR` with `sf = 0`, the leading-zero count rounded
 **down to even** so halving the exponent is exact, the magnitude shifted into `[64,256)`, a 192-entry
@@ -6343,12 +6579,15 @@ than replacing anything.
 > `0x800E3ED8`, whose end pointer `0x800B2EC4` has exactly two writers and both of them reset it to the
 > array's base. The two arrays are also contiguous — `0x800E3D18 + 16*28 == 0x800E3ED8` — and the appender's
 > full test is a compare against the second array's base, so what is really there is one sixteen-slot array
-> plus a permanently empty view over its end. An entity taking the view-space branch therefore gets **no
-> lights at all** and is drawn by its back colour alone. That is behaviour, not a gap in this port.
+> plus a permanently empty view over its end. An entity whose signed `+0xF4` is negative therefore gets
+> **no lights at all** and is drawn by its back colour alone. That is behaviour, not a gap in this port.
 
-**Not established.** Which entity states set `+0xFC`, `+0xFE` and `+0xF4`, so the port takes the first two as
-parameters with 4096 as their neutral value and the third as an explicit "view space" flag. And which effects
-call `AddDynamicLight`, and with what radii — the appender is reconstructed, its callers are not traced.
+**The viewmodel's state is established.** The allocator seeds the `+0xFC/+0xFE` intensity factors to 4096 and its ambient to
+0x40; the constructor writes literal **+1** to `+0xF4`, which `bgez` sends down the ordinary world/static
+path, and `0x8004EE70` refreshes `+0xFC` from the player each frame. Other entity states may still assign
+different values, so the port passes the signed halfword and both intensities through rather than collapsing
+them to booleans. Which remaining effects call `AddDynamicLight`, and with what radii, is recorded beside
+their individual reconstructions rather than inferred from the appender alone.
 
 ---
 
@@ -6927,13 +7166,12 @@ substantially resolved** and are recorded below with their answers; what remains
    non-`{5,10,20}` candidate outright, so the "step height is 18" and "gravity is 800" correspondences are
    provably coincidences. The remaining ambiguity is a single unknown: the PSX-texel to PC-texel ratio. See
    #5 below for how to close it. Quantisation is CONFIRMED as truncation toward zero.
-4. **~~`Events` operand stream~~ — FRAMING SOLVED, SEMANTICS PARTIAL (§2.10).** The record body is a nested
+4. **~~`Events` operand stream~~ — SOLVED for the active runtime (§2.9–2.10).** The record body is a nested
    TLV item list; byte `+2` is the item count and byte `+3` a mutable flags byte, exact on 4,179/4,179
    records / 6,646 items. Opcode dispatch, the 43-entry `UserFuncs` binding table, per-primitive argument
-   lengths, zone gates, level progression and teleports are all CONFIRMED and implementable. *Residual:* the
-   chunk is **self-modifying** — a load-time pre-pass rewrites the `int16_t` slots from `Scene` node indices
-   into runtime object indices — and the `fnB` motion integrators plus the 92-byte runtime object interior
-   are undecoded, so doors and lifts still cannot be driven from disc data alone.
+   lengths, contact categories, zone gates, level progression, teleports, doors, lifts and PLATFORM are all
+   implemented. The console's load-time in-place Scene-slot rewrite is understood but deliberately replaced
+   by native objects built from the immutable on-disc indices.
 
 ### Blocking — cannot render or load a level
 
@@ -6973,12 +7211,10 @@ numbers so that nothing downstream needs renumbering.
     solved this is cheap: decompress one texture payload, count its pixels, and compare against the PC
     Quake II `.wal` it derives from.
 
-4a. **The `Events` `fnB` motion integrators and the 92-byte runtime object.** 27 of the 43 `UserFuncs`
-    primitives carry a second function pointer called once per frame from `0x8002DC04` via `obj+0x2C`; none
-    were decompiled, and their state lives in the runtime object. Known object fields so far: `+0x38` the
-    `Scene` node index the object was built from, `+0x3A` `abs(item+4)`, `+0x3C` `item+16`, `+0x42` the
-    primary `Scene` node, `+0x44` `-(item+2)`, `+0x58` 1. Unknown: `+0x00…+0x24`, `+0x30…+0x38`,
-    `+0x46…+0x4C`, `+0x53…+0x57`. This is what stands between the trigger graph and working doors and lifts.
+4a. **~~The `Events` mover integrators and 92-byte runtime object.~~ — SOLVED for linear and rotating
+    movers and PLATFORM (§2.9.1–2.9.3, §3.1.1).** The seven states, draw-time offsets, timers, block/retry
+    behaviour, multipart chains and PLATFORM path vector are decoded and implemented. The rotating family
+    has its three integrators, constructor-derived pivots and ROTHATCH hinge adjustment reconstructed too.
 
 5. **Collision plane point encoding is only 95.6 % confirmed.** The `u16[3]` at `+0x00` reads as an unsigned
    offset from the owning node's `bboxMin`, which puts 46,968 of 49,148 planes inside their node and makes
@@ -6992,15 +7228,15 @@ numbers so that nothing downstream needs renumbering.
 
 ### Blocking — degrades the level badly but does not prevent loading
 
-7. **`SortData` encoding.** Bit-packed, no offset table, no fixed per-node record (4.0…88.6 bytes per scene
-   node, a 22× spread). Almost certainly draw-order / BSP-ish data; without it, transparency and overdraw
-   will be wrong. Requires the EXE's bit reader.
+7. **~~`SortData` encoding and selection.~~ — SOLVED (§3.11).** It is the authored, variable-width world
+   draw stream. Each PrimaryColl cell carries its exact stream byte offset at `+28`; this is the default
+   render path.
 8. **`AreaConx` 9-byte link payload.** The portal graph's topology parses; the per-link payload does not. No
    fixed offset yields a 1.3.12 unit normal in more than 39 % of 3,494 links, and byte histograms suggest
    *unaligned* `int16_t` values that no single struct layout can express (links start at `record + 1 + 9*L`,
    so parity alternates). Byte `+3` is the best neighbour-index candidate. Blocks portal-based visibility.
-9. **`SpaceLights` per-node partition.** A flat `uint16_t` index array with no length prefix and no
-   discoverable partition (0.68…7.12 entries per scene node). Blocks correct dynamic/ambient lighting.
+9. **~~`SpaceLights` per-node partition.~~ — SOLVED (§3.11.1).** SecondaryCol node sentinels partition the
+   flat light-index array; all 37,285 reachable indices are in range.
 10. **`Population` `spawn.classId` target table.** 25 distinct values 0…37; 15 of 673 records exceed the
     map's `ModelNames` count, and resolving against `ModelNames` yields semantically wrong results. Until it
     is found, monsters and items cannot be mapped to their classes.
@@ -7011,9 +7247,8 @@ numbers so that nothing downstream needs renumbering.
     looked most like a clue was a red herring in a useful way: mover-driven nodes set these bits on 6.24 %
     of their polygons against 11.84 % for static world nodes, which is just artists rotating textures on
     world geometry more often than on doors.
-12. **`Scene` node fields `flags08`, `unk0C`, `unk0D`, `unk0E`.** `unk0E` (range 0…197, 119 distinct values,
-    non-zero on all but 3 of 17,035 nodes) is the highest-value single byte in the zone format. Find the
-    52-byte-stride `Scene` reader in the EXE and see what it does with byte 14.
+12. **`Scene` node fields `unk0C` and `unk0D`.** Byte `+0x0E` is solved as the seven-bit screen/draw area;
+    only the two rare preceding bytes remain unattributed.
 
 ### Behavioural / audio-visual polish
 
@@ -7052,7 +7287,9 @@ numbers so that nothing downstream needs renumbering.
     supposed "12 + 8*numParts*frames" size law fails on 458 of 1,723 models.
 22. `PrimaryRemap` value space — definitively *not* a scene-node index (max exceeds the scene node count in
     100 of 115 files); probably a polygon or surface id in a shared table.
-23. `CollNode` fields `c` (0…65,077,433, non-monotonic) and `d` (0…75).
+23. ~~`CollNode` fields `c` and `d`.~~ **RESOLVED:** `d`'s low byte is contents;
+    `c` is two hull-specific halfwords — PrimaryColl `+28` is the SortData byte offset and SecondaryCol
+    `+30` is the first SpaceLights index (§3.4, §3.11).
 24. `Resources` `unk0` (−3000…6600) and `unk4` (40…180); `unk3` (64, occasionally 80).
 25. `TrigBounds` trigger `id` (9…75 plus 255) and `flags` (14 distinct values) value semantics.
 26. The five `Lights` style values (`(n<<3)|7`, n = 0…4) — what each style *does*.

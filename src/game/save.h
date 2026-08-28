@@ -94,6 +94,12 @@
 #define Q2_SAVE_MAGIC      "Q2PS"
 
 /*
+ * 5 — deferred Population history joined the file in ITEM, and projectile
+ * velocity/timer values acquired the retail per-kind stepping semantics.
+ * Version 4 cannot be migrated honestly: it has no activation order for a
+ * CREBATCH roster, and the same PROJ bytes would move at the wrong rate. It is
+ * rejected at the header rather than applied approximately.
+ *
  * 4 — the water life-support state joined the player chunk: accumulated air,
  * its next deadline, and the every-other-warning latch. A save taken mid-dive
  * must not return the player to the surface with a fresh breath.
@@ -109,10 +115,7 @@
  *
  * Version 1 was a flat format that stored a raw `q2_inventory`.
  */
-#define Q2_SAVE_VERSION    4   /* the BRKS chunk is additive: an older file
-                               * simply has none, and a reader that does not
-                               * know the tag skips it — which is what the
-                               * chunked format is for */
+#define Q2_SAVE_VERSION    5
 
 #define Q2_SAVE_MAP_LEN    16
 #define Q2_SAVE_SERIAL_LEN 16
@@ -139,12 +142,11 @@ struct q2_mission;   /* mission.h; only the copy helpers below need it */
 /* Per-entity state                                                           */
 /* ------------------------------------------------------------------------- */
 /*
- * The entity SET is rebuilt from the map by q2_sim_attach_items, which walks
- * the Population in a fixed order — so the save does not store entities, it
- * stores the mutable part of each one and reapplies it by index. `place_id` is
- * carried alongside as a check: if the map's population has changed under the
- * save, the ids stop matching and the restore says so instead of teleporting
- * one item's "taken" flag onto another.
+ * Version-4 saves rebuilt the entity SET from the map and reapplied this
+ * mutable part by index. Version 5 also carries q2_save_item_key for each slot,
+ * because a collected item frees its slot and a later CREBATCH can reuse it:
+ * after that, rebuilding in Population order no longer produces the same
+ * indices. `place_id` remains a second check against changed map data.
  */
 /*
  * Which think is installed. The pointer itself cannot be written to a file, and
@@ -165,7 +167,7 @@ typedef struct q2_save_entity {
     u8  hidden;
     u8  taken;            /* bit per player, so four players fit in a byte    */
     u8  think;            /* a q2_save_think                                  */
-    s16 scale;            /* +0xFC, mid-materialise when it is not 4096       */
+    s16 scale;            /* +0xFC light intensity (historical field name)    */
     s16 health;           /* +0x108                                           */
     s32 frame;            /* +0x100                                           */
     s32 spin;             /* +0xE8, the yaw the think decrements              */
@@ -174,6 +176,13 @@ typedef struct q2_save_entity {
     s32 pos[3];           /* +0x54 — a dropped item does not stay where it
                            * spawned, so position is state, not map data      */
 } q2_save_entity;
+
+/* Stable identity of one Population-backed entity. `group == -1` names a
+ * dead/free or non-Population slot and retains the legacy index treatment. */
+typedef struct q2_save_item_key {
+    s32 group;
+    u32 slot;
+} q2_save_item_key;
 
 /*
  * A breakable's mutable state.
@@ -309,6 +318,26 @@ typedef struct q2_save {
     /* Per-entity mutable state, parallel to the rebuilt entity set. */
     q2_save_entity *entities;
     u32             entity_count;
+
+    /*
+     * ITEM, introduced with version 5. `item_group_order` is the exact order
+     * in which startup selection and later CREBATCH calls first ran groups;
+     * membership is therefore also the one-shot latch. Keys are parallel to
+     * ENTS and let restore rebuild a reused runtime slot from its Population
+     * identity rather than guessing from its current index.
+     *
+     * Compatibility decision: a version-4 file cannot reconstruct a deferred
+     * roster whose history it never recorded, and old PROJ bytes now have
+     * different per-kind stepping semantics. The header therefore advances to
+     * version 5 and rejects v4. Within v5, ITEM is mandatory when the loaded
+     * map has Population groups; no-Population utility snapshots may omit it.
+     */
+    bool              item_state_present;
+    u32               item_population_group_count;
+    u32              *item_group_order;
+    u32               item_group_order_count;
+    q2_save_item_key *item_keys;
+    u32               item_key_count;
 
     /* Which panes have been shot, and how much they have left. */
     q2_save_breakable *breakables;
@@ -454,6 +483,25 @@ u32 q2_save_slots_scan(q2_save_info *out, u32 count);
  */
 const char *q2_save_slot_row(const q2_save_info *info, int slot,
                              char *out, u32 out_size);
+
+/*
+ * LOAD/SAVE SETTINGS uses the same four memory-card positions but a different
+ * file type from a saved game (QFRONT distinguishes them with engine flag
+ * 0x01000000). The game layer keeps the payload opaque so menu.h remains a
+ * one-way dependency: the client packs its settings and match setup into this
+ * bounded run of signed words.
+ */
+#define Q2_SETTINGS_VALUE_MAX 64
+typedef struct q2_settings_blob {
+    u32 count;
+    s16 value[Q2_SETTINGS_VALUE_MAX];
+} q2_settings_blob;
+
+q2_result q2_settings_slot_path(int slot, char *out, u32 out_size);
+q2_result q2_settings_slot_write(const q2_settings_blob *settings, int slot);
+q2_result q2_settings_slot_read(q2_settings_blob *out, int slot);
+q2_result q2_settings_slot_delete(int slot);
+u32       q2_settings_slots_scan(bool *used, u32 count);
 
 /* A default label for a new save: the map, zone and elapsed time. Returns
  * `out`. */

@@ -173,7 +173,7 @@ static void census_rotators(const disc *d, int *failures)
             continue;
         }
 
-        if (q2_rotators_build(&set, &ev, &uf) != Q2_OK) {
+        if (q2_rotators_build(&set, &ev, &uf, NULL) != Q2_OK) {
             q2_common_close(&cf);
             continue;
         }

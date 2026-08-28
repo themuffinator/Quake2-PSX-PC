@@ -35,6 +35,7 @@
 #define TAG_EVNT TAG('E', 'V', 'N', 'T')   /* script flags                    */
 #define TAG_TRIG TAG('T', 'R', 'I', 'G')   /* trigger residency               */
 #define TAG_ENTS TAG('E', 'N', 'T', 'S')   /* per-entity mutable state        */
+#define TAG_ITEM TAG('I', 'T', 'E', 'M')   /* group order and stable item keys */
 #define TAG_MISN TAG('M', 'I', 'S', 'N')   /* the mission tallies             */
 #define TAG_BRKS TAG('B', 'R', 'K', 'S')   /* which panes have been shot      */
 #define TAG_MOVR TAG('M', 'O', 'V', 'R')   /* which doors are open, and where */
@@ -42,12 +43,15 @@
 #define TAG_SETT TAG('S', 'E', 'T', 'T')   /* the menu settings               */
 
 #define SAVE_FILE_HEADER 16                /* magic, version, size, crc       */
+#define SETTINGS_MAGIC "Q2CF"
+#define SETTINGS_VERSION 1u
 
 /* A corrupt count must not become a gigabyte allocation. These are far above
  * anything a real map produces and far below anything that hurts. */
 #define SAVE_MAX_EVENTS   (1u << 20)
 #define SAVE_MAX_TRIGGERS (1u << 16)
 #define SAVE_MAX_ENTITIES (1u << 16)
+#define SAVE_MAX_ITEM_GROUPS (1u << 16)
 
 /* ------------------------------------------------------------------------- */
 /* CRC32                                                                      */
@@ -275,6 +279,8 @@ void q2_save_free(q2_save *s)
     free(s->event_flags);
     free(s->trigger_inside);
     free(s->entities);
+    free(s->item_group_order);
+    free(s->item_keys);
     free(s->breakables);
     free(s->movers);
     free(s->creatures);
@@ -446,6 +452,54 @@ q2_result q2_save_capture(q2_save *out, const q2_sim *sim,
         }
     }
 
+    /*
+     * --- Population group lifetime and stable entity identity ------------
+     *
+     * The order is not reducible to a bitmap: BASE1 can call ShotgunRoom and
+     * LiftRoom in either order, and each appends/reuses slots in that order.
+     * The keys are needed for the reuse half — a pickup collected before the
+     * call leaves a hole a deferred place can occupy.
+     */
+    if (sim->item_population_ready && sim->item_population.group_count > 0 &&
+        sim->item_group_run && sim->item_group_order) {
+        u32 n = sim->item_population.group_count;
+        u32 i;
+
+        out->item_state_present = true;
+        out->item_population_group_count = n;
+        out->item_group_order_count = sim->item_group_order_count;
+
+        if (out->item_group_order_count > n) {
+            q2_save_free(out);
+            return Q2_ERR_BAD_FORMAT;
+        }
+        if (out->item_group_order_count) {
+            out->item_group_order = (u32 *)malloc(
+                (size_t)out->item_group_order_count * sizeof(u32));
+            if (!out->item_group_order) {
+                q2_save_free(out);
+                return Q2_ERR_NO_MEMORY;
+            }
+            memcpy(out->item_group_order, sim->item_group_order,
+                   (size_t)out->item_group_order_count * sizeof(u32));
+        }
+
+        out->item_key_count = out->entity_count;
+        if (out->item_key_count) {
+            out->item_keys = (q2_save_item_key *)calloc(
+                out->item_key_count, sizeof(*out->item_keys));
+            if (!out->item_keys) {
+                q2_save_free(out);
+                return Q2_ERR_NO_MEMORY;
+            }
+
+            for (i = 0; i < out->item_key_count; i++) {
+                out->item_keys[i].group = sim->entities.ent[i].population_group;
+                out->item_keys[i].slot  = sim->entities.ent[i].population_slot;
+            }
+        }
+    }
+
     q2_save_default_label(out, out->label, (u32)sizeof(out->label));
     return Q2_OK;
 }
@@ -453,9 +507,214 @@ q2_result q2_save_capture(q2_save *out, const q2_sim *sim,
 /* ------------------------------------------------------------------------- */
 /* Apply                                                                      */
 /* ------------------------------------------------------------------------- */
+static q2_result rebuild_saved_item_roster(const q2_save *s, q2_sim *sim)
+{
+    q2_sim stage;
+    q2_entity_set rebuilt;
+    u8 *seen = NULL;
+    u8 *used = NULL;
+    u32 capacity, i;
+    q2_result result = Q2_ERR_BAD_FORMAT;
+
+    if (!s->item_state_present) {
+        /* A Population-backed version-5 save without ITEM has lost the exact
+         * startup/CREBATCH history needed to identify reused entity slots.
+         * Refuse the whole restore; applying ENTS by index would silently put
+         * one item's state on another. Utility sims without Population remain
+         * valid because they have no such history to preserve. */
+        if (sim->item_population_ready &&
+            sim->item_population.group_count > 0) {
+            Q2_ERROR("version-%d save for a Population map has no ITEM chunk",
+                     Q2_SAVE_VERSION);
+            return Q2_ERR_BAD_FORMAT;
+        }
+        return Q2_OK;
+    }
+
+    if (!sim->item_population_ready || !sim->item_group_run ||
+        !sim->item_group_order ||
+        sim->entities.count > SAVE_MAX_ENTITIES ||
+        (sim->entities.count && !sim->entities.ent) ||
+        s->item_population_group_count != sim->item_population.group_count ||
+        s->item_group_order_count > s->item_population_group_count ||
+        s->item_key_count != s->entity_count ||
+        (s->entity_count && (!s->entities || !s->item_keys)))
+        return Q2_ERR_BAD_FORMAT;
+
+    seen = (u8 *)calloc(s->item_population_group_count ?
+                        s->item_population_group_count : 1, 1);
+    if (!seen)
+        return Q2_ERR_NO_MEMORY;
+
+    /* The fresh load's startup selection must be an exact prefix. Everything
+     * after it is a CREBATCH first-run, in the order the allocator saw it. */
+    if (sim->item_group_order_count > s->item_group_order_count)
+        goto done;
+    for (i = 0; i < s->item_group_order_count; i++) {
+        u32 gi = s->item_group_order[i];
+
+        if (gi >= s->item_population_group_count || seen[gi])
+            goto done;
+        seen[gi] = 1;
+        if (i < sim->item_group_order_count &&
+            sim->item_group_order[i] != gi)
+            goto done;
+    }
+
+    /* Pre-size the staged set for the full logical roster. Runtime activation
+     * may reuse holes; the fresh stage has none, so this is deliberately an
+     * upper bound and prevents a partial replay on realloc failure. */
+    capacity = sim->entities.count;
+    for (i = sim->item_group_order_count;
+         i < s->item_group_order_count; i++) {
+        q2_pop_group g;
+        u32 slot;
+
+        if (!q2_pop_get_group(&sim->item_population,
+                              s->item_group_order[i], &g))
+            goto done;
+        for (slot = 0; ; slot++) {
+            q2_pop_place place;
+
+            if (!q2_pop_get_place(&sim->item_population, &g, slot, &place))
+                break;
+            if (!q2_item_find(sim->item_table, (s32)place.id))
+                continue;
+            if (capacity >= SAVE_MAX_ENTITIES)
+                goto done;
+            capacity++;
+        }
+    }
+
+    stage = *sim;
+    memset(&stage.entities, 0, sizeof(stage.entities));
+    stage.item_group_run = NULL;
+    stage.item_group_order = NULL;
+
+    if (capacity) {
+        stage.entities.ent = (q2_entity *)calloc(capacity,
+                                                  sizeof(q2_entity));
+        if (!stage.entities.ent) {
+            result = Q2_ERR_NO_MEMORY;
+            goto done;
+        }
+        if (sim->entities.count)
+            memcpy(stage.entities.ent, sim->entities.ent,
+                   (size_t)sim->entities.count * sizeof(q2_entity));
+        stage.entities.count    = sim->entities.count;
+        stage.entities.capacity = capacity;
+    }
+
+    stage.item_group_run = (u8 *)malloc(
+        s->item_population_group_count ? s->item_population_group_count : 1);
+    stage.item_group_order = (u32 *)calloc(
+        s->item_population_group_count ? s->item_population_group_count : 1,
+        sizeof(u32));
+    if (!stage.item_group_run || !stage.item_group_order) {
+        result = Q2_ERR_NO_MEMORY;
+        goto stage_done;
+    }
+    memcpy(stage.item_group_run, sim->item_group_run,
+           s->item_population_group_count);
+    if (sim->item_group_order_count)
+        memcpy(stage.item_group_order, sim->item_group_order,
+               (size_t)sim->item_group_order_count * sizeof(u32));
+
+    for (i = sim->item_group_order_count;
+         i < s->item_group_order_count; i++) {
+        q2_pop_group g;
+        u32 before = stage.item_group_order_count;
+        u32 gi = s->item_group_order[i];
+
+        if (!q2_pop_get_group(&stage.item_population, gi, &g))
+            goto stage_done;
+        (void)q2_sim_activate_item_group(&stage, g.name);
+        if (!stage.item_group_run[gi] ||
+            stage.item_group_order_count != before + 1 ||
+            stage.item_group_order[before] != gi)
+            goto stage_done;
+    }
+
+    memset(&rebuilt, 0, sizeof(rebuilt));
+    if (s->entity_count) {
+        rebuilt.ent = (q2_entity *)calloc(s->entity_count,
+                                          sizeof(q2_entity));
+        used = (u8 *)calloc(stage.entities.count ? stage.entities.count : 1,
+                            1);
+        if (!rebuilt.ent || !used) {
+            result = Q2_ERR_NO_MEMORY;
+            goto rebuilt_done;
+        }
+        rebuilt.count = rebuilt.capacity = s->entity_count;
+    }
+
+    for (i = 0; i < s->entity_count; i++) {
+        const q2_save_item_key *key = &s->item_keys[i];
+        u32 j;
+
+        q2_entity_init(&rebuilt.ent[i]);
+        if (key->group >= 0) {
+            for (j = 0; j < stage.entities.count; j++) {
+                const q2_entity *e = &stage.entities.ent[j];
+
+                if (used[j] || !e->in_use)
+                    continue;
+                if (e->population_group != key->group ||
+                    e->population_slot != key->slot)
+                    continue;
+                rebuilt.ent[i] = *e;
+                used[j] = 1;
+                break;
+            }
+            if (j == stage.entities.count)
+                goto rebuilt_done;
+        } else if (s->entities[i].in_use) {
+            /* Non-Population entities retain the legacy by-index rule. They
+             * are not part of CREBATCH reconstruction, but rejecting a changed
+             * slot is safer than attaching their state to an item. */
+            if (i >= stage.entities.count || used[i] ||
+                !stage.entities.ent[i].in_use ||
+                stage.entities.ent[i].population_group >= 0)
+                goto rebuilt_done;
+            rebuilt.ent[i] = stage.entities.ent[i];
+            used[i] = 1;
+        }
+
+        if (s->entities[i].in_use &&
+            rebuilt.ent[i].place_id != s->entities[i].place_id)
+            goto rebuilt_done;
+    }
+
+    /* All validation happened against private storage. Only now replace the
+     * live roster and its two group-lifetime shadows. */
+    q2_entity_set_free(&sim->entities);
+    sim->entities = rebuilt;
+    memset(&rebuilt, 0, sizeof(rebuilt));
+    memcpy(sim->item_group_run, stage.item_group_run,
+           s->item_population_group_count);
+    if (stage.item_group_order_count)
+        memcpy(sim->item_group_order, stage.item_group_order,
+               (size_t)stage.item_group_order_count * sizeof(u32));
+    sim->item_group_order_count = stage.item_group_order_count;
+    result = Q2_OK;
+
+rebuilt_done:
+    q2_entity_set_free(&rebuilt);
+    free(used);
+stage_done:
+    q2_entity_set_free(&stage.entities);
+    free(stage.item_group_run);
+    free(stage.item_group_order);
+done:
+    free(seen);
+    return result;
+}
+
 q2_result q2_save_apply(const q2_save *s, q2_sim *sim, q2_inventory *inv,
                         const char *serial, const char *map)
 {
+    q2_result rebuild;
+
     if (!s || !sim)
         return Q2_ERR_INVALID_ARG;
 
@@ -473,6 +732,10 @@ q2_result q2_save_apply(const q2_save *s, q2_sim *sim, q2_inventory *inv,
         Q2_ERROR("save is for map %s, but %s is loaded", s->map, map);
         return Q2_ERR_INVALID_ARG;
     }
+
+    rebuild = rebuild_saved_item_roster(s, sim);
+    if (rebuild != Q2_OK)
+        return rebuild;
 
     /*
      * The entity set is rebuilt by the caller's attach sequence, so its size is
@@ -606,6 +869,8 @@ q2_result q2_save_apply(const q2_save *s, q2_sim *sim, q2_inventory *inv,
             }
         }
     }
+
+    q2_sim_breakables_sync_solidity(sim);
 
     /* --- the entity set ------------------------------------------------------ */
     if (s->entities && sim->entities.ent) {
@@ -1121,6 +1386,80 @@ static bool read_entities(rbuf *r, q2_save *s)
     return true;
 }
 
+static void write_item_state(wbuf *w, const q2_save *s)
+{
+    size_t at;
+    u32 i;
+
+    if (!s->item_state_present)
+        return;
+
+    at = w_chunk_begin(w, TAG_ITEM);
+    w_u32(w, s->item_population_group_count);
+    w_u32(w, s->item_group_order_count);
+    for (i = 0; i < s->item_group_order_count; i++)
+        w_u32(w, s->item_group_order[i]);
+
+    w_u32(w, s->item_key_count);
+    for (i = 0; i < s->item_key_count; i++) {
+        w_s32(w, s->item_keys[i].group);
+        w_u32(w, s->item_keys[i].slot);
+    }
+    w_chunk_end(w, at);
+}
+
+static bool read_item_state(rbuf *r, q2_save *s)
+{
+    u32 groups = r_u32(r);
+    u32 order_count = r_u32(r);
+    u32 i;
+
+    if (r->bad || groups > SAVE_MAX_ITEM_GROUPS || order_count > groups)
+        return false;
+
+    free(s->item_group_order);
+    s->item_group_order = NULL;
+    s->item_group_order_count = 0;
+    if (order_count) {
+        s->item_group_order = (u32 *)calloc(order_count, sizeof(u32));
+        if (!s->item_group_order)
+            return false;
+        for (i = 0; i < order_count; i++) {
+            s->item_group_order[i] = r_u32(r);
+            if (r->bad || s->item_group_order[i] >= groups)
+                return false;
+        }
+        s->item_group_order_count = order_count;
+    }
+
+    s->item_key_count = r_u32(r);
+    if (r->bad || s->item_key_count > SAVE_MAX_ENTITIES)
+        return false;
+
+    free(s->item_keys);
+    s->item_keys = NULL;
+    if (s->item_key_count) {
+        s->item_keys = (q2_save_item_key *)calloc(s->item_key_count,
+                                                  sizeof(*s->item_keys));
+        if (!s->item_keys)
+            return false;
+
+        for (i = 0; i < s->item_key_count; i++) {
+            s32 group = r_s32(r);
+            u32 slot  = r_u32(r);
+
+            if (r->bad || group < -1 ||
+                (group >= 0 && (u32)group >= groups))
+                return false;
+            s->item_keys[i].group = group;
+            s->item_keys[i].slot  = slot;
+        }
+    }
+    s->item_population_group_count = groups;
+    s->item_state_present = true;
+    return true;
+}
+
 static void write_breakables(wbuf *w, const q2_save *s)
 {
     size_t at = w_chunk_begin(w, TAG_BRKS);
@@ -1536,6 +1875,7 @@ static q2_result build_body(const q2_save *s, wbuf *w)
     write_bytes_chunk(w, TAG_EVNT, s->event_flags, s->event_count);
     write_bytes_chunk(w, TAG_TRIG, s->trigger_inside, s->trigger_count);
     write_entities(w, s);
+    write_item_state(w, s);
     write_breakables(w, s);
     write_movers(w, s);
     write_creatures(w, s);
@@ -1725,6 +2065,11 @@ static q2_result read_body(q2_save *out, const u8 *body, size_t body_size)
 
         case TAG_ENTS:
             if (!read_entities(&c, out))
+                return Q2_ERR_BAD_FORMAT;
+            break;
+
+        case TAG_ITEM:
+            if (!read_item_state(&c, out))
                 return Q2_ERR_BAD_FORMAT;
             break;
 
@@ -2053,6 +2398,140 @@ const char *q2_save_slot_row(const q2_save_info *info, int slot,
         snprintf(out, out_size, "%d %s", slot + 1, info->map);
 
     return out;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Multiplayer settings slots                                                */
+
+q2_result q2_settings_slot_path(int slot, char *out, u32 out_size)
+{
+    if (!out || out_size == 0)
+        return Q2_ERR_INVALID_ARG;
+    if (slot < 0 || slot >= Q2_SAVE_SLOTS)
+        return Q2_ERR_RANGE;
+
+    snprintf(out, out_size, "%s/settings%d.q2c", q2_save_dir(), slot);
+    return Q2_OK;
+}
+
+q2_result q2_settings_slot_write(const q2_settings_blob *settings, int slot)
+{
+    u8 file[SAVE_FILE_HEADER + 4 + Q2_SETTINGS_VALUE_MAX * 2];
+    u8 *body = file + SAVE_FILE_HEADER;
+    u32 body_size, crc, i;
+    char path[512];
+    FILE *f;
+    q2_result rc;
+
+    if (!settings)
+        return Q2_ERR_INVALID_ARG;
+    if (settings->count > Q2_SETTINGS_VALUE_MAX)
+        return Q2_ERR_RANGE;
+    rc = q2_settings_slot_path(slot, path, (u32)sizeof(path));
+    if (rc != Q2_OK)
+        return rc;
+
+    body_size = 4 + settings->count * 2;
+    q2_wr_u32(body, settings->count);
+    for (i = 0; i < settings->count; i++)
+        q2_wr_u16(body + 4 + i * 2, (u16)settings->value[i]);
+    crc = crc32_of(body, body_size);
+
+    memcpy(file, SETTINGS_MAGIC, 4);
+    q2_wr_u32(file + 4, SETTINGS_VERSION);
+    q2_wr_u32(file + 8, body_size);
+    q2_wr_u32(file + 12, crc);
+
+    ensure_dir(q2_save_dir());
+    f = fopen(path, "wb");
+    if (!f)
+        return Q2_ERR_IO;
+    if (fwrite(file, 1, SAVE_FILE_HEADER + body_size, f) !=
+        SAVE_FILE_HEADER + body_size) {
+        fclose(f);
+        return Q2_ERR_IO;
+    }
+    fclose(f);
+    return Q2_OK;
+}
+
+q2_result q2_settings_slot_read(q2_settings_blob *out, int slot)
+{
+    u8 *data = NULL;
+    size_t size = 0;
+    u32 version, body_size, crc, count, i;
+    char path[512];
+    q2_result rc;
+
+    if (!out)
+        return Q2_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    rc = q2_settings_slot_path(slot, path, (u32)sizeof(path));
+    if (rc != Q2_OK)
+        return rc;
+    rc = slurp(path, &data, &size);
+    if (rc != Q2_OK)
+        return rc;
+
+    if (size < SAVE_FILE_HEADER || memcmp(data, SETTINGS_MAGIC, 4) != 0) {
+        rc = Q2_ERR_BAD_FORMAT;
+        goto done;
+    }
+    version   = q2_rd_u32(data + 4);
+    body_size = q2_rd_u32(data + 8);
+    crc       = q2_rd_u32(data + 12);
+    if (version != SETTINGS_VERSION) {
+        rc = Q2_ERR_UNSUPPORTED;
+        goto done;
+    }
+    if (body_size > size - SAVE_FILE_HEADER || body_size < 4 ||
+        crc32_of(data + SAVE_FILE_HEADER, body_size) != crc) {
+        rc = Q2_ERR_BAD_FORMAT;
+        goto done;
+    }
+
+    count = q2_rd_u32(data + SAVE_FILE_HEADER);
+    if (count > Q2_SETTINGS_VALUE_MAX || body_size != 4 + count * 2) {
+        rc = Q2_ERR_BAD_FORMAT;
+        goto done;
+    }
+    out->count = count;
+    for (i = 0; i < count; i++)
+        out->value[i] = (s16)q2_rd_u16(data + SAVE_FILE_HEADER + 4 + i * 2);
+    rc = Q2_OK;
+
+done:
+    free(data);
+    if (rc != Q2_OK)
+        memset(out, 0, sizeof(*out));
+    return rc;
+}
+
+q2_result q2_settings_slot_delete(int slot)
+{
+    char path[512];
+    q2_result rc = q2_settings_slot_path(slot, path, (u32)sizeof(path));
+
+    if (rc != Q2_OK)
+        return rc;
+    return (remove(path) == 0) ? Q2_OK : Q2_ERR_NOT_FOUND;
+}
+
+u32 q2_settings_slots_scan(bool *used, u32 count)
+{
+    u32 i, found = 0;
+
+    if (!used)
+        return 0;
+    if (count > Q2_SAVE_SLOTS)
+        count = Q2_SAVE_SLOTS;
+    for (i = 0; i < count; i++) {
+        q2_settings_blob probe;
+        used[i] = (q2_settings_slot_read(&probe, (int)i) == Q2_OK);
+        if (used[i])
+            found++;
+    }
+    return found;
 }
 
 const char *q2_save_default_label(const q2_save *s, char *out, u32 out_size)

@@ -12,9 +12,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "crebind.h"
 #include "entity.h"
 #include "item.h"
 #include "itemtable.h"
+#include "levelbin.h"
+#include "modeldraw.h"
 
 static int g_failures;
 static int g_checks;
@@ -89,6 +92,16 @@ static void test_table(void)
     check_eq_i(find("Hyperbl P")->effect,   9, "Hyperbl P  -> effect 9");
     check_eq_i(find("Railgun P")->effect,  10, "Railgun P  -> effect 10");
     check_eq_i(find("Bfg P")->effect,      11, "Bfg P      -> effect 11");
+
+    /* The final eight bytes are global storage vertices for 0x800784CC's
+     * posed shadow footprint, not animation clips. Values such as 63 are
+     * deliberately well beyond these single-clip item models' clip index. */
+    e = find("Shotgun P");
+    check_eq_i(e->shadow_vertex_count, 2, "Shotgun carries two shadow vertices");
+    check_eq_i(e->shadow_vertex[0], 13, "Shotgun shadow vertex 0 is 13");
+    check_eq_i(e->shadow_vertex[1], 63, "Shotgun shadow vertex 1 is 63");
+    check_eq_i(find("Medi P")->shadow_vertex_count, 0,
+               "Medi has no shadow-vertex expansion list");
 
     /*
      * The eight items whose effect index lands on the dispatch's failure exit.
@@ -490,7 +503,7 @@ static void test_spawn_and_think(void)
     place.x = 1000;
     place.y = 2000;
     place.z = 3000;
-    place.unk = 0x9400;          /* bits 12..15 set, plus a heading of 0x400 */
+    place.angle_flags = 0x9400;  /* marker + NOT_HARD, plus yaw 0x400 */
     place.id = 39;               /* Shotgun P */
 
     e = q2_item_spawn(&set, &place, NULL, 0, NULL);
@@ -498,9 +511,19 @@ static void test_spawn_and_think(void)
     check_eq_i(e->effect, 2, "and carries the table's effect index");
     check_eq_i(e->kind, Q2_ENT_KIND_ITEM, "and the item kind, 46");
     check(strcmp(e->model, "Shotgun P") == 0, "and the table's model name");
+    check_eq_i(e->glow[0], 0x30, "item ambient red is retail's 0x30");
+    check_eq_i(e->glow[1], 0x30, "item ambient green is retail's 0x30");
+    check_eq_i(e->glow[2], 0x30, "item ambient blue is retail's 0x30");
+    check_eq_i(e->shadow_vertex_count, 2,
+               "spawn copies the table's shadow-vertex count");
+    check_eq_i(e->shadow_vertex[0], 13,
+               "spawn copies the first global shadow vertex");
+    check_eq_i(e->shadow_vertex[1], 63,
+               "spawn copies the second global shadow vertex");
 
     /* 0x80058930: the heading is the low twelve bits only. */
-    check_eq_i(e->angles[1], 0x400, "the yaw is place->unk & 0xFFF");
+    check_eq_i(e->angles[1], 0x400,
+               "the yaw is place->angle_flags & 0xFFF");
 
     /*
      * 0x80051068 / 0x800510A4 raise the record by 286 and then 30 before the
@@ -553,6 +576,128 @@ static void test_spawn_and_think(void)
     }
 
     q2_entity_set_free(&set);
+}
+
+/* ------------------------------------------------------------------------- */
+static void wr16(u8 *p, s16 v)
+{
+    p[0] = (u8)((u16)v & 0xFFu);
+    p[1] = (u8)((u16)v >> 8);
+}
+
+static void put_vertex(u8 *p, s16 x, s16 y, s16 z)
+{
+    wr16(p + 0, x);
+    wr16(p + 2, y);
+    wr16(p + 4, z);
+    wr16(p + 6, 0);
+    wr16(p + 8, 0);
+    wr16(p + 10, 0);
+}
+
+static void test_shadow_packet(void)
+{
+    u8 image[64];
+    q2_model model;
+    q2_model_pose pose;
+    q2_model_instance inst;
+    q2_model_draw_stats stats;
+    q2_camera cam;
+    psx_ot ot;
+    gte_state gte;
+    u16 selected[2] = { 0, 1 };
+    psx_prim *p;
+
+    printf("\nitem shadow (0x800783B8 / 0x800784CC)\n");
+
+    memset(image, 0, sizeof(image));
+    memset(&model, 0, sizeof(model));
+    memset(&pose, 0, sizeof(pose));
+
+    /* Two global storage vertices, then one four-byte part record. The pose
+     * moves them before the X/Z extrema are accumulated. */
+    put_vertex(image + 0,  -20, 0, -30);
+    put_vertex(image + 12,  40, 0,  50);
+    image[32 + 2] = 0;                    /* scratch-window base */
+    image[32 + 3] = 2;                    /* storage vertex count */
+
+    model.base          = image;
+    model.size          = sizeof(image);
+    model.hdr.num_parts = 1;
+    model.hdr.num_verts = 2;
+    model.hdr.num_faces = 0;
+    model.hdr.ofs_verts = 0;
+    model.hdr.ofs_parts = 32;
+    model.scratch_size  = 2;
+
+    pose.q[3] = Q2_ONE_12;                /* identity quaternion */
+    pose.t[0] = 10;
+    pose.t[2] = -5;
+
+    if (psx_ot_init(&ot, 256, 8) != Q2_OK) {
+        check(false, "shadow test allocates an ordering table");
+        return;
+    }
+
+    q2_camera_default(&cam, 512, 248);
+    cam.pos[1] = -1000;                   /* look down onto the floor */
+    gte_init(&gte);
+    gte_set_projection(&gte, cam.projection, 256, 124);
+
+    q2_model_instance_init(&inst);
+    inst.model               = &model;
+    inst.pose                = &pose;
+    inst.origin[2]           = 4000;
+    inst.shadow_enabled      = true;
+    inst.shadow_vertex       = selected;
+    inst.shadow_vertex_count = 2;
+    inst.shadow_origin[2]    = 4000;
+
+    psx_ot_clear(&ot);
+    check_eq_i(q2_model_build_ot(&inst, &cam, &ot, &gte, &stats), 1,
+               "a posed vertex list emits one primitive");
+    check_eq_i(stats.faces_emitted, 0, "the synthetic model has no faces");
+    check_eq_i(stats.shadows_emitted, 1, "the emitted primitive is a shadow");
+    check_eq_i(ot.prim_count, 1, "the shadow consumes one packet");
+
+    p = &ot.prims[0];
+    check_eq_i(p->kind, PSX_PRIM_FT4, "shadow is POLY_FT4");
+    check(p->semi_transparent, "shadow sets ABE");
+    check(p->textured_blend, "shadow modulates its texture");
+    check(p->quad_zorder, "shadow packet keeps libgpu Z order");
+    check_eq_i(p->rgb[0].r, 128, "shadow modulation red is 128");
+    check_eq_i(p->rgb[0].g, 128, "shadow modulation green is 128");
+    check_eq_i(p->rgb[0].b, 128, "shadow modulation blue is 128");
+    check_eq_i(p->tpage, psx_make_tpage(0, 1, PSX_BLEND_SUB, PSX_TEX_4BIT),
+               "shadow samples slot 15's 4bpp page with ABR 2");
+    check_eq_i(p->clut, psx_make_clut(0, 248),
+               "shadow samples executable palette 1 at (0,248)");
+    check_eq_i(p->uv[0].u, 224, "shadow uv0.u");
+    check_eq_i(p->uv[0].v, 224, "shadow uv0.v");
+    check_eq_i(p->uv[1].u, 239, "shadow uv1.u");
+    check_eq_i(p->uv[1].v, 224, "shadow uv1.v");
+    check_eq_i(p->uv[2].u, 224, "shadow uv2.u");
+    check_eq_i(p->uv[2].v, 239, "shadow uv2.v");
+    check_eq_i(p->uv[3].u, 239, "shadow uv3.u");
+    check_eq_i(p->uv[3].v, 239, "shadow uv3.v");
+    check(p->xy[0].x != p->xy[1].x && p->xy[0].y != p->xy[2].y,
+          "posed extrema project to a non-degenerate floor quad");
+
+    /* Height 600 is the exact retail cutoff; a zero-radius item with no list
+     * likewise collapses and spends no primitive. */
+    psx_ot_clear(&ot);
+    inst.shadow_height = Q2_MODEL_SHADOW_FADE;
+    check_eq_i(q2_model_build_ot(&inst, &cam, &ot, &gte, &stats), 0,
+               "height 600 suppresses the shadow");
+    check_eq_i(ot.prim_count, 0, "the height cutoff allocates no packet");
+
+    psx_ot_clear(&ot);
+    inst.shadow_height = 0;
+    inst.shadow_vertex_count = 0;
+    check_eq_i(q2_model_build_ot(&inst, &cam, &ot, &gte, &stats), 0,
+               "zero radius plus no list is degenerate");
+
+    psx_ot_free(&ot);
 }
 
 static void test_touch_sweep(void)
@@ -823,9 +968,9 @@ static void test_entity_set(void)
  *
  * A group is spawned because a script SELECTED it by name (0x80056C60 sets bit
  * 0 of its flags word; the pass at 0x80056D68 runs only what has bit 0 set and
- * bit 1 clear). Those scripts live in the level modules, which this port does
- * not run — so the port's rule is the one thing the disc settles by itself: a
- * group whose NAME claims a zone belongs to that zone and to no other.
+ * bit 1 clear). `q2_levelbin_selected` reads those calls from the level module,
+ * so a category or script-batch group appears only when selected. A group whose
+ * NAME claims the resident zone remains the fallback, as it does for creatures.
  *
  * The population is built by hand rather than read off a disc, so this runs in
  * the self-contained suite and pins the rule rather than one map's data.
@@ -833,6 +978,12 @@ static void test_entity_set(void)
 static void put_u32(u8 *p, u32 v)
 {
     p[0] = (u8)v; p[1] = (u8)(v >> 8); p[2] = (u8)(v >> 16); p[3] = (u8)(v >> 24);
+}
+
+static void put_u16(u8 *p, u16 v)
+{
+    p[0] = (u8)v;
+    p[1] = (u8)(v >> 8);
 }
 
 static void put_group(u8 *buf, u32 at, const char *name, u32 place_offset)
@@ -856,30 +1007,49 @@ static void put_places(u8 *buf, u32 at, u32 count, u16 id)
     put_u32(buf + at + count * Q2_POP_PLACE_SIZE, Q2_POP_TERM_FFFF);
 }
 
-static u32 spawn_count(const q2_population *pop, int zone, u32 *other_zone)
+/* One synthetic `select(name)` call in the exact instruction shape decoded by
+ * q2_levelbin_selected: form a pointer to a twelve-byte field, load import slot
+ * +36, then call it through the loaded register. */
+static void put_select(u8 *buf, u32 call_at, u32 name_at, const char *name)
+{
+    memset(buf + name_at, 0, 12);
+    memcpy(buf + name_at, name, strlen(name));
+    put_u32(buf + call_at + 0,
+            0x24040000u | name_at);              /* addiu a0,zero,name_at */
+    put_u32(buf + call_at + 4,
+            0x8C620000u | Q2_LEVELBIN_SLOT_SELECT); /* lw v0,+36(v1)      */
+    put_u32(buf + call_at + 8, 0x00400009u);      /* jalr v0              */
+    put_u32(buf + call_at + 12, 0);               /* delay slot            */
+}
+
+static u32 spawn_count(const q2_population *pop, int zone,
+                       const u8 *levelbin, u32 levelbin_size,
+                       q2_item_spawn_stats *out)
 {
     q2_entity_set set;
     q2_item_spawn_stats st;
     u32 n;
 
     memset(&set, 0, sizeof(set));
-    q2_item_spawn_zone(&set, pop, zone, NULL, NULL, &st);
+    q2_item_spawn_zone(&set, pop, zone, levelbin, levelbin_size,
+                       NULL, NULL, NULL, &st);
     n = set.count;
-    if (other_zone)
-        *other_zone = st.other_zone;
+    if (out)
+        *out = st;
     q2_entity_set_free(&set);
     return n;
 }
 
 static void test_zone_groups(void)
 {
-    /* Three groups: two named after zones, one named after a category. */
-    enum { P0 = 96, P1 = P0 + 2 * 16 + 4, P2 = P1 + 2 * 16 + 4,
-           SIZE = P2 + 1 * 16 + 4 };
+    /* Four groups: two named after zones and two category/script batches. */
+    enum { P0 = 112, P1 = P0 + 2 * 16 + 4, P2 = P1 + 2 * 16 + 4,
+           P3 = P2 + 1 * 16 + 4, SIZE = P3 + 1 * 16 + 4 };
     u8 buf[SIZE];
+    u8 levelbin[96];
     q2_population pop;
     q2_pop_group g;
-    u32 skipped;
+    q2_item_spawn_stats st;
 
     printf("zone groups\n");
 
@@ -887,14 +1057,22 @@ static void test_zone_groups(void)
     put_group(buf,  0, "Zone0",   P0);
     put_group(buf, 24, "Zone1",   P1);
     put_group(buf, 48, "Weapons", P2);
-    put_u32(buf + 72, 0);                     /* the group table's terminator */
+    put_group(buf, 72, "Ammo",    P3);
+    put_u32(buf + 96, 0);                     /* the group table's terminator */
     put_places(buf, P0, 2, 27);               /* Shells P */
     put_places(buf, P1, 2, 27);
     put_places(buf, P2, 1, 27);
+    put_places(buf, P3, 1, 27);
 
     pop.data        = buf;
     pop.size        = SIZE;
-    pop.group_count = 3;
+    pop.group_count = 4;
+
+    /* The module selects one unzoned category and one group belonging to zone
+     * 1. The latter must not leak across the resident-zone boundary. */
+    memset(levelbin, 0, sizeof(levelbin));
+    put_select(levelbin, 0, 64, "Weapons");
+    put_select(levelbin, 16, 80, "Zone1");
 
     /* The name rule itself. */
     memset(&g, 0, sizeof(g));
@@ -917,19 +1095,134 @@ static void test_zone_groups(void)
     snprintf(g.name, sizeof(g.name), "%s", "Zone");
     check_eq_i(q2_pop_group_zone(&g), -1, "'Zone' with no digits names none");
 
-    /* And what that does to a spawn. A zone gets its own group and every group
-     * that claims none — never another zone's. */
-    check_eq_i(spawn_count(&pop, 0, &skipped), 3, "zone 0 spawns its 2 plus the 1");
-    check_eq_i(skipped, 1, "zone 0 skips one group");
-    check_eq_i(spawn_count(&pop, 1, &skipped), 3, "zone 1 spawns its 2 plus the 1");
-    check_eq_i(skipped, 1, "zone 1 skips one group");
-    check_eq_i(spawn_count(&pop, 2, &skipped), 1,
-               "a zone with no group of its own still gets the unclaimed one");
-    check_eq_i(skipped, 2, "zone 2 skips both zone-named groups");
+    /* A resident zone gets its own group plus the unzoned group the LevelBin
+     * selected — not every category that happens to have a place list. */
+    check_eq_i(spawn_count(&pop, 0, levelbin, sizeof(levelbin), &st), 3,
+               "zone 0 spawns its 2 plus selected Weapons");
+    check_eq_i(st.other_zone, 1, "zone 0 rejects Zone1 even though it was selected");
+    check_eq_i(st.not_selected, 1, "zone 0 skips unselected Ammo");
+
+    check_eq_i(spawn_count(&pop, 1, levelbin, sizeof(levelbin), &st), 3,
+               "zone 1 spawns its 2 plus selected Weapons");
+    check_eq_i(st.other_zone, 1, "zone 1 rejects Zone0");
+    check_eq_i(st.not_selected, 1, "zone 1 skips unselected Ammo");
+
+    check_eq_i(spawn_count(&pop, 2, levelbin, sizeof(levelbin), &st), 1,
+               "a zone with no group of its own gets selected Weapons only");
+    check_eq_i(st.other_zone, 2, "zone 2 skips both zone-named groups");
+    check_eq_i(st.not_selected, 1, "zone 2 still skips unselected Ammo");
+
+    /* Without a module, match the creature world's conservative fallback: the
+     * resident Zone<N> group is known; unzoned batches are not guessed live. */
+    check_eq_i(spawn_count(&pop, 0, NULL, 0, &st), 2,
+               "without LevelBin only the resident zone group spawns");
+    check_eq_i(st.not_selected, 2, "both unzoned groups are skipped");
 
     /* -1 is the census: every group, whichever zone it names. */
-    check_eq_i(spawn_count(&pop, -1, &skipped), 5, "zone -1 spawns every group");
-    check_eq_i(skipped, 0, "zone -1 skips nothing");
+    check_eq_i(spawn_count(&pop, -1, levelbin, sizeof(levelbin), &st), 6,
+               "zone -1 spawns every group");
+    check_eq_i(st.other_zone, 0, "zone -1 skips no other-zone group");
+    check_eq_i(st.not_selected, 0, "zone -1 skips no unselected group");
+
+    /* The mutable group flag's bit-1 shadow spans both passes: startup marks
+     * what it ran, a later CREBATCH can add a deferred group, and neither kind
+     * can run the same place list twice. */
+    {
+        q2_entity_set set;
+        u8 group_run[4] = { 0, 0, 0, 0 };
+
+        memset(&set, 0, sizeof(set));
+        check_eq_i(q2_item_spawn_zone(&set, &pop, 0, levelbin,
+                                      sizeof(levelbin), NULL, NULL,
+                                      group_run, &st), Q2_OK,
+                   "the latched startup pass succeeds");
+        check_eq_i(set.count, 3, "the latched pass spawns the same selection");
+        check(group_run[0] && !group_run[1] && group_run[2] && !group_run[3],
+              "only resident Zone0 and selected Weapons are marked run");
+        check_eq_i(set.ent[0].population_group, 0,
+                   "a startup item keeps its Population group identity");
+        check_eq_i(set.ent[1].population_slot, 1,
+                   "and its stable place-list slot");
+        check_eq_i(set.ent[2].population_group, 2,
+                   "the selected batch is keyed independently of set order");
+
+        check_eq_i(q2_item_spawn_group(&set, &pop, "Ammo", NULL, NULL,
+                                       group_run, &st), Q2_OK,
+                   "CREBATCH can run the deferred Ammo group");
+        check_eq_i(st.spawned, 1, "the deferred group reports its one item");
+        check_eq_i(set.count, 4, "the deferred item joins the entity set");
+        check(group_run[3] != 0, "the deferred group is latched as run");
+        check_eq_i(set.ent[3].population_group, 3,
+                   "the deferred item carries the group CREBATCH named");
+        check_eq_i(set.ent[3].population_slot, 0,
+                   "and its slot within that group's place list");
+
+        check_eq_i(q2_item_spawn_group(&set, &pop, "Ammo", NULL, NULL,
+                                       group_run, &st), Q2_OK,
+                   "repeating CREBATCH is a successful no-op");
+        check_eq_i(st.spawned, 0, "the repeated group reports no new item");
+        check_eq_i(set.count, 4, "the repeated group cannot duplicate items");
+
+        check_eq_i(q2_item_spawn_group(&set, &pop, "Weapons", NULL, NULL,
+                                       group_run, &st), Q2_OK,
+                   "a startup group also rejects later activation");
+        check_eq_i(set.count, 4, "startup items cannot be duplicated either");
+        q2_entity_set_free(&set);
+    }
+}
+
+static void test_place_difficulty_flags(void)
+{
+    enum { PLACE = 28, COUNT = 4,
+           SIZE = PLACE + COUNT * Q2_POP_PLACE_SIZE + 4 };
+    static const u16 flags[COUNT] = {
+        Q2_POP_PLACE_UNUSED_1000,
+        Q2_POP_PLACE_NOT_EASY,
+        Q2_POP_PLACE_NOT_MEDIUM,
+        Q2_POP_PLACE_NOT_HARD
+    };
+    u8 buf[SIZE];
+    q2_population pop;
+    q2_item_spawn_stats st;
+    u32 i;
+
+    printf("place difficulty flags (0x8007F538)\n");
+
+    memset(buf, 0, sizeof(buf));
+    put_group(buf, 0, "Zone0", PLACE);
+    put_u32(buf + Q2_POP_GROUP_SIZE, 0);
+    put_places(buf, PLACE, COUNT, 27); /* Shells P */
+    for (i = 0; i < COUNT; i++)
+        put_u16(buf + PLACE + i * Q2_POP_PLACE_SIZE + 12, flags[i]);
+
+    pop.data        = buf;
+    pop.size        = SIZE;
+    pop.group_count = 1;
+
+    check(q2_pop_place_allows_skill(Q2_POP_PLACE_UNUSED_1000, 0),
+          "bit 12 does not exclude easy");
+    check(q2_pop_place_allows_skill(Q2_POP_PLACE_UNUSED_1000, 1),
+          "bit 12 does not exclude medium");
+    check(q2_pop_place_allows_skill(Q2_POP_PLACE_UNUSED_1000, 2),
+          "bit 12 does not exclude hard");
+
+    for (i = 0; i < 3; i++) {
+        q2_cre_set_skill((s32)i);
+        check_eq_i(spawn_count(&pop, 0, NULL, 0, &st), 3,
+                   i == 0 ? "easy skips NOT_EASY only" :
+                   i == 1 ? "medium skips NOT_MEDIUM only" :
+                            "hard skips NOT_HARD only");
+        check_eq_i(st.skill_filtered, 1,
+                   "the rejected place is counted separately");
+    }
+
+    /* Exact default arm of 0x8007F57C: an out-of-menu skill is unfiltered. */
+    q2_cre_set_skill(3);
+    check_eq_i(spawn_count(&pop, 0, NULL, 0, &st), 4,
+               "an out-of-range skill takes retail's unfiltered default");
+    check_eq_i(st.skill_filtered, 0,
+               "the unfiltered default rejects no place");
+    q2_cre_set_skill(1);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -950,12 +1243,14 @@ int main(void)
     test_capacity_and_powerups();
     test_keys();
     test_spawn_and_think();
+    test_shadow_packet();
     test_touch_sweep();
     test_weapons_stay();
     test_pickup_caption();
     test_timed_removal();
     test_entity_set();
     test_zone_groups();
+    test_place_difficulty_flags();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

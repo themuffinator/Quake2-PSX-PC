@@ -84,16 +84,17 @@
  * and must let its own mover binding write it.
  *
  * That is also why a node's stored origin is uniform across a zone and yet doors
- * move: the object supplies BOTH a rotation and two translations, which the zone
- * draw applies at 0x800678B4-0x800678EC:
+ * move: the object supplies a rotation, a displacement and a rotational pivot,
+ * which the zone draw applies at 0x800678B4-0x8006793C:
  *
  *     RotMatrix(&obj[0x0C], m)              three s16 Euler angles
  *     node position += obj.s16[0x12..0x16]  the mover's linear displacement
- *                    + obj.s16[0x18..0x1C]  a second, independent offset
+ *                    - R(obj.s16[0x18..0x1C])
+ *                    + obj.s16[0x18..0x1C]  rotate about this local pivot
  *
- * The port previously applied only the first triple. Both are added, and the
- * rotation is applied to the node's own transform, which is what ROTHATCH,
- * SIMROT and ROTBUTTON need.
+ * The constructors derive the pivot from the raw Scene-box midpoint minus the
+ * Scene origin; ROTHATCH then applies its item+10..+14 hinge adjustment. See
+ * rotator.h for the instruction-level derivation.
  *
  * **Bit 15 is a hide flag** (`andi 0x8000` at 0x8006771C, branch straight to the
  * next node). It is clear on all 17,035 nodes on the disc: it is what OBJDRAWOFF
@@ -103,7 +104,7 @@
  * of linking straight into the node's ordering-table entry, the emitter takes a
  * record off a bump allocator, projects the node's origin to get one depth for
  * the whole node, records the mover-displaced bounding box, and hands the record
- * to 0x80047744 keyed on the node's `unk0E` byte (low 7 bits, 64-byte stride
+ * to 0x80047744 keyed on the node's area byte (low 7 bits, 64-byte stride
  * table at 0x800D8D78). It is set on the nodes whose on-disc flags are
  * 0x4000/0x4400/0x4800.
  *

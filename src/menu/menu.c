@@ -281,6 +281,7 @@ static bool any_selectable(const q2_menu *m)
 /* Page entry */
 
 static void page_entered(q2_menu *m);
+static void front_setup_refresh(q2_menu *m);
 
 static const q2_menu_page *resolve(const q2_menu *m, int id)
 {
@@ -288,6 +289,10 @@ static const q2_menu_page *resolve(const q2_menu *m, int id)
         return q2_menu_variables_page(m->cheat_level);
     if (id == Q2_PAGE_VIDEO)
         return q2_menu_video_page(m->multiplayer);
+    if (id == Q2_PAGE_FRONT_DMSETUP)
+        return q2_menu_front_setup_page(m->mp_setup.mode);
+    if (id == Q2_PAGE_FRONT_VARIABLES)
+        return q2_menu_front_variables_page(m->cheat_level);
     return q2_menu_page_find(id);
 }
 
@@ -421,6 +426,10 @@ static void page_entered(q2_menu *m)
         break;
     }
 
+    case Q2_PAGE_FRONT_DMSETUP:
+        front_setup_refresh(m);
+        break;
+
     case Q2_PAGE_RESTARTING:
         m->request = Q2_MREQ_RESTART;
         break;
@@ -446,9 +455,26 @@ void q2_menu_init(q2_menu *m, q2_menu_settings *settings, int screen_h)
     m->set      = settings;
     m->screen_h = screen_h > 0 ? screen_h : Q2_MENU_SCREEN_H;
     m->page_id  = Q2_PAGE_NONE;
+    m->controller_count       = Q2_MENU_MP_MAX_PLAYERS;
+    m->mp_setup.mode          = Q2_MENU_MP_DEATHMATCH;
+    m->mp_setup.players       = 2;
+    m->mp_setup.arena         = 0;
+    m->mp_setup.time_option   = Q2_MENU_MP_TIME_DEFAULT;
+    m->mp_setup.frag_option   = Q2_MENU_MP_FRAG_DEFAULT;
+    m->mp_setup.round_option  = Q2_MENU_MP_ROUND_DEFAULT;
 }
 
 void q2_menu_set_multiplayer(q2_menu *m, bool on)  { if (m) m->multiplayer = on; }
+void q2_menu_set_controller_count(q2_menu *m, int count)
+{
+    if (!m)
+        return;
+    if (count < 2) count = 2;
+    if (count > Q2_MENU_MP_MAX_PLAYERS) count = Q2_MENU_MP_MAX_PLAYERS;
+    m->controller_count = count;
+    if (m->mp_setup.players > count)
+        m->mp_setup.players = (s16)count;
+}
 void q2_menu_set_cheat_level(q2_menu *m, int level)
 {
     if (!m) return;
@@ -580,14 +606,26 @@ static void run_action(q2_menu *m, int action)
     /* Picking a mode opens the setup, which is the page the capture shows
      * next: a player count, a map, the two limits, the variables and PROCEED. */
     case Q2_ACT_DM_MODE:
+        m->mp_setup.mode = (m->cursor == 1) ? Q2_MENU_MP_TEAM_DEATHMATCH
+                         : (m->cursor == 2) ? Q2_MENU_MP_VERSUS
+                                            : Q2_MENU_MP_DEATHMATCH;
         push(m, Q2_PAGE_FRONT_DMSETUP);
         break;
 
     case Q2_ACT_LOAD_GAME:
+        m->request = Q2_MREQ_LOAD_GAME;
+        q2_menu_close(m);
+        break;
     case Q2_ACT_MP_SETTINGS:
+        m->request = (m->cursor == 4) ? Q2_MREQ_MP_SAVE_SETTINGS
+                                      : Q2_MREQ_MP_LOAD_SETTINGS;
+        q2_menu_close(m);
+        break;
     case Q2_ACT_GAME_VARIABLES:
+        push(m, Q2_PAGE_FRONT_VARIABLES);
+        break;
     case Q2_ACT_PROCEED:
-        m->request = Q2_MREQ_NOT_BUILT;
+        m->request = Q2_MREQ_MP_PROCEED;
         q2_menu_close(m);
         break;
     case Q2_ACT_MULTIPLAYER:
@@ -714,6 +752,106 @@ static void update_choice(q2_menu *m, int index)
 
     if (*v < lo)  *v = (s16)(hi - 1);
     if (*v >= hi) *v = (s16)lo;
+}
+
+/* ------------------------------------------------------------------------- */
+/* QFRONT's match-setup page hook — module+0x50D0.                           */
+
+static const s16 k_front_time_options[Q2_MENU_MP_TIME_OPTIONS] = {
+    1, 2, 3, 4, 5, 10, 15, 20, 25, 30, 60, -1
+};
+static const s16 k_front_frag_options[Q2_MENU_MP_FRAG_OPTIONS] = {
+    1, 2, 3, 4, 5, 10, 15, 20, -1
+};
+static const s16 k_front_round_options[Q2_MENU_MP_ROUND_OPTIONS] = {
+    1, 2, 3, 5, 10
+};
+
+static void front_setup_refresh(q2_menu *m)
+{
+    int v;
+
+    if (!m || m->page_id != Q2_PAGE_FRONT_DMSETUP)
+        return;
+
+    snprintf(m->text[0], Q2_MENU_TEXT_MAX, "%d PLAYERS",
+             (int)m->mp_setup.players);
+    snprintf(m->text[1], Q2_MENU_TEXT_MAX, "%s",
+             q2_menu_mp_arena_name(m->mp_setup.arena));
+
+    if (m->mp_setup.mode == Q2_MENU_MP_VERSUS) {
+        v = k_front_round_options[m->mp_setup.round_option];
+        snprintf(m->text[2], Q2_MENU_TEXT_MAX, "ROUNDS %2d", v);
+    } else {
+        v = k_front_time_options[m->mp_setup.time_option];
+        if (v < 0)
+            snprintf(m->text[2], Q2_MENU_TEXT_MAX, "TIME LIMIT  i");
+        else
+            snprintf(m->text[2], Q2_MENU_TEXT_MAX, "TIME LIMIT %2d", v);
+
+        v = k_front_frag_options[m->mp_setup.frag_option];
+        if (v < 0)
+            snprintf(m->text[3], Q2_MENU_TEXT_MAX, "FRAG LIMIT  i");
+        else
+            snprintf(m->text[3], Q2_MENU_TEXT_MAX, "FRAG LIMIT %2d", v);
+    }
+}
+
+static int wrap_option(int value, int count)
+{
+    if (value < 0) return count - 1;
+    if (value >= count) return 0;
+    return value;
+}
+
+static void update_front_setup(q2_menu *m)
+{
+    int before, after;
+    int step = ((m->pad_new & Q2_PAD_RIGHT) ? 1 : 0)
+             - ((m->pad_new & Q2_PAD_LEFT)  ? 1 : 0);
+
+    if (!step)
+        return;
+
+    switch (m->cursor) {
+    case 0:
+        before = m->mp_setup.players;
+        after  = before + step;
+        if (after < 2) after = 2;
+        if (after > m->controller_count) after = m->controller_count;
+        m->mp_setup.players = (s16)after;
+        break;
+    case 1:
+        before = m->mp_setup.arena;
+        after = wrap_option(before + step, Q2_MENU_MP_ARENA_COUNT);
+        m->mp_setup.arena = (s16)after;
+        break;
+    case 2:
+        if (m->mp_setup.mode == Q2_MENU_MP_VERSUS) {
+            before = m->mp_setup.round_option;
+            after = wrap_option(before + step, Q2_MENU_MP_ROUND_OPTIONS);
+            m->mp_setup.round_option = (s16)after;
+        } else {
+            before = m->mp_setup.time_option;
+            after = wrap_option(before + step, Q2_MENU_MP_TIME_OPTIONS);
+            m->mp_setup.time_option = (s16)after;
+        }
+        break;
+    case 3:
+        if (m->mp_setup.mode == Q2_MENU_MP_VERSUS)
+            return;
+        before = m->mp_setup.frag_option;
+        after = wrap_option(before + step, Q2_MENU_MP_FRAG_OPTIONS);
+        m->mp_setup.frag_option = (s16)after;
+        break;
+    default:
+        return;
+    }
+
+    if (after != before) {
+        m->sound = Q2_MSND_TOGGLE;
+        front_setup_refresh(m);
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -882,6 +1020,9 @@ void q2_menu_advance(q2_menu *m, u16 buttons)
     }
 
     move_cursor(m);
+
+    if (m->page_id == Q2_PAGE_FRONT_DMSETUP)
+        update_front_setup(m);
 
     /* The widget under the cursor, adjusted before the activation test so a
      * left/right press cannot also count as a select. */

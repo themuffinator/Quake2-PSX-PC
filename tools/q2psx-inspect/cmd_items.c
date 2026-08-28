@@ -109,15 +109,27 @@ int cmd_items(disc *d)
     /* Per-place-id census, and per-record placement count. */
     unsigned long long places = 0, resolved = 0, with_model = 0;
     unsigned long long inert = 0, scenery = 0, live = 0;
+    unsigned long long shadow_places = 0;
     unsigned long long angle_over_4096 = 0, upper_bits = 0;
+    unsigned long long place_flag_hist[16];
+    unsigned long long place_flag_yaw_zero[16];
+    unsigned long long place_allowed[3] = { 0, 0, 0 };
+    unsigned place_maps = 0, marker_all_maps = 0, marker_none_maps = 0;
+    unsigned marker_mixed_maps = 0;
     unsigned per_record[Q2_ITEM_COUNT];
     unsigned unknown_id[128];
     int unknown_count = 0;
+    char first_shadow_path[160] = "";
+    char first_shadow_group[13] = "";
+    char first_shadow_model[Q2_ITEM_MODEL_LEN + 1] = "";
+    q2_pop_place first_shadow_place;
 
     if (!d)
         return 1;
 
     memset(per_record, 0, sizeof(per_record));
+    memset(place_flag_hist, 0, sizeof(place_flag_hist));
+    memset(place_flag_yaw_zero, 0, sizeof(place_flag_yaw_zero));
 
     if (q2_identify(d, &id) != Q2_OK) {
         fprintf(stderr, "cannot identify this disc\n");
@@ -142,20 +154,20 @@ int cmd_items(disc *d)
 
     /* ------------------------------------------------------------------ */
     printf("  %-4s %-14s %-4s %-18s %-22s %-13s %s\n",
-           "id", "model", "fx", "caption", "effect", "flags", "clips");
+           "id", "model", "fx", "caption", "effect", "flags", "shadow verts");
     for (i = 0; i < table->count; i++) {
         const q2_item_def *e = &table->def[i];
-        char flags[64], clips[32], what[32];
+        char flags[64], shadow[32], what[32];
         u32 k;
 
         flag_text(e->flags, flags, sizeof(flags));
 
-        clips[0] = '\0';
-        for (k = 0; k < e->extra_count; k++)
-            snprintf(clips + strlen(clips), sizeof(clips) - strlen(clips),
-                     "%s%u", k ? "," : "", e->extra[k]);
-        if (!clips[0])
-            snprintf(clips, sizeof(clips), "-");
+        shadow[0] = '\0';
+        for (k = 0; k < e->shadow_vertex_count; k++)
+            snprintf(shadow + strlen(shadow), sizeof(shadow) - strlen(shadow),
+                     "%s%u", k ? "," : "", e->shadow_vertex[k]);
+        if (!shadow[0])
+            snprintf(shadow, sizeof(shadow), "-");
 
         if (e->effect == 0)
             snprintf(what, sizeof(what), "scenery");
@@ -173,7 +185,7 @@ int cmd_items(disc *d)
         printf("  %-4d %-14s %-4u %-18s %-22s %-22s %s\n",
                e->place_id, e->model, e->effect,
                q2_item_display_name(table, e->effect),
-               what, flags, clips);
+               what, flags, shadow);
     }
 
     /* ------------------------------------------------------------------ */
@@ -220,6 +232,8 @@ int cmd_items(disc *d)
         q2_population pop;
         q2_model_bank bank;
         bool have_bank;
+        unsigned map_flag_hist[16] = { 0 };
+        unsigned map_places = 0;
         u32 g;
 
         base = base ? base + 1 : file->path;
@@ -247,13 +261,22 @@ int cmd_items(disc *d)
 
                     places++;
 
-                    /* The spawner masks the halfword with 0xFFF and calls it a
-                     * heading. Count how often the upper nibble carries
-                     * anything, because that is what is still unexplained. */
-                    if ((pl.unk & 0x0FFFu) >= 4096u)
+                    /* 0x8007F538 reads the upper nibble before item spawn:
+                     * 0x2000/0x4000/0x8000 exclude skill 0/1/2. Keep the full
+                     * histogram visible so the remaining 0x1000 bit cannot be
+                     * mistaken for a difficulty flag merely by association. */
+                    if (Q2_POP_PLACE_ANGLE(pl.angle_flags) >= 4096u)
                         angle_over_4096++;
-                    if (pl.unk & 0xF000u)
+                    if (Q2_POP_PLACE_FLAGS(pl.angle_flags))
                         upper_bits++;
+                    place_flag_hist[pl.angle_flags >> 12]++;
+                    map_flag_hist[pl.angle_flags >> 12]++;
+                    map_places++;
+                    if (Q2_POP_PLACE_ANGLE(pl.angle_flags) == 0)
+                        place_flag_yaw_zero[pl.angle_flags >> 12]++;
+                    for (i = 0; i < 3; i++)
+                        if (q2_pop_place_allows_skill(pl.angle_flags, (s32)i))
+                            place_allowed[i]++;
 
                     if (!e) {
                         int seen = 0, u;
@@ -266,6 +289,22 @@ int cmd_items(disc *d)
                     }
                     resolved++;
                     per_record[(u32)(e - table->def)]++;
+
+                    if (e->shadow_vertex_count) {
+                        shadow_places++;
+                        if (!first_shadow_path[0]) {
+                            snprintf(first_shadow_path,
+                                     sizeof(first_shadow_path), "%s",
+                                     file->path);
+                            snprintf(first_shadow_group,
+                                     sizeof(first_shadow_group), "%s",
+                                     grp.name);
+                            snprintf(first_shadow_model,
+                                     sizeof(first_shadow_model), "%s",
+                                     e->model);
+                            first_shadow_place = pl;
+                        }
+                    }
 
                     if (e->effect == 0)
                         scenery++;
@@ -280,6 +319,20 @@ int cmd_items(disc *d)
                 }
             }
         }
+        if (map_places) {
+            unsigned marker_places = 0;
+
+            place_maps++;
+            for (g = 0; g < 16; g++)
+                if (g & 1u)
+                    marker_places += map_flag_hist[g];
+            if (marker_places == map_places)
+                marker_all_maps++;
+            else if (marker_places == 0)
+                marker_none_maps++;
+            else
+                marker_mixed_maps++;
+        }
         q2_common_close(&cf);
         q2_buf_free(&buf);
     }
@@ -290,9 +343,27 @@ int cmd_items(disc *d)
     printf("  carrying a live effect                   : %llu\n", live);
     printf("  carrying an effect with no handler       : %llu\n", inert);
     printf("  pure scenery (effect 0)                  : %llu\n", scenery);
+    printf("  carrying posed shadow vertices          : %llu\n", shadow_places);
+    if (first_shadow_path[0])
+        printf("    first: %s / %s / %s at (%d,%d,%d) yaw %u\n",
+               first_shadow_path, first_shadow_group, first_shadow_model,
+               first_shadow_place.x, first_shadow_place.y,
+               first_shadow_place.z,
+               Q2_POP_PLACE_ANGLE(first_shadow_place.angle_flags));
     printf("  angle field >= 4096 after masking 0xFFF  : %llu\n",
            angle_over_4096);
     printf("  place records with bits 12..15 set       : %llu\n", upper_bits);
+    printf("  place upper-nibble histogram (all / yaw0):\n");
+    for (i = 0; i < 16; i++) {
+        if (place_flag_hist[i])
+            printf("    %X000  %4llu / %4llu\n", i,
+                   place_flag_hist[i], place_flag_yaw_zero[i]);
+    }
+    printf("  bit 12 by map (all / none / mixed)       : %u / %u / %u"
+           " of %u\n", marker_all_maps, marker_none_maps,
+           marker_mixed_maps, place_maps);
+    printf("  allowed by skill easy / medium / hard   : %llu / %llu / %llu\n",
+           place_allowed[0], place_allowed[1], place_allowed[2]);
 
     if (unknown_count) {
         int u;

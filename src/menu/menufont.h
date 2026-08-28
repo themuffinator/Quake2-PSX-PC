@@ -150,6 +150,24 @@
 /* Which of the three a session uses (0x8003FEAC). */
 const char *q2_menu_icons_name(bool multiplayer, int players);
 
+/*
+ * QFRONT's arena-preview sheets. The renderer at module+0x2AD4 chooses slot 8
+ * for arenas 0..9 and slot 12 for 10..11. Their palettes are deliberately NOT
+ * the per-image CLUT8 blocks in SNDVRAM: the calls pass built-in palette ids 0
+ * and 3 to the shared textured-quad helper. Id 0 is the executable's exceptional
+ * 256-entry palette at (0,255); id 3 starts one of the packed 256-entry rows
+ * formed by the sixteen-entry built-in palettes.
+ */
+#define Q2_MENU_ARENA_SHEETS       2
+#define Q2_MENU_ARENA_NAME_0       "multipics.lbm"
+#define Q2_MENU_ARENA_NAME_1       "multipic2.lbm"
+#define Q2_MENU_ARENA_SLOT_0       8
+#define Q2_MENU_ARENA_SLOT_1      12
+#define Q2_MENU_ARENA_PAGE_X_0     9    /* slot x 576 / 64 */
+#define Q2_MENU_ARENA_PAGE_X_1    13    /* slot x 832 / 64 */
+#define Q2_MENU_ARENA_PAGE_Y       1
+#define Q2_MENU_ARENA_PALETTE_1    3
+
 /* ------------------------------------------------------------------------- */
 /* The three faces                                                            */
 /* ------------------------------------------------------------------------- */
@@ -196,15 +214,22 @@ typedef struct q2_menu_font {
     u16  icons_w, icons_h;
     bool icons_resident;
 
+    /* QFRONT's two 8bpp arena-thumbnail sheets. */
+    u16  arena_tpage[Q2_MENU_ARENA_SHEETS];
+    u16  arena_clut[Q2_MENU_ARENA_SHEETS];
+    bool arena_resident[Q2_MENU_ARENA_SHEETS];
+
     bool item_resident;          /* three maps carry no frontend.lbm         */
     bool small_resident;         /* two carry no chars.lbm                   */
 } q2_menu_font;
 
 /*
- * Upload both atlases, the icon sheet, and the executable's palette bank into
- * `vram` at the addresses the console used. Missing images are recorded rather
- * than treated as failures; the result is Q2_OK whenever anything was placed
- * and Q2_ERR_NOT_FOUND when the map carries none of them.
+ * Upload both arena-preview sheets, both font atlases, the icon sheet, and the
+ * executable's palette bank into `vram` at the addresses and in the order the
+ * console used. The order is observable because preview slot 12 aliases the
+ * font's slot 13; see menufont.c. Missing images are recorded rather than
+ * treated as failures; the result is Q2_OK whenever either font atlas was
+ * placed and Q2_ERR_NOT_FOUND when the map carries neither one.
  */
 q2_result q2_menu_font_upload(q2_menu_font *out, const q2_hud_tables *tab,
                               const q2_vram_section *section, psx_vram *vram,

@@ -188,7 +188,7 @@ static void fallback_light(q2_light *out, const s32 origin[3])
 }
 
 void q2_light_gather(q2_light_set *set, const q2_light_world *w,
-                     const s32 origin[3], s32 coll_node, bool view_space)
+                     const s32 origin[3], s32 coll_node, s16 entity_f4)
 {
     u32 i;
 
@@ -200,9 +200,9 @@ void q2_light_gather(q2_light_set *set, const q2_light_world *w,
     if (!w)
         return;
 
-    if (view_space) {
-        /* 0x8006B048: the view list, and nothing else — no world lights and no
-         * static ones. */
+    if (entity_f4 < 0) {
+        /* 0x8006B040 is `bgez`: only a negative +0xF4 reaches the view list at
+         * 0x8006B048, and then nothing else — no world or static lights. */
         for (i = 0; i < w->dynamic_view_count && i < Q2_DYNLIGHT_MAX; i++)
             q2_light_set_add(set, origin, &w->dynamic_view[i]);
         return;

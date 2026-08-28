@@ -73,7 +73,7 @@ typedef struct cd_track {
 /* ------------------------------------------------------------------------- */
 typedef struct disc_file {
     char  path[256];      /* '/'-separated, uppercase, no ";1" version suffix */
-    u32   lba;
+    u32   lba;            /* absolute disc LBA, rebased from the ISO extent    */
     u32   size;
     bool  form2;          /* payload is 2324-byte Form 2 (streamed media)     */
 } disc_file;
@@ -119,7 +119,8 @@ const disc_file *disc_find(const disc *d, const char *path);
  * demuxer wants. */
 q2_result disc_read_file(const disc *d, const char *path, q2_buf *out);
 
-/* Raw sector access, for the media demuxers that need the subheader. `out` must
+/* Raw sector access, for the media demuxers that need the subheader. Declared,
+ * physically stored INDEX 00 pregap sectors are addressable too. `out` must
  * hold at least CD_SECTOR_RAW bytes. Returns the full 2352-byte sector when the
  * source has one, or a synthesised sector for cooked images. */
 q2_result disc_read_raw_sector(const disc *d, u32 lba, u8 *out);

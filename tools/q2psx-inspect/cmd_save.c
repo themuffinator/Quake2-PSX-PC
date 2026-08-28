@@ -525,7 +525,8 @@ int cmd_save(const disc *d, const char *map, const char *out)
     printf("Q2PSX-PC save system\n\n");
     printf("format      %s version %d, chunked\n",
            Q2_SAVE_MAGIC, Q2_SAVE_VERSION);
-    printf("chunks      HEAD PLYR SIMS INVN CMBT PROJ EVNT TRIG ENTS MISN SETT\n");
+    printf("chunks      HEAD PLYR SIMS INVN CMBT PROJ EVNT TRIG ENTS ITEM "
+           "BRKS MOVR CREA MISN SETT\n");
     printf("slots       %d, the four rows of SAVE FILE\n", Q2_SAVE_SLOTS);
 
     /* Somewhere to work that is not the player's own save directory. */

@@ -51,6 +51,7 @@ bool q2_scene_get_node(const q2_scene *s, u32 index, q2_scene_node *out)
 
     out->mapmod_offset = q2_rd_u32(rec + 0x00);
     out->flags         = q2_rd_u16(rec + 0x08);
+    out->area          = q2_rd_u8(rec + 0x0E);
 
     for (i = 0; i < 3; i++) {
         out->bbox_min[i] = q2_rd_s32(rec + 0x10 + i * 4);

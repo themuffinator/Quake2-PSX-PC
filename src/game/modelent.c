@@ -13,6 +13,9 @@ static const char *const g_names[Q2_MODEL_ENT_KIND_COUNT] = {
     "Hexplosion"
 };
 
+/* 0x800AEAD4, packed into a1 for the 0x80075C34 call at 0x8005A744. */
+static const u8 g_explosion_light[3] = { 0xC0, 0x40, 0x31 };
+
 const char *q2_model_ent_name(q2_model_ent_kind kind)
 {
     if (kind < 0 || kind >= Q2_MODEL_ENT_KIND_COUNT)
@@ -178,6 +181,11 @@ q2_entity *q2_model_ent_spawn(q2_entity_set *set, const q2_model_bank *bank,
     e->surface = surface;              /* ent+0x9E */
     e->field90 = Q2_MODEL_ENT_FIELD90; /* ent+0x90 */
 
+    /* 0x8005A8E4..0x8005A910 copies the constant at 0x800AEAC8 into
+     * +0x2B0 and +0x2AC. It is 40 40 40 00: retail's ambient floor for the
+     * effect mesh, distinct from the C0/40/31 dynamic light below. */
+    e->glow[0] = e->glow[1] = e->glow[2] = Q2_MODEL_ENT_AMBIENT;
+
     /*
      * The two marks that make it EVICTABLE — the allocator at 0x8006C0F0 pairs
      * a non-zero +0xF4 with bit 0x01000000 of +0x10C and recycles anything
@@ -222,13 +230,20 @@ void q2_model_ent_think(q2_entity *e, q2_entity_world *w)
         return;
     }
 
-    /* +0xFE, which entitydraw multiplies into the instance matrix. */
+    /* +0xFE, the second lighting-intensity factor at 0x8006B298/0x8006B468. */
     e->fade = (s16)q2_model_ent_scale(e->frame);
 
     /*
-     * And the translucent quad's size operand, which nothing consumes yet.
-     * Recorded rather than dropped, for the reason modelent.h gives: a future
-     * flare emitter wants the console's own number and not a fresh guess.
+     * 0x8005A6E4..0x8005A764 builds a WORLD DYNAMIC LIGHT and calls
+     * 0x80075C34. The outer radius is the second ramp; the inner is exactly
+     * three quarters of it. The packed colour at 0x800AEAD4 is C0/40/31 and
+     * both style fields supplied from 0x800AEAB4 are zero.
+     *
+     * The game layer records the call as an event because the renderer owns
+     * the sixteen-entry runtime-light list. `client_drain_entity_events` turns
+     * this back into the same q2_light_add_dynamic call later in the frame.
      */
     e->flash = q2_model_ent_flash(e->frame);
+    q2_ent_light_at(&w->events, e->origin, g_explosion_light,
+                    (e->flash * 3) / 4, e->flash);
 }

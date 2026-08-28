@@ -7,6 +7,15 @@ target_link_libraries(test_surface PRIVATE
 
 add_test(NAME surface COMMAND test_surface)
 
+add_executable(test_disc test_disc.c)
+
+target_link_libraries(test_disc PRIVATE
+    q2psx_common
+    q2psx_disc
+)
+
+add_test(NAME disc_cue_layout COMMAND test_disc)
+
 add_executable(test_light test_light.c)
 
 target_link_libraries(test_light PRIVATE
@@ -286,6 +295,15 @@ target_link_libraries(test_stxenc PRIVATE
 )
 
 add_test(NAME movie_encoder COMMAND test_stxenc)
+
+add_executable(test_sound_pitch test_sound_pitch.c)
+
+target_link_libraries(test_sound_pitch PRIVATE
+    q2psx_common
+    q2psx_audio
+)
+
+add_test(NAME sound_pitch COMMAND test_sound_pitch)
 
 add_executable(test_explosive test_explosive.c)
 

@@ -67,7 +67,9 @@
 
 typedef enum q2_save_ui_mode {
     Q2_SAVE_UI_SAVE = 0,
-    Q2_SAVE_UI_LOAD
+    Q2_SAVE_UI_LOAD,
+    Q2_SAVE_UI_SETTINGS_SAVE,
+    Q2_SAVE_UI_SETTINGS_LOAD
 } q2_save_ui_mode;
 
 typedef enum q2_save_ui_status {
@@ -115,6 +117,12 @@ typedef struct q2_save_ui {
      * q2_save_ui_free releases whatever is left. */
     q2_save loaded;
     bool    have_loaded;
+
+    /* LOAD/SAVE SETTINGS: an opaque copy, because this layer deliberately
+     * does not know menu.h's field layout. */
+    q2_settings_blob settings_source;
+    q2_settings_blob settings_loaded;
+    bool             have_settings_loaded;
 } q2_save_ui;
 
 void q2_save_ui_init(q2_save_ui *ui);
@@ -128,6 +136,9 @@ void q2_save_ui_rescan(q2_save_ui *ui);
  * must outlive the session. */
 void q2_save_ui_open_save(q2_save_ui *ui, const q2_save *snapshot);
 void q2_save_ui_open_load(q2_save_ui *ui);
+void q2_save_ui_open_settings_save(q2_save_ui *ui,
+                                   const q2_settings_blob *settings);
+void q2_save_ui_open_settings_load(q2_save_ui *ui);
 
 /* Abandon the session. The status becomes CANCELLED. */
 void q2_save_ui_close(q2_save_ui *ui);
@@ -170,6 +181,7 @@ const char *q2_save_ui_row(const q2_save_ui *ui, int slot);
 /* Move the loaded snapshot out. Returns false when there is nothing to take;
  * on success `out` owns it and the ui no longer does. */
 bool q2_save_ui_take_loaded(q2_save_ui *ui, q2_save *out);
+bool q2_save_ui_take_settings(q2_save_ui *ui, q2_settings_blob *out);
 
 const char *q2_save_ui_status_name(q2_save_ui_status s);
 

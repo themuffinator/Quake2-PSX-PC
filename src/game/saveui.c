@@ -35,16 +35,33 @@ void q2_save_ui_rescan(q2_save_ui *ui)
     if (!ui)
         return;
 
-    q2_save_slots_scan(ui->info, Q2_SAVE_SLOTS);
-    for (i = 0; i < Q2_SAVE_SLOTS; i++)
-        q2_save_slot_row(&ui->info[i], i, ui->row[i],
-                         (u32)sizeof(ui->row[i]));
+    if (ui->mode == Q2_SAVE_UI_SETTINGS_SAVE ||
+        ui->mode == Q2_SAVE_UI_SETTINGS_LOAD) {
+        bool used[Q2_SAVE_SLOTS];
+
+        q2_settings_slots_scan(used, Q2_SAVE_SLOTS);
+        for (i = 0; i < Q2_SAVE_SLOTS; i++) {
+            memset(&ui->info[i], 0, sizeof(ui->info[i]));
+            ui->info[i].used = used[i];
+            if (used[i])
+                snprintf(ui->row[i], sizeof(ui->row[i]), "%d MULTIPLAYER",
+                         i + 1);
+            else
+                ui->row[i][0] = '\0';
+        }
+    } else {
+        q2_save_slots_scan(ui->info, Q2_SAVE_SLOTS);
+        for (i = 0; i < Q2_SAVE_SLOTS; i++)
+            q2_save_slot_row(&ui->info[i], i, ui->row[i],
+                             (u32)sizeof(ui->row[i]));
+    }
 }
 
 static void open_common(q2_save_ui *ui, q2_save_ui_mode mode)
 {
     q2_save_free(&ui->loaded);
     ui->have_loaded = false;
+    ui->have_settings_loaded = false;
 
     ui->open       = true;
     ui->mode       = mode;
@@ -73,6 +90,25 @@ void q2_save_ui_open_load(q2_save_ui *ui)
         return;
     open_common(ui, Q2_SAVE_UI_LOAD);
     ui->source = NULL;
+}
+
+void q2_save_ui_open_settings_save(q2_save_ui *ui,
+                                   const q2_settings_blob *settings)
+{
+    if (!ui || !settings)
+        return;
+    open_common(ui, Q2_SAVE_UI_SETTINGS_SAVE);
+    ui->source = NULL;
+    ui->settings_source = *settings;
+}
+
+void q2_save_ui_open_settings_load(q2_save_ui *ui)
+{
+    if (!ui)
+        return;
+    open_common(ui, Q2_SAVE_UI_SETTINGS_LOAD);
+    ui->source = NULL;
+    memset(&ui->settings_source, 0, sizeof(ui->settings_source));
 }
 
 void q2_save_ui_close(q2_save_ui *ui)
@@ -128,7 +164,8 @@ static void advance_from_list(q2_save_ui *ui)
     if (ui->slot < 0 || ui->slot >= Q2_SAVE_SLOTS)
         return;
 
-    if (ui->mode == Q2_SAVE_UI_LOAD) {
+    if (ui->mode == Q2_SAVE_UI_LOAD ||
+        ui->mode == Q2_SAVE_UI_SETTINGS_LOAD) {
         if (!ui->info[ui->slot].used) {
             set_message(ui, "NO SAVE", "IN THIS SLOT");
             return;
@@ -213,6 +250,25 @@ static void do_save(q2_save_ui *ui)
 {
     q2_result rc;
 
+    if (ui->mode == Q2_SAVE_UI_SETTINGS_SAVE) {
+        char where[Q2_SAVE_UI_MSG_MAX];
+
+        rc = q2_settings_slot_write(&ui->settings_source, ui->slot);
+        ui->last_error = rc;
+        if (rc != Q2_OK) {
+            char why[Q2_SAVE_UI_MSG_MAX];
+            ui->status = Q2_SAVE_UI_FAILED;
+            snprintf(why, sizeof(why), "%s", q2_result_str(rc));
+            set_message(ui, "SAVE FAILED", why);
+            return;
+        }
+        ui->status = Q2_SAVE_UI_SAVED;
+        snprintf(where, sizeof(where), "TO SLOT %d", ui->slot + 1);
+        set_message(ui, "SETTINGS SAVED", where);
+        q2_save_ui_rescan(ui);
+        return;
+    }
+
     if (!ui->source) {
         ui->last_error = Q2_ERR_INVALID_ARG;
         ui->status     = Q2_SAVE_UI_FAILED;
@@ -247,6 +303,23 @@ static void do_load(q2_save_ui *ui)
 {
     q2_result rc;
 
+    if (ui->mode == Q2_SAVE_UI_SETTINGS_LOAD) {
+        rc = q2_settings_slot_read(&ui->settings_loaded, ui->slot);
+        ui->last_error = rc;
+        ui->have_settings_loaded = false;
+        if (rc != Q2_OK) {
+            char why[Q2_SAVE_UI_MSG_MAX];
+            ui->status = Q2_SAVE_UI_FAILED;
+            snprintf(why, sizeof(why), "%s", q2_result_str(rc));
+            set_message(ui, "LOAD FAILED", why);
+            return;
+        }
+        ui->have_settings_loaded = true;
+        ui->status = Q2_SAVE_UI_LOADED;
+        set_message(ui, "SETTINGS LOADED", "MULTIPLAYER");
+        return;
+    }
+
     q2_save_free(&ui->loaded);
     ui->have_loaded = false;
 
@@ -280,7 +353,8 @@ q2_save_ui_status q2_save_ui_update(q2_save_ui *ui)
     if (ui->slot < 0 || ui->slot >= Q2_SAVE_SLOTS) {
         ui->status = Q2_SAVE_UI_FAILED;
         set_message(ui, "FAILED", "NO SLOT CHOSEN");
-    } else if (ui->mode == Q2_SAVE_UI_SAVE) {
+    } else if (ui->mode == Q2_SAVE_UI_SAVE ||
+               ui->mode == Q2_SAVE_UI_SETTINGS_SAVE) {
         do_save(ui);
     } else {
         do_load(ui);
@@ -319,6 +393,17 @@ bool q2_save_ui_take_loaded(q2_save_ui *ui, q2_save *out)
     *out = ui->loaded;
     memset(&ui->loaded, 0, sizeof(ui->loaded));
     ui->have_loaded = false;
+    return true;
+}
+
+bool q2_save_ui_take_settings(q2_save_ui *ui, q2_settings_blob *out)
+{
+    if (!ui || !out || !ui->have_settings_loaded)
+        return false;
+
+    *out = ui->settings_loaded;
+    memset(&ui->settings_loaded, 0, sizeof(ui->settings_loaded));
+    ui->have_settings_loaded = false;
     return true;
 }
 

@@ -16,8 +16,8 @@
  *         SpaceLights[ node[i].c_hi .. node[i+1].c_hi )
  *
  * where `c_hi` is the HIGH halfword of the collision node's 32-bit field at
- * +28 — the field FORMATS.md §3.4 recorded as `c`, "no instruction in the image
- * reads offset +28". It doesn't. It reads offset +30.
+ * +28. The low halfword is the PrimaryColl cell's SortData byte offset; this
+ * independent SecondaryCol consumer reads the high half at byte offset +30.
  *
  * Read out of the entity light gather at 0x8006B0C8:
  *

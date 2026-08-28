@@ -730,11 +730,11 @@ u32 q2_model_anim_count(const q2_model *m);
  *     position = record[18] + 30 * (frame - record[0])
  *
  * — reading a SIGNED halfword at +0 as the terminator. Block D's +0 is ASCII,
- * so it can never terminate that walk. The runtime table is therefore built
- * from block D at load rather than being block D, and the note at the top of
- * this file claims the build multiplies `+12/+14/+16` by 5. **That
- * transformation is unverified**, so nothing here feeds the animation path yet
- * — see openquestions #51e.
+ * so it can never terminate that walk. The runtime table is therefore not
+ * block D. The exact construction is still unlocated, but #97 closed the
+ * behavioural join: a creature move's disc-authored name selects block D and
+ * its start is converted from 2-per-frame to 10-per-frame at use time by
+ * q2_model_position_for_move().
  *
  * The surrounding facts are settled: the position is in tenths of an animation
  * frame (`0x8006B5D8` divides by 10, magic 0x66666667, keeping the remainder
@@ -780,10 +780,9 @@ bool q2_model_move_by_name(const q2_model *m, const char *name,
  *
  * `index` here is a BLOCK D move index, which is not a creature module's move
  * index: the Soldier's model has 31 moves and its module has 18, in a different
- * frame numbering (see #51h). So this does NOT yet replace
- * `q2_model_anim_by_length()` on the AI path — that still matches on length
- * with a `skip` to break ties. It replaces it only once a module's move can be
- * named or ordered into this table.
+ * frame numbering (see #51h). The client therefore reaches it through the
+ * module's disc-authored move NAME. Length matching survives only for the few
+ * module moves that genuinely have no recovered name.
  */
 bool q2_model_clip_for_move(const q2_model *m, u32 index, q2_model_anim *out);
 
@@ -821,6 +820,35 @@ bool q2_model_position_for_move(const q2_model *m, const char *move_name,
 
 /* Position units per AI frame within a move, from `0x8007EA44`. */
 #define Q2_MODEL_POS_PER_MOVE_FRAME 30
+
+/*
+ * The entity animation cursor at +0x100/+0xB0 in retail.
+ *
+ * AI chooses key bases in 10 Hz steps, 30 position units apart. Rendering
+ * samples BASE + PHASE, where 0x8007EB10 supplies a 0..29 phase in 1/300-second
+ * units; when the AI base changes, the phase returns to zero. 0x8006B924 then
+ * retains the remainder after division by ten for translation lerp /
+ * quaternion slerp. `q2_model_cursor_phase` reconstructs that first half;
+ * q2_model_pose_at already implements the second.
+ */
+typedef struct q2_model_cursor {
+    s32  position;       /* tenths of a model frame */
+    s32  target;
+    bool ready;
+} q2_model_cursor;
+
+void q2_model_cursor_reset(q2_model_cursor *c, s32 position);
+s32  q2_model_cursor_phase(q2_model_cursor *c, s32 base, s32 dt);
+
+/* Resolve a continuous position without discarding its sub-frame remainder.
+ * `within_tick` is ready to pass directly to q2_model_pose_at. The held form
+ * preserves the existing end-of-timeline fallback used for malformed/short
+ * authored pairings. */
+bool q2_model_anim_at_position(const q2_model *m, u32 position,
+                               q2_model_anim *out, u32 *within_tick);
+bool q2_model_anim_at_position_held(const q2_model *m, u32 position,
+                                    q2_model_anim *out, u32 *within_tick,
+                                    bool *clamped);
 
 /*
  * Decode one packed rotation word into a quaternion — `0x800699E8`.

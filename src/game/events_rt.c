@@ -111,6 +111,66 @@ bool q2_event_rt_trigger_named(q2_event_rt *rt, const char *name)
     return false;
 }
 
+void q2_event_rt_contacts_begin(q2_event_rt *rt)
+{
+    u32 i;
+
+    if (!rt || !rt->flags)
+        return;
+
+    for (i = 0; i < rt->record_count; i++)
+        rt->flags[i] &= (u8)~Q2_EVREC_RT1;
+}
+
+bool q2_event_rt_contact(q2_event_rt *rt, u32 offset)
+{
+    s32 slot;
+    u8 flags;
+
+    if (!rt || !rt->flags)
+        return false;
+
+    slot = record_slot(rt, offset);
+    if (slot < 0)
+        return false;
+
+    flags = rt->flags[slot];
+    rt->flags[slot] = flags | Q2_EVREC_RT1;
+
+    /* 0x80027F38..0x80027F54: CAT_B wins and runs continuously. Without it,
+     * CAT_A runs only while the previous-contact bit is clear. */
+    if ((flags & Q2_EVREC_CAT_B) ||
+        ((flags & (Q2_EVREC_CAT_A | Q2_EVREC_RT2)) == Q2_EVREC_CAT_A))
+        return q2_event_rt_trigger(rt, offset);
+
+    return true;
+}
+
+void q2_event_rt_contacts_end(q2_event_rt *rt)
+{
+    u32 i;
+
+    if (!rt || !rt->flags)
+        return;
+
+    for (i = 0; i < rt->record_count; i++) {
+        u8 flags = rt->flags[i];
+        bool now = (flags & Q2_EVREC_RT1) != 0;
+        bool was = (flags & Q2_EVREC_RT2) != 0;
+
+        /* 0x80028070..0x80028084: CAT_C plus previous contact and no current
+         * contact is the leave edge. */
+        if ((flags & Q2_EVREC_CAT_C) && was && !now)
+            q2_event_rt_trigger(rt, rt->offsets[i]);
+
+        /* 0x80028160..0x80028180: RT1 is copied to RT2, then RT1 is cleared. */
+        flags &= (u8)~(Q2_EVREC_RT1 | Q2_EVREC_RT2);
+        if (now)
+            flags |= Q2_EVREC_RT2;
+        rt->flags[i] = flags;
+    }
+}
+
 /* ------------------------------------------------------------------------- */
 /* Item handlers                                                              */
 /* ------------------------------------------------------------------------- */

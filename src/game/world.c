@@ -15,6 +15,274 @@
 #include "trig.h"
 #include "vram.h"
 
+/* ------------------------------------------------------------------------- */
+/* SortData screen changes — 0x80065804 / 0x80065D08.                        */
+/* ------------------------------------------------------------------------- */
+
+#define Q2_SORT_SCREEN_RECORDS 24
+
+typedef struct sort_screen_state {
+    psx_ot_area_screen record[Q2_SORT_SCREEN_RECORDS];
+    psx_ot_area_screen current;
+    u32 count; /* highest allocated index; record 0 is the seeded viewport */
+} sort_screen_state;
+
+static s16 sort_sub16(s32 a, s32 b)
+{
+    return (s16)((u16)a - (u16)b);
+}
+
+static void sort_rect_empty(psx_ot_area_screen *r, s16 add_x, s16 add_y)
+{
+    memset(r, 0, sizeof(*r));
+    r->add_x = add_x;
+    r->add_y = add_y;
+}
+
+static bool sort_rect_same_state(const psx_ot_area_screen *a,
+                                 const psx_ot_area_screen *b)
+{
+    return a->min_x == b->min_x && a->min_y == b->min_y &&
+           a->max_x == b->max_x && a->max_y == b->max_y &&
+           a->add_x == b->add_x && a->add_y == b->add_y;
+}
+
+static void sort_screen_begin(sort_screen_state *s,
+                              s16 clip_w, s16 clip_h,
+                              s16 add_x, s16 add_y)
+{
+    memset(s, 0, sizeof(*s));
+    s->record[0].max_x = clip_w;
+    s->record[0].max_y = clip_h;
+    s->record[0].add_x = add_x;
+    s->record[0].add_y = add_y;
+    s->current = s->record[0];
+}
+
+static const psx_ot_area_screen *sort_screen_parent(
+    const sort_screen_state *s, u32 index)
+{
+    if (index < Q2_SORT_SCREEN_RECORDS && index <= s->count)
+        return &s->record[index];
+    return &s->record[0];
+}
+
+/* SetDefDrawEnv stores both the clip origin and drawing offset at the same
+ * relative coordinate.  This packet restores the PREVIOUS screen state while
+ * the OT is walked in the reverse of the SortData construction order. */
+static bool sort_screen_emit_restore(psx_ot *ot, u32 console_bucket,
+                                     const psx_ot_area_screen *old)
+{
+    psx_prim *prim;
+
+    prim = psx_ot_add_bucket(ot,
+                             psx_ot_authored_bucket(ot, console_bucket));
+    if (!prim)
+        return false;
+    prim->kind = PSX_PRIM_DRAW_ENV;
+    prim->xy[0].x = (s16)(old->min_x + old->add_x);
+    prim->xy[0].y = (s16)(old->min_y + old->add_y);
+    prim->xy[1].x = (s16)(old->max_x - old->min_x);
+    prim->xy[1].y = (s16)(old->max_y - old->min_y);
+    prim->xy[2] = prim->xy[0];
+    return true;
+}
+
+static void sort_bounds_add(psx_ot_area_screen *r, s16 x, s16 y)
+{
+    if (x < r->min_x) r->min_x = x;
+    if (x > r->max_x) r->max_x = x;
+    if (y < r->min_y) r->min_y = y;
+    if (y > r->max_y) r->max_y = y;
+}
+
+static void sort_bounds_init(psx_ot_area_screen *r)
+{
+    memset(r, 0, sizeof(*r));
+    r->min_x = r->min_y = 1024;
+    r->max_x = r->max_y = -1024;
+}
+
+static void sort_bounds_merge(psx_ot_area_screen *dst,
+                              const psx_ot_area_screen *src)
+{
+    if (src->min_x < dst->min_x) dst->min_x = src->min_x;
+    if (src->min_y < dst->min_y) dst->min_y = src->min_y;
+    if (src->max_x > dst->max_x) dst->max_x = src->max_x;
+    if (src->max_y > dst->max_y) dst->max_y = src->max_y;
+}
+
+/* 0x8006637C..0x800663DC clamps each packed coordinate independently.  The
+ * low test reloads the parent's minimum and the high test reloads its maximum;
+ * confusing the latter reload for the old minimum collapses every portal which
+ * crosses the right or bottom edge to a zero-sized rectangle. */
+static void sort_rect_clamp_to_parent(psx_ot_area_screen *r,
+                                     const psx_ot_area_screen *parent)
+{
+    s16 *x[2] = { &r->min_x, &r->max_x };
+    s16 *y[2] = { &r->min_y, &r->max_y };
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        if (*x[i] < parent->min_x)
+            *x[i] = parent->min_x;
+        else if (*x[i] > parent->max_x)
+            *x[i] = parent->max_x;
+        if (*y[i] < parent->min_y)
+            *y[i] = parent->min_y;
+        else if (*y[i] > parent->max_y)
+            *y[i] = parent->max_y;
+    }
+}
+
+/*
+ * Opcode 1 is a SCREEN-REGION change, despite its historical ENTITY name in
+ * sortdata.h.  Its return value still controls a variable-width bitstream arm,
+ * but retail also retains the rectangle, changes SetGeomOffset for the wall run
+ * which follows, and associates the new region with f4's area.
+ */
+static bool sort_entity_projects(const q2_world_zone *z, s32 index,
+                                 u32 parent_index, u32 area,
+                                 u32 console_bucket,
+                                 const q2_camera *cam,
+                                 int screen_w, int screen_h,
+                                 psx_ot *ot, gte_state *gte,
+                                 const gte_matrix *view,
+                                 sort_screen_state *state,
+                                 q2_world_stats *stats)
+{
+    const psx_ot_area_screen *parent = sort_screen_parent(state, parent_index);
+    psx_ot_area_screen front, zero, out;
+    q2_scene_node node;
+    const q2_point_group *grp = NULL;
+    bool all_zero = true, all_positive = true;
+    bool valid_node;
+    s32 centre_x, centre_y;
+    u32 i;
+
+    centre_x = (cam->ofs_x || cam->ofs_y) ? cam->ofs_x : screen_w / 2;
+    centre_y = (cam->ofs_x || cam->ofs_y) ? cam->ofs_y : screen_h / 2;
+
+    /* 0x80065DD0 resets projection to the viewport centre before it measures
+     * the marker, irrespective of the region used by the preceding wall run. */
+    gte_set_projection(gte, cam->projection, centre_x, centre_y);
+    gte_set_rotation(gte, view);
+
+    valid_node = z && index >= 0 && (u32)index < z->scene.node_count &&
+                 (u32)index < z->points.group_count &&
+                 q2_scene_get_node(&z->scene, (u32)index, &node);
+
+    /* Hidden markers pass three packed zeroes to 0x80065804.  The old port
+     * returned TRUE here; that selects the wrong SortData arm after
+     * OBJDRAWOFF and corrupts every node reference which follows it. */
+    if (!valid_node || q2_scene_flags_nodraw(node.flags) ||
+        (z->node_hidden && (u32)index < z->node_hidden_count &&
+         z->node_hidden[index])) {
+        sort_rect_empty(&out, 0, 0);
+    } else {
+        s16 rel[3];
+
+        grp = &z->points.groups[index];
+        rel[0] = sort_sub16(node.origin[0], cam->pos[0]);
+        rel[1] = sort_sub16(node.origin[1], cam->pos[1]);
+        rel[2] = sort_sub16(node.origin[2], cam->pos[2]);
+        gte->v[0].x = rel[0];
+        gte->v[0].y = rel[1];
+        gte->v[0].z = rel[2];
+        gte_mvmva(gte, 1, 0, 0, 3, 0);
+        gte_set_translation(gte, gte->mac[0], gte->mac[1], gte->mac[2]);
+
+        sort_bounds_init(&front);
+        sort_bounds_init(&zero);
+
+        for (i = 0; i < grp->count; i++) {
+            q2_point pt;
+            psx_ot_area_screen *bounds;
+
+            if (!q2_points_get(&z->points, grp->first + i, &pt))
+                continue;
+            gte->v[0].x = pt.x;
+            gte->v[0].y = pt.y;
+            gte->v[0].z = pt.z;
+            gte_rtps(gte, false);
+
+            if (gte->sz[3] != 0) {
+                all_zero = false;
+                bounds = &front;
+            } else {
+                all_positive = false;
+                bounds = &zero;
+            }
+            sort_bounds_add(bounds, gte->sxy[2].x, gte->sxy[2].y);
+        }
+
+        if (all_zero) {
+            s32 mid[3];
+
+            /* A group wholly at/behind SZ=0 is accepted as its parent region
+             * unless the transformed stored AABB centre is farther than 200
+             * units behind the camera. */
+            for (i = 0; i < 3; i++) {
+                mid[i] = (node.bbox_min[i] + node.bbox_max[i]) / 2;
+                gte->v[0].x = (i == 0) ? sort_sub16(mid[i], cam->pos[i])
+                                       : gte->v[0].x;
+                gte->v[0].y = (i == 1) ? sort_sub16(mid[i], cam->pos[i])
+                                       : gte->v[0].y;
+                gte->v[0].z = (i == 2) ? sort_sub16(mid[i], cam->pos[i])
+                                       : gte->v[0].z;
+            }
+            gte_mvmva(gte, 1, 0, 0, 3, 0);
+            if (gte->mac[2] < -200)
+                sort_rect_empty(&out, 0, 0);
+            else
+                out = *parent;
+        } else if (!all_positive &&
+                   ((front.min_x > 0 && front.max_x < screen_w) ||
+                    (front.min_y > 0 && front.max_y < screen_h))) {
+            /* A mixed near-plane group whose positive-depth projection lies
+             * strictly inside either screen axis expands to the parent. */
+            out = *parent;
+        } else {
+            sort_bounds_merge(&front, &zero);
+            out = front;
+            out.add_x = parent->add_x;
+            out.add_y = parent->add_y;
+            sort_rect_clamp_to_parent(&out, parent);
+        }
+
+        /* 0x80065848 normalises every packed point rectangle to literal zero;
+         * it does not retain a non-zero collapsed coordinate. */
+        if (!q2_world_sort_region_visible(&out)) {
+            s16 add_x = out.add_x, add_y = out.add_y;
+            sort_rect_empty(&out, add_x, add_y);
+        }
+    }
+
+    /* Record zero is seeded; every call increments first and writes record N.
+     * Shipped streams stay below the 24-record retail allocation. */
+    state->count++;
+    if (state->count < Q2_SORT_SCREEN_RECORDS)
+        state->record[state->count] = out;
+    else if (state->count == Q2_SORT_SCREEN_RECORDS)
+        Q2_WARN("SortData screen-change record pool exceeded retail's 24 entries");
+
+    if (!sort_rect_same_state(&out, &state->current)) {
+        if (!sort_screen_emit_restore(ot, console_bucket, &state->current) &&
+            stats)
+            stats->ot_overflow++;
+    }
+    state->current = out;
+
+    /* The following Scene run is projected relative to the new region. */
+    gte_set_projection(gte, cam->projection,
+                       centre_x - out.min_x, centre_y - out.min_y);
+
+    if (q2_world_sort_region_visible(&out))
+        psx_ot_area_register_screen(ot, area & 0x7Fu,
+                                    console_bucket, &out);
+    return q2_world_sort_region_visible(&out);
+}
+
 q2_result q2_world_load_zone(q2_world_zone *out, const disc *d,
                              const char *map, int zone_index)
 {
@@ -75,6 +343,51 @@ q2_result q2_world_load_zone(q2_world_zone *out, const disc *d,
         return Q2_ERR_BAD_FORMAT;
     }
 
+    return Q2_OK;
+}
+
+q2_result q2_world_move_zone(q2_world_zone *dst, q2_world_zone *src)
+{
+    q2_world_zone copy;
+    q2_result r;
+
+    if (!dst || !src)
+        return Q2_ERR_INVALID_ARG;
+    if (dst == src)
+        return Q2_OK;
+
+    /* Save the fields whose pointers either address the zone buffer directly
+     * (Scene/Points) or are caller-owned runtime attachments. The zone file
+     * itself must be moved separately so its chunk[] entries are re-resolved
+     * against the DESTINATION archive's inline directory. See level.h. */
+    copy = *src;
+
+    q2_world_free_zone(dst);
+    r = q2_zone_move(&dst->zone, &src->zone);
+    if (r != Q2_OK) {
+        q2_points_free(&copy.points);
+        memset(src, 0, sizeof(*src));
+        memset(dst, 0, sizeof(*dst));
+        return r;
+    }
+
+    dst->scene             = copy.scene;
+    dst->points            = copy.points;
+    memcpy(dst->name, copy.name, sizeof(dst->name));
+    dst->node_filter       = copy.node_filter;
+    dst->node_filter_count = copy.node_filter_count;
+    dst->movers            = copy.movers;
+    dst->node_hidden       = copy.node_hidden;
+    dst->node_hidden_count = copy.node_hidden_count;
+    dst->sort              = copy.sort;
+    dst->sort_offset       = copy.sort_offset;
+    dst->sort_area         = copy.sort_area;
+    dst->rotators          = copy.rotators;
+    dst->lights            = copy.lights;
+    dst->light_node        = copy.light_node;
+
+    /* The groups allocation and the zone buffer now belong to dst. */
+    memset(src, 0, sizeof(*src));
     return Q2_OK;
 }
 
@@ -201,11 +514,11 @@ static psx_prim *emit_quad(psx_ot *ot,
                            const world_quad *q,
                            const q2_mapmod_poly *poly,
                            s32 forced_bucket,
+                           s32 batch,
                            q2_world_stats *stats)
 {
     psx_prim *prim;
     u32 otz;
-    u32 span;
     s32 far;
     int i;
 
@@ -218,10 +531,7 @@ static psx_prim *emit_quad(psx_ot *ot,
             stats->depth_max = otz;
     }
 
-    span = psx_ot_bucket_span(ot);
     far  = cam->sort_range > 0 ? cam->sort_range : Q2_CAMERA_SORT_RANGE;
-    if (span == 0)
-        span = 1;
 
     /*
      * A forced bucket is the authored one: the whole node goes into the bucket
@@ -229,7 +539,11 @@ static psx_prim *emit_quad(psx_ot *ot,
      * the console's behaviour — see sortdata.h — and the depth mapping below is
      * the port's stand-in for when no order is supplied.
      */
-    if (forced_bucket >= 0) {
+    if (batch >= 0) {
+        /* Bit-14 is a Standard (bounds-aware) private chain. It must stay
+         * atomic until the regional dependency graph is drained. */
+        prim = psx_ot_batch_add(ot, batch);
+    } else if (forced_bucket >= 0) {
         /*
          * A CONSOLE bucket, so it is scaled on the way in like every other
          * console constant that names a bucket outright — q2_screen_view_otz,
@@ -240,10 +554,8 @@ static psx_prim *emit_quad(psx_ot *ot,
          * authored world was packed into the far ninth of a 408-bucket slice
          * while every entity sharing that slice spread across all of it.
          */
-        otz = (u32)forced_bucket * PSX_OT_SUBDIV;
-        if (otz >= span)
-            otz = span - 1;
-        prim = psx_ot_add_bucket(ot, ot->window_len ? ot->window_base + otz : otz);
+        otz = psx_ot_authored_bucket(ot, (u32)forced_bucket);
+        prim = psx_ot_add_bucket(ot, otz);
     } else {
         /*
          * ONE MAPPING for everything that shares the slice. The world used to
@@ -358,6 +670,7 @@ static u32 emit_subdivided(psx_ot *ot,
                            const world_quad *flat,
                            const q2_mapmod_poly *poly,
                            s32 forced_bucket,
+                           s32 batch,
                            q2_world_stats *stats)
 {
     enum { N = Q2_SURF_SUBDIV_STEPS, V = Q2_SURF_SUBDIV_STEPS + 1 };
@@ -498,7 +811,8 @@ static u32 emit_subdivided(psx_ot *ot,
                 }
             }
 
-            if (emit_quad(ot, cam, render, &sub, poly, forced_bucket, stats))
+            if (emit_quad(ot, cam, render, &sub, poly, forced_bucket,
+                          batch, stats))
                 emitted++;
         }
     }
@@ -518,7 +832,9 @@ u32 q2_world_build_ot(const q2_world_zone *z,
     gte_matrix rot, spin;
     q2_world_render local;
     q2_sort_reader order;
+    sort_screen_state screen_state;
     bool have_order = false;
+    bool have_screen_state = false;
     u32 next_node = 0;
     u32 emitted = 0;
     u32 n;
@@ -543,6 +859,10 @@ u32 q2_world_build_ot(const q2_world_zone *z,
      */
     if (ot->window_len == 0)
         psx_ot_clear(ot);
+
+    /* Area records are per viewport. In split screen the primitive table must
+     * retain earlier views while this routing map must not. */
+    psx_ot_area_clear(ot);
 
     gte_init(gte);
     /*
@@ -580,9 +900,30 @@ u32 q2_world_build_ot(const q2_world_zone *z,
      * those are genuinely different renderings rather than two granularities of
      * the same one.
      */
-    if (z->sort && z->sort->data)
+    if (z->sort && z->sort->data) {
         have_order = q2_sort_begin(&order, z->sort, z->sort_offset,
                                    Q2_SORT_BUCKET_START);
+        if (have_order) {
+            s32 centre_x = (cam->ofs_x || cam->ofs_y)
+                          ? cam->ofs_x : screen_w / 2;
+            s32 centre_y = (cam->ofs_x || cam->ofs_y)
+                          ? cam->ofs_y : screen_h / 2;
+            s16 clip_w = (s16)(cam->clip_w > 0 ? cam->clip_w : screen_w);
+            s16 clip_h = (s16)(cam->clip_h > 0 ? cam->clip_h : screen_h);
+            s16 add_x = (s16)(screen_w - clip_w);
+            s16 add_y = (s16)(screen_h - clip_h);
+
+            sort_screen_begin(&screen_state, clip_w, clip_h, add_x, add_y);
+            have_screen_state = true;
+            psx_ot_area_prepare(ot, (s16)screen_w, (s16)screen_h,
+                                add_x, add_y,
+                                (s16)centre_x, (s16)centre_y);
+            psx_ot_area_register_screen(ot, z->sort_area & 0x7Fu,
+                                        Q2_SORT_BUCKET_SEED,
+                                        &screen_state.record[0]);
+            if (stats) stats->sort_areas_registered++;
+        }
+    }
 
     for (;;) {
         q2_scene_node node;
@@ -592,6 +933,11 @@ u32 q2_world_build_ot(const q2_world_zone *z,
         s16 spin_angles[3], spin_pivot[3];
         bool spin_active = false;
         s32 forced_bucket = -1;
+        s32 batch = PSX_OT_BATCH_INVALID;
+        s32 deferred_area = -1;
+        s32 mover_shift[3] = { 0, 0, 0 };
+        s32 active_clip_w = cam->clip_w > 0 ? cam->clip_w : screen_w;
+        s32 active_clip_h = cam->clip_h > 0 ? cam->clip_h : screen_h;
         u32 p;
         s32 translation[3];
 
@@ -602,10 +948,19 @@ u32 q2_world_build_ot(const q2_world_zone *z,
                 break;
 
             if (it.kind == Q2_SORT_ENTITY) {
-                /* Models are drawn by their own emitter, so nothing is placed
-                 * here — but the bucket must still step, because that stepping
-                 * is what the world's own order is measured against. */
-                q2_sort_entity_resolve(&order, true);
+                bool visible = sort_entity_projects(
+                    z, it.f1, it.f3 & 0xFFu, it.f4 & 0xFFu, it.bucket,
+                    cam, screen_w, screen_h, ot, gte, &rot,
+                    &screen_state, stats);
+
+                if (stats) {
+                    stats->sort_entities++;
+                    if (visible) stats->sort_entities_visible++;
+                    else         stats->sort_entities_degenerate++;
+                    if (visible && (it.f4 & 0x7Fu) < PSX_OT_AREA_RETAIL_COUNT)
+                        stats->sort_areas_registered++;
+                }
+                q2_sort_entity_resolve(&order, visible);
                 continue;
             }
 
@@ -656,11 +1011,27 @@ u32 q2_world_build_ot(const q2_world_zone *z,
         /*
          * Bit 14 puts the node on the deferred path (0x80066524): one depth for
          * the whole node from its projected origin, registered against a table
-         * keyed on `unk0E`. The port draws it inline for now and counts it, so
-         * the difference is visible rather than silent.
+         * keyed on the area byte at +0x0E. Its private packet chain is retained
+         * through the other regional emitters and joined at the viewport's
+         * 0x80046E14-equivalent final drain.
          */
-        if (q2_scene_flags_deferred(node.flags) && stats)
-            stats->nodes_deferred++;
+        if (q2_scene_flags_deferred(node.flags)) {
+            u32 resolved;
+
+            if (stats)
+                stats->nodes_deferred++;
+
+            /* A stale area is not drained by 0x80046E14. Rendering it in the
+             * node's inline bucket is not a conservative fallback: it makes a
+             * wall feature from a non-visible portal paint over this one. */
+            if (have_order) {
+                if (!psx_ot_area_bucket(ot, node.area & 0x7Fu, &resolved)) {
+                    if (stats) stats->nodes_deferred_culled++;
+                    continue;
+                }
+                deferred_area = (s32)(node.area & 0x7Fu);
+            }
+        }
 
         if (!q2_scene_get_mapmod(&z->scene, n, &rec)) {
             if (stats) stats->quads_rejected_bad++;
@@ -694,6 +1065,20 @@ u32 q2_world_build_ot(const q2_world_zone *z,
         }
 
         grp = &z->points.groups[n];
+
+        /* The four world linkers read the packed CURRENT region extent at
+         * 0x800B2E90 (0x800AFA8C / AFCEC / AFF50 / B0108), not the viewport's
+         * original clip.  The GTE coordinates have already been made local by
+         * `centre - region.min`, so testing them against the full viewport lets
+         * portal-exterior polygons into a private run and defeats the DRAWENV
+         * boundary which is supposed to make that run atomic.
+         */
+        if (have_screen_state) {
+            active_clip_w = screen_state.current.max_x
+                          - screen_state.current.min_x;
+            active_clip_h = screen_state.current.max_y
+                          - screen_state.current.min_y;
+        }
         if (stats) {
             stats->nodes_visited++;
             stats->quads_total += rec.num_polys;
@@ -723,8 +1108,12 @@ u32 q2_world_build_ot(const q2_world_zone *z,
         {
             s32 shift[3] = { 0, 0, 0 };
 
-            if (z->movers)
-                q2_movers_node_offset(z->movers, n, shift);
+            if (z->movers) {
+                q2_movers_node_offset(z->movers, n, mover_shift);
+                shift[0] = mover_shift[0];
+                shift[1] = mover_shift[1];
+                shift[2] = mover_shift[2];
+            }
 
             spin_active = z->rotators &&
                           q2_rotators_node_transform(z->rotators, n,
@@ -797,6 +1186,29 @@ u32 q2_world_build_ot(const q2_world_zone *z,
                                 (s32)(tx >> Q2_FRAC_12),
                                 (s32)(ty >> Q2_FRAC_12),
                                 (s32)(tz >> Q2_FRAC_12));
+        }
+
+        if (deferred_area >= 0) {
+            s32 bounds_min[3], bounds_max[3];
+            int axis;
+
+            /* 0x80066560 zeroes a local SVECTOR and RTPS projects it once for
+             * the 20-byte deferred batch record. Every quad in the node uses
+             * this one signed +4 value; per-quad depth would be a different
+             * sorter. +8 points at the node AABB with only the mover's linear
+             * +0x12 displacement added (0x80066614..0x8006669C). */
+            gte->v[0].x = 0;
+            gte->v[0].y = 0;
+            gte->v[0].z = 0;
+            gte_rtps(gte, false);
+            for (axis = 0; axis < 3; axis++) {
+                bounds_min[axis] = node.bbox_min[axis] + mover_shift[axis];
+                bounds_max[axis] = node.bbox_max[axis] + mover_shift[axis];
+            }
+            batch = psx_ot_batch_begin_box(
+                        ot, (u32)deferred_area, false,
+                        (s16)(gte->sz[3] ? gte->sz[3] : 1u),
+                        bounds_min, bounds_max, cam->pos);
         }
 
         for (p = 0; p < rec.num_polys; p++) {
@@ -936,18 +1348,21 @@ u32 q2_world_build_ot(const q2_world_zone *z,
                  * Variant 1 (0x800AFDA0-0x800AFDEC) has no escape: it needs at
                  * least one corner inside on each axis.
                  */
-                if (cam->clip_w > 0 && cam->clip_h > 0) {
+                if (active_clip_w <= 0 || active_clip_h <= 0) {
+                    if (stats) stats->quads_rejected_bounds++;
+                    continue;
+                } else {
                     int k, in_x = 0, in_y = 0;
                     int lo_x = 0, hi_x = 0, lo_y = 0, hi_y = 0;
 
                     for (k = 0; k < 4; k++) {
                         s32 sx = screen[k].x, sy = screen[k].y;
 
-                        if (sx >= 0 && sx < cam->clip_w) in_x++;
+                        if (sx >= 0 && sx < active_clip_w) in_x++;
                         else if (sx < 0)                 lo_x++;
                         else                             hi_x++;
 
-                        if (sy >= 0 && sy < cam->clip_h) in_y++;
+                        if (sy >= 0 && sy < active_clip_h) in_y++;
                         else if (sy < 0)                 lo_y++;
                         else                             hi_y++;
                     }
@@ -1101,7 +1516,7 @@ u32 q2_world_build_ot(const q2_world_zone *z,
                                              render->pressure)) {
                     u32 sub = emit_subdivided(ot, gte, cam, render,
                                               pt, &q, &poly, forced_bucket,
-                                              stats);
+                                              batch, stats);
                     if (sub) {
                         emitted += sub;
                         if (stats) stats->quads_subdivided++;
@@ -1111,11 +1526,40 @@ u32 q2_world_build_ot(const q2_world_zone *z,
                     continue;
                 }
 
-                prim = emit_quad(ot, cam, render, &q, &poly, forced_bucket, stats);
+                prim = emit_quad(ot, cam, render, &q, &poly, forced_bucket,
+                                 batch, stats);
                 if (prim)
                     emitted++;
             }
         }
+    }
+
+    if (have_screen_state) {
+        psx_ot_area_screen full = screen_state.record[0];
+        s32 centre_x = (cam->ofs_x || cam->ofs_y)
+                       ? cam->ofs_x : screen_w / 2;
+        s32 centre_y = (cam->ofs_x || cam->ofs_y)
+                       ? cam->ofs_y : screen_h / 2;
+
+        /* The final call uses view+274/+276, not the shake-reduced initial
+         * record copied from the draw globals. */
+        full.min_x = full.min_y = 0;
+        full.max_x = (s16)screen_w;
+        full.max_y = (s16)screen_h;
+
+        /* 0x80067DFC..0x80067E68 makes one final 0x80065804 call with the
+         * full viewport, bucket 1 and area -1.  This is not the viewport's
+         * structural DRAWENV being rewritten: that full env is linked later,
+         * so it executes first in bucket 1, then this packet restores the last
+         * portal region for the low-numbered run which follows the final
+         * marker.  Folding the two into one override puts area-2/private
+         * chains on the wrong side of the state change.
+         */
+        if (!sort_rect_same_state(&full, &screen_state.current) &&
+            !sort_screen_emit_restore(ot, 1, &screen_state.current) && stats)
+            stats->ot_overflow++;
+        screen_state.current = full;
+        gte_set_projection(gte, cam->projection, centre_x, centre_y);
     }
 
     /*
@@ -1146,6 +1590,13 @@ u32 q2_world_build_ot(const q2_world_zone *z,
                                                           : screen_w);
         view.extent[1] = (s16)((cam->ext_w || cam->ext_h) ? cam->ext_h
                                                           : screen_h);
+
+        /* Flares are a viewport pass, not a portal-region run. */
+        gte_set_projection(gte, cam->projection,
+                           (cam->ofs_x || cam->ofs_y) ? cam->ofs_x
+                                                     : screen_w / 2,
+                           (cam->ofs_x || cam->ofs_y) ? cam->ofs_y
+                                                     : screen_h / 2);
 
         /*
          * One bucket for all of them, as the original has. Nearest in the

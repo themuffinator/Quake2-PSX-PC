@@ -57,7 +57,7 @@
  *   6. ent+0x90 = 128, ent+0x9E = the SURFACE byte (the second argument),
  *      ent+0xA0 = ent+0xA2 = -1.
  *
- * `explosive.h`'s caller passes `scene[node].unk0E & 0x7F` for the surface and
+ * `explosive.h`'s caller passes `scene[node].area & 0x7F` for the surface and
  * a fixed 4096 for the radius, so both of those are already decoded on the
  * other side.
  *
@@ -68,7 +68,8 @@
  *     if (ent[+0x100] >= lh(model + 2) * 10)   ; +2 is the TOTAL clip length
  *         remove(ent)                             ; 0x8006D280
  *     ent[+0xFE] = clamp(25 * (320 - ent[+0x100]), 0, 4096)
- *     ...and a translucent quad, see below
+ *     outer = clamp(51 * (320 - t), 0, 4096) * 1300 / 4096
+ *     light(ent+0xA4, C0/40/31, outer * 3 / 4, outer, style 0)
  *
  * THREE THINGS ABOUT THAT ARE LOAD-BEARING.
  *
@@ -86,50 +87,46 @@
  * at 0x8005A630, over `lh(model + 2)` — which is the sum of every clip's
  * frames and not the current clip's, on 1,723 of 1,723 models
  * (`q2psx-inspect modelents`). It matters only for a multi-clip effect model,
- * and `Explosion` has one clip of 40 — so it lives 400 units, and 400 is
- * exactly where the scale ramp below reaches zero. That agreement is the sort
- * of thing that says both readings are right.
+ * and `Explosion` has one clip of 40 — so it lives 400 units. Its lighting
+ * ramp has already reached zero by then, as the code below records.
  *
  * ---------------------------------------------------------------------------
- * +0xFE is a SECOND scale, and the draw multiplies the two
+ * +0xFE is a SECOND lighting intensity, and the draw multiplies the two
  * ---------------------------------------------------------------------------
- * `0x8006B298` builds the instance matrix from BOTH:
+ * `0x8006B298` builds the GTE light matrix from BOTH:
  *
  *     8006B298  lh   v1, 252(s2)      ; +0xFC, the one this port already has
  *     8006B29C  lh   v0, 254(s2)      ; +0xFE, the one it did not
  *     8006B2A4  mult v1, v0
  *     8006B2BC  sra  a1, v1, 11       ; ...and the product scales each row
  *
- * and the allocator initialises BOTH to 4096 (0x8006C1B8..0x8006C1C0), so the
- * default pair is the identity however the >> 11 is normalised downstream.
- * This port folds them as `(scale * fade) >> 12` so that the default pair is
- * exactly `Q2_ONE_12` and every entity that existed before this module looks
- * the same as it did.
+ * The destination passed as `a1` is 0x800DDD1C; 0x8006BBD4 immediately installs
+ * it with SetLightMatrix. The model rotation installed next is independently
+ * composed from entity+0x2C0. At 0x8006B468 the same product scales the ambient
+ * back colour, so +0xFE changes illumination and never geometry.
  *
  * That is why `q2_entity.fade` defaults to Q2_ONE_12 and not to zero: an
- * entity that forgets to set it would otherwise collapse to a point.
+ * entity that forgets to set it would otherwise render black.
  *
  * The ramp itself is `25 * (320 - t)` clamped into [0, 4096]. It sits at the
  * ceiling until t = 156 and then falls to nothing at t = 320 — so an explosion
- * holds full size for the first 39% of its life and shrinks away over the rest.
+ * holds full brightness for the first 39% of its life and darkens over the
+ * rest. Its mesh does not shrink.
  *
  * ---------------------------------------------------------------------------
- * What is NOT reconstructed, and said rather than faked
+ * The tail is a dynamic light, not a sprite
  * ---------------------------------------------------------------------------
  * The think's tail (0x8005A6E4..0x8005A764) computes a second ramp —
  * `clamp(51 * (320 - t), 0, 4096) * 1300 / 4096`, then three quarters of it —
- * and hands it to `0x80075C34`, which is a PRIMITIVE EMITTER: it allocates out
- * of the buffer at gp+18624, bounded by 0x800E3ED8, and pokes a
- * semi-transparency field into the primitive's first word. So the explosion
- * also draws a translucent quad at its own origin, every frame, sized by that
- * ramp — a flash on top of the model.
+ * and hands both radii to `0x80075C34`. That address is the runtime-light
+ * appender reconstructed as `q2_light_add_dynamic`: it writes one 28-byte
+ * light into the sixteen-entry world list bounded by 0x800E3ED8. It is not a
+ * primitive emitter and does not draw a translucent quad.
  *
- * This module drives the MODEL and not the quad. The quad wants the flare path
- * (flare.h) rather than the entity path, its colour operands live in two
- * gp-relative blobs at 0x800AEAD4 and 0x800AEAB4 that are not decoded, and
- * inventing it would put a bright sprite in front of geometry the port cannot
- * yet place correctly. `q2_model_ent_flash` computes the ramp anyway and
- * records it on the entity, so the operand is there when the emitter is.
+ * The colour operand at 0x800AEAD4 is C0/40/31 and the style/size bytes at
+ * 0x800AEAB4 are both zero. The port raises that exact light through the
+ * entity-event seam every tick, so the explosion model lights actors around
+ * it just as retail did.
  */
 #ifndef Q2PSX_MODELENT_H
 #define Q2PSX_MODELENT_H
@@ -158,12 +155,15 @@ const char *q2_model_ent_name(q2_model_ent_kind kind);
 /* ent+0x90, written with 128 at 0x8005A9D8. No reader is decoded yet. */
 #define Q2_MODEL_ENT_FIELD90    128
 
+/* 0x800AEAC8, copied to entity+0x2AC by 0x8005A8E4..0x8005A910. */
+#define Q2_MODEL_ENT_AMBIENT    0x40
+
 /* The think's three constants — see the header comment. */
 #define Q2_MODEL_ENT_CLOCK_RATE 2      /* 0x8005A618: dt is doubled       */
 #define Q2_MODEL_ENT_LIFE_MUL   10     /* 0x8005A630: clip_length x 10    */
 #define Q2_MODEL_ENT_RAMP_BASE  320    /* 0x8005A654                      */
 #define Q2_MODEL_ENT_RAMP_SCALE 25     /* 0x8005A668, the model's ramp    */
-#define Q2_MODEL_ENT_FLASH_SCALE 51    /* 0x8005A69C, the quad's          */
+#define Q2_MODEL_ENT_FLASH_SCALE 51    /* 0x8005A69C, the light radius    */
 
 
 /*
@@ -180,7 +180,7 @@ bool q2_model_ent_height(const q2_model_bank *bank, const char *name,
  * Spawn one — 0x8005A778.
  *
  * `at` is the world point the effect happens at; `surface` is the byte the
- * caller wants at ent+0x9E (opcode 0x08 passes the Scene node's `unk0E & 0x7F`).
+ * caller wants at ent+0x9E (opcode 0x08 passes the Scene node's `area & 0x7F`).
  *
  * Returns the entity, or NULL when the pool is full or the map's CastList does
  * not carry the name. A NULL return is a real outcome and not an error: three
@@ -197,9 +197,9 @@ void q2_model_ent_think(q2_entity *e, q2_entity_world *w);
 /*
  * The two ramps, separated so both are testable and neither is buried.
  *
- * `q2_model_ent_scale` is +0xFE, which the draw multiplies into the instance
- * matrix. `q2_model_ent_flash` is the translucent quad's size operand, which
- * nothing consumes yet — see the header.
+ * `q2_model_ent_scale` is the historically named +0xFE lighting ramp.
+ * `q2_model_ent_flash` is the dynamic light's outer radius; its think emits
+ * three quarters of it as the inner radius.
  */
 s32 q2_model_ent_scale(s32 clock);
 s32 q2_model_ent_flash(s32 clock);

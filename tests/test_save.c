@@ -80,6 +80,13 @@ static void clear_slots(void)
         q2_save_slot_delete(i);
 }
 
+static void clear_settings_slots(void)
+{
+    int i;
+    for (i = 0; i < Q2_SAVE_SLOTS; i++)
+        q2_settings_slot_delete(i);
+}
+
 /* ------------------------------------------------------------------------- */
 /* A sim with something in every corner of it, so the round trip has something */
 /* to lose.                                                                    */
@@ -178,6 +185,222 @@ static void attach_fake_world(q2_sim *sim, u32 triggers, u32 entities)
 }
 
 /* ------------------------------------------------------------------------- */
+/* A three-group Population for the deferred-item save regression.            */
+/* ------------------------------------------------------------------------- */
+static void batch_put_u32(u8 *p, u32 v)
+{
+    p[0] = (u8)v;
+    p[1] = (u8)(v >> 8);
+    p[2] = (u8)(v >> 16);
+    p[3] = (u8)(v >> 24);
+}
+
+static void batch_put_group(u8 *buf, u32 at, const char *name, u32 places)
+{
+    memset(buf + at, 0, Q2_POP_GROUP_SIZE);
+    memcpy(buf + at, name, strlen(name));
+    batch_put_u32(buf + at + 0x10, places);
+}
+
+static void batch_put_place(u8 *buf, u32 at, s32 x, u16 id)
+{
+    memset(buf + at, 0, Q2_POP_PLACE_SIZE);
+    batch_put_u32(buf + at, (u32)x);
+    buf[at + 14] = (u8)id;
+    buf[at + 15] = (u8)(id >> 8);
+    batch_put_u32(buf + at + Q2_POP_PLACE_SIZE, Q2_POP_TERM_FFFF);
+}
+
+/*
+ * The allocator reuses a collected item's slot. That makes this sequence the
+ * hard case for a save:
+ *
+ *   Zone0 starts in slot 0 -> collected -> Second reuses slot 0 -> First
+ *   appends at slot 1.
+ *
+ * Replaying a bitmap in Population order would instead build First, Second;
+ * replaying the right order without stable place keys would still leave the
+ * fresh Zone0 template in slot 0. The ITEM chunk has to carry both facts.
+ */
+static void test_deferred_item_group_restore(void)
+{
+    enum {
+        ZONE_PLACE   = 80,
+        FIRST_PLACE  = ZONE_PLACE + Q2_POP_PLACE_SIZE + 4,
+        SECOND_PLACE = FIRST_PLACE + Q2_POP_PLACE_SIZE + 4,
+        POP_SIZE     = SECOND_PLACE + Q2_POP_PLACE_SIZE + 4
+    };
+    u8 population[POP_SIZE];
+    dat_chunk pop_chunk;
+    q2_common_file common;
+    q2_sim source, restored;
+    q2_save saved, loaded;
+    q2_result applied;
+
+    printf("deferred item group restore\n");
+
+    memset(population, 0, sizeof(population));
+    batch_put_group(population, 0,  "Zone0",  ZONE_PLACE);
+    batch_put_group(population, 24, "First",  FIRST_PLACE);
+    batch_put_group(population, 48, "Second", SECOND_PLACE);
+    batch_put_u32(population + 72, 0);       /* group-table terminator */
+
+    /* All three use the same item id deliberately: place_id alone cannot
+     * distinguish which group owns a reconstructed slot. */
+    batch_put_place(population, ZONE_PLACE,   1000, 27); /* Shells P */
+    batch_put_place(population, FIRST_PLACE,  2000, 27);
+    batch_put_place(population, SECOND_PLACE, 3000, 27);
+
+    memset(&pop_chunk, 0, sizeof(pop_chunk));
+    pop_chunk.data = population;
+    pop_chunk.size = sizeof(population);
+    memset(&common, 0, sizeof(common));
+    common.chunk[Q2_COMMON_POPULATION] = &pop_chunk;
+
+    q2_sim_init(&source, NULL, 50);
+    check_eq_i(q2_sim_attach_items(&source, &common, 0, NULL, NULL), Q2_OK,
+               "source attaches the synthetic Population");
+    check_eq_i(source.entities.count, 1, "only resident Zone0 starts live");
+    check_eq_i(source.entities.ent[0].population_group, 0,
+               "the startup entity is keyed to Zone0");
+
+    q2_entity_remove(&source.entities.ent[0]);
+    check(!source.entities.ent[0].in_use,
+          "collecting the startup item leaves an allocator hole");
+
+    check_eq_i(q2_sim_activate_item_group(&source, "Second"), 1,
+               "the later Population row activates first");
+    check_eq_i(source.entities.count, 1,
+               "Second reuses the collected Zone0 slot");
+    check_eq_i(source.entities.ent[0].population_group, 2,
+               "the reused slot keeps Second's stable group key");
+    check_eq_i(q2_sim_activate_item_group(&source, "First"), 1,
+               "the earlier Population row activates second");
+    check_eq_i(source.entities.count, 2, "First appends after the reused slot");
+    check_eq_i(source.item_group_order_count, 3,
+               "the source records startup plus both dynamic groups");
+    check_eq_i(source.item_group_order[0], 0, "Zone0 is the startup prefix");
+    check_eq_i(source.item_group_order[1], 2,
+               "Second retains its actual activation position");
+    check_eq_i(source.item_group_order[2], 1,
+               "First is not sorted back into Population order");
+
+    /* Mutable ENTS state must still land on the physical slots selected by
+     * the stable keys after the roster is rebuilt. */
+    source.entities.ent[0].pos[0] = 32002;
+    source.entities.ent[0].hidden = true;
+    source.entities.ent[0].taken[0] = true;
+    source.entities.ent[1].pos[0] = 21001;
+    source.entities.ent[1].scale = 1024;
+
+    check_eq_i(q2_save_capture(&saved, &source, NULL,
+                               "SLES-01534", "BASE1", 0), Q2_OK,
+               "captures a dynamically activated item roster");
+    check(saved.item_state_present, "capture emits the version-5 ITEM state");
+    check_eq_i(saved.item_population_group_count, 3,
+               "ITEM records the Population group count");
+    check_eq_i(saved.item_group_order_count, 3,
+               "ITEM records every first-run latch");
+    check_eq_i(saved.item_group_order[1], 2,
+               "capture preserves reversed activation order");
+    check_eq_i(saved.item_key_count, 2,
+               "ITEM carries one stable key per ENTS slot");
+    check_eq_i(saved.item_keys[0].group, 2,
+               "the reused physical slot is keyed to Second");
+    check_eq_i(saved.item_keys[1].group, 1,
+               "the appended physical slot is keyed to First");
+
+    check_eq_i(q2_save_write(&saved, tmp_path()), Q2_OK,
+               "writes the deferred-item save");
+    check_eq_i(q2_save_read(&loaded, tmp_path()), Q2_OK,
+               "reads the deferred-item save");
+    check(loaded.item_state_present, "the ITEM chunk survives the file");
+    check_eq_i(loaded.item_group_order_count, 3,
+               "the activation order survives the file");
+    check_eq_i(loaded.item_group_order[1], 2,
+               "the reversed middle entry survives the file");
+    check_eq_i(loaded.item_keys[0].group, 2,
+               "stable slot identity survives the file");
+
+    q2_sim_init(&restored, NULL, 50);
+    check_eq_i(q2_sim_attach_items(&restored, &common, 0, NULL, NULL), Q2_OK,
+               "load starts from a fresh startup roster");
+    check_eq_i(restored.entities.count, 1,
+               "the fresh roster initially contains Zone0 only");
+
+    loaded.item_state_present = false;
+    applied = q2_save_apply(&loaded, &restored, NULL,
+                            "SLES-01534", "BASE1");
+    check_eq_i(applied, Q2_ERR_BAD_FORMAT,
+               "a Population-backed v5 save cannot omit ITEM");
+    check_eq_i(restored.entities.count, 1,
+               "a missing ITEM rejection leaves the roster untouched");
+    loaded.item_state_present = true;
+
+    loaded.item_keys[0].slot = 99;
+    applied = q2_save_apply(&loaded, &restored, NULL,
+                            "SLES-01534", "BASE1");
+    check_eq_i(applied, Q2_ERR_BAD_FORMAT,
+               "apply rejects a stable key absent from the Population");
+    check_eq_i(restored.entities.count, 1,
+               "a rejected roster rebuild leaves the entity set untouched");
+    check_eq_i(restored.entities.ent[0].population_group, 0,
+               "a rejected rebuild leaves the startup entity untouched");
+    check_eq_i(restored.item_group_order_count, 1,
+               "a rejected rebuild does not commit deferred latches");
+    check(restored.item_group_run[0] && !restored.item_group_run[1] &&
+              !restored.item_group_run[2],
+          "a rejected rebuild leaves the startup latch bitmap untouched");
+
+    loaded.item_keys[0].slot = 0;
+    applied = q2_save_apply(&loaded, &restored, NULL,
+                            "SLES-01534", "BASE1");
+    check_eq_i(applied, Q2_OK,
+               "apply rebuilds dynamic items without an entity-count mismatch");
+    check_eq_i(restored.entities.count, 2,
+               "the collected startup item stays absent after load");
+    check_eq_i(restored.entities.ent[0].population_group, 2,
+               "Second returns to its reused physical slot");
+    check_eq_i(restored.entities.ent[1].population_group, 1,
+               "First returns to its appended physical slot");
+    check_eq_i(restored.entities.ent[0].pos[0], 32002,
+               "Second's mutable ENTS state follows its key");
+    check(restored.entities.ent[0].hidden,
+          "Second's hidden state follows its key");
+    check(restored.entities.ent[0].taken[0],
+          "Second's per-player taken bit follows its key");
+    check_eq_i(restored.entities.ent[1].pos[0], 21001,
+               "First's mutable ENTS state follows its key");
+    check_eq_i(restored.entities.ent[1].scale, 1024,
+               "First's scale follows its key");
+
+    check(restored.item_group_run[0] && restored.item_group_run[1] &&
+              restored.item_group_run[2],
+          "all startup and dynamic one-shot latches are restored");
+    check_eq_i(restored.item_group_order_count, 3,
+               "the restored order contains each group once");
+    check_eq_i(restored.item_group_order[0], 0,
+               "the restored order keeps the startup prefix");
+    check_eq_i(restored.item_group_order[1], 2,
+               "the restored order keeps Second before First");
+    check_eq_i(restored.item_group_order[2], 1,
+               "the restored order keeps First last");
+
+    check_eq_i(q2_sim_activate_item_group(&restored, "Second"), 0,
+               "Second cannot duplicate after load");
+    check_eq_i(q2_sim_activate_item_group(&restored, "First"), 0,
+               "First cannot duplicate after load");
+    check_eq_i(restored.entities.count, 2,
+               "repeated post-load CREBATCH calls leave the roster unchanged");
+
+    q2_save_free(&saved);
+    q2_save_free(&loaded);
+    q2_sim_free(&source);
+    q2_sim_free(&restored);
+    remove(tmp_path());
+}
+
+/* ------------------------------------------------------------------------- */
 static void test_round_trip(void)
 {
     q2_sim sim;
@@ -218,9 +441,13 @@ static void test_round_trip(void)
     check_eq_i(saved.player.pos[0], 1234, "captured x");
     check_eq_i(saved.zone, 2, "captured zone");
     check_eq_i(saved.entity_count, 4, "captured every entity slot");
+    check(!saved.item_state_present,
+          "a sim without Population keeps the optional ITEM chunk absent");
 
     check(q2_save_write(&saved, tmp_path()) == Q2_OK, "writes to disk");
     check(q2_save_read(&loaded, tmp_path()) == Q2_OK, "reads back");
+    check(!loaded.item_state_present,
+          "a version-5 no-Population file may omit ITEM");
 
     /* --- identity ------------------------------------------------------- */
     check(strcmp(loaded.map, "BASE1") == 0, "map name survives");
@@ -623,6 +850,50 @@ static void test_rejects_bad_files(void)
 }
 
 /*
+ * This is a checksum-valid, chunk-valid pre-batch fixture: the captured sim
+ * has no Population state and therefore no ITEM chunk. Only its header is
+ * relabelled as the old version, exactly as a save written before deferred
+ * item rosters existed would be. Rejecting it at the header proves we cannot
+ * fall through to the unsafe by-index entity or old PROJ interpretation.
+ */
+static void test_rejects_pre_batch_v4(void)
+{
+    q2_sim sim;
+    q2_inventory inv;
+    q2_save saved, loaded;
+    const char *path = tmp_path();
+    const u8 v4[4] = { 4, 0, 0, 0 };
+    FILE *f;
+
+    printf("pre-batch version 4\n");
+
+    check_eq_i(Q2_SAVE_VERSION, 5, "the incompatible format is version 5");
+    build_state(&sim, &inv);
+    check_eq_i(q2_save_capture(&saved, &sim, &inv,
+                               "SLES-01534", "BASE1", 0), Q2_OK,
+               "captures the pre-batch-shaped state");
+    check(!saved.item_state_present, "the fixture has no ITEM history");
+    check_eq_i(q2_save_write(&saved, path), Q2_OK,
+               "writes a checksum-valid fixture body");
+
+    f = fopen(path, "r+b");
+    if (!f) {
+        check(false, "reopens the fixture header");
+    } else {
+        check(fseek(f, 4, SEEK_SET) == 0 &&
+              fwrite(v4, 1, sizeof(v4), f) == sizeof(v4),
+              "marks the fixture as version 4");
+        fclose(f);
+        check_eq_i(q2_save_read(&loaded, path), Q2_ERR_UNSUPPORTED,
+                   "rejects a valid v4 body before interpreting its chunks");
+    }
+
+    q2_save_free(&saved);
+    q2_sim_free(&sim);
+    remove(path);
+}
+
+/*
  * A file that is the right length and wrong in the middle. The chunk sizes
  * cannot catch this; the checksum is what exists for it, and a save system
  * without one turns a bad byte into a game that behaves strangely.
@@ -809,6 +1080,96 @@ static void test_slot_scan_survives_rubbish(void)
     clear_slots();
 }
 
+/* QFRONT distinguishes multiplayer settings from game saves with its file
+ * type flag. The host backend does the same with a separate four-slot format. */
+static void test_settings_slots_and_ui(void)
+{
+    q2_settings_blob source, loaded;
+    q2_save_ui ui;
+    bool used[Q2_SAVE_SLOTS];
+    char path[512];
+    FILE *f;
+    int i;
+
+    printf("multiplayer settings slots\n");
+    q2_save_set_dir(tmp_dir());
+    clear_settings_slots();
+
+    memset(&source, 0, sizeof(source));
+    source.count = 9;
+    for (i = 0; i < (int)source.count; i++)
+        source.value[i] = (s16)(i == 7 ? -1 : i * 17 - 40);
+
+    check_eq_i(q2_settings_slots_scan(used, Q2_SAVE_SLOTS), 0,
+               "no settings slots begin in use");
+    check(q2_settings_slot_write(&source, 2) == Q2_OK,
+          "writes settings slot 3");
+    check(q2_settings_slot_write(&source, Q2_SAVE_SLOTS) == Q2_ERR_RANGE,
+          "rejects an out-of-range settings slot");
+    check_eq_i(q2_settings_slots_scan(used, Q2_SAVE_SLOTS), 1,
+               "one settings slot is in use");
+    check(used[2] && !used[0], "the settings scan preserves positions");
+    check(q2_settings_slot_read(&loaded, 2) == Q2_OK,
+          "reads settings back");
+    check_eq_i(loaded.count, source.count, "the settings count survives");
+    check_eq_i(loaded.value[7], -1, "signed settings survive");
+
+    /* The settings mode drives the same deferred card flow and does not list
+     * game-save files as settings files. */
+    q2_save_ui_init(&ui);
+    q2_save_ui_open_settings_load(&ui);
+    check(q2_save_ui_row(&ui, 0)[0] == '\0',
+          "a game-save position is empty in the settings listing");
+    check(strstr(q2_save_ui_row(&ui, 2), "MULTIPLAYER") != NULL,
+          "a settings row identifies its file type");
+    q2_save_ui_choose(&ui, 2);
+    q2_save_ui_request(&ui, Q2_SAVEUI_STATE_LIST);
+    check_eq_i(q2_save_ui_poll(&ui), Q2_SAVEUI_STATE_BUSY,
+               "settings load enters the busy state");
+    check_eq_i(q2_save_ui_update(&ui), Q2_SAVE_UI_LOADED,
+               "settings load completes");
+    check(q2_save_ui_take_settings(&ui, &loaded),
+          "the loaded settings can be collected");
+    check_eq_i(loaded.value[8], source.value[8],
+               "the UI returns the complete payload");
+    q2_save_ui_acknowledge(&ui);
+    q2_save_ui_free(&ui);
+
+    /* A save to a different empty position is deferred, then immediately
+     * appears in a fresh settings scan. */
+    q2_save_ui_init(&ui);
+    q2_save_ui_open_settings_save(&ui, &source);
+    q2_save_ui_choose(&ui, 1);
+    q2_save_ui_request(&ui, Q2_SAVEUI_STATE_LIST);
+    check_eq_i(q2_save_ui_update(&ui), Q2_SAVE_UI_SAVED,
+               "settings save completes");
+    check(strstr(ui.message, "SETTINGS") != NULL,
+          "the report names settings, not a game");
+    check(q2_save_ui_row(&ui, 1)[0] != '\0',
+          "the written settings row appears");
+    q2_save_ui_acknowledge(&ui);
+    q2_save_ui_free(&ui);
+
+    /* CRC validation applies to the small format too. */
+    check(q2_settings_slot_path(2, path, (u32)sizeof(path)) == Q2_OK,
+          "resolves a settings path");
+    f = fopen(path, "r+b");
+    if (f) {
+        int byte;
+        fseek(f, 20, SEEK_SET);
+        byte = fgetc(f);
+        fseek(f, 20, SEEK_SET);
+        fputc(byte ^ 0x40, f);
+        fclose(f);
+        check(q2_settings_slot_read(&loaded, 2) == Q2_ERR_BAD_FORMAT,
+              "a corrupt settings payload fails its checksum");
+    } else {
+        check(false, "opens a settings slot for corruption");
+    }
+
+    clear_settings_slots();
+}
+
 /* ------------------------------------------------------------------------- */
 /* The front end's three entry points, without a screen                        */
 /* ------------------------------------------------------------------------- */
@@ -977,14 +1338,17 @@ int main(void)
 {
     printf("Q2PSX-PC save tests\n\n");
 
+    test_deferred_item_group_restore();
     test_round_trip();
     test_apply();
     test_apply_rejects_mismatched_map();
     test_rejects_bad_files();
+    test_rejects_pre_batch_v4();
     test_detects_corruption();
     test_mission_and_settings();
     test_slots();
     test_slot_scan_survives_rubbish();
+    test_settings_slots_and_ui();
     test_ui_save_flow();
     test_ui_load_flow();
     test_ui_reports_failure();

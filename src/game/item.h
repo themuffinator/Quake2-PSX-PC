@@ -175,7 +175,9 @@ typedef struct q2_item_spawn_stats {
     u32 inert;          /* spawned, but its effect index has no handler    */
     u32 scenery;        /* spawned with effect 0 — decoration by design    */
     u32 no_memory;
+    u32 skill_filtered; /* +0x0C difficulty flags rejected this place       */
     u32 other_zone;     /* groups skipped: their name claims another zone  */
+    u32 not_selected;   /* unzoned groups the LevelBin did not select       */
 } q2_item_spawn_stats;
 
 /*
@@ -194,37 +196,54 @@ q2_entity *q2_item_spawn(q2_entity_set *set, const q2_pop_place *place,
                          q2_collision *coll);
 
 /*
- * Every place record of every group the loaded zone could own. Path groups
- * carry place lists too — the two lists are independent — so unlike the creature
- * walk this does not skip them.
+ * Every place record of every group selected for the loaded zone. Path groups
+ * carry place lists too — the two lists are independent — so unlike the
+ * creature walk this does not skip them.
  *
  * `zone` drops the groups the disc says belong somewhere else: a group whose
  * name claims a zone (q2_pop_group_zone) is spawned only when that is the zone
  * being loaded. Pass -1 for every group regardless, which is what a census over
  * a whole map wants.
  *
- * ---------------------------------------------------------------------------
- * Why this is a filter and not a selection
- * ---------------------------------------------------------------------------
- * The engine does not spawn a group because it is there. A script selects it by
- * name and the spawn pass runs only what has been selected — see the long note
- * on q2_pop_group_zone. The selecting scripts live in the `LevelBin` modules,
- * which this port does not run, so no caller can reproduce the real set.
+ * `levelbin` is the map's own LevelBin module. `q2_levelbin_selected` recovers
+ * its calls to the retail group selector, so an unzoned group such as `Weapons`
+ * or `ShotgunRoom` spawns only when the module selected it. This is the same
+ * rule `q2_creature_world_hold_batches` applies to creature groups. A resident
+ * `Zone<N>` group remains the fallback when the module is absent or empty;
+ * unzoned script batches do not appear early.
  *
- * What it CAN do is refuse the case the disc settles on its own. A group named
- * `Zone3` cannot belong to the zone-1 load under any reading of that mechanism,
- * so it is dropped. A group named `Weapons` or `ShotgunRoom` claims nothing
- * either way, and dropping it would invent an absence exactly as spawning
- * `Zone3` invents a presence — so it is kept, and the level is over-populated by
- * its script-triggered batches rather than by four other zones as well.
+ * Before either spawner runs, retail's list walker at `0x8007F538` rejects a
+ * place carrying NOT_EASY / NOT_MEDIUM / NOT_HARD for the current global
+ * skill. Zone -1 remains a raw census and deliberately bypasses that filter.
  *
- * That is a KNOWN divergence in both directions and it is the honest one
- * available until the level modules run.
+ * `group_run` is optional. When supplied it has `pop->group_count` bytes and
+ * records every group this startup pass actually ran, ready for
+ * q2_item_spawn_group to enforce the same retail bit-1 latch at runtime.
  */
 q2_result q2_item_spawn_zone(q2_entity_set *set, const q2_population *pop,
-                             int zone, const q2_item_table *table,
+                             int zone, const u8 *levelbin, u32 levelbin_size,
+                             const q2_item_table *table,
                              q2_collision *coll,
+                             u8 *group_run,
                              q2_item_spawn_stats *stats);
+
+/*
+ * Spawn one Population group's place list by its twelve-byte name.
+ *
+ * `group_run`, when non-NULL, has `pop->group_count` bytes and is the port's
+ * shadow of the Population group flags' retail bit-1 latch. A group selected
+ * at level load or by CREBATCH sets its byte before the place-list walk; asking
+ * for it again succeeds but spawns nothing. Pass the same bitmap to
+ * `q2_item_spawn_zone` and this function so startup and runtime selection share
+ * one latch.
+ */
+q2_result q2_item_spawn_group(q2_entity_set *set,
+                              const q2_population *pop,
+                              const char *group,
+                              const q2_item_table *table,
+                              q2_collision *coll,
+                              u8 *group_run,
+                              q2_item_spawn_stats *stats);
 
 /* Every group of the map, whichever zone it names. `q2_item_spawn_zone` with
  * -1, kept under its own name because a census is a different intent. */

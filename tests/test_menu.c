@@ -12,7 +12,9 @@
 #include "menu.h"
 #include "menufont.h"
 #include "menumouse.h"
+#include "prompt.h"
 
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -43,6 +45,69 @@ static void open_menu(q2_menu *m, q2_menu_settings *s, bool multiplayer)
     q2_menu_open(m);
     q2_menu_advance(m, 0);   /* burn the settle frame */
     (void)q2_menu_take_request(m);
+}
+
+/*
+ * 0x8003FE20 registers multipic2.lbm before frontend.lbm. Their placement
+ * overlaps: slot 12's 256-byte 8bpp row reaches x 832..959, while slot 13's
+ * 128-byte 4bpp row replaces x 896..959. The preview renderer samples only
+ * the surviving left half. This order is therefore data, not housekeeping.
+ */
+static void test_font_upload_alias_order(void)
+{
+    static u8 packed[] = {
+        0x80, 0x11, 0x82, 0x11, /* 129 + 127 bytes: multipic2 */
+        0x81, 0x22              /* 128 bytes: frontend font  */
+    };
+    q2_vram_image image[2];
+    q2_vram_section section;
+    q2_hud_tables tab;
+    q2_menu_font font;
+    psx_vram *vram;
+
+    memset(image, 0, sizeof(image));
+    memset(&section, 0, sizeof(section));
+    memset(&tab, 0, sizeof(tab));
+
+    image[0].offset       = 0;
+    image[0].packed_size  = 4;
+    image[0].width        = 256;
+    image[0].height       = 1;
+    image[0].decoded_size = 256;
+    image[0].name         = Q2_MENU_ARENA_NAME_1;
+    image[1].offset       = 4;
+    image[1].packed_size  = 2;
+    image[1].width        = 128;
+    image[1].height       = 1;
+    image[1].decoded_size = 128;
+    image[1].name         = Q2_MENU_ATLAS_NAME;
+
+    section.buf.data    = packed;
+    section.buf.size    = sizeof(packed);
+    section.images      = image;
+    section.image_count = 2;
+
+    vram = (psx_vram *)calloc(1, sizeof(*vram));
+    CHECK(vram != NULL, "allocate synthetic VRAM");
+    if (!vram)
+        return;
+
+    CHECK(q2_menu_font_upload(&font, &tab, &section, vram, false, 1) == Q2_OK,
+          "synthetic font upload succeeds");
+    CHECK(font.arena_resident[1] && font.item_resident,
+          "both aliased images are resident");
+    CHECK(vram->px[256][832] == 0x1111,
+          "preview remains in the left half: %04x", vram->px[256][832]);
+    CHECK(vram->px[256][895] == 0x1111,
+          "preview reaches its sampled edge: %04x", vram->px[256][895]);
+    CHECK(vram->px[256][896] == 0x2222,
+          "font replaces preview's unused right half: %04x",
+          vram->px[256][896]);
+    CHECK(vram->px[256][959] == 0x2222,
+          "font survives through the shared page edge: %04x",
+          vram->px[256][959]);
+
+    free(vram);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -483,6 +548,162 @@ static void test_video_variant(void)
     CHECK(mp->count == 3, "multiplayer video has %u items", mp->count);
     CHECK(strcmp(mp->items[0].label, "HORIZONTAL SPLIT") == 0,
           "multiplayer item 0 is %s", mp->items[0].label);
+}
+
+/* QFRONT+0x4AD8/+0x50D0/+0x49F8: the complete local-match front end. */
+static void test_front_multiplayer_setup(void)
+{
+    static const u8 vars_count[4] = { 3, 5, 7, 9 };
+    q2_menu_settings s;
+    q2_menu m;
+    const q2_menu_page *p;
+    int level;
+
+    q2_menu_settings_defaults(&s);
+    q2_menu_init(&m, &s, Q2_MENU_SCREEN_H);
+    q2_menu_set_controller_count(&m, 3);
+    q2_menu_open(&m);
+    q2_menu_advance(&m, 0);
+    q2_menu_goto(&m, Q2_PAGE_FRONT_MULTI);
+
+    /* The shared mode action derives the mode from the selected row. */
+    m.cursor = 0;
+    tap(&m, Q2_PAD_CROSS);
+    CHECK(m.page_id == Q2_PAGE_FRONT_DMSETUP, "DM opens page %d", m.page_id);
+    CHECK(m.mp_setup.mode == Q2_MENU_MP_DEATHMATCH, "DM mode is %d",
+          m.mp_setup.mode);
+    CHECK(strcmp(m.page->title, "DEATHMATCH") == 0, "DM banner is %s",
+          m.page->title);
+    CHECK(m.page->count == 6 && m.page->addr == 0x8010F914u,
+          "DM setup is %u rows at %08x", m.page->count, m.page->addr);
+    CHECK(strcmp(q2_menu_item_text(&m, 0), "2 PLAYERS") == 0,
+          "player row is %s", q2_menu_item_text(&m, 0));
+    CHECK(strcmp(q2_menu_item_text(&m, 1), "COLD STORAGE") == 0,
+          "arena row is %s", q2_menu_item_text(&m, 1));
+    CHECK(strcmp(q2_menu_item_text(&m, 2), "TIME LIMIT 10") == 0,
+          "time row is %s", q2_menu_item_text(&m, 2));
+    CHECK(strcmp(q2_menu_item_text(&m, 3), "FRAG LIMIT 10") == 0,
+          "frag row is %s", q2_menu_item_text(&m, 3));
+
+    /* Player count clamps, while every indexed option wraps. */
+    m.cursor = 0;
+    tap(&m, Q2_PAD_LEFT);
+    CHECK(m.mp_setup.players == 2, "players clamp low at %d", m.mp_setup.players);
+    tap(&m, Q2_PAD_RIGHT);
+    tap(&m, Q2_PAD_RIGHT);
+    CHECK(m.mp_setup.players == 3, "players clamp to controllers at %d",
+          m.mp_setup.players);
+
+    m.cursor = 1;
+    tap(&m, Q2_PAD_LEFT);
+    CHECK(m.mp_setup.arena == 11 &&
+          strcmp(q2_menu_item_text(&m, 1), "BADLANDS") == 0,
+          "arena wraps left to %d/%s", m.mp_setup.arena,
+          q2_menu_item_text(&m, 1));
+    tap(&m, Q2_PAD_RIGHT);
+    CHECK(m.mp_setup.arena == 0, "arena wraps right to %d", m.mp_setup.arena);
+
+    m.cursor = 2;
+    m.mp_setup.time_option = 0;
+    tap(&m, Q2_PAD_LEFT);
+    CHECK(m.mp_setup.time_option == 11 &&
+          strcmp(q2_menu_item_text(&m, 2), "TIME LIMIT  i") == 0,
+          "time wraps to NONE: %d/%s", m.mp_setup.time_option,
+          q2_menu_item_text(&m, 2));
+    m.cursor = 3;
+    m.mp_setup.frag_option = 0;
+    tap(&m, Q2_PAD_LEFT);
+    CHECK(m.mp_setup.frag_option == 8 &&
+          strcmp(q2_menu_item_text(&m, 3), "FRAG LIMIT  i") == 0,
+          "frag wraps to NONE: %d/%s", m.mp_setup.frag_option,
+          q2_menu_item_text(&m, 3));
+
+    /* This is QFRONT's own page-12 layout, not PAUSED's page 42. */
+    q2_menu_set_cheat_level(&m, 3);
+    m.cursor = 4;
+    tap(&m, Q2_PAD_CROSS);
+    CHECK(m.page_id == Q2_PAGE_FRONT_VARIABLES &&
+          strcmp(m.page->title, "GAME VARIABLES") == 0,
+          "front variables page/banner is %d/%s", m.page_id, m.page->title);
+    CHECK(m.page->count == 9 && m.page->items[0].y == 56 &&
+          m.page->items[8].y == 192,
+          "gold front variables layout is %u rows, y %d..%d", m.page->count,
+          m.page->items[0].y, m.page->items[8].y);
+    tap(&m, Q2_PAD_TRIANGLE);
+    CHECK(m.page_id == Q2_PAGE_FRONT_DMSETUP && m.cursor == 4,
+          "back restores setup row %d on page %d", m.cursor, m.page_id);
+
+    m.cursor = 5;
+    tap(&m, Q2_PAD_CROSS);
+    CHECK(q2_menu_take_request(&m) == Q2_MREQ_MP_PROCEED,
+          "PROCEED raises its own request");
+
+    /* TEAM and VERSUS install different live setup variants. */
+    q2_menu_init(&m, &s, Q2_MENU_SCREEN_H);
+    m.open = true;
+    q2_menu_goto(&m, Q2_PAGE_FRONT_MULTI);
+    m.cursor = 1;
+    tap(&m, Q2_PAD_CROSS);
+    CHECK(m.mp_setup.mode == Q2_MENU_MP_TEAM_DEATHMATCH &&
+          strcmp(m.page->title, "TEAM DEATHMATCH") == 0,
+          "team row gives mode/banner %d/%s", m.mp_setup.mode, m.page->title);
+
+    q2_menu_init(&m, &s, Q2_MENU_SCREEN_H);
+    m.open = true;
+    q2_menu_goto(&m, Q2_PAGE_FRONT_MULTI);
+    m.cursor = 2;
+    tap(&m, Q2_PAD_CROSS);
+    CHECK(m.mp_setup.mode == Q2_MENU_MP_VERSUS &&
+          strcmp(m.page->title, "VERSUS") == 0,
+          "versus row gives mode/banner %d/%s", m.mp_setup.mode, m.page->title);
+    CHECK(m.page->count == 5 && m.page->addr == 0x8010F9BCu &&
+          m.page->items[0].y == 63 && m.page->items[4].y == 191,
+          "versus table is %u rows at %08x, y %d..%d", m.page->count,
+          m.page->addr, m.page->items[0].y, m.page->items[4].y);
+    CHECK(strcmp(q2_menu_item_text(&m, 2), "ROUNDS  3") == 0,
+          "round row is %s", q2_menu_item_text(&m, 2));
+    m.cursor = 2;
+    m.mp_setup.round_option = 0;
+    tap(&m, Q2_PAD_LEFT);
+    CHECK(m.mp_setup.round_option == 4 &&
+          strcmp(q2_menu_item_text(&m, 2), "ROUNDS 10") == 0,
+          "rounds wrap to %d/%s", m.mp_setup.round_option,
+          q2_menu_item_text(&m, 2));
+
+    /* The four formerly-collapsed leaves are distinguishable to the host. */
+    q2_menu_init(&m, &s, Q2_MENU_SCREEN_H);
+    m.open = true;
+    q2_menu_goto(&m, Q2_PAGE_FRONT_NEWLOAD);
+    m.cursor = 1;
+    tap(&m, Q2_PAD_CROSS);
+    CHECK(q2_menu_take_request(&m) == Q2_MREQ_LOAD_GAME,
+          "LOAD GAME raises its own request");
+
+    q2_menu_init(&m, &s, Q2_MENU_SCREEN_H);
+    m.open = true;
+    q2_menu_goto(&m, Q2_PAGE_FRONT_MULTI);
+    m.cursor = 3;
+    tap(&m, Q2_PAD_CROSS);
+    CHECK(q2_menu_take_request(&m) == Q2_MREQ_MP_LOAD_SETTINGS,
+          "LOAD SETTINGS raises load");
+
+    q2_menu_init(&m, &s, Q2_MENU_SCREEN_H);
+    m.open = true;
+    q2_menu_goto(&m, Q2_PAGE_FRONT_MULTI);
+    m.cursor = 4;
+    tap(&m, Q2_PAD_CROSS);
+    CHECK(q2_menu_take_request(&m) == Q2_MREQ_MP_SAVE_SETTINGS,
+          "SAVE SETTINGS raises save");
+
+    for (level = 0; level < 4; level++) {
+        p = q2_menu_front_variables_page(level);
+        CHECK(p->count == vars_count[level],
+              "front cheat level %d gives %u rows", level, p->count);
+    }
+    CHECK(strcmp(q2_menu_mp_arena_directory(0), "MATRIX6") == 0 &&
+          strcmp(q2_menu_mp_arena_name(11), "BADLANDS") == 0 &&
+          strcmp(q2_menu_mp_arena_directory(11), "MATRIX5") == 0,
+          "arena endpoints match the level table");
 }
 
 /* 0x8001FD18 counts everything but the four control letters. */
@@ -1052,9 +1273,72 @@ static void test_point_at(void)
     CHECK(!q2_menu_point_at(&m, 0), "the static question cannot be pointed at");
 }
 
+/* 0x8001A280..0x8001A348, plus QFRONT module+0x4618..0x4738. */
+static void test_prompt_menu_policy(void)
+{
+    q2_menu_settings s;
+    q2_prompt_bar b;
+    q2_menu m;
+
+    q2_menu_settings_defaults(&s);
+    q2_menu_init(&m, &s, Q2_MENU_SCREEN_H);
+    q2_menu_open(&m);
+    q2_prompt_init(&b);
+
+    /* The retail title capture has SELECT alone. */
+    q2_menu_goto(&m, Q2_PAGE_FRONT_TITLE);
+    q2_prompt_sync_menu(&b, &m, true);
+    CHECK(b.rec[Q2_PROMPT_SELECT].y_target == 208, "title SELECT target");
+    CHECK(b.rec[Q2_PROMPT_BACK].y_target == Q2_PROMPT_Y_HIDDEN,
+          "title has no BACK");
+    CHECK(b.rec[Q2_PROMPT_RULES].y_target == Q2_PROMPT_Y_HIDDEN,
+          "title has no RULES");
+
+    /* START, SINGLE PLAYER and DIFFICULTY all show BACK + SELECT in the
+     * captured retail page sequence. */
+    q2_menu_goto(&m, Q2_PAGE_FRONT_START);
+    q2_prompt_sync_menu(&b, &m, true);
+    CHECK(b.rec[Q2_PROMPT_SELECT].y_target == 208, "START SELECT target");
+    CHECK(b.rec[Q2_PROMPT_BACK].y_target == 208, "START BACK target");
+    q2_menu_goto(&m, Q2_PAGE_FRONT_NEWLOAD);
+    q2_prompt_sync_menu(&b, &m, true);
+    CHECK(b.rec[Q2_PROMPT_SELECT].y_target == 208, "SINGLE PLAYER SELECT");
+    CHECK(b.rec[Q2_PROMPT_BACK].y_target == 208, "SINGLE PLAYER BACK");
+    q2_menu_goto(&m, Q2_PAGE_FRONT_SKILL);
+    q2_prompt_sync_menu(&b, &m, true);
+    CHECK(b.rec[Q2_PROMPT_SELECT].y_target == 208, "DIFFICULTY SELECT");
+    CHECK(b.rec[Q2_PROMPT_BACK].y_target == 208, "DIFFICULTY BACK");
+
+    /* RULES is lower than QFRONT's other two prompts and follows only the
+     * first three MULTIPLAYER rows. */
+    q2_menu_goto(&m, Q2_PAGE_FRONT_MULTI);
+    q2_prompt_sync_menu(&b, &m, true);
+    CHECK(b.rec[Q2_PROMPT_RULES].y_target == 212, "mode row RULES target");
+    m.cursor = (int)m.page->first + 3;
+    q2_prompt_sync_menu(&b, &m, true);
+    CHECK(b.rec[Q2_PROMPT_RULES].y_target == Q2_PROMPT_Y_HIDDEN,
+          "settings row parks RULES");
+
+    /* In-game widgets have no action pointer, while their page still has a
+     * back handler; the retail in-game bar uses caller y = 220. */
+    q2_menu_goto(&m, Q2_PAGE_PLAYER);
+    q2_prompt_sync_menu(&b, &m, false);
+    CHECK(b.rec[Q2_PROMPT_SELECT].y_target == Q2_PROMPT_Y_HIDDEN,
+          "toggle row has no SELECT");
+    CHECK(b.rec[Q2_PROMPT_BACK].y_target == 212, "in-game BACK target");
+
+    q2_menu_close(&m);
+    q2_prompt_sync_menu(&b, &m, false);
+    CHECK(b.rec[Q2_PROMPT_SELECT].y_target == Q2_PROMPT_Y_HIDDEN &&
+          b.rec[Q2_PROMPT_BACK].y_target == Q2_PROMPT_Y_HIDDEN &&
+          b.rec[Q2_PROMPT_RULES].y_target == Q2_PROMPT_Y_HIDDEN,
+          "closing the menu parks the whole bar");
+}
+
 /* ------------------------------------------------------------------------- */
 int main(void)
 {
+    test_font_upload_alias_order();
     test_defaults();
     test_variables_apply();
     test_navigation();
@@ -1072,6 +1356,7 @@ int main(void)
     test_screen_position();
     test_variables_pages();
     test_video_variant();
+    test_front_multiplayer_setup();
     test_text_length();
     test_title_y();
     test_font_metrics();
@@ -1090,6 +1375,7 @@ int main(void)
     test_hit_slider();
     test_hit_choice_halves();
     test_point_at();
+    test_prompt_menu_policy();
 
     if (g_fail) {
         printf("\n%d menu check%s failed\n", g_fail, g_fail == 1 ? "" : "s");

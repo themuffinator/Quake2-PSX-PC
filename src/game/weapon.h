@@ -184,23 +184,52 @@ extern const q2_weapon_behaviour q2_weapon_behaviour_table[Q2_WT_SLOTS];
 /* The quad multiplier, as it appears at every fire site. */
 #define Q2_QUAD_MULTIPLIER 4
 
-/* Grenade launcher: a fixed local launch direction (0, up 2048, forward 6144)
+/* Grenade launcher: a fixed local launch velocity (0, up 2048, forward 6144)
  * rotated by the view, at 0x8004CF40 reading gp+1016. The ratio 2048:6144 is
- * exactly id's 200-up-out-of-600-forward. */
+ * exactly id's 200-up-out-of-600-forward. It is already in the shared entity
+ * mover's pre-divide units; 0x800464D4 advances each component as vel*dt/320.
+ *
+ * 900 is NOT a speed. The caller passes it as argument 5 at 0x8004CF9C, the
+ * spawner copies that argument to entity+0xF4 at 0x8004A2F8, and the think at
+ * 0x80049FE8 subtracts dt from +0xF4 until it reaches zero. */
 #define Q2_GRENADE_LAUNCH_UP      2048
 #define Q2_GRENADE_LAUNCH_FORWARD 6144
-#define Q2_GRENADE_LAUNCH_SPEED    900   /* 0x8004CF9C, argument 5           */
-#define Q2_HAND_GRENADE_TIMER     1650   /* 0x8004EC3C, argument 3           */
-#define Q2_ROCKET_SPEED          20000   /* 0x8004B030                       */
+#define Q2_GRENADE_LAUNCH_FUSE     900   /* 0x8004CF9C -> entity+0xF4       */
+#define Q2_HAND_GRENADE_FUSE      1650   /* 0x8004EC3C -> entity+0xF4       */
+
+/* Grenade3's private held/release figures, read from 0x8004A368.
+ *
+ * The spawner writes 4096 to entity+0x4C. While the owner's view-model
+ * position is exactly 380, the held think adds 6 * dt to that field. On the
+ * 261 and 411 crossings it plays the prime and throw samples respectively;
+ * the latter rotates {0,2048,charge} and makes the entity visible.
+ *
+ * The release origin literal at 0x800AE980 is {80,-50,200}. The original
+ * negates its middle component before RotMatrix and negates world Y after it;
+ * in this port's (right, DOWN, forward) muzzle convention the final local
+ * triple is the literal itself. */
+#define Q2_HAND_GRENADE_CHARGE_START       4096
+#define Q2_HAND_GRENADE_CHARGE_PER_DT         6
+#define Q2_HAND_GRENADE_RELEASE_UP          2048
+#define Q2_HAND_GRENADE_RELEASE_RIGHT         80
+#define Q2_HAND_GRENADE_RELEASE_DOWN         -50
+#define Q2_HAND_GRENADE_RELEASE_FORWARD      200
+
+/* The rocket spawner stores 20000 at entity+0xF4 (0x8004B030). Its think at
+ * 0x8004AD74 subtracts dt from that halfword and frees the entity at zero.
+ * Direction is the player's 1.3.12 aim doubled by the fire function, already
+ * expressed in the same pre-divide-by-320 units as every shared entity. */
+#define Q2_ROCKET_LIFETIME       20000
 
 /*
- * The BFG blast's flight speed is NOT READ. 0x8004BE04 works its own direction
- * out and the port has not followed that; the 2400 at 0x8004BF20 goes to entity
- * +0xF4, which the player spawn also writes (as 1), so it is not a speed. Until
- * the spawner is read the blast flies at the rocket's speed, named so the
- * substitution is visible at every use rather than only in this comment.
+ * The BFG has its own mover. The spawner rotates the literal s16 vector
+ * {0,0,768} at 0x800AE9B4, and 0x8004B90C..0x8004B9DC advances each component
+ * as vel*dt/64. The 2400 stored at entity+0xF4 is independently counted down at
+ * 0x8004B8C0, making an eight-second lifetime on the 300 Hz level clock.
  */
-#define Q2_BFG_SPEED_UNREAD Q2_ROCKET_SPEED
+#define Q2_BFG_RAW_SPEED      768
+#define Q2_BFG_VEL_DIV         64
+#define Q2_BFG_LIFETIME      2400
 
 /* The aim vector the fire functions read from the player at +0x3C..+0x40 is
  * scaled differently by each. These are the shifts, as read. */
@@ -242,6 +271,11 @@ int q2_weapon_autoselect(const q2_inventory *inv);
  * the value from before the shot.
  */
 void q2_weapon_refund(q2_inventory *inv, int weapon_id);
+
+/* Charge one shot's ammo now. Ordinary fire functions do this inside
+ * q2_weapon_fire; Grenade3 is the exception, because 0x8004A7C0 decrements
+ * grenades only when the held entity crosses the release position. */
+bool q2_weapon_consume(q2_inventory *inv, int weapon_id);
 
 /* True when the id is owned and has ammo for one shot. */
 bool q2_weapon_usable(const q2_inventory *inv, int id);
@@ -363,8 +397,7 @@ typedef struct q2_fire_result_v2 {
     s16  kick[3];           /* what to write into the player's view kick     */
     s32  next_fire;         /* level tick when firing is allowed again       */
     s16  sound;             /* q2_wt_sound, or -1                            */
-    s32  projectile_speed;  /* meaningful for the projectile kinds           */
-    s16  projectile_timer;  /* hand grenade fuse                             */
+    s32  projectile_timer;  /* spawner's fuse/lifetime, in level ticks       */
 } q2_fire_result_v2;
 
 /*

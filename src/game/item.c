@@ -1,5 +1,7 @@
 #include "item.h"
 
+#include "crebind.h"
+#include "levelbin.h"
 #include "trig.h"
 #include "weapontables.h"
 
@@ -626,10 +628,15 @@ q2_entity *q2_item_spawn(q2_entity_set *set, const q2_pop_place *place,
     e->effect   = def->effect;
     e->def      = def;
 
+    /* 0x80058944..0x80058970 copies "000" (30 30 30 00 at
+     * 0x800AEABC) into the entity's current and target ambient colours. The
+     * current triplet is what the entity draw feeds to the GTE back colour. */
+    e->glow[0] = e->glow[1] = e->glow[2] = 0x30;
+
     memcpy(e->model, def->model, sizeof(e->model));
-    for (i = 0; i < Q2_ITEM_EXTRA_MAX; i++)
-        e->clip[i] = def->extra[i];
-    e->clip_count = def->extra_count;
+    for (i = 0; i < Q2_ITEM_SHADOW_VERTEX_MAX; i++)
+        e->shadow_vertex[i] = def->shadow_vertex[i];
+    e->shadow_vertex_count = def->shadow_vertex_count;
 
     /*
      * 0x80051054 copies the place record straight in, then 0x80051068 and
@@ -669,9 +676,9 @@ q2_entity *q2_item_spawn(q2_entity_set *set, const q2_pop_place *place,
                                  &e->node))
         e->node = -1;
 
-    /* 0x80058930: the low twelve bits of the place record's halfword are the
-     * heading. Bits 12..15 are something else and are left alone. */
-    e->angles[1] = (s32)(place->unk & 0x0FFFu);
+    /* 0x80058930: the low twelve bits are the heading. The list walker has
+     * already consumed the difficulty exclusions above it. */
+    e->angles[1] = (s32)Q2_POP_PLACE_ANGLE(place->angle_flags);
 
     /*
      * 0x800588F0: the draw origin is the position lowered by 286 and raised
@@ -710,12 +717,67 @@ q2_entity *q2_item_spawn(q2_entity_set *set, const q2_pop_place *place,
     return e;
 }
 
+static q2_result spawn_group_places(q2_entity_set *set,
+                                    const q2_population *pop,
+                                    const q2_pop_group *g,
+                                    u32 group_index,
+                                    s32 skill,
+                                    const q2_item_table *table,
+                                    q2_collision *coll,
+                                    q2_item_spawn_stats *stats)
+{
+    u32 slot;
+
+    for (slot = 0; ; slot++) {
+        q2_pop_place place;
+        q2_entity *e;
+
+        if (!q2_pop_get_place(pop, g, slot, &place))
+            break;
+
+        stats->places++;
+
+        /* 0x8007F54C..0x8007F5D8: filter the authored list before calling
+         * 0x800599DC. Bit 12 is intentionally absent — no retail reader uses
+         * it — and a negative skill is the offline all-record census. */
+        if (skill >= 0 &&
+            !q2_pop_place_allows_skill(place.angle_flags, skill)) {
+            stats->skill_filtered++;
+            continue;
+        }
+
+        e = q2_item_spawn(set, &place, table, 0, coll);
+        if (!e) {
+            if (q2_item_find(table, (s32)place.id))
+                stats->no_memory++;
+            else
+                stats->no_def++;
+            continue;
+        }
+
+        e->population_group = (s32)group_index;
+        e->population_slot  = slot;
+
+        stats->spawned++;
+        if (e->effect == 0)
+            stats->scenery++;
+        else if (!q2_item_effect_is_live(table, e->effect))
+            stats->inert++;
+    }
+
+    return stats->no_memory ? Q2_ERR_NO_MEMORY : Q2_OK;
+}
+
 q2_result q2_item_spawn_zone(q2_entity_set *set, const q2_population *pop,
-                             int zone, const q2_item_table *table,
+                             int zone, const u8 *levelbin, u32 levelbin_size,
+                             const q2_item_table *table,
                              q2_collision *coll,
+                             u8 *group_run,
                              q2_item_spawn_stats *stats)
 {
     q2_item_spawn_stats local;
+    u32 selected[32];
+    u32 selected_count = 0;
     u32 gi;
 
     if (!set || !pop)
@@ -726,47 +788,67 @@ q2_result q2_item_spawn_zone(q2_entity_set *set, const q2_population *pop,
     if (!table)
         table = q2_item_table_builtin();
 
+    /* The same bounded decode used by q2_creature_world_hold_batches. The
+     * disc-wide census finds at most a small handful per module; 32 also keeps
+     * malformed input from turning selection into an allocation surface. */
+    if (zone >= 0 && levelbin && levelbin_size)
+        selected_count = q2_levelbin_selected(levelbin, levelbin_size,
+                                               selected, 32);
+
     for (gi = 0; gi < pop->group_count; gi++) {
         q2_pop_group g;
         int claims;
-        u32 slot;
+        bool selected_here = false;
 
         if (!q2_pop_get_group(pop, gi, &g))
             continue;
 
-        /* The one case the disc settles by itself — see item.h. */
+        /* A group owned by another resident zone never crosses the streaming
+         * boundary, even if a static LevelBin scan sees a conditional select
+         * for returning to that zone. */
         claims = q2_pop_group_zone(&g);
         if (zone >= 0 && claims >= 0 && claims != zone) {
             local.other_zone++;
             continue;
         }
 
-        /* Every group can carry a place list, the path group included: the
-         * spawn and place lists are independent. */
-        for (slot = 0; ; slot++) {
-            q2_pop_place place;
-            q2_entity *e;
+        /* Resident Zone<N> groups are the fallback, exactly as in the creature
+         * startup pass. A group that names no zone is a script batch unless the
+         * LevelBin's selector call explicitly names it. */
+        if (zone >= 0 && claims < 0) {
+            u32 si;
+            u32 n = selected_count < 32 ? selected_count : 32;
 
-            if (!q2_pop_get_place(pop, &g, slot, &place))
-                break;
-
-            local.places++;
-
-            e = q2_item_spawn(set, &place, table, 0, coll);
-            if (!e) {
-                if (q2_item_find(table, (s32)place.id))
-                    local.no_memory++;
-                else
-                    local.no_def++;
-                continue;
+            for (si = 0; si < n; si++) {
+                if (selected[si] + 12 > levelbin_size)
+                    continue;
+                if (memcmp(levelbin + selected[si], g.name, 12) == 0) {
+                    selected_here = true;
+                    break;
+                }
             }
 
-            local.spawned++;
-            if (e->effect == 0)
-                local.scenery++;
-            else if (!q2_item_effect_is_live(table, e->effect))
-                local.inert++;
+            if (!selected_here) {
+                local.not_selected++;
+                continue;
+            }
         }
+
+        /* The retail spawn pass sets group flag bit 1 so neither another
+         * selector nor a later CREBATCH can run the same list twice. Mark it
+         * before walking the list for the same one-shot behaviour even if an
+         * allocation failure makes this pass partial. */
+        if (group_run) {
+            if (group_run[gi])
+                continue;
+            group_run[gi] = 1;
+        }
+
+        /* Every group can carry a place list, the path group included: the
+         * spawn and place lists are independent. */
+        (void)spawn_group_places(set, pop, &g, gi,
+                                 zone < 0 ? -1 : q2_cre_skill(),
+                                 table, coll, &local);
     }
 
     if (stats)
@@ -775,12 +857,60 @@ q2_result q2_item_spawn_zone(q2_entity_set *set, const q2_population *pop,
     return local.no_memory ? Q2_ERR_NO_MEMORY : Q2_OK;
 }
 
+q2_result q2_item_spawn_group(q2_entity_set *set,
+                              const q2_population *pop,
+                              const char *group,
+                              const q2_item_table *table,
+                              q2_collision *coll,
+                              u8 *group_run,
+                              q2_item_spawn_stats *stats)
+{
+    q2_item_spawn_stats local;
+    u32 gi;
+
+    if (!set || !pop || !group || !group[0])
+        return Q2_ERR_INVALID_ARG;
+
+    memset(&local, 0, sizeof(local));
+    if (!table)
+        table = q2_item_table_builtin();
+
+    for (gi = 0; gi < pop->group_count; gi++) {
+        q2_pop_group g;
+
+        if (!q2_pop_get_group(pop, gi, &g))
+            continue;
+        if (strcmp(g.name, group) != 0)
+            continue;
+
+        if (group_run) {
+            if (group_run[gi]) {
+                if (stats)
+                    *stats = local;
+                return Q2_OK;
+            }
+            group_run[gi] = 1;
+        }
+
+        (void)spawn_group_places(set, pop, &g, gi, q2_cre_skill(),
+                                 table, coll, &local);
+        if (stats)
+            *stats = local;
+        return local.no_memory ? Q2_ERR_NO_MEMORY : Q2_OK;
+    }
+
+    if (stats)
+        *stats = local;
+    return Q2_ERR_NOT_FOUND;
+}
+
 q2_result q2_item_spawn_all(q2_entity_set *set, const q2_population *pop,
                             const q2_item_table *table,
                             q2_item_spawn_stats *stats)
 {
     /* A census, not a placement: no hull, so no drop. */
-    return q2_item_spawn_zone(set, pop, -1, table, NULL, stats);
+    return q2_item_spawn_zone(set, pop, -1, NULL, 0, table, NULL, NULL,
+                              stats);
 }
 
 /* ------------------------------------------------------------------------- */

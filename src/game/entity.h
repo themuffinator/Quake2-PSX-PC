@@ -30,7 +30,8 @@
  *     +0xE6   angles           SVECTOR; yaw at +0xE8 is the spin
  *     +0xF4   remove_in        the Q2_ITEM_TIMED countdown
  *     +0xF8   model_offset     lh model[+0x1C], the model's own height bias
- *     +0xFC   scale            4096 == 1.0; 0 while materialising
+ *     +0xFC   light intensity  4096 == 1.0; 0 while materialising
+ *     +0xFE   light fade       second intensity factor; explosion ramp
  *     +0x100  frame            animation cursor, wrapped by the clip length
  *     +0x108  health
  *     +0x10C  render_flags     0x08000001 at spawn; bit 1 cleared when !(flags&1)
@@ -124,6 +125,11 @@ struct q2_entity_world;
  */
 #define Q2_RF_TRANSIENT 0x01000000u
 
+/* 0x8006DCD8: models carrying this bit are registered on an area's 128-entry
+ * Quick list instead of its 32-entry Standard list. The record remains a box
+ * record; only the dependency graph it participates in changes. */
+#define Q2_RF_QUICK_SORT 0x00800000u
+
 /* entity+0xD2. 46 is what the item spawner writes (0x80059A60); other values
  * belong to entity kinds this module does not own yet. */
 #define Q2_ENT_KIND_ITEM 46
@@ -163,26 +169,28 @@ typedef struct q2_entity {
     u32  effect;                /* +0x48 */
     u16  place_id;              /* +0xDA */
 
+    /* Historical field name retained in the save/API: this is LIGHT
+     * INTENSITY, not a geometric model scale. */
     s16  scale;                 /* +0xFC */
 
     /*
-     * THE SECOND SCALE — +0xFE, and the draw multiplies it by the first.
+     * THE SECOND LIGHT-INTENSITY FACTOR — +0xFE.
      *
      *     8006B298  lh   v1, 252(s2)      ; +0xFC, `scale`
      *     8006B29C  lh   v0, 254(s2)      ; +0xFE, this
-     *     8006B2A4  mult v1, v0           ; ...and the product scales the
-     *     8006B2BC  sra  a1, v1, 11       ;    instance matrix's three rows
+     *     8006B2A4  mult v1, v0           ; ...and the product scales a row
+     *     8006B2BC  sra  a1, v1, 11       ;    of the GTE LIGHT matrix
      *
-     * The allocator initialises both to 4096 (0x8006C1B8), so the identity is
-     * the PAIR and not either one alone. `q2_entity_init` therefore sets this
-     * to Q2_ONE_12 as well; an entity that leaves it at the memset's zero
-     * draws nothing at all.
+     * The destination is the matrix at 0x800DDD1C, installed by SetLightMatrix
+     * at 0x8006BBD4. The model rotation installed next comes independently
+     * from entity+0x2C0. The same product scales the ambient back colour at
+     * 0x8006B468, so neither field changes geometry.
      *
-     * `scale` is what an item's materialise ramp drives. This is what a
-     * transient effect's does — see modelent.h, where the explosion runs it
-     * from full down to nothing over the back 61% of its life.
+     * The allocator initialises both to 4096 (0x8006C1B8). `scale` is what an
+     * item's materialise ramp drives; this field is what the model-entity
+     * explosion fades from full to zero over the back 61% of its life.
      */
-    s16  fade;                  /* +0xFE */
+    s16  fade;                  /* +0xFE, historical name */
 
     s16  model_offset;          /* +0xF8 */
     s32  frame;                 /* +0x100 */
@@ -194,22 +202,18 @@ typedef struct q2_entity {
 
     /*
      * The surface byte the spawner is handed — +0x9E, `sb s4, 158(s1)` at
-     * 0x8005AA40. Opcode 0x08 passes the Scene node's `unk0E & 0x7F`, whose low
-     * seven bits index the 64-byte table at 0x800D8D78 on the deferred draw
-     * path (scene.h). Carried because the spawner carries it; no reader in this
-     * port yet.
+     * 0x8005AA40. Opcode 0x08 passes the Scene node's area byte & 0x7F, whose
+     * low seven bits index retail's 64-byte screen-area table. Movement writes
+     * the occupied collision cell's byte +32 here as well (0x80046B08), and
+     * entitydraw.c now uses it to route the model's private packet chain.
      */
     u8   surface;               /* +0x9E */
 
     /* +0x90, written with 128 at 0x8005A9D8. No decoded reader. */
     s16  field90;
 
-    /*
-     * The translucent quad's size operand, which the explosion think computes
-     * every tick and hands to the primitive emitter at 0x80075C34. Nothing in
-     * this port consumes it — see modelent.h for why the quad is decoded and
-     * not drawn.
-     */
+    /* The explosion light's outer radius, computed every tick before the
+     * 0x80075C34 runtime-light call. See modelent.h. */
     s32  flash;
 
     s32  remove_in;             /* +0xF4 */
@@ -221,12 +225,13 @@ typedef struct q2_entity {
 
     /*
      * The model. The engine holds a pointer to the CastList node it found by
-     * name; this holds the name and the clip list, because the port resolves
-     * models through its own bank and only needs to know which one.
+     * name. The item table's final list is copied separately because it names
+     * posed vertices that expand the floor-shadow footprint; every shipped
+     * item model has one animation clip and always plays clip zero.
      */
     char model[Q2_ITEM_MODEL_LEN + 1];
-    u16  clip[Q2_ITEM_EXTRA_MAX];
-    u8   clip_count;
+    u16  shadow_vertex[Q2_ITEM_SHADOW_VERTEX_MAX];
+    u8   shadow_vertex_count;
     s32  clip_length;           /* lh model[+2], the wrap the frame uses */
 
     /*
@@ -242,6 +247,16 @@ typedef struct q2_entity {
 
     /* The table record this came from, when it came from one. Borrowed. */
     const q2_item_def *def;
+
+    /*
+     * Stable Population identity for save reconstruction. Runtime entity
+     * slots are reusable, so an ordinal in q2_entity_set is not an item's
+     * identity after a collected pickup and a later CREBATCH. -1 means this
+     * entity did not come from a Population place record (a dropped item,
+     * effect model, or front-end prop).
+     */
+    s32 population_group;
+    u32 population_slot;
 } q2_entity;
 
 void q2_entity_init(q2_entity *e);

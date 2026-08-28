@@ -853,6 +853,26 @@ static void test_build_ot(void)
     check_eq_i(w.stats.groups_drawn, 1, "the budget stopped after one burst");
     check(w.stats.groups_skipped_budget > 0, "the rest were dropped whole");
 
+    /* Area freshness is a visibility gate, not merely a bucket hint. Retail
+     * never drains an effect whose area has no screen record for this view. */
+    q2_fx_world_clear(&w);
+    at[2] = 4000;
+    q2_fx_spawn(&w, &rng, Q2_FX_EXPLOSION, at, 7);
+    psx_ot_clear(&ot);
+    psx_ot_area_register(&ot, 3, 43);
+    check_eq_i(q2_fx_build_ot(&w, &cam, 0, &ot, &gte), 0,
+               "a particle group in a stale area is culled whole");
+    check_eq_i(ot.prim_count, 0,
+               "stale-area culling leaves no orphan packets");
+
+    psx_ot_clear(&ot);
+    psx_ot_area_register(&ot, 7, 43);
+    check(q2_fx_build_ot(&w, &cam, 0, &ot, &gte) > 0,
+          "the same group draws when its area is registered");
+    psx_ot_flush_batches(&ot);
+    check(ot.bucket_head[43 * PSX_OT_SUBDIV] >= 0,
+          "its private chain joins the area's authored bucket");
+
     /* A beam long enough to have segments. */
     q2_fx_world_clear(&w);
     {

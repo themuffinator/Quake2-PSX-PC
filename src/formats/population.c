@@ -206,8 +206,18 @@ bool q2_pop_get_place(const q2_population *p, const q2_pop_group *g,
     out->x   = q2_rd_s32(rec + 0x00);
     out->y   = q2_rd_s32(rec + 0x04);
     out->z   = q2_rd_s32(rec + 0x08);
-    out->unk = q2_rd_u16(rec + 0x0C);
-    out->id  = q2_rd_u16(rec + 0x0E);
+    out->angle_flags = q2_rd_u16(rec + 0x0C);
+    out->id          = q2_rd_u16(rec + 0x0E);
 
     return true;
+}
+
+bool q2_pop_place_allows_skill(u16 angle_flags, s32 skill)
+{
+    switch (skill) {
+    case 0:  return (angle_flags & Q2_POP_PLACE_NOT_EASY) == 0;
+    case 1:  return (angle_flags & Q2_POP_PLACE_NOT_MEDIUM) == 0;
+    case 2:  return (angle_flags & Q2_POP_PLACE_NOT_HARD) == 0;
+    default: return true;
+    }
 }

@@ -14,6 +14,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 
 #include "combat.h"
 #include "monster.h"
@@ -587,6 +588,131 @@ static void test_hitscan(void)
 }
 
 /* ------------------------------------------------------------------------- */
+/* 0x800544EC does not measure a 3-D sphere. It solves an X/Z cylinder and a
+ * Y slab separately, then uses the first fraction common to both intervals. */
+static void test_actor_cylinder_trace(void)
+{
+    q2_actor corner, inside;
+    q2_actor broad, narrow;
+    q2_actor *list[2];
+    q2_combat_rules rules;
+    q2_damage_result damage;
+    q2_monster corpse;
+    s32 corner_origin[3] = { -1000, 0, 5550 };
+    s32 corner_dir[3]    = { 2000, 0, -2000 };
+    s32 beam_origin[3]   = { 0, 0, 0 };
+    s32 beam_dir[3]      = { 0, 0, 10000 };
+    s32 idx;
+
+    printf("actor cylinder trace\n");
+    q2_combat_rules_default(&rules);
+
+    /* x+z(relative to the centre) stays 550: the line clips the old 572-unit
+     * AABB at its X/Z corner, but remains 550/sqrt(2) outside radius 286. */
+    place(&corner, 0, 0, 4000, 100);
+    list[0] = &corner;
+    idx = q2_combat_nearest_on_segment(corner_origin, corner_dir,
+                                        Q2_HITSCAN_RADIUS, list, 1);
+    check_eq_i(idx, -1, "an X/Z box corner is outside the retail cylinder");
+
+    /* Move the parallel line inward: 400/sqrt(2) is just inside the circle. */
+    place(&inside, 0, 0, 4000, 100);
+    corner_origin[2] = 5400;
+    list[0] = &inside;
+    idx = q2_combat_nearest_on_segment(corner_origin, corner_dir,
+                                        Q2_HITSCAN_RADIUS, list, 1);
+    check_eq_i(idx, 0, "the parallel sweep hits inside the X/Z circle");
+
+    /* The monster projection must carry the corpse resize. A standing sphere
+     * of radius 429 would catch y=100; the anchored 143-unit slab does not. */
+    q2_monster_init(&corpse);
+    corpse.pos[2] = 4000;
+    corpse.health = -20;
+    corpse.gib_health = -60;
+    q2_monster_corpse_detach(&corpse);
+    corpse.takedamage = Q2_DAMAGE_YES;
+    q2_actor_from_monster(&corner, &corpse);
+    check_eq_i(corner.radius, 429, "a detached body projects its wider radius");
+    check_eq_i(corner.height, 143, "and the retail quarter-height of 143");
+    check_eq_i(corner.mins[1], -71, "and its shortened upper Y bound");
+    check_eq_i(corner.maxs[1], 71, "and its shortened lower Y bound");
+
+    beam_origin[1] = 100;
+    list[0] = &corner;
+    idx = q2_combat_nearest_on_segment(beam_origin, beam_dir,
+                                        Q2_HITSCAN_RADIUS, list, 1);
+    check_eq_i(idx, -1, "a ray above the corpse slab passes over the body");
+    beam_origin[1] = 144;
+    idx = q2_combat_nearest_on_segment(beam_origin, beam_dir,
+                                        Q2_HITSCAN_RADIUS, list, 1);
+    check_eq_i(idx, 0, "one unit inside the anchored corpse slab hits it");
+
+    /* Nearest means earliest surface entry, not nearest centre and not target
+     * array order. The broad far-centred actor starts at z=3000; the narrow
+     * near-centred one starts at z=3900. */
+    place(&broad, 0, 0, 6000, 200);
+    broad.radius = 3000;
+    place(&narrow, 0, 0, 4000, 200);
+    narrow.radius = 100;
+    list[0] = &narrow;
+    list[1] = &broad;
+    beam_origin[1] = 0;
+    idx = q2_combat_nearest_on_segment(beam_origin, beam_dir,
+                                        Q2_HITSCAN_RADIUS, list, 2);
+    check_eq_i(idx, 1, "nearest selection uses cylinder entry fraction");
+
+    /* A world stop after that near face but before the actor's centre must not
+     * occlude it. Conversely, moving the stop before the face must. */
+    idx = q2_combat_fire_bullet(NULL, beam_origin, beam_dir, 8, 1300,
+                                Q2_HITSCAN_RADIUS, list + 1, 1,
+                                &rules, &damage);
+    check_eq_i(idx, 0, "a near face before the wall is hittable");
+    check_eq_i(broad.health, 192, "the pre-wall hit delivers damage");
+    idx = q2_combat_fire_bullet(NULL, beam_origin, beam_dir, 8, 1200,
+                                Q2_HITSCAN_RADIUS, list + 1, 1,
+                                &rules, &damage);
+    check_eq_i(idx, -1, "a wall before the entry face occludes the actor");
+
+    /* Retain the rail's established penetrating/list-order pass: a far entry
+     * listed first does not prevent the earlier second actor also being hit. */
+    broad.health = narrow.health = 200;
+    check_eq_i(q2_combat_fire_rail(NULL, beam_origin, beam_dir, 25, 4096,
+                                   Q2_HITSCAN_RADIUS, list, 2, &rules), 2,
+               "rail visits both cylinders in its target-list order");
+    check_eq_i(narrow.health, 175, "rail damages the first listed cylinder");
+    check_eq_i(broad.health, 175, "rail also damages the second cylinder");
+
+    /* The retail paths never approach this range, but the host API accepts
+     * s32 coordinates. This makes b^2 and 4ac exceed s64 in the naive formula
+     * while the short local geometry is still an ordinary centre hit. */
+    place(&inside, INT_MAX - 200000, 0, INT_MAX - 200000, 100);
+    beam_origin[0] = INT_MAX - 300000;
+    beam_origin[1] = 0;
+    beam_origin[2] = INT_MAX - 200000;
+    beam_dir[0] = 200000;
+    beam_dir[1] = 0;
+    beam_dir[2] = 0;
+    list[0] = &inside;
+    idx = q2_combat_nearest_on_segment(beam_origin, beam_dir,
+                                        Q2_HITSCAN_RADIUS, list, 1);
+    check_eq_i(idx, 0, "large legal s32 coordinates do not overflow tracing");
+
+    /* The exact arm's broad box can admit a large-radius centre which is still
+     * outside the cylinder. Reject the negative discriminant before its x4:
+     * scaling first exceeds s64 for this otherwise legal public-API input. */
+    beam_origin[0] = beam_origin[1] = beam_origin[2] = 0;
+    beam_dir[0] = 30000;
+    beam_dir[1] = 0;
+    beam_dir[2] = 30000;
+    place(&inside, 30000, 0, -29999, 100);
+    inside.radius = 30000;
+    list[0] = &inside;
+    idx = q2_combat_nearest_on_segment(beam_origin, beam_dir,
+                                        Q2_HITSCAN_RADIUS, list, 1);
+    check_eq_i(idx, -1, "large negative discriminant is rejected without overflow");
+}
+
+/* ------------------------------------------------------------------------- */
 static void test_mod_classification(void)
 {
     printf("means of death\n");
@@ -661,6 +787,7 @@ int main(void)
     test_knockback();
     test_splash();
     test_hitscan();
+    test_actor_cylinder_trace();
     test_mod_classification();
 
     test_energy_light_gate();

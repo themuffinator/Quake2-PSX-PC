@@ -31,9 +31,11 @@
  *   0x0A  u16   pad             always 0 on disc; the loader writes 0x8000
  *   0x0C  u8    unk0C           0..4, nonzero in 6 nodes disc-wide
  *   0x0D  u8    unk0D           0..3, nonzero in 5 nodes
- *   0x0E  u8    unk0E           0..197. Read only on the bit-14 deferred path
- *                               (0x80066800): its low 7 bits index a 64-byte
- *                               stride table at 0x800D8D78.
+ *   0x0E  u8    area            0..197. Its low 7 bits name a 64-byte runtime
+ *                               screen-area record. Bit-14 world nodes and
+ *                               dynamic entities route private packet chains
+ *                               through that record's authored OT insertion
+ *                               point (0x80066800 / 0x80046E14).
  *   0x0F  u8    reserved        always 0; the zone draw uses it as scratch,
  *                               writing a per-frame counter into it (0x80067A34)
  *   0x10  s32[3] bbox_min
@@ -125,6 +127,7 @@
 typedef struct q2_scene_node {
     u32 mapmod_offset;
     u16 flags;
+    u8  area;          /* +0x0E: deferred-sort area, low seven bits */
     s32 bbox_min[3];   /* world space — differs per node */
     s32 bbox_max[3];
 
@@ -203,9 +206,10 @@ bool q2_mapmod_get_poly(const q2_mapmod_rec *rec, u32 poly, q2_mapmod_poly *out)
  * no node mixes index 0 with a real palette anywhere on the disc, so the
  * property is a property of the node and not of a stray polygon.
  *
- * A renderer walking nodes in index order — which is what a port does until it
- * knows which SortData stream a viewport wants (open question 7a) — has to
- * apply this itself or it draws the black planes the streams were avoiding.
+ * A renderer deliberately walking nodes in index order — this port's
+ * `--depth-sort` diagnostic fallback — has to apply this itself or it draws the
+ * black planes the authored streams were avoiding. The parity renderer reads
+ * the exact stream offset from the camera's PrimaryColl cell.
  */
 bool q2_mapmod_rec_is_sealing(const q2_mapmod_rec *rec);
 

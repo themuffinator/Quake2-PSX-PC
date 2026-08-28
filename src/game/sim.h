@@ -70,9 +70,9 @@
  * ---------------------------------------------------------------------------
  * Items ARE owned here, because the engine owns them the same way: one entity
  * set, one think sweep, run at the end of the tick so an item's touch test sees
- * where the player actually ended up. `q2_sim_attach_items` spawns a map's
- * Population place records; without it the set is empty and the sweep is free.
- * See entity.h and item.h.
+ * where the player actually ended up. `q2_sim_attach_items` spawns the map's
+ * resident-zone and LevelBin-selected Population place records; without it the
+ * set is empty and the sweep is free. See entity.h and item.h.
  */
 #ifndef Q2PSX_SIM_H
 #define Q2PSX_SIM_H
@@ -451,6 +451,10 @@ typedef struct q2_breakable {
     /* MOVER: the event item the leaf was built from, which is the identity
      * q2_movers_trigger_item keys on. */
     u32 item_offset;
+    /* GLASS only: index of its live Q2_MOVE_KIND_ENTITY box in `volumes`.
+     * Movers are inserted before it, so this is rebased whenever that prefix
+     * is rebuilt. -1 for breakables that never block movement. */
+    s32 solid_target;
     bool broken;
 } q2_breakable;
 
@@ -658,8 +662,9 @@ typedef struct q2_sim {
      * player walked through.
      */
     q2_move_target *volumes;
-    u32             volume_count;   /* mover parts + trigger volumes           */
+    u32             volume_count;   /* movers + intact glass + trigger volumes */
     u32             mover_count;    /* how many of them are mover parts        */
+    u32             breakable_solid_count; /* GLASS boxes after mover prefix    */
 
     /*
      * The mover parts' PRISTINE boxes, six s32 each, parallel to the first
@@ -793,6 +798,20 @@ typedef struct q2_sim {
     q2_entity_set   entities;
     q2_entity_world ent_world;
     bool            entities_ready;
+
+    /*
+     * Population place groups keep the same two-bit lifetime as creature
+     * groups: selected, then run. The chunk and tables are borrowed from the
+     * current map; `item_group_run` owns one byte per Population group and is
+     * the bit-1 shadow that stops CREBATCH from duplicating a place list.
+     */
+    q2_population                  item_population;
+    const q2_item_table           *item_table;
+    const struct q2_model_bank    *item_bank;
+    u8                            *item_group_run;
+    u32                           *item_group_order;
+    u32                            item_group_order_count;
+    bool                           item_population_ready;
 
     /*
      * Set while q2_sim_settle is driving the tick, and read by the tick to
@@ -997,6 +1016,11 @@ u32 q2_sim_breakable_call(q2_sim *sim, const q2_scene *scene,
  * as `q2_sim_breakable_call` takes it, because four of the disc's ten object
  * slots read -1 in COMMON's copy and resolve only in a zone's.
  *
+ * Every GLASS record also receives a Q2_MOVE_KIND_ENTITY target from the same
+ * raw Scene box. It is solid to movement, point traces and projectiles until
+ * the fatal callback frees it; SHOOTTHEN and explosive boxes retain their
+ * existing damage-only semantics.
+ *
  * Returns how many were registered.
  */
 u32 q2_sim_attach_breakables(q2_sim *sim, const q2_scene *scene,
@@ -1013,6 +1037,11 @@ u32 q2_sim_attach_breakables(q2_sim *sim, const q2_scene *scene,
  */
 u32 q2_sim_breakable_shot(q2_sim *sim, const s32 from[3], const s32 to[3],
                           s16 damage);
+
+/* Re-apply intact/broken pane state to the movement boxes. Save loading writes
+ * the breakable records directly, then calls this once so shattered panes do
+ * not become solid again merely because a zone was reconstructed first. */
+void q2_sim_breakables_sync_solidity(q2_sim *sim);
 
 /*
  * Put a zone's `func_explosive` groups into the same registry.
@@ -1149,7 +1178,9 @@ q2_result q2_sim_attach_gameplay(q2_sim *sim, const q2_common_file *common);
  * Population is per MAP while a session is in one ZONE: a group the disc names
  * after a different zone is dropped rather than left standing in this one. Pass
  * -1 to spawn every group, which is what an offline pass over a whole map wants.
- * See q2_item_spawn_zone for what that filter can and cannot decide.
+ * For a live zone the map's LevelBin supplies the other half of the answer: an
+ * unzoned category or script batch is spawned only when its selector call names
+ * it. See q2_item_spawn_zone for the shared creature/item fallback rule.
  *
  * `bank` is the map's CastList and may also be NULL. When it is given, each
  * item's model is resolved at spawn as the engine does it (0x80058850), so the
@@ -1178,7 +1209,8 @@ u32 q2_sim_attach_scene(q2_sim *sim, const q2_common_file *common,
  * What a front-end page change does to the scene — `module+0x3414`'s tail.
  *
  * `title` picks which of the module's two thinks the logo runs: the title
- * screen's grows it to full size, every other page's shrinks it to a quarter.
+ * screen raises its light intensity to full, every other page dims it to a
+ * quarter. The model geometry itself stays fixed.
  * `visible` is false for the one page that hides even the logo (id 11).
  *
  * The four player models are not addressed: the module shows object 0 and only
@@ -1207,6 +1239,14 @@ u32 q2_sim_scene_advance(q2_sim *sim, double elapsed_seconds);
 q2_result q2_sim_attach_items(q2_sim *sim, const q2_common_file *common,
                               int zone, const q2_item_table *table,
                               const struct q2_model_bank *bank);
+
+/*
+ * Run one named Population place group, as a CREBATCH CALL does. Returns the
+ * number of newly spawned entities. The group's retail bit-1 latch is shared
+ * with q2_sim_attach_items, so a startup group or a batch already activated
+ * once returns zero and cannot duplicate its pickups.
+ */
+u32 q2_sim_activate_item_group(q2_sim *sim, const char *group);
 
 /* What the item thinks asked for since the last call: pickup sounds, the
  * materialise sound, and the glow lights. Cleared at the start of every tick. */
@@ -1298,14 +1338,13 @@ typedef struct q2_sim_proj_stats {
     u32 dropped_full;
 
     /*
-     * Bolts and rockets a DOOR stopped, as against the hull. Separately
-     * counted because "a rocket goes through a closed door" and "a rocket goes
-     * through a wall" look the same from the far side and are different
-     * faults: the second is a hull that does not describe the map, the first
-     * is a hull that describes it correctly and an entity the sweep never
-     * asked about.
+     * Bolts and rockets a runtime solid (door, lift or intact pane) stopped, as
+     * against the hull. Separately counted because "a rocket goes through a
+     * closed door/window" and "a rocket goes through a wall" look the same
+     * from the far side and are different faults: the second is a bad hull,
+     * the first is an entity the sweep never asked about.
      */
-    u32 stopped_on_mover;
+    u32 stopped_on_entity;
 } q2_sim_proj_stats;
 
 extern q2_sim_proj_stats q2_sim_proj_scan;
@@ -1375,9 +1414,9 @@ typedef struct q2_trace {
     s32  node;          /* the cell the trace ended in, -1 if none     */
     s32  contents;      /* that cell's contents id                     */
     /*
-     * WHICH MOVER stopped it, or -1 for the world. A door is an entity and
-     * not part of either hull (trace.h), so a trace that ends on one ends on
-     * nothing the `node`/`contents` pair can describe — they are cell fields
+     * WHICH RUNTIME ENTITY BOX stopped it, or -1 for the world. Doors and glass
+     * are not part of either hull (trace.h), so a trace that ends on one ends
+     * on nothing the `node`/`contents` pair can describe — they are cell fields
      * and there is no cell. This is the other half of the answer.
      */
     s32  ent;
@@ -1385,11 +1424,10 @@ typedef struct q2_trace {
 } q2_trace;
 
 /*
- * Clipped against the zone's HULL and then against its DOORS AND LIFTS, in
- * that order, nearest wins. The second pass is not an extra: the hull is the
- * map's static geometry and a mover is a runtime entity, so without it every
- * query answers as though the level's doors were all open — which is what a
- * bullet through a shut door looks like.
+ * Clipped against the zone's HULL and then against its runtime entity boxes —
+ * doors, lifts and intact glass — in that order, nearest wins. The second pass
+ * is not an extra: these are runtime objects absent from the static hull, so
+ * without it a bullet sees every door open and every pane already broken.
  */
 void q2_sim_trace(q2_sim *sim, const s32 start[3], const s32 end[3],
                   q2_trace *out);
@@ -1442,6 +1480,20 @@ bool q2_sim_autoselect_weapon(q2_sim *sim);
  * Returns what was fired, which is also left in `sim->combat.last_shot`.
  */
 q2_fire_result_v2 q2_sim_fire(q2_sim *sim);
+
+typedef enum q2_hand_grenade_update {
+    Q2_HAND_GRENADE_NONE = 0,
+    Q2_HAND_GRENADE_HELD,
+    Q2_HAND_GRENADE_RELEASED,
+    Q2_HAND_GRENADE_EXPIRED
+} q2_hand_grenade_update;
+
+/* Feed Grenade3 the owning view weapon's world position and model-timeline
+ * outputs after q2_vw_advance. It stays hidden/attached while held, accumulates
+ * 6*cook_dt charge, detonates before release if its 1650-tick fuse elapsed,
+ * and otherwise releases on the 411 crossing. */
+q2_hand_grenade_update q2_sim_hand_grenade_update(
+    q2_sim *sim, const s32 attached_pos[3], s32 cook_dt, bool release);
 
 /* Hurt the player, going through the same damage path everything else does. */
 q2_damage_result q2_sim_hurt_player(q2_sim *sim, q2_actor *attacker,

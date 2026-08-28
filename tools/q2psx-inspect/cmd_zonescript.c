@@ -34,8 +34,8 @@
  *
  *
  * What is left for this command to do is measure the script that does run:
- * COMMON's, fired by every trigger volume, with the rotators built from the
- * same chunk the engine's global points at.
+ * COMMON's, fired by every trigger volume, with constructor operands rebased
+ * into the resident zone's same-offset Events copy.
  */
 #include "cmd_zonescript.h"
 
@@ -1044,7 +1044,7 @@ int cmd_zonescript(const disc *d, const char *only_map)
                     q2_rotators_set_operand_source(&probe, cev.data,
                                                    zev[zq].data, zev[zq].size);
                     if (q2_userfuncs_parse(&puf, &cf) == Q2_OK &&
-                        q2_rotators_build(&probe, &cev, &puf) == Q2_OK) {
+                        q2_rotators_build(&probe, &cev, &puf, NULL) == Q2_OK) {
                         if (probe.count > best) {
                             best = probe.count;
                             bz   = zq;
@@ -1126,7 +1126,7 @@ int cmd_zonescript(const disc *d, const char *only_map)
                                                zev[bz].data, zev[bz].size);
             }
             if (q2_userfuncs_parse(&uf, &cf) == Q2_OK &&
-                q2_rotators_build(&rs, &cev, &uf) == Q2_OK &&
+                q2_rotators_build(&rs, &cev, &uf, NULL) == Q2_OK &&
                 q2_event_rt_init(&rt, &cev) == Q2_OK) {
                 live_rot_ctx ctx;
                 u32 t;
@@ -1237,7 +1237,7 @@ int cmd_zonescript(const disc *d, const char *only_map)
     printf("    a ZONE's Events chunk         : %u\n", past_zone);
 
     printf("\n  COMMON's script, fired by every trigger volume — what the\n"
-           "  console runs, since the zone loader never looks up \"Events\":\n");
+           "  console executes (constructors read zone Events operands):\n");
     printf("    rotation CALLs  : %u  in COMMON's scripts, disc-wide\n",
            rot_prim_calls);
     printf("      too short     : %u  (the item cannot hold the operands)\n",

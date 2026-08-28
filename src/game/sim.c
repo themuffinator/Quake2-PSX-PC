@@ -102,6 +102,8 @@ void q2_sim_free(q2_sim *sim)
         return;
     q2_event_rt_free(&sim->event_rt);
     q2_entity_set_free(&sim->entities);
+    free(sim->item_group_run);
+    free(sim->item_group_order);
     free(sim->trigger_inside);
     free(sim->volumes);
     free(sim->mover_base);
@@ -116,6 +118,7 @@ q2_result q2_sim_attach_items(q2_sim *sim, const q2_common_file *common,
                               int zone, const q2_item_table *table,
                               const struct q2_model_bank *bank)
 {
+    const dat_chunk *levelbin;
     q2_population pop;
     q2_result r;
 
@@ -123,6 +126,15 @@ q2_result q2_sim_attach_items(q2_sim *sim, const q2_common_file *common,
         return Q2_ERR_INVALID_ARG;
 
     q2_entity_set_free(&sim->entities);
+    free(sim->item_group_run);
+    free(sim->item_group_order);
+    sim->item_group_run        = NULL;
+    sim->item_group_order      = NULL;
+    sim->item_group_order_count = 0;
+    sim->item_population_ready = false;
+    memset(&sim->item_population, 0, sizeof(sim->item_population));
+    sim->item_table = NULL;
+    sim->item_bank  = NULL;
     q2_entity_world_init(&sim->ent_world);
     sim->entities_ready = false;
 
@@ -135,6 +147,9 @@ q2_result q2_sim_attach_items(q2_sim *sim, const q2_common_file *common,
      * the same flag the item handlers read to double an ammo box and the same
      * one that decides whether a collected item respawns at all.
      */
+    if (!table)
+        table = q2_item_table_builtin();
+
     sim->ent_world.deathmatch = sim->multiplayer;
     sim->ent_world.items      = table;
     sim->ent_world.level_time = sim->level_time;
@@ -148,13 +163,50 @@ q2_result q2_sim_attach_items(q2_sim *sim, const q2_common_file *common,
     if (r != Q2_OK)
         return r;
 
+    sim->item_group_run = (u8 *)calloc(pop.group_count ? pop.group_count : 1,
+                                       sizeof(*sim->item_group_run));
+    if (!sim->item_group_run)
+        return Q2_ERR_NO_MEMORY;
+    sim->item_group_order = (u32 *)calloc(pop.group_count ? pop.group_count : 1,
+                                          sizeof(*sim->item_group_order));
+    if (!sim->item_group_order) {
+        free(sim->item_group_run);
+        sim->item_group_run = NULL;
+        return Q2_ERR_NO_MEMORY;
+    }
+
+    sim->item_population = pop;
+    sim->item_table      = table;
+    sim->item_bank       = bank;
+
+    /* Which Population groups exist at level start is code in LevelBin, not a
+     * property of the place lists. The selector decoder recovers those calls
+     * without executing the module; item.c applies the same resident-zone plus
+     * selected-batch rule the creature world already uses. */
+    levelbin = common->chunk[Q2_COMMON_LEVEL_BIN];
+
     /* SecondaryCol, so every item is dropped onto its floor as the console
      * drops it. NULL until the zone's hull is parsed, which is the order
      * q2_sim_attach_zone already establishes. */
-    r = q2_item_spawn_zone(&sim->entities, &pop, zone, table,
-                           sim->coll_ready ? &sim->coll : NULL, NULL);
+    r = q2_item_spawn_zone(&sim->entities, &pop, zone,
+                           levelbin ? levelbin->data : NULL,
+                           levelbin ? levelbin->size : 0,
+                           table,
+                           sim->coll_ready ? &sim->coll : NULL,
+                           sim->item_group_run, NULL);
     if (r != Q2_OK)
         return r;
+
+    /* q2_item_spawn_zone walks Population order. Record that exact order,
+     * including selected groups with empty place lists, so a save can append
+     * later CREBATCH groups in the sequence the allocator originally saw. */
+    {
+        u32 gi;
+        for (gi = 0; gi < pop.group_count; gi++) {
+            if (sim->item_group_run[gi])
+                sim->item_group_order[sim->item_group_order_count++] = gi;
+        }
+    }
 
     if (bank) {
         u32 i;
@@ -163,14 +215,67 @@ q2_result q2_sim_attach_items(q2_sim *sim, const q2_common_file *common,
     }
 
     sim->entities_ready = true;
+    sim->item_population_ready = true;
     return Q2_OK;
+}
+
+u32 q2_sim_activate_item_group(q2_sim *sim, const char *group)
+{
+    q2_item_spawn_stats stats;
+    q2_result r;
+    u32 gi, i;
+    bool was_run;
+
+    if (!sim || !sim->entities_ready || !sim->item_population_ready ||
+        !group || !group[0])
+        return 0;
+
+    for (gi = 0; gi < sim->item_population.group_count; gi++) {
+        q2_pop_group g;
+
+        if (!q2_pop_get_group(&sim->item_population, gi, &g))
+            continue;
+        if (strcmp(g.name, group) == 0)
+            break;
+    }
+    if (gi == sim->item_population.group_count)
+        return 0;
+
+    was_run = sim->item_group_run[gi] != 0;
+    r = q2_item_spawn_group(&sim->entities, &sim->item_population, group,
+                            sim->item_table,
+                            sim->coll_ready ? &sim->coll : NULL,
+                            sim->item_group_run, &stats);
+    if (r != Q2_OK && r != Q2_ERR_NO_MEMORY)
+        return 0;
+
+    if (!was_run && sim->item_group_run[gi] &&
+        sim->item_group_order_count < sim->item_population.group_count)
+        sim->item_group_order[sim->item_group_order_count++] = gi;
+
+    if (sim->item_bank) {
+        /* The entity allocator reuses collected holes before it appends.
+         * Scanning only the old count..new count tail leaves a CREBATCH item
+         * placed into a low slot unresolved at spawn time. Restrict the pass
+         * by the stable Population group instead: existing members are cheap
+         * no-ops in q2_entity_resolve_model, while both reused and appended
+         * members receive the retail spawn-time lookup. */
+        for (i = 0; i < sim->entities.count; i++) {
+            q2_entity *e = &sim->entities.ent[i];
+
+            if (e->in_use && e->population_group == (s32)gi)
+                q2_entity_resolve_model(e, sim->item_bank);
+        }
+    }
+
+    return stats.spawned;
 }
 
 /*
  * The Q2LOGO's own think, which the module installs over the item one on every
  * page change — module+0x9D24 on the title screen, module+0x9E0C on every other
  * front-end page. See levelbin.h for the pair side by side; the only difference
- * is which way the scale ramp runs and where it stops.
+ * is which way the light-intensity ramp runs and where it stops.
  *
  * The spin is `yaw -= 4 * dt` in both, taken from `*(engine+0xD4)` — the same
  * level-clock delta the item think reads, so `w->dt` is it.
@@ -186,8 +291,8 @@ static void scene_logo_title_think(q2_entity *e, q2_entity_world *w)
         return;
     /*
      * 0x80109D38: the test is on the OLD value and the add is in the branch's
-     * delay slot, so a scale of 3968 goes to 4224 for one frame and is clamped
-     * the next. That overshoot is the original's and is left in.
+     * delay slot, so an intensity of 3968 goes to 4224 for one frame and is
+     * clamped the next. That overshoot is the original's and is left in.
      */
     if (e->scale < Q2_LB_SCENE_SCALE_FULL)
         e->scale = (s16)(e->scale + Q2_LB_SCENE_SCALE_STEP);
@@ -320,7 +425,7 @@ u32 q2_sim_attach_scene(q2_sim *sim, const q2_common_file *common,
         /* module+0xE48, the template the spawner fills: every field zero but
          * the flags nibble and the id. */
         memset(&place, 0, sizeof(place));
-        place.unk = 0x1000u;
+        place.angle_flags = Q2_POP_PLACE_UNUSED_1000;
         place.id  = scene.id[i];
 
         /* The front end's props are a synthetic template at the origin and
@@ -657,19 +762,24 @@ bool q2_sim_take_zone_change(q2_sim *sim, u32 *out_zone)
 }
 
 /*
- * Fire any trigger the player has just ENTERED.
+ * Feed the player's trigger contacts to the Events record categories.
  *
- * Edge-triggered, not level-triggered: standing inside a volume must not run
- * its script 25 times a second. The previous-inside bitmap is what makes that
- * distinction, and it is why the trigger state has to persist across ticks.
+ * This used to make every volume edge-triggered. Retail does not: record flag
+ * 0x08 means enter, 0x10 means every frame inside, and 0x20 means leave
+ * (0x80027E64). In particular, liquid/environment records and held-open doors
+ * need the continuous arm. The event runtime owns the two record-level contact
+ * bits because several volumes can name one record; `trigger_inside` remains
+ * the per-volume edge used by diagnostics and save games.
  */
 static void update_triggers(q2_sim *sim)
 {
     s32 at[3];
     u32 i;
 
-    if (!sim->triggers_ready || !sim->events_ready)
+    if (!sim->events_ready)
         return;
+
+    q2_event_rt_contacts_begin(&sim->event_rt);
 
     /*
      * THE SAMPLE POINT IS THE ENTITY ORIGIN, and this was the whole of "doors
@@ -697,13 +807,14 @@ static void update_triggers(q2_sim *sim)
     at[1] = q2_sim_origin_y(sim->player[sim->cur_player].pos[1]);
     at[2] = sim->player[sim->cur_player].pos[2];
 
-    for (i = 0; i < sim->triggers.count && i < sim->trigger_capacity; i++) {
+    for (i = 0; sim->triggers_ready &&
+                i < sim->triggers.count && i < sim->trigger_capacity; i++) {
         bool inside = q2_trigger_contains(&sim->triggers, i, at);
         bool was    = sim->trigger_inside[i] != 0;
 
         sim->trigger_inside[i] = inside ? 1u : 0u;
 
-        if (!inside || was)
+        if (!inside)
             continue;
 
         {
@@ -713,7 +824,7 @@ static void update_triggers(q2_sim *sim)
             if (trig.event_offset == Q2_TRIGGER_NO_EVENT)
                 continue;
 
-            if (sim->trace_zone) {
+            if (sim->trace_zone && !was) {
                 u32 k;
                 sim->trace_last_trigger = i;
                 for (k = 0; k < 3; k++) {
@@ -727,9 +838,11 @@ static void update_triggers(q2_sim *sim)
                         trig.min[2], trig.max[2], trig.event_offset);
             }
 
-            q2_event_rt_trigger(&sim->event_rt, trig.event_offset);
+            q2_event_rt_contact(&sim->event_rt, trig.event_offset);
         }
     }
+
+    q2_event_rt_contacts_end(&sim->event_rt);
 
     if (q2_event_rt_update(&sim->event_rt) == Q2_EVENT_ZONE_CHANGE) {
         sim->zone_change_pending = true;
@@ -845,12 +958,20 @@ static void mover_part_box(const q2_scene *scene, s32 node,
 
 static void mover_targets_drop(q2_sim *sim)
 {
+    u32 i;
+
     if (!sim->mover_count || !sim->volumes)
         return;
 
     memmove(sim->volumes, sim->volumes + sim->mover_count,
             (sim->volume_count - sim->mover_count) * sizeof(*sim->volumes));
     sim->volume_count -= sim->mover_count;
+
+    /* Glass follows the mover prefix in the same entity table. Moving the
+     * tail down changes every cached pane index by exactly that prefix. */
+    for (i = 0; i < sim->breakable_count; i++)
+        if (sim->breakable[i].solid_target >= 0)
+            sim->breakable[i].solid_target -= (s32)sim->mover_count;
     sim->mover_count   = 0;
 
     free(sim->mover_base);
@@ -910,6 +1031,10 @@ q2_result q2_sim_attach_movers(q2_sim *sim, const q2_mover_set *set,
                sim->volume_count * sizeof(*grown));
     free(sim->volumes);
     sim->volumes = grown;
+
+    for (i = 0; i < sim->breakable_count; i++)
+        if (sim->breakable[i].solid_target >= 0)
+            sim->breakable[i].solid_target += (s32)parts;
 
     out = 0;
     for (i = 0; i < set->count; i++) {
@@ -1151,6 +1276,13 @@ static void build_volumes(q2_sim *sim)
     sim->mover_base     = NULL;
     sim->mover_last_off = NULL;
     sim->mover_count    = 0;
+    sim->breakable_solid_count = 0;
+
+    {
+        u32 b;
+        for (b = 0; b < sim->breakable_count; b++)
+            sim->breakable[b].solid_target = -1;
+    }
 
     memset(&sim->move_world, 0, sizeof(sim->move_world));
     sim->move_world.half_extent = Q2_SWEEP_HALF_EXTENT;
@@ -2608,25 +2740,25 @@ static void update_pain(q2_sim *sim)
  * one unit out on a long move. Do not feed it back into the geometry.
  */
 /*
- * THE SECOND PASS — the doors.
+ * THE SECOND PASS — runtime entity boxes.
  *
  * A mover is an entity, not hull (trace.h), so the walk above answers as if
- * every door in the level were open. The console's own bullet path traces the
- * hull and then re-traces against the entity list, and this is that: the
- * segment is clipped against the mover boxes from the ORIGINAL start to
+ * every door and intact glass pane in the level were absent. The console's own
+ * bullet path traces the hull and then re-traces against the entity list, and
+ * this is that: the segment is clipped against the entity boxes from the ORIGINAL start to
  * wherever the hull left it, so whichever of the two is nearer wins without
  * needing the fractions compared.
  *
- * `ent` names the mover, which is what makes a contact actionable: a shot that
- * stops on a door can say WHICH door, and a shoot-to-open leaf is exactly that
- * question asked once more.
+ * `ent` is the entity box's caller handle. Movers use their mover index and
+ * glass uses its breakable index; the weapon's dedicated damageable-box sweep
+ * still supplies the latter's callback routing.
  */
-static void trace_clip_movers(q2_sim *sim, const s32 start[3], q2_trace *out)
+static void trace_clip_entities(q2_sim *sim, const s32 start[3], q2_trace *out)
 {
     q2_move_seg_hit mh;
     int k;
 
-    if (!sim->mover_count || !sim->move_world.count)
+    if (!sim->move_world.count)
         return;
 
     if (!q2_move_clip_segment(&sim->move_world, start, out->end, NULL, &mh))
@@ -2691,7 +2823,7 @@ void q2_sim_trace(q2_sim *sim, const s32 start[3], const s32 end[3],
          * the arm that used to return before the second pass ran — i.e. the
          * common case: a corridor with a closed door across it is open hull
          * for the whole of the shot's length. */
-        trace_clip_movers(sim, start, out);
+        trace_clip_entities(sim, start, out);
         return;
     }
 
@@ -2733,7 +2865,7 @@ void q2_sim_trace(q2_sim *sim, const s32 start[3], const s32 end[3],
         }
     }
 
-    trace_clip_movers(sim, start, out);
+    trace_clip_entities(sim, start, out);
 }
 
 /* ------------------------------------------------------------------------- */

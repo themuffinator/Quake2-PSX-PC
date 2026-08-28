@@ -90,9 +90,10 @@
  * and drives a 1.0.12 ramp — 4096 in IDLE, then 4096/3296/2096/1296 minus forty
  * per elapsed tick over fire frames 1..4, then `(left << 12) / duration` — into
  * 0x8006D43C, which PATCHES one component of part 6's quaternion in the model's
- * own key data. That is the barrel turning, and it is not reconstructed here:
- * the patch mutates shared model bytes and the packing of the key word was not
- * read out. The ramp arithmetic above is exact if anyone wants it.
+ * own key data. That is the barrel turning. `q2_viewweapon_build_ot` now applies
+ * the same low-eleven-bit patch to the per-instance pose rather than mutating
+ * the shared model bank; the result is identical and remains player-local in
+ * split screen.
  *
  * And the thing it does not do: 0x8004F644…0x8004F694 rotates a vector by the
  * composed matrix and adds the result to the weapon's world position, which
@@ -135,6 +136,13 @@
  */
 #define Q2_VW_COOK_POSITION  380
 
+/* Grenade3's think compares the owner's current model position with its
+ * previous one and raises these two one-shot crossings. The first plays
+ * wep_hgrenc1b; the second reveals/releases the grenade and plays
+ * wep_hgrent1a (0x8004A474 and 0x8004A4A8). */
+#define Q2_VW_HAND_PRIME_POSITION    261
+#define Q2_VW_HAND_RELEASE_POSITION  411
+
 /* Parts in the biggest view model on the disc is 19 (`HandGren G`); the bound
  * is the same one entitydraw.c uses, and a model past it draws unposed rather
  * than not at all. */
@@ -170,6 +178,25 @@ typedef enum q2_vw_fire_result {
 
 typedef struct q2_viewweapon {
     const q2_vm_tables *tab;
+
+    /*
+     * The ordinary entity fields the view model retains.
+     *
+     * It is allocated by 0x8006C0F0, so +0xFC/+0xFE and both ambient colours
+     * begin at 4096/4096 and 0x40/0x40/0x40.  The constructor at 0x8004F750
+     * then writes 1 to +0xF4.  The light gather tests that field with `bgez`
+     * at 0x8006B040, so literal 1 selects the ordinary WORLD list and static
+     * lamps; only a negative value selects the alternate list.  Treating the
+     * write as a boolean view-space flag was a signedness error.
+     *
+     * 0x8004EE70 refreshes +0xFC from the player each frame; the port's player
+     * scale is currently always the allocator default, but keeping the field
+     * here preserves the ownership and makes that future copy explicit.
+     */
+    s16         scale;           /* entity +0xFC light intensity, 4096 = 1.0 */
+    s16         fade;            /* entity +0xFE second intensity factor      */
+    s16         light_selector;  /* entity +0xF4, constructor writes +1       */
+    u8          glow[3];         /* entity +0x2AC, allocator default 0x40      */
 
     /* What is in the hands now, and what has been asked for. Both are 1-based
      * weapon ids; they differ exactly while the weapon is being swapped. */
@@ -363,6 +390,13 @@ typedef struct q2_viewweapon {
     s32         last_fire_frame; /* +218: fire once per NEW frame            */
     bool        cook;            /* the grenade is primed and held           */
 
+    /* Grenade3 observes the model timeline from its own think. These are the
+     * port-side bridge: elapsed time at the pinned 380 position charges the
+     * hidden projectile, and crossing 411 releases it. */
+    s16         hand_prev_anim;
+    s32         hand_cook_ticks;
+    bool        hand_release;
+
     /* The frame-driven shot the arms ask for, drained by the caller: on the
      * console these arms `jalr` the fire function themselves. */
     u32         frame_fires;
@@ -390,6 +424,15 @@ u32 q2_vw_take_frame_fires(q2_viewweapon *vw);
 
 /* The sound a frame boundary asked for, or -1. Drains it. */
 s16 q2_vw_take_frame_sound(q2_viewweapon *vw);
+
+/* Drain Grenade3's two gameplay outputs. Cook time is in the same 300 Hz dt
+ * units passed to q2_vw_advance; release is a one-shot 411 crossing. */
+s32 q2_vw_take_hand_grenade_cook(q2_viewweapon *vw);
+bool q2_vw_take_hand_grenade_release(q2_viewweapon *vw);
+
+/* The held fuse reached zero. Retail forces fire frame 2, clears the model
+ * move, rewinds its position and gives the key 150 ticks (0x8004AA1C). */
+void q2_vw_hand_grenade_expired(q2_viewweapon *vw);
 
 /* The quad's own firing sound — `itm_damage3` — if a shot asked for one while
  * `quad_active` was set. Drains it. The console gates a second one on the

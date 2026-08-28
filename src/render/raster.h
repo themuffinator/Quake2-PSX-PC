@@ -91,7 +91,7 @@ void psx_raster_prim(psx_framebuffer *fb,
 
 /* Walk the ordering table far-to-near and draw everything in it. */
 void psx_raster_ot(psx_framebuffer *fb,
-                   const psx_ot *ot,
+                   psx_ot *ot,
                    const psx_vram *vram,
                    const psx_raster_opts *opts);
 

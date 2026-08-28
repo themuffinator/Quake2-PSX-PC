@@ -61,3 +61,4 @@ extracted/
 dump/
 .tmp/
 *.log
+/artifacts

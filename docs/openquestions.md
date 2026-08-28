@@ -380,6 +380,12 @@ Legend: `[ ]` open · `[~]` partially resolved · `[x]` resolved (move the item,
       clip end; and the last key of a model's last clip has no successor inside block C, which the original
       reads anyway. The port's computed inverse cosine matches the original's 4096-entry table on 4,094
       entries and is one unit out on the other two.
+      **The caller supplies sub-frame time for creatures and players.** The world-entity frame passes its
+      residual 0…29 phase to `0x8007EB10`, whose `0x8007ECAC` arm stores `move.base + phase` at
+      `entity+0x100`; the player driver at `0x8003DF58` independently adds each frame delta to that same
+      halfword. `0x8006B5D8` divides it by ten and keeps the remainder for the interpolation above. Creature
+      and multiplayer Male2 cursors now preserve that remainder instead of changing pose only on an AI/key
+      boundary.
 - [x] **39. The weapon stats table. — SOLVED, and there is no table.**
       Two passes swept the rodata around the ammo arrays for eleven damage values and found nothing. The
       sweep was right: every weapon has its **own fire function**, reached through a 12-entry pointer array
@@ -398,13 +404,35 @@ Legend: `[ ]` open · `[~]` partially resolved · `[x]` resolved (move the item,
       Implemented in `src/game/weapon.[ch]`, `combat.[ch]`, `projectile.[ch]` and
       `src/build/weapontables.[ch]`. `q2psx-inspect weapons` reads the data half back off the disc and
       compares it: **11 weapons, 3 armour classes, 22 sounds, 0 mismatches**. Full detail in FORMATS.md §13.
-  - [ ] 39a. Residue: the BFG blast's flight speed. `0x8004BE04` works out its own direction and the port
-        has not followed it; the 2400 at `0x8004BF20` goes to entity `+0xF4`, which the player spawn also
-        writes (as 1), so it is not a speed. The port flies it at the rocket's and names the substitution
-        `Q2_BFG_SPEED_UNREAD` so it is visible at every use.
-  - [ ] 39b. Residue: the grenade launcher's fuse. Its spawner stores 380 into the entity at `+0x4C`
-        alongside a second timer and which of the two is the fuse was not established. The hand grenade's
-        1650 IS read — it is argument 3 at `0x8004EC3C`.
+  - [x] 39a. **BFG flight and lifetime — SOLVED.** The spawner rotates the literal s16 vector
+        `{0,0,768}` at `0x800AE9B4`; the rotation is a componentwise fixed multiply/`>>12`, not a
+        Euclidean normalisation of the already-built view-matrix column. Its private think at `0x8004B2B4` advances each component as
+        `vel * dt / 64` (`0x8004B90C..0x8004B9DC`), so the ball covers 12 world units per dt unit, or
+        3600 per second. The 2400 at `0x8004BF20` is separately stored at entity `+0xF4` and counted down
+        at `0x8004B8C0`, giving an eight-second lifetime; expiry takes the quiet entity-free path at
+        `0x8004B8E4`. Implemented without the rocket-speed stand-in or a synthetic timeout explosion.
+  - [x] 39b. **Grenade-launcher fuse — SOLVED.** The caller's 900 at `0x8004CF9C` is copied from stack
+        argument 5 to entity `+0xF4` at `0x8004A2F8`; the think at `0x80049FE8` subtracts dt and detonates
+        at zero. It is a three-second fuse. The fixed rotated `{0,2048,6144}` is the velocity and the shared
+        mover advances it as `vel * dt / 320`, with its one-sided falling-Y clamp at 8192. The misleading
+        380 is in Grenade3's held think at
+        `0x8004A430`: it compares the owner's view-weapon position and gates a `6 * dt` charge of entity
+        `+0x4C`. It was never written by the launcher spawner and is not a fuse.
+  - [x] 39d. **Held hand-grenade state — SOLVED.** `Grenade3` is now its own three-state machine rather
+        than an immediate Grenade2-style throw. The spawner at `0x8004AA6C` starts hidden in state 1,
+        owner-attached, with raw forward charge **4096** and its **1650-tick fuse already running**. Its
+        think at `0x8004A368` copies viewmodel `+0xA4..+0xAC`, plays `wep_hgrenc1b` when the model timeline
+        crosses **261**, adds exactly **`6 * dt`** while position **380** is pinned, and crosses **411**
+        into release. Release uses the read origin literal `{80,-50,200}`, rotates
+        `{0,2048,charged}`, reveals the entity, plays `wep_hgrent1a`, and only then decrements grenade
+        ammo (`0x8004A7C0`). If the fuse wins while held, it detonates at the hand and forces the view
+        model to fire frame 2 / position 0 / 150 ticks remaining (`0x8004AA1C..0x8004AA40`) without
+        charging ammo or playing the throw sound. Implemented across `weapon`, `projectile`,
+        `viewweapon`, `simcombat` and the client; held state reuses the projectile record's collision-node
+        sentinel, so save version 5 remains byte-compatible. `test_weapon`, `test_viewweapon` and
+        `test_sim` pin attachment, charge, crossings, deferred ammo, release velocity, cook-off and
+        owner damage. An identical `--headless --weapon 6 --shoot` frame-20 capture removes the old
+        orange in-flight body/light while retaining the live hidden entity.
   - [x] 39c. **Residue: the chaingun's spin state. — SOLVED. It is three bands off the animation frame.**
         `+0x2C` is written by the FIRE-state driver at `0x800501C0`, and `0x80050180` is the table that
         decides what to write: **frame < 5 -> 1, 5..8 -> 2 while the trigger is held and 1 when it is not,
@@ -457,9 +485,10 @@ Legend: `[ ]` open · `[~]` partially resolved · `[x]` resolved (move the item,
         turns the result into the camera. So the "running three-halfword total" is an angle triple, not a
         wobble, and the previous reading had the *arithmetic* right and the *meaning* unlocated. The port
         applies all three now: FORMATS.md §9.12.11a, `q2_sim_view_angles`, `tests/test_pad.c`.
-  - [ ] Residue: **`0x800D8D78`**, the table the viewport draw stamps twice through `0x800689F4(p, 1)` with
-        the tick at `0x800B2DE4`. Eleven other materialisations across the world and model draw; looks like a
-        per-viewport freshness stamp, unidentified, not reproduced.
+  - [x] Residue: **`0x800D8D78` is the screen-area table** (region-relative; `0x800D8FE8` in NTSC).
+        `0x800689F4(p, 1)` stamps area 1's per-viewport record with the tick at `0x800B2DE4`. The 64-byte
+        area stride and 16-byte viewport stride lead to the screen record and the two final batch lists
+        reconstructed in 7b; the duplicate call is idempotent.
 
 - [~] **2d. What the two caller matrices hold when a model is drawn. — ANSWERED; one residue left.**
       The caller is the entity draw at `0x8006B924`, and it fills a draw context whose fields `0x800B1F90`
@@ -473,13 +502,15 @@ Legend: `[ ]` open · `[~]` partially resolved · `[x]` resolved (move the item,
 
       So the two differ by exactly the **view rotation**, and that asymmetry is correct rather than an
       oversight: the light directions are in world space, so rotating them into the camera as well would
-      make a model's shading swing as the player turned. The uniform scale rides in the same entity matrix
-      (`0x8006B298` scales its rows by `(entity+0xFC · entity+0xFE) >> 11`), which is why a materialising
-      item's parts stay attached as it grows.
+      make a model's shading swing as the player turned. `0x8006B298` does **not** scale that entity
+      matrix: its destination is the separate matrix at `0x800DDD1C`, installed by `SetLightMatrix` at
+      `0x8006BBD4`. It scales the gathered light directions by
+      `(entity+0xFC · entity+0xFE) >> 11`; the geometric rotation installed immediately afterwards comes
+      from entity `+0x2C0` and never reads either halfword.
       Implemented: `src/game/modeldraw.c` composes both the same way, and shades through `NCS`.
       **Residue:** posing an articulated model flat still does not restore agreement between its extents and
       the header's `ext2`/`ext3` (4/399 and 15/399 against 0/399 and 5/399 unposed), while static models are
-      unaffected. Now that the matrices are known to carry no per-model transform beyond the scale, the
+      unaffected. Now that the matrices are known to carry no per-model scale at all, the
       remaining explanation is that `ext2`/`ext3` are authored bounds rather than measured ones.
 
 - [x] **HUD. — SOLVED, and the answer is that there is no status bar.**
@@ -684,8 +715,9 @@ The residues of the resolved blockers keep their parents' numbers.
       a single `int` and the client declined anything that was not one of the Soldier's three flash
       tables. It carries the figures now. What IS known from the executable, and is implemented, is which mod each
       creature attack carries: a contact hit is mod 7 (`0x800612F0`), a thrown grenade is the launcher's own
-      spawner at speed 600 rather than 900 (`0x80061724`), and a creature rocket is `0x8004AF28` with the
-      aim scaled by 3/2 (`0x80062164`).
+      spawner through the wrapper's 600-valued ballistic solve; that same value is passed as its `+0xF4`
+      timer rather than the player's 900 (`0x80061724`). A creature rocket is `0x8004AF28` with the aim
+      scaled by 3/2 (`0x80062164`).
       *Attack:* the modules disassemble now (`q2psx-inspect moddisasm`), each carries its animation names as
       plain strings, and its spawn function is export 0 — so the remaining work is per-creature transcription
       rather than another format problem.
@@ -791,16 +823,19 @@ The residues of the resolved blockers keep their parents' numbers.
       `+28`, word-aligned down with the remainder consumed as bits.
       The header is seven fields, each holding its width **minus one** (widths 1…16), in the literal order of
       the `slti` bounds: `4,3,4,3,3,3,4` bits giving `w_base, w_op_short, w_op_long, w_f1, w_f3, w_f4, w_f2`,
-      then `w_base` bits of `base`. Then opcodes: **0** ends, **1** is an entity draw record (four fields, and
-      `f2` is the BIT length of a payload the entity consumes only if it was drawn — otherwise the stream
-      skips it), **2** switches between a windowed mode that adds `base` and an absolute mode that does not,
+      then `w_base` bits of `base`. Then opcodes: **0** ends, **1** is a screen-region change (historically
+      called an entity record; `f1` names a Scene/Points marker, `f3` its parent region, `f4` its draw area,
+      and `f2` is branch data), **2** switches between a windowed mode that
+      adds `base` and an absolute mode that does not,
       carrying the replacement opcode at the new mode's width, and **≥3** is a scene node, `op - 3`.
-      **The load-bearing consequence.** The ordering-table bucket starts at 45 (`0x80066978`) or 43
-      (`0x80066A3C`) and is decremented in exactly one place — after an entity record (`0x800675E0`). The node
-      path never touches it: it draws a whole node into the current bucket and stops the stream once the
-      bucket falls below 4. So **the world's draw order is authored, and the ordering table only carries it**;
-      buckets exist to interleave entities with the world at the right depth. A port that computes a bucket
-      per quad from the GTE's depth — which this one did — produces a *different* order, not a finer one.
+      **The load-bearing consequence.** The two apparent starts are consecutive operations, not alternatives:
+      `0x80066970` seeds the camera area's full-view screen record at bucket **45**, then `0x80066A34` starts
+      the actual SortData stream at bucket **43**. The stream bucket is decremented in exactly one place —
+      after an entity record (`0x800675E0`). The node path never touches it: it draws a whole node into the
+      current bucket and stops the stream once the bucket falls below 4. So **the world's draw order is
+      authored, and the ordering table only carries it**; buckets exist to interleave entities with the
+      world at the right insertion point. Starting the stream at 45 shifts all world geometry by two console
+      buckets and breaks its relationship with every structural and dynamic packet.
       Implemented in `src/formats/sortdata.[ch]`, unit-tested in `tests/test_surface.c` against an
       independent encoder (word-straddling fields, multi-word skips, both modes, unaligned starts).
       Checked disc-wide by `q2psx-inspect surfaces`, which **tiles** each chunk end to end — decode to the end
@@ -808,18 +843,40 @@ The residues of the resolved blockers keep their parents' numbers.
       87 overruns at chunk tails, 178,801 node references and ZERO out of range.** A desynchronised bit reader
       does not land on a valid header 8,968 times in a row, which is what makes tiling a test rather than an
       illustration.
-  - [~] 7a. Residue: which stream a given viewport starts at — **narrowed, and no longer a functional gap.**
-        The offset is an `int16_t` at `+28` of a 36-byte record indexed by the viewport's own `+146`
-        (`0x80066AFC`), reached through the table pointer at `0x800C8E94`. That record is runtime state: the
-        chunk pointer `0x800B2C84` has exactly **one** reader in the whole image (`0x80066B00`, the stream
-        init) and two writers, both in the zone loader, and `+28` likewise has exactly one reader. Nothing on
-        the disc carries the mapping. `Resources` was the obvious candidate and is ruled out — 32 bytes per
-        record, not 36.
-        What removes the practical consequence is that the streams are **self-delimiting and therefore
-        enumerable**: `q2_sortdata_enumerate` / `q2_sortdata_stream_offset` tile a chunk and hand back a stable
-        stream INDEX, which is a disc-derived handle where a raw byte offset is not. The renderer takes one;
-        stream 0 is what a single-stream chunk holds. What remains unknown is only which index a given
-        viewport picks, not how to reach any of them.
+      **Opcode 1's branch is now exact too.** `0x80065D08` projects every point in the `f1` Scene/Points
+      marker and the callee returns true iff both projected dimensions are non-zero; either collapsed axis
+      is normalised to a literal zero rectangle. The result is clipped to
+      parent `f3`: below-edge values clamp to the parent's minimum and above-edge values to its maximum.
+      Hidden markers pass literal zero bounds. False skips `f2` bits; true
+      treats non-zero `f2` as the signal for a new base. Forcing true globally was not harmless overdraw: a
+      collapsed group then changed the bit position and made every later surface look like broken culling.
+  - [x] 7a. Which stream a viewport starts at — **SOLVED directly; the equal-index inference is withdrawn.**
+        The table pointer at `0x800C8E94` is the on-disc **PrimaryColl node array**, not a separate runtime
+        record. `0x80066AD4` reads the camera cell from `view+146`, multiplies by the 36-byte node stride, and
+        `0x80066AFC` loads signed halfword `+28`: the exact SortData **byte offset** for that cell. The client
+        now locates each viewport camera in PrimaryColl and uses `node.sort_offset` directly. Stream tiling is
+        retained for offline grammar/census work only; cell `i` never needs to be guessed as tiled stream
+        `i`.
+  - [x] 7b. What opcode 1 and Scene byte `+0x0E` build — **SOLVED directly.** PrimaryColl byte `+32`
+        is the camera's seven-bit draw area. Opcode 1 projects its Scene/Points group and registers `f4`
+        as another live area at the current authored bucket. Each projected rectangle changes the GTE origin
+        and emits an in-list DRAWENV that restores the previous region when the OT later reaches that bucket;
+        the world linkers cull against the current region-local extent. Each area is a 64-byte runtime record (table
+        `0x800D8FE8` in NTSC): `+0` freshness tick, `+2` ordinal, `+4` screen-change record, `+8` Standard
+        batches and `+12` Quick batches. Scene flags08 bit 14 builds a private packet
+        chain keyed by `Scene[+0x0E] & 0x7F`; models use entity byte `+0x9E`, which movement fills from the
+        occupied collision cell's byte `+32` at `0x80046B08`. The final drain at `0x80046E14` reconstructs
+        `0x80047080`'s exact bounded dependency sort: newest-first Standard AABBs (maximum 32), reciprocal-
+        edge suppression, midpoint splitting of intersecting boxes, Quick-to-Standard dependencies
+        (maximum 128), stable signed-depth Quick runs, cyclic Standard selection, and minimum-edge cycle
+        breaking. Area 1 instead concatenates at fixed slice bucket 46; area 2 sorts at fixed slice bucket 1;
+        ordinary areas 3…95 require a fresh screen record. It then `CatPrim`s every whole private chain onto the area's authored bucket. A stale area
+        is culled; global depth is not a fallback. The projection selector at
+        `0x80065684` is stateful: negative returns untouched, 0 selects the
+        global extent, 1 the viewport, and ordinary areas use viewport centre
+        minus their region minimum. The view weapon writes area 1 at
+        `0x8004EE58` before the normal model selector; using `-1` as an invented
+        reset instead leaked the last particle/projectile region into the gun.
 - [x] **8. `AreaConx` — SOLVED. It was never a 9-byte record, and the premise is what held it for three
       passes.**
 
@@ -898,20 +955,34 @@ The residues of the resolved blockers keep their parents' numbers.
       transcription, then walks every place record: **1,013 of 1,013** resolve, **1,013 of 1,013** name a
       model the same map ships. Implemented in `src/build/itemtable.[ch]`, `src/game/entity.[ch]`,
       `src/game/item.[ch]` and `src/game/entitydraw.[ch]`; full decode in FORMATS.md §15.
-      Three residues, all recorded rather than papered over:
-  - [ ] 10d. The place record's halfword at `+0x0C`: the low twelve bits are the entity's yaw (`andi 0xFFF`
-        at `0x80058938`), but **bits 12…15 are unread**. 627 of 1,013 records set at least one and all four
-        occur. The angle itself is zero in 905 of 1,013 and never lands on a quarter turn, which is what a
-        spinning pickup would look like — but it means the field carries almost no information and the upper
-        nibble probably carries most of it.
-  - [ ] 10e. The item table's `clips[4]` is a `0xFFFF`-terminated list whose pointer is stored into the
-        entity's model state; twelve records carry two entries each. Which of the model's own clips those
-        indices select is not checked against a real CastList yet, so the port stores them and plays the
-        first.
-  - [ ] 10f. The entity's `+0xFC` scale is multiplied by a second halfword at `+0xFE` before the renderer
-        scales the matrix by `(a * b) >> 11` (`0x8006B298`). Nothing was found that writes `+0xFE`, so the
-        port folds the pair into one 1.0.12 scale. If `+0xFE` is ever anything but a constant, every item's
-        size is wrong by that factor.
+      The three former residues are now closed:
+  - [x] 10d. **The place halfword packs yaw plus three skill exclusions; bit 12 is unused authoring
+        provenance. — SOLVED.** `0x8007F538` is the missing pre-spawn list walker. It reads the global skill
+        at `0x800B334A`: skill 0 rejects `0x2000`, skill 1 rejects `0x4000`, and skill 2 rejects `0x8000`,
+        naming NOT_EASY / NOT_MEDIUM / NOT_HARD exactly. Surviving records go to `0x800599DC`, whose generic
+        spawner masks the low 12 yaw bits at `0x80058938`. No path tests `0x1000`; the census independently
+        finds it set on every place in 22 maps and none in 12, with **zero mixed maps**, so it is a map-build
+        marker with no retail gameplay reader. The port now filters both startup and CREBATCH place walks by
+        the same global skill, while the all-record inspector deliberately bypasses the runtime filter.
+  - [x] 10e. **The item table's final list names posed vertices for a subtractive floor shadow, not clips. —
+        SOLVED.** `0x800599DC` stores `record + 0x10` in model-wrapper slot `+4`; its only consumer is the
+        render-flag-bit-0 path at `0x800784CC`, after model drawing. That loop reads up to four halfwords until
+        `0xFFFF`, maps each as a GLOBAL STORAGE vertex through `0x8006D608`, poses it through `0x8006C6C8`,
+        and accumulates X/Z extrema. Item spawn leaves radius `+0x94` zero, so only the twelve records with
+        two listed vertices produce a non-degenerate footprint. Rocket launcher's value `95` alone refutes a
+        clip interpretation: the model has one clip, but storage vertex 95 is valid. The port now poses every
+        item through clip zero, emits retail's RGB-128, ABR-2 `POLY_FT4` using the existing `chars.lbm`
+        shadow tile, applies its `(600-height)/600` shrink, and reports emitted shadows in the headless census.
+- [x] 10f. **`+0xFC` and `+0xFE` are two lighting-intensity factors, not geometric scales. — SOLVED.**
+        The destination of the three `ScaleMatrix` calls at `0x8006B298` is `0x800DDD1C`, and
+        `0x8006BBD4` installs that exact buffer with `SetLightMatrix`. The model rotation installed next is
+        independently composed from entity `+0x2C0`; an exhaustive `access 0xFC` / `access 0xFE` sweep
+        finds no geometric reader. The same product scales the ambient back colour at `0x8006B468`.
+        `+0xFE` is not constant: the model-entity think writes
+        `clamp(25 * (320 - time), 0, 4096)` at `0x8005A68C`, dimming an explosion without shrinking it.
+        The allocator is the other entity writer and seeds both fields to 4096 at
+        `0x8006C1B8..0x8006C1C0`. The port now keeps entity geometry at unity, sends both fields only to
+        `q2_light_env_build`, and no longer culls a zero-intensity model.
 - [x] **11. `MapMod` `Poly.uvIdxFlags` bits 6–7. — RESOLVED as a UV rotation; kept in Tier 0 above.**
 - [x] **12. `Scene` node `flags08`. — SOLVED. It is four fields, not one bitfield.**
       The zone draw and the node emitter read the halfword at node `+8` four different ways, and the low ten
@@ -956,9 +1027,12 @@ The residues of the resolved blockers keep their parents' numbers.
       with `R = RotMatrix(obj[0x0C..0x10])` (libgte, `0x80089E38`), `p = obj[0x18]` the **pivot**, and
       `d = obj[0x12]` the linear displacement. `R . p` is the 1.3.12 matrix-vector routine at `0x8006FB18`
       (three `mult`s summed, then `>> 12`). The `- R.p + p` shape is what identifies `obj+0x18` as a pivot
-      rather than the "second independent displacement" an earlier pass called it, and `ROTHATCH`'s
-      constructor confirms it from the data side: it fills `obj+0x18`/`+0x1A` with the item's pivot at
-      `+10`/`+12` **minus the node's own origin** (`0x8002B7B4`–`0x8002B808`).
+      rather than the "second independent displacement" an earlier pass called it. The missing constructor
+      half is now implemented too: SIMROT/SIMROT2 (`0x800284C8`–`0x80028548`, `0x800286C0`–`0x80028740`)
+      and ROTBUTTON (`0x8002C210`–`0x8002C288`) store the raw Scene-box midpoint minus Scene.origin.
+      ROTHATCH (`0x8002B798`–`0x8002B830`) starts there, subtracts signed `item+10` from X and adds
+      `item+12`/`item+14` to Y/Z. All three use the MIPS round-toward-zero midpoint sequence. Leaving these
+      fields at the object's memset zero was why the native renderer rotated brushes around the wrong origin.
       The integrator is `0x8002F1A8`, reached from the 48-object sweep at `0x8002DC04`:
 
           if (!(obj[0x50] & 0x01000000)) return;
@@ -998,11 +1072,10 @@ The residues of the resolved blockers keep their parents' numbers.
         `0xFFFFC3FF`) but the renderer masks to two, so values 4…15 alias onto 0…3. Bit 12 is nevertheless
         authored on disc — `0x1000` on one node and `0x1400` on three — and **no reader was located** for
         either bit anywhere in the image.
-  - [ ] 12b. Residue: `unk0C`, `unk0D`, and `unk0E`'s meaning. `unk0E` now has a consumer: on the bit-14
-        deferred path only, its low 7 bits index a 64-byte-stride table at `0x800D8D78` and the record is
-        handed to `0x80047744` (`0x80066800`). What that table holds is still open. `unk0C` (0…4, non-zero on
-        6 nodes) and `unk0D` (0…3, non-zero on 5) remain unread. Byte `+0x0F`, documented as "always 0", is
-        scratch: the zone draw writes a per-frame counter into it at `0x80067A34`.
+  - [ ] 12b. Residue: `unk0C` and `unk0D`. Scene `+0x0E` is solved as the seven-bit draw area (7b).
+        `unk0C` (0…4, non-zero on 6 nodes) and `unk0D` (0…3, non-zero on 5) remain unread. Byte `+0x0F`,
+        documented as "always 0", is scratch: the zone draw writes a per-frame counter into it at
+        `0x80067A34`.
 
 ---
 
@@ -1363,35 +1436,36 @@ The residues of the resolved blockers keep their parents' numbers.
         draws a viewport's world, which is why it is anchored per viewport and why its cells shrink in
         split screen.
         Its anchor is **view+304 / view+306** — the two halfwords screen.h carried as `pad_a`/`pad_b`,
-        unknown. Thirteen 10-byte field records at `0x800337EC` give every cell a literal offset from it,
+        unknown. Seventeen 10-byte field records at `0x800337EC` give every cell a literal offset from it,
         and sorted by x they read **three digits then an icon, three times**, digits 24 apart:
         A at −71/−47/−23 with its icon at +0, B at +64/+88/+112 with +135, C at +179/+203/+227 with +250.
-        A thirteenth field at +330 is unidentified.
+        Field 12 at +330 is the one-player auxiliary icon filled by `0x80037CAC`; its precise gameplay
+        meaning remains open, but it is not the split-screen frag counter.
         The **numerals are at `0x8009C598`** — ten four-byte {u, v, w, h}, all 24 x 24 at v = 168, u = 24 *
-        digit. That 24 is the same stride the field table uses, and the two were read independently.
-        Retail capture gives the left-to-right order health, ammo, armour; the three groups are identical in
-        the code, so that one fact is from the screenshot and is labelled so at the enum.
+        digit, followed by the minus sign at (0, 192) and the 1 x 1 blank. That 24 is the same stride the
+        one-player field table uses. The call sites now prove the group order directly: `0x80035178` gets
+        health, `0x800352C0` ammo and `0x80035554` armour; capture independently agrees.
         Implemented in `src/game/statusbar.[ch]`, wired into the client's per-viewport draw and fed the
         sim's real health, armour and current-weapon ammo. Full detail in FORMATS.md §11.1.1.
-  - [ ] 20f. Residue: **which rect is which item**, and **the quad layout's table.** Each record's fifth
-        byte is an id whose value space is unidentified, so there is no name-to-rect vocabulary — health's
-        and armour's icons are caller inputs rather than named constants. And the three draw hooks build
-        three DIFFERENT field tables: the one-player one at `0x800337D0` (17 fields in two rows), the
-        two-player one at `0x80033D30` (9 fields, two counters, digits 20 apart rather than 24), and the quad
-        one at `0x80034288`.
-        **All three are now read — SOLVED.** None of them is a table in the data segment, which is why a
-        search for arrays of ten-byte records never found them: all three are built **inline on the stack**
-        and copied into the view record. Evaluating the quad builder symbolically gives **sixteen** fields,
-        and the shape says what it is — four counters of three digits and an icon, in **two rows**. In
-        four-player split the bar is not per viewport: it carries every player's counters at once, two along
-        the top and two along the bottom. The lower row's `dy` is `40 - screen_height`, taken from the live
-        framebuffer height at `0x800B2DA2` rather than from a constant, so it follows the display mode. Digit
-        pitch is 20, the two-player table's.
-        Running the same extraction on `0x800337D0` re-derives the one-player table byte for byte, so that
-        transcription is now confirmed from two directions rather than one. The four trailing bytes of every
-        record are the same in all three layouts — a source rect of (255, 255) sized 1 x 1, the blank — and
-        are initial values the draw overwrites, not layout.
-        `src/game/statusbar.[ch]`, `q2_sbar_fields_4p`; `tests/test_statusbar.c`.
+  - [x] 20f. **The icon vocabulary and the quad layout.** Each record's fifth byte is its **palette index**,
+        copied to byte +8 of the ten-byte field record; it is not an item-effect id. All three status-bar
+        sub-draws select a rect by index (`base + index * 5`) and none scans or compares that byte. Pickup
+        captions use the item effect as a rect index directly, while health and armour use the hard-coded
+        rect indices proved at their reader arms.
+        **All four installed hooks are now read — SOLVED.** The selector is the proof that corrected the old
+        labels: `0x800337D0` is one player (17 fields), `0x80033D30` two stacked (16), `0x80034288` two
+        side-by-side (16), and the real three/four-player hook is **`0x80034830`**, not `0x80034288`.
+        The side-by-side hook puts armour and signed frags on its upper row with the literal expression
+        `anchor_y + 40 - framebuffer_height`. The real quad hook builds **11 fields per viewport** from 44
+        x halfwords at `0x8009C600` (`view * 11 + field`) and four y halfwords at `0x800AE808`:
+        `{110, 110, 1, 1}`. Each viewport carries its own health, ammo and signed frag readout; armour is
+        omitted. Views 1 and 3 slide one- and two-character frag values against their inner edge.
+        The client now selects these exact tables, feeds each viewport its owning player's parked combat
+        state and frag count, and omits the one-player pickup/powerup/weapon-strip sub-draws from the three
+        split hooks exactly as their call graphs do. Headless 2H capture shows player 0 at 100 health and
+        player 1 at 84 in separate panes; quad capture shows four bars along the central split.
+        `src/game/statusbar.[ch]`, `q2_sbar_fields_2h`, `q2_sbar_fields_2v`,
+        `q2_sbar_fields_quad`; `tests/test_statusbar.c`.
 - [x] 46. **The deathmatch scoreboard.** *(#101 reads its static page and recovers the six mode titles; #106 puts the prompt where the module puts it. The per-player rows are runtime, not records, which is the answer rather than the gap.)* Capture shows a `DM SCORES` screen: a title on a **red** bar rather
       than the usual blue, one row per player carrying that player's own bar colour (RETRODAN red, PLAYER 1
       blue) with a name and a frag count, a `READY` marker on the left of a row that has pressed fire, a
@@ -1448,20 +1522,14 @@ The residues of the resolved blockers keep their parents' numbers.
       cross-reference rather than a runtime index — and the last measurement supports that: the pointer is
       installed at `ctx+0x10` by `0x80051798` and **nothing in the collision code reads offset 0x10 of a
       context**. This port implements the whole collision model without it and walks 47 of 47 maps.
-- [~] 23. `CollNode` fields `c` and `d`. **`d` is SOLVED**: its low byte is the node's **contents id**,
+- [x] 23. `CollNode` fields `c` and `d`. **Both runtime meanings are SOLVED.** `d`'s low byte is the node's **contents id**,
       read with `lbu +32` at `0x80044DB8` — where a trace records it into its contact list whenever it
       changes along the path — and at `0x8004510C`. The other three bytes are zero on all 22,773 nodes.
-      **`c` (+28) is HALF SOLVED, and the negative result that stood here was the clue.** It said no
-      instruction in the image loads offset +28 of a collision node, which is true and stays true: the
-      gather at `0x8006B0E4` loads offset **+30**. The field is two halfwords, and the high one — bytes
-      +30..+31 — is the node's first index into `SpaceLights` (#9). Reading `c` as one 32-bit quantity is
-      what made it look like noise; its "max 65,077,433" is `0x03E10039`, i.e. light index 993 beside a low
-      half of 57.
-      The **low** halfword at +28 is still unread, and no instruction loads it either. It is non-zero on
-      8,968 of 9,083 primary records and 13,625 of 13,920 secondary ones, reaching 18,544 and 20,603. The
-      obvious next test — that it is a second partition of the same shape into another chunk — is
-      **REFUTED**: it is non-decreasing on only 30 and 15 of 115 zones respectively, where the light index
-      is monotonic on all 115. Whatever it is, it is not a running offset.
+      **`c` (+28) is two hull-specific halfwords.** The high one — bytes +30..+31 — is SecondaryCol's first
+      index into `SpaceLights` (#9), read at `0x8006B0E4`. The low one is PrimaryColl's exact SortData byte
+      offset, read with `lh +28` at `0x80066AFC` after the viewport camera cell indexes that hull. Reading
+      them as one 32-bit quantity made the old maximum look like noise. The unused opposite-hull copies need
+      not be monotonic: no located consumer reads PrimaryColl's light half or SecondaryCol's sort half.
 - [~] 24. **`Resources` `unk0` and `unk4` are authored constants, not derived budgets — measured against
       six properties of the zone each one names and correlated with none of them.** Over all 115
       record/zone pairs:
@@ -1530,10 +1598,13 @@ The residues of the resolved blockers keep their parents' numbers.
       name. (0x0004 is absent from the union, which matches TIMED's own note: the runtime sets it on items
       a dying actor drops, and no authored record carries it.)
 
-      **`extra` is the model's CLIP LIST.** The spawner does `ent->model->clips = &rec->extra[0]` — a
-      0xFFFF-terminated run of clip ids — and this port has been assigning it as exactly that since the
-      item path was written: `e->clip[i] = def->extra[i]` in `item.c`. The consumer was located; the entry
-      was never updated.
+      **The final list is a set of posed SHADOW VERTICES, not clips.** The spawner does store
+      `record + 0x10` into model-wrapper slot `+4`, but the only consumer at `0x800784CC` treats its
+      `0xFFFF`-terminated halfwords as global-storage vertex indices. It maps and poses each vertex, grows
+      X/Z extrema, applies yaw and the entity base, then emits a subtractive `POLY_FT4` from the lower-right
+      16 × 16 tile of `chars.lbm`. Every shipped item model has one clip and plays clip zero; values up to 95
+      in this list could never have been clip ids. This correction and the packet path are covered by
+      `tests/test_item.c`, while `q2psx-inspect items` checks all disc placements and prints the vertex census.
 - [x] 28. **All three clauses answered, and two of them were answered elsewhere without this entry being
       updated.**
 
@@ -1770,15 +1841,18 @@ item records at run time instead of transcribing a table, so there is nothing to
       mirrored by writing the screen corners backwards against ascending UVs, not by flipping the UVs. It
       overhangs its rectangle by 10 and 6. FORMATS §11.10; `src/menu/panel.[ch]`; `tests/test_panel.c`.
 
-- [~] 42. **The button prompts — the art and the table SOLVED, the per-screen placement not.** The reason a
+- [~] 42. **The button prompts — the art, table and ordinary-menu policy SOLVED.** The reason a
       string sweep never found `BACK` is that there is no such string: each prompt is one 76 x 16
       pre-rendered cell in `frontend.lbm`, glyph and word together, drawn as a single quad. The table is
       three 18-byte records at `0x8009B4D8` giving uv, size, x and a target/current y pair; the three sit at
       the quarter marks of the 512-pixel screen, and they **slide** three pixels a frame towards the target.
       `q2_menu_open` parks all three below the screen on every page open, so a screen that wants a prompt has
       to ask again. FORMATS §11.11; `src/menu/prompt.[ch]`.
-      *Still open:* which screen asks for which prompt at which y — every caller but the page open reaches
-      the setter through the front end's function-pointer table at `0x80079ECC`, which is #44.
+      `0x8001A280..0x8001A348` settles the common policy: SELECT follows a non-NULL action on the current
+      row and BACK follows a non-NULL page back handler, at caller y 216 in QFRONT and 220 in-game. QFRONT
+      module+`0x459C` adds RULES at y 220 for the first three MULTIPLAYER mode rows and parks it on the two
+      settings rows. `q2_prompt_sync_menu` and the client now apply and render those rules. *Still open
+      outside the ordinary menu:* the retail drawer's page-11 BACK special case at (230,114).
 
 - [x] 43. **The briefing screen — SOLVED.** `0x800215A0`. It is a sibling of the MISSION screen only in that
       it hands one markup string to the same printf: MISSION positions every run with an explicit `@XXXYY`
@@ -2035,10 +2109,10 @@ item records at run time instead of transcribing a table, so there is nothing to
       scenery taken: with one player registered the touch sweep really would run over it.
       *`proj = 160` is confirmed from a third direction* — `engine+0x174(0, 160, 4000)` agrees with
       `SetGeomScreen`'s eleven call sites and with the sky-wedge measurement.
-      *The logo is NOT born small.* An earlier pass here had it grow in from zero on the first frame, and
+      *The logo is NOT born dark.* An earlier pass here had its intensity grow from zero on the first frame, and
       nothing in the module zeroes `+0xFC`: `q2_item_spawn` leaves a non-materialising record at full size
       and the think reads what is there. What the title screen's ramp is for is the way BACK — a sub-page
-      has driven the scale to 1024 and returning walks it up to 4096 again. It is one animation seen from
+      has driven the intensity to 1024 and returning walks it up to 4096 again. It is one fade seen from
       two ends, and it only runs after you have been somewhere.
       And the earlier guess in this entry that the rows sit low because the logo occupies the space *above*
       them is superseded by the geometry: at scale 4096, z 1700 and proj 160 the posed bounds
@@ -2058,11 +2132,11 @@ item records at run time instead of transcribing a table, so there is nothing to
       references to it — `0x80076A00` reads it into the env's rgb, and `0x8006E0B0` and `0x80070FA0` each
       `memset` it to zero. Four zero bytes on disc, no writer that puts anything else there. The invented
       navy was invisible in a lit corridor and obvious the moment the front end drew one model over it.
-      One more thing the entity draw owed: **the light intensity is the entity's own scale.** `0x8006B298`
+      One more thing the entity draw owed: **the light intensity is the entity's own `+0xFC`.** `0x8006B298`
       folds `+0xFC` and `+0xFE` as `(a * b) >> 11`, the allocator sets both to 4096 at `0x8006C1B8`, and
-      `+0xFC` is the scale — so an item is lit in proportion to how big it currently is. The port passed a
+      `+0xFC` is an intensity — so an item is lit in proportion to its fade. The port passed a
       neutral pair, which agrees with the engine only for entities at full size. It shows here because the
-      logo's own think moves that field: shrunk onto a sub-page it is lit at a quarter.
+      logo's own think moves that field: dimmed on a sub-page it is lit at a quarter.
 
       *Read in full by #126:* the **attract loop**. `module+0xCEE0` parks 9000 (30 s at 1/300) in
       `module+0x12DC0` and installs `module+0xC6AC` as the page hook; any input resets it and zero calls
@@ -2624,52 +2698,26 @@ scale call at all. The squeeze is the game's, not the reconstruction's, and must
 
 ---
 
-- [ ] 50c. **The view weapon is a VIEW-SPACE entity for lighting, and the list that would light it has
-      no producer.** `0x8004F750` writes **1** to the viewmodel entity's `+0xF4` when it is created — and
-      that halfword is exactly the flag `q2_light_gather`'s `view_space` branch keys on (lighting.h §
-      "the branch the original takes on the entity's +0xF4"). So the console lights the gun from the VIEW
-      dynamic list at `0x800E3ED8` alone, skipping the world list and every static lamp. The client
-      gathers it as a creature instead — world list, static lights, the lot.
+- [x] 50c. **The view weapon takes the WORLD lighting branch; `+0xF4 = 1` was
+      misread as a boolean instead of a signed selector.** The decisive instruction is the one immediately
+      after the load: `lh v0,244(s2); bgez v0,0x8006B08C` at `0x8006B038`. Non-negative values take the
+      world dynamic list and the node's static lamps; only a negative halfword takes the alternate list.
+      The constructor's literal **+1** at `0x8004F750` therefore proves that the client's world gather was
+      the right mechanism. The dark-grey experimental render was not evidence for a missing view-list
+      producer; it was the exact visible consequence of inverting `bgez`.
 
-      **Switching the flag alone makes it worse, and that is the finding.** Tried: the blaster goes dark
-      and flat, because `q2_light_world.dynamic_view` is READ (lighting.c:206) and CLEARED
-      (lighting.c:308) and **written by nothing**. It is a sixteen-slot list with no caller — the same
-      shape as the eleven multiplayer functions and the rotating brushes before them. The console's gun is
-      plainly lit in a capture, so the console's view list is not empty.
+      **The actual client error was the ambient floor.** The entity allocator writes
+      `0x40/0x40/0x40` to both ambient colours at `0x8006C1D8..0x8006C1FC`; nothing in the viewmodel
+      constructor overwrites them. The client guessed the item spawner's separate `0x30` constant. The
+      viewweapon now retains its real `+0xFC`, `+0xFE`, `+0xF4` and `+0x2AC` fields, folds the two intensity
+      factors into lighting, passes literal +1 through a signed gather API, and uses the allocator's
+      0x40 back colour. `tests/test_light.c` pins all three arms of the signed test (+1, zero, -1), and
+      `tests/test_viewweapon.c` pins the constructor state.
 
-      So the port is wrong in mechanism and closer in result: lighting the gun off the world compensates
-      for view lights it never adds. Reverted rather than left in, because a dark flat gun is further from
-      the capture than a slightly washed one.
-
-      **AND THERE IS NO PRODUCER ON THE CONSOLE EITHER — the port's empty list is right.** The two lists
-      are appended through cursors: `gp+18624` for the world and `gp+18628` for the view, both reset
-      together at `0x80075DFC`/`0x80075E08`. Sweeping every gp-relative access to each:
-
-          world cursor 0x800B2EC0   thirteen sites, read and written, appended by 0x80075C34
-          view  cursor 0x800B2EC4   TWO sites, both writes, both resets — never read
-
-      Nothing can append to a list whose cursor is never loaded. So the console's view dynamic list is as
-      empty as the port's, and `dynamic_view` having no producer is a faithful reconstruction rather than
-      a missing caller. That closes the question this entry opened.
-
-      **What it leaves open is narrower and different**, and three configurations have now been tried
-      against the same BASE0 capture:
-
-          world list + the player's node   too bright, washed pink   (what the port ships)
-          view space, the player's node    dark and flat
-          view space, no node (fallback)   dark and grey
-
-      The console's is a mid-tone purple with clearly separated face brightnesses — none of the three.
-      So the difference is not in WHICH lights are gathered: the gather has been tried three ways and the
-      answer is in what is done with the result. The candidates left are the modulate path, the back
-      colour, the glow the viewmodel is actually created with (the port hardcodes `0x30` a component from
-      the entity spawn default), and the two 1.12 intensities at `+0xFC`/`+0xFE` — which the client passes
-      as ONE and which `0x8004EE70` shows the viewmodel COPYING from the player entity. That last one is
-      the first thing to check and it has not been.
-
-      **This is a lighting question rather than a view-weapon one** and should be chased in
-      `q2_light_env_build`. Recorded here because the three negative results are worth more than the
-      hypothesis that generated them.
+      Deterministic BASE0 frame 119 changes only the weapon coverage: the violet body and arm gain the
+      allocator's missing ambient while the world and HUD remain identical. This closes the lighting
+      mechanism; the later arm-material discrepancy is the separate VRAM/CLUT question recorded near
+      #131, not a reason to invert a branch whose instruction is unambiguous.
 
 - [x] 50a. **The view weapon queues something white and 128 units wide at its own position — and the
       gate it is behind is NEVER WRITTEN, so it never happens.** `0x8004F6CC` calls `0x8007012C` with the
@@ -4836,7 +4884,7 @@ nothing saying so.
       **The second site is identified: `0x8004AC4C` is the ROCKET.** It is referenced only as a materialised
       constant, never called — an entity think pointer — and the code that installs it names it beyond doubt:
 
-          8004B030  addiu v0, zero, 20000    ; the rocket's speed (projectile.h)
+          8004B030  addiu v0, zero, 20000    ; rocket lifetime, entity+0xF4
           8004B034  sh    v0, 244(s0)
           8004B03C  addiu v0, v0, -21428     ; 0x8004AC4C
           8004B040  sw    v0, 60(s0)         ; installed as the entity's think at +0x3C
@@ -7169,9 +7217,10 @@ frame exists, "the weapon looks smaller" is an impression from mid-play footage 
 
       That is what stands in for the LevelBin selection this port cannot run, and it needs no LevelBin.
 
-      **The port spawns every record and holds the batches DORMANT** rather than re-running the spawn
-      pass mid-level against a set other systems already hold pointers into. The effect is the console's,
-      and the bit-1 latch is honoured: a group already summoned wakes nobody.
+      **For creature spawn records, the port spawns every record and holds the batches DORMANT** rather
+      than re-running the module-owned monster setup mid-level. Population *place* records now take the
+      other safe path: only the resident/LevelBin-selected item groups exist at startup, and CREBATCH
+      appends a deferred place group when called. Both paths honour the bit-1 one-shot latch.
 
       Measured across twenty maps, every one of them summons — BASE1 19 creatures, JAIL2 31, JAIL4 26,
       BASE3 24, JAIL3 25. And BASE1 now starts with **4 live where it started with 8**, the other four
@@ -7429,6 +7478,12 @@ frame exists, "the weapon looks smaller" is an impression from mid-play footage 
       75 groups across 21 maps — but a mention is not a selection. JAIL3's `Bridge` is named by the module
       AND by a CREBATCH, which is what forced the call decode rather than the string search.
 
+      The decoded selection is now shared by **items as well as creatures**. `q2_item_spawn_zone` runs the
+      resident `Zone<N>` and explicitly selected place groups, while `q2_sim_activate_item_group` handles a
+      later CREBATCH once. Version-5 saves carry an `ITEM` chunk with exact group activation order and stable
+      Population `(group, place-slot)` keys, so a collected startup slot reused by a deferred item restores
+      to the same physical entity slot instead of failing the old entity-count check.
+
 - [x] 88. **The campaign runs end to end.** Five maps carry a `MISCOMPLETE` and it is **one per unit, on
       that unit's last level**: BASE2 ends unit 1, SECURITY 2, POWER2 3, COMMAND 4, BOSS2 5. Nothing was
       tuned to produce that; it falls out of the unit numbers recovered from `Unit<N>Miss1` (#70) meeting
@@ -7542,9 +7597,11 @@ frame exists, "the weapon looks smaller" is an impression from mid-play footage 
       printable bytes is the line.
 
       **Where it stops is the handler.** It is MIPS in the module and this port does not run modules, so
-      what a mission event DOES is not reproduced. The client names the event, attributes it to its table
-      and counts it, and says so — a MISEVENT that silently did nothing would look like the script
-      working.
+      each live handler still has to be reconstructed. BASE0's `DOCRATES` now is: the named `CRATES`
+      zero-speed LIFT1 supplies four runtime objects, slots 0/1 advance by `(16*dt)/8`, slots 2/3 by
+      `(20*dt)/8`, and each wraps by -3500 once its translated box centre reaches -1044. The named `ALWAYS`
+      record is queued once per actual simulation tick, which is how retail continuously calls it. Handlers
+      not yet reconstructed remain named and counted rather than failing silently.
 
       The engine's own half either side of the handler is two lines and neither needs reproducing:
       `0x8006D2EC` parks the twelve-byte name in a global at `0x800DD950`, and `0x800435D0` spills three
@@ -8489,6 +8546,14 @@ frame exists, "the weapon looks smaller" is an impression from mid-play footage 
       meet a window. A projectile is tested over the STEP it just took rather than at its impact point: a
       pane is thinner than a step at bolt speed.
 
+      **The same registered box is solid while it is live.** `0x80053C58` walks that 48-slot entity table
+      before trigger volumes for movement, and the general point/projectile passes also test runtime entity
+      boxes because neither collision hull contains a pane. The port now inserts every GLASS box after mover
+      parts, using the Scene record's raw bounds, and disables it in the same fatal-hit call that marks the
+      pane broken. Save restore re-synchronises the box from the broken latch. A zero-mover regression test
+      is deliberate: glass must arm those passes by itself rather than depending on a door elsewhere in the
+      map.
+
       Measured on LAB, whose two panes bind: standing at 3200,-160,-4478 and firing, `1 SHOT, 11 pieces`
       — 1 from the hit and 10 from the shatter, which is exactly what that item's own operands at +10 and
       +12 say. Nine maps carry a breakable: BASE0, BASE1, BASE3, COMMAND, JAIL2, LAB (two), MAGDEMO,
@@ -9148,8 +9213,8 @@ separate from the upper-left pickup caption because the retail sub-draws are sep
       finish (`entity+0x102`, whose bit 0 `0x8003DF90` raises when the frame cursor walks past the move's
       end), flattens the body's collision box to 143 on Y, and hands it to `respawn_think` — which counts
       the 1500 at `+0xF4` away and then installs `body_fade`, and `body_fade` takes `dt << 4` off the
-      scale at `+0xFC` until the model is released. That is the whole of it: the body animates, lies
-      there for five seconds and dissolves. `0x8003DDF8` is the only thing on the disc that puts a player
+      light intensity at `+0xFC` until the model is released. That is the whole of it: the body animates,
+      lies there for five seconds and darkens away. `0x8003DDF8` is the only thing on the disc that puts a player
       back, and it has **one caller** — `0x8003DECC`, the mode gate this port already carries as
       `q2_mp_may_respawn` — plus one materialised constant, slot 12 of the engine block, which is
       QMULTI.C's. Respawning is the map module's decision and the engine's death chain has no opinion.
@@ -9547,3 +9612,33 @@ unit, 4095.3 mean over every part of `Blaster G`) or the GTE reaches it.
       `pad: 1 resume` — the boundary the report was about. `tests/test_pad.c` pins the behaviour from both
       sides, including a case that reproduces the defect: an ordinary roll on a fresh pair DOES jump, and
       that is what the level start used to do.
+
+- [x] 134. **The BASE1/BASE2 parity cluster was seven independent state mistakes, not one missing train.**
+
+      **BASE1's crate conveyor is `DOCRATES`, not PLATFORM.** The first playable base map is internally
+      `BASE0`; its LevelBin handler drives Scene nodes 197, 196, 198 and 199 through four zero-speed LIFT1
+      runtime objects. Generic train motion is PLATFORM and the sole disc instance is BIGGUN's three-part
+      carriage. Treating the crates as a train therefore searched the wrong primitive and also discarded the
+      zero-speed bindings the real handler needs.
+
+      **Held creatures still need `monster_start_go`.** `q2_creature_world_summon` used to flip only
+      `in_use`; the infantry and soldier released by BASE1's LiftRoom CREBATCH consequently had no installed
+      AI think. Summoning now runs the normal monster-start path before making the record live.
+
+      **Retail explosions have two different lights.** Spawn writes 0x40/0x40/0x40 to the model entity's
+      ambient at +0x2AC. Think appends a separate C0/40/31 dynamic light whose outer radius is
+      `clamp(51*(320-t),0,4096)*1300/4096` and whose inner radius is three quarters of that. The port had the
+      fiery asset but fed its renderer zero ambient, producing the dark ball; both paths are now reproduced.
+
+      **A same-map zone seam is not a player respawn.** It preserves the full movement integrator and weapon
+      machine, including fire timing, and merely rebinds the viewweapon model from the new zone bank. Camera
+      state is published immediately after the load. The zone object itself must be *moved*, not plainly
+      copied: its chunk views point into an inline DAT archive, so a struct assignment left every pointer
+      aimed into the loader's dead stack frame. Rebinding those views removed the intermittent crash and
+      corrupted SortData sizes seen during transition probing.
+
+      **The remaining small state rules are exact.** Mouse look suppresses spring-centering and clears an
+      already-running recenter when enabled; a PrimaryColl cell carries the exact SortData byte offset at
+      `+28`; event category bits 08/10/20 are enter/stay/leave; and BASE2 CAGELIFT1 reads its delay/wait at
+      item +18/+19. Its actual
+      0/0xFF pair means drop to 1491 and remain there, not return immediately.

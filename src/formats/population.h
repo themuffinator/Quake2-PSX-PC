@@ -67,17 +67,14 @@
  *
  * Place record, 16 bytes:
  *     0x00  s32  x, y, z
- *     0x0C  u16  angle_flags   the LOW TWELVE BITS are a heading on the
- *                           4096-step circle and bits 12..15 are something
- *                           else. CONFIRMED from the reader: the entity spawner
- *                           at 0x80058930 does `lhu`, `andi 0xFFF`, `sh` into
- *                           the entity's yaw at +0xE8. An earlier note read the
- *                           whole halfword as one value and concluded "flags
- *                           OR'd with an angle" from the observed 4096 / 32768 /
- *                           36864 / 53248 — those are all heading 0 with upper
- *                           bits set. 627 of 1,013 records set at least one
- *                           upper bit and all four are used; what they mean is
- *                           still UNKNOWN.
+ *     0x0C  u16  angle_flags   low 12 bits: heading on the 4096-step circle.
+ *                           0x2000 / 0x4000 / 0x8000 are NOT_EASY /
+ *                           NOT_MEDIUM / NOT_HARD, tested by the sole list
+ *                           walker at 0x8007F538 before item spawn. Bit 12 is
+ *                           never read: it is a map-wide authoring/export
+ *                           marker, set on either every place or none in all
+ *                           34 maps that carry places. The spawner at
+ *                           0x80058930 masks the heading with 0x0FFF.
  *     0x0E  u16  id         0..56, 41 distinct. CONFIRMED as the key into the
  *                           24-byte item table at 0x8009F5CC: the spawner scans
  *                           it with `lb`, so only the low byte can ever match.
@@ -135,13 +132,22 @@ typedef struct q2_pop_path {
 
 typedef struct q2_pop_place {
     s32 x, y, z;
-    u16 unk;    /* angle in bits 0..11, unknown flags in 12..15 */
-    u16 id;     /* keys the item table; see itemtable.h        */
+    u16 angle_flags;
+    u16 id;     /* keys the item table; see itemtable.h */
 } q2_pop_place;
 
 /* The heading the entity spawner takes from a place record (0x80058938). */
-#define Q2_POP_PLACE_ANGLE(unk)  ((unk) & 0x0FFFu)
-#define Q2_POP_PLACE_FLAGS(unk)  ((unk) & 0xF000u)
+#define Q2_POP_PLACE_ANGLE(v)       ((v) & 0x0FFFu)
+#define Q2_POP_PLACE_FLAGS(v)       ((v) & 0xF000u)
+#define Q2_POP_PLACE_UNUSED_1000    0x1000u
+#define Q2_POP_PLACE_NOT_EASY       0x2000u
+#define Q2_POP_PLACE_NOT_MEDIUM     0x4000u
+#define Q2_POP_PLACE_NOT_HARD       0x8000u
+#define Q2_POP_PLACE_DIFFICULTY     0xE000u
+
+/* Exact 0x8007F54C..0x8007F5D8 selection. Skills outside the retail menu's
+ * 0..2 range take the default arm and are not filtered. */
+bool q2_pop_place_allows_skill(u16 angle_flags, s32 skill);
 
 typedef struct q2_population {
     const u8 *data;

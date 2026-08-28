@@ -1106,3 +1106,75 @@ bool q2_model_pose_low_y(const q2_model *m, const q2_model_pose *pose,
     *out_low_y = low;
     return true;
 }
+
+bool q2_model_anim_at_position(const q2_model *m, u32 position,
+                               q2_model_anim *out, u32 *within_tick)
+{
+    u32 within = 0;
+    u32 sub = position % Q2_MODEL_TICKS_PER_FRAME;
+
+    if (!q2_model_anim_at(m, position / Q2_MODEL_TICKS_PER_FRAME,
+                          out, &within))
+        return false;
+    if (within_tick)
+        *within_tick = within * Q2_MODEL_TICKS_PER_FRAME + sub;
+    return true;
+}
+
+bool q2_model_anim_at_position_held(const q2_model *m, u32 position,
+                                    q2_model_anim *out, u32 *within_tick,
+                                    bool *clamped)
+{
+    u32 within = 0;
+    u32 sub = position % Q2_MODEL_TICKS_PER_FRAME;
+    bool held = false;
+
+    if (!q2_model_anim_at_held(m, position / Q2_MODEL_TICKS_PER_FRAME,
+                               out, &within, &held))
+        return false;
+
+    /* Once the timeline is held there is no next key to interpolate toward. */
+    if (within_tick)
+        *within_tick = within * Q2_MODEL_TICKS_PER_FRAME + (held ? 0u : sub);
+    if (clamped)
+        *clamped = held;
+    return true;
+}
+
+void q2_model_cursor_reset(q2_model_cursor *c, s32 position)
+{
+    if (!c)
+        return;
+    c->position = position;
+    c->target   = position;
+    c->ready    = true;
+}
+
+s32 q2_model_cursor_phase(q2_model_cursor *c, s32 base, s32 dt)
+{
+    s64 next, limit;
+
+    if (!c)
+        return base;
+    if (!c->ready) {
+        q2_model_cursor_reset(c, base);
+        return base;
+    }
+
+    if (dt < 0)
+        dt = 0;
+
+    /* 0x8007ECAC writes the selected record's base PLUS a2, where a2 is the
+     * caller's remainder after consuming 30-unit AI intervals. A changed base
+     * is therefore a phase reset, not a destination to approach from behind. */
+    if (base != c->target) {
+        q2_model_cursor_reset(c, base);
+        return base;
+    }
+
+    next  = (s64)c->position + dt;
+    limit = (s64)base + Q2_MODEL_POS_PER_MOVE_FRAME - 1;
+    c->position = next < limit ? (s32)next : (s32)limit;
+
+    return c->position;
+}

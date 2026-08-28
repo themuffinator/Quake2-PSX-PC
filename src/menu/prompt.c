@@ -85,6 +85,39 @@ void q2_prompt_step(q2_prompt_bar *b)
     }
 }
 
+void q2_prompt_sync_menu(q2_prompt_bar *b, const q2_menu *m, bool front_end)
+{
+    const q2_menu_item *item = NULL;
+    int y;
+    bool rules;
+
+    if (!b)
+        return;
+    if (!m || !m->open || !m->page) {
+        q2_prompt_hide_all(b);
+        return;
+    }
+
+    /* 0x8001A280..0x8001A348. The test is the current object's action
+     * pointer, not general navigability: sliders and toggles are adjustable,
+     * but deliberately do not advertise CROSS/SELECT. */
+    if (m->cursor >= 0 && m->cursor < (int)m->page->count)
+        item = &m->page->items[m->cursor];
+
+    y = front_end ? 216 : 220;
+    q2_prompt_show(b, Q2_PROMPT_SELECT,
+                   item && item->action != Q2_ACT_NONE ? y : 260);
+    q2_prompt_show(b, Q2_PROMPT_BACK,
+                   m->page->back != Q2_ACT_NONE ? y : 260);
+
+    /* QFRONT module+0x4618..0x4738: RULES belongs to the three game-mode
+     * rows, not LOAD SETTINGS or SAVE SETTINGS, and has its own y = 220. */
+    rules = front_end && m->page_id == Q2_PAGE_FRONT_MULTI &&
+            m->cursor >= (int)m->page->first &&
+            m->cursor - (int)m->page->first < 3;
+    q2_prompt_show(b, Q2_PROMPT_RULES, rules ? 220 : 260);
+}
+
 u32 q2_prompt_build_ot(const q2_prompt_bar *b, const q2_menu_font *font,
                        psx_ot *ot, u32 bucket)
 {

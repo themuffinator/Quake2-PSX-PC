@@ -274,8 +274,9 @@ const char *q2_creature_world_sound_for_addr(const q2_creature_world *w,
  * DORMANT — `in_use` clear — because the alternative is re-running the spawn
  * pass mid-level against a set other systems already hold pointers into. The
  * effect is the console's: an ambush is not standing there until it is called
- * for. Returns how many creatures this call woke, which is 0 for a group
- * already summoned — the bit-1 latch.
+ * for. Waking also runs `q2_monster_start_go`, since dormant records were
+ * deliberately skipped by the initial world wake. Returns how many creatures
+ * this call woke, which is 0 for a group already summoned — the bit-1 latch.
  */
 u32 q2_creature_world_summon(q2_creature_world *w, const char *group);
 

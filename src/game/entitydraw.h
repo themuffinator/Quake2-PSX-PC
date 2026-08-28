@@ -3,7 +3,7 @@
  *
  * modeldraw.c draws ONE model instance. This walks a whole entity set, resolves
  * each entity's model out of the map's CastList, applies the state its think
- * left behind — the spin, the materialise scale, the glow tint — and appends
+ * left behind — the spin, the materialise intensity, the glow — and appends
  * the lot to the same ordering table the world was built into.
  *
  * That last part is why this is a separate module and not something the client
@@ -14,15 +14,16 @@
  * ---------------------------------------------------------------------------
  * What is faithful here and what is not
  * ---------------------------------------------------------------------------
- * FAITHFUL: the scale reaches the GPU through the instance matrix, as it does in
- * the original (0x8006B298 scales the rows of entity+0x2C0); the yaw is the
- * entity's own +0xE8 on the 4096-step circle; the origin is +0xA4, which the
- * spawner already biased by 286 and the model's own offset.
+ * FAITHFUL: +0xFC/+0xFE reach the GPU through the GTE light matrix and back
+ * colour (`0x8006B298`, `0x8006B468`) without changing geometry; the yaw is
+ * the entity's own +0xE8 on the 4096-step circle; the origin is +0xA4, which
+ * the spawner already biased by 286 and the model's own offset.
  *
- * NOT YET: the engine also draws a translucent shadow quad and the sparkle
- * particles the materialise ramp emits. Neither is reconstructed, and neither is
- * faked — an item that has not finished materialising simply appears at its
- * current size with no sparkles around it.
+ * NOT YET: the sparkle particles the materialise ramp emits. The translucent
+ * floor shadow is reconstructed from the item table's posed-vertex list and
+ * the real 16x16 tile/palette in `chars.lbm` / the executable palette bank.
+ * An item that has not finished materialising therefore brightens through the
+ * decoded lighting ramp and casts its retail shadow, but has no sparkles yet.
  */
 #ifndef Q2PSX_ENTITYDRAW_H
 #define Q2PSX_ENTITYDRAW_H
@@ -40,8 +41,9 @@ typedef struct q2_entity_draw_stats {
     u32 considered;
     u32 drawn;
     u32 no_model;      /* the bank does not carry the name the table gave    */
-    u32 invisible;     /* hidden, collected, or scaled to nothing            */
+    u32 invisible;     /* hidden or collected                                */
     u32 faces_emitted;
+    u32 shadows_emitted;
     u32 ot_overflow;
 } q2_entity_draw_stats;
 
@@ -148,6 +150,7 @@ bool q2_entity_resolve_model(q2_entity *e, const q2_model_bank *bank);
 struct q2_projectiles;
 
 u32 q2_projectiles_build_ot(const struct q2_projectiles *list,
+                            const q2_collision *coll,
                             const q2_camera *cam, psx_ot *ot, gte_state *gte);
 
 #endif /* Q2PSX_ENTITYDRAW_H */

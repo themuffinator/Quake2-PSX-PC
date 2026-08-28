@@ -15,19 +15,30 @@ void q2_entity_init(q2_entity *e)
      * spawner when the record does not carry Q2_ITEM_SPIN (0x80059ACC). */
     e->render_flags = 0x08000001u;
 
-    /* 0x80059AAC: an item that does not materialise starts at full size. */
+    /* 0x80059AAC: a non-materialising item starts at full light intensity. */
     e->scale = Q2_ONE_12;
 
     /*
-     * AND SO DOES THE SECOND SCALE. The allocator at 0x8006C1B8..0x8006C1C0
-     * writes 4096 into BOTH +0xFC and +0xFE, and the draw at 0x8006B298
-     * multiplies the pair. Leaving this at the memset's zero collapses every
-     * entity in the set to a point — see modelent.h.
+     * AND SO DOES THE SECOND INTENSITY. The allocator at
+     * 0x8006C1B8..0x8006C1C0 writes 4096 into BOTH +0xFC and +0xFE, and the
+     * lighting setup at 0x8006B298 multiplies the pair. Leaving this at the
+     * memset's zero makes the entity black rather than collapsing its model.
      */
     e->fade = Q2_ONE_12;
 
+    /*
+     * The allocator's ambient pair — 0x8006C1D8..0x8006C1FC copies the
+     * four-byte constant at 0x800AEB84 (40 40 40 00) into both +0x2AC and
+     * +0x2B0. The draw reads +0x2AC unconditionally as the GTE back colour;
+     * leaving it at the memset's zero makes every newly allocated model lose
+     * retail's ambient floor. Individual spawners may replace it (items use
+     * 0x30, transient explosions explicitly restore 0x40).
+     */
+    e->glow[0] = e->glow[1] = e->glow[2] = 0x40;
+
     e->model_index = -1;      /* not resolved against a bank yet */
     e->model_bank  = NULL;
+    e->population_group = -1; /* not a Population place record   */
 }
 
 bool q2_entity_visible(const q2_entity *e, u32 player)

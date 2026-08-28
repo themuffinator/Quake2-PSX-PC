@@ -65,10 +65,13 @@ for a problem that no longer exists.
 
 ## 3. Ordering-table sorting, and the absence of a depth buffer
 
-**Cause.** There is no Z-buffer. Every primitive is assigned to a bucket indexed
-by its average depth (computed by `AVSZ3`/`AVSZ4`), and buckets are drawn far to
-near. Depth resolution is therefore the bucket count, and sorting is *per
-primitive*, not per pixel.
+**Cause.** There is no Z-buffer. GPU packets are chained into an ordering table
+and its buckets are drawn far to near. The assignment is emitter-specific:
+ordinary fallback geometry can use `AVSZ3`/`AVSZ4`, but authored world nodes use
+SortData buckets and each model/deferred object is one private packet chain.
+Retail's regional sorter relates those chains with camera-relative world bounds;
+projected-origin depth is the secondary order for its Quick list. Sorting is per
+object or polygon, never per pixel.
 
 **Visible consequences that must be preserved:**
 
@@ -81,31 +84,70 @@ primitive*, not per pixel.
   list by prepending, so the **last primitive added is drawn first**.
 
 **Implementation.** `src/psx/gpu.c`. `psx_ot_add()` prepends to the bucket's
-intrusive linked list and `psx_ot_walk()` iterates buckets from high index to
-low, matching both behaviours. When the primitive pool fills, geometry is dropped
+intrusive linked list and `psx_ot_walk()` iterates bucket 0 upward, with depth
+inverted on insertion so the result is far to near. When the primitive pool fills, geometry is dropped
 rather than the pool being grown — the original did the same, and reported it.
 
-**Where the port departs, and why it has to.** The console does not sort the
-world by depth at all: the draw order is authored in `SortData` and the table
-only carries it (see `src/formats/sortdata.h`). Which stream a viewport starts
-at is still unresolved, so the port sorts by depth instead — and a depth sort
-inherits a problem the authored order never had. A bucket is a depth SLAB, about
-a hundred units wide at `PSX_OT_SUBDIV` 8 and the default sort range, and the
-insertion rule above orders everything inside one slab by emission order, which
-for the world is node index. A light, a shootable button or any other detail
-surface mounted a few units off a wall shares that wall's slab, so the two were
-ordered by node index while the slab BOUNDARY between them followed depth; walk
-towards such a surface and the two rules disagree, and the surface swaps in and
-out. That is z-fighting produced by the port's own quantisation, not by anything
-the console does.
+**World order.** The console does not sort the world by depth at all: the draw
+order is authored in `SortData` and the table only carries it (see
+`src/formats/sortdata.h`). The viewport's PrimaryColl cell selects the stream
+by carrying its exact byte offset at node `+28`; this is now the normal renderer
+path. Opcode 1 projects its named Scene/Points group and chooses its bitstream
+arm from whether the rectangle has non-zero area. That predicate is part of the
+codec: forcing either arm globally desynchronises every later node. Together
+these rules remove missing rooms and the port-created z-fighting where a light,
+button or other near-coplanar wall detail shared a coarse depth bucket with its
+backing face and their node-index order flipped at a slab boundary.
 
-`psx_ot_add_depth()` takes the depth the bucket quantised away and orders the
+The camera area's full-view record is seeded at console bucket 45, then the
+SortData stream itself starts at 43. Opcode 1 is a screen-region change (the
+decoder's `ENTITY` name is historical): it projects its Scene/Points marker,
+clips that rectangle to the parent named by `f3`, registers `f4` as a seven-bit
+draw area at the current authored bucket, and moves both the GTE origin and GPU
+draw environment into that local rectangle. Values below a parent edge clamp
+to its minimum and values above it clamp to its maximum. A hidden marker passes
+a literal zero rectangle and must take the false bitstream arm; a rectangle
+collapsed on either axis is normalised the same way. Treating either as visible
+desynchronises every record that follows. Draw-environment restore
+packets live inside the OT, so they execute in authored order, and world 2D
+culling uses the current region's extent rather than the full viewport.
+
+Deferred wall nodes, models and effects build private chains against those
+areas. At retail's `0x80046E14` drain, area 1 concatenates unsorted at slice
+bucket 46, area 2 is sorted at slice bucket 1, and each ordinary live area's
+newest-first Standard list (at most 32 records) becomes a dependency
+graph from its AABBs and the camera position. Strictly overlapping boxes are
+split at the midpoint of their shallowest overlap before comparison, and an
+already-established edge suppresses its reciprocal. Quick records (at most
+128, including particle/beam points and flagged models) depend on Standard
+records but not on one another; currently unblocked Quick records are stable-
+sorted by signed projected-origin depth. The drain alternates those ready Quick
+runs with a cyclic Standard selection, breaks a true cycle at the row with the
+fewest dependencies, and `CatPrim`s each result as one atomic chain onto the
+authored bucket. An area not registered by the current viewport is stale and
+its objects are culled rather than globally depth-sorted through a different
+room.
+
+The area's projection selector is deliberately stateful. A negative selector
+returns without changing the GTE; area 0 selects the global extent, area 1 the
+current viewport, and an ordinary live area uses `viewport centre - region
+minimum`. The view-weapon entity is explicitly area 1 (`0x8004EE58`) before it
+reaches the normal model selector at `0x8006BEB0`. Treating `-1` as a full-view
+reset let the gun inherit a particle or projectile's portal-local origin and
+made it move or clip when the visible area set changed.
+
+`--depth-sort` retains the old approximation for diagnostics. A bucket there is
+a depth slab, about a hundred units wide at `PSX_OT_SUBDIV` 8 and the default
+sort range, and insertion order still decides ties inside it.
+
+On the diagnostic fallback, `psx_ot_add_depth()` takes the depth the bucket quantised away and orders the
 slab by it, so the order inside a slab continues the order between slabs and
 there is no boundary left to swap across. The two console artifacts above are
 untouched: a primitive is still sorted by ONE depth for the whole of it, so long
-polygons still sort by their average and intersecting polygons still pop. Every
-emitter that sorts by depth supplies the key — world, models, effects, bolts —
-because they share a slice and a rule that only some of them follow is not one.
+polygons still sort by their average and intersecting polygons still pop.
+Area-routed emitters instead supply the one batch depth retail assigns to the
+whole private chain as well as its point or absolute bounds; only the Quick
+merge orders directly by that depth.
 `psx_ot_add()` and `psx_ot_add_bucket()` do not, and behave exactly as before.
 
 **Setting.** `r_psx_ot_sort` (default on). Off enables a depth buffer.

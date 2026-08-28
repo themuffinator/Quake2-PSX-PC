@@ -109,7 +109,7 @@
  *         if (n >= 0) {
  *             if (!suppressed) {                    // gp+0x4234, see below
  *                 if (destroy < 0) {
- *                     spawn_explosion(centre(n), scene[n].unk0E & 0x7F,
+ *                     spawn_explosion(centre(n), scene[n].area & 0x7F,
  *                                     4096, 0);     // 0x80026950
  *                     sound(wep_grenlx1a, centre(n));// 0x8002695C
  *                 }
@@ -163,8 +163,8 @@
  * stands in for is missing; this one outlived that and became a lie about what
  * the engine does.
  *
- * The model is `modelent.h`. `q2_explosive_burst` still carries `scale` — the
- * Scene node's `unk0E & 0x7F`, which the spawner writes to ent+0x9E — because
+ * The model is `modelent.h`. `q2_explosive_burst` carries `area` — the Scene
+ * node's `area & 0x7F`, which the spawner writes to ent+0x9E — because
  * that is the operand the console passes and this is where it comes from.
  */
 #ifndef Q2PSX_EXPLOSIVE_H
@@ -252,7 +252,7 @@ typedef struct q2_explosive_burst {
     s32  at[3];         /* the centre of its box — 0x80026898 on */
     u8   pieces;        /* debris count, already sign-decoded    */
     u8   explode;       /* spawn_explosion + wep_grenlx1a         */
-    u16  scale;         /* scene[node].unk0E & 0x7F, spawn_explosion's second */
+    u16  area;          /* scene[node].area & 0x7F, spawn_explosion's second */
 } q2_explosive_burst;
 
 /*
@@ -347,9 +347,9 @@ bool q2_explosive_trigger_item(q2_explosive_set *set, u32 item_offset,
 
 /*
  * The second argument spawn_explosion is given: the low seven bits of the
- * Scene node record's byte at +0x0E, read raw because q2_scene_node does not
- * carry it. Returns 0 for a node the scene does not have.
+ * Scene node record's area byte at +0x0E. Returns 0 for a node the scene does
+ * not have.
  */
-u16 q2_explosive_node_scale(const q2_scene *scene, s16 node);
+u16 q2_explosive_node_area(const q2_scene *scene, s16 node);
 
 #endif /* Q2PSX_EXPLOSIVE_H */

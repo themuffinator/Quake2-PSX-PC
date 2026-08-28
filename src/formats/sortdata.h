@@ -44,10 +44,10 @@
  *                                  later base update
  *     3 bits   w_op_short  - 1     opcode width in windowed mode
  *     4 bits   w_op_long   - 1     opcode width in absolute mode
- *     3 bits   w_f1        - 1     entity record field 1
- *     3 bits   w_f3        - 1                        3
- *     3 bits   w_f4        - 1                        4
- *     4 bits   w_f2        - 1     entity record's skip length, in BITS
+ *     3 bits   w_f1        - 1     screen-region record field 1
+ *     3 bits   w_f3        - 1                            3
+ *     3 bits   w_f4        - 1                            4
+ *     4 bits   w_f2        - 1     screen-region skip length, in BITS
  *   w_base bits  base            added to a windowed-mode node index
  *
  * 24 header bits plus w_base. The odd mixture of 3- and 4-bit widths is not a
@@ -63,31 +63,40 @@
  * Opcode 2 switches modes and carries the first value of the new mode with it.
  *
  *     0        end of stream                       (0x80067238)
- *     1        an ENTITY draw record               (0x80067240)
+ *     1        a SCREEN-REGION change              (0x80067240)
  *     2        switch mode; the replacement opcode follows, read at the OTHER
  *              mode's width                        (0x8006718C, 0x80067604)
  *     >= 3     scene node (op - 3), plus `base` in windowed mode
  *                                                  (0x800676B4)
  *
- * An entity record is four fields in stream order — f1 (w_f1), f2 (w_f2), f3
- * (w_f3), f4 (w_f4) — handed to the entity draw at 0x80065D0C as
+ * A screen-region record is four fields in stream order — f1 (w_f1), f2
+ * (w_f2), f3 (w_f3), f4 (w_f4) — handed to 0x80065D08 as
  * (f1 signed, f3 & 0xFF, f4 & 0xFF, bucket). What happens next depends on what
- * that draw returns, which is why this decoder cannot be a pure pull loop:
+ * that projection returns, which is why this decoder cannot be a pure pull loop:
  *
  *     drawn == false  ->  skip f2 more bits. f2 is a BIT LENGTH, and the skip
  *                         is done with the word-stepping arithmetic at
  *                         0x800675A8, so it can cross any number of words.
  *     drawn == true   ->  if f2 is non-zero, read w_base bits as a NEW base.
  *
- * So f2 is the size of an optional payload that only a drawn entity consumes.
- * Call q2_sort_entity_resolve() with the answer before asking for the next item.
+ * f1 names the Scene/Points marker projected into a rectangle, f3 names its
+ * parent screen record, and f4 names the seven-bit draw area registered at the
+ * current bucket. The GTE origin and GPU draw environment change to that local
+ * rectangle until a later in-list DRAWENV restores the previous one. The return
+ * value is whether the rectangle has non-zero area. f2 is therefore BRANCH
+ * DATA, not an entity model payload: the rejected arm skips f2 bits, while the
+ * accepted arm uses a non-zero f2 as the signal that a new w_base-bit window
+ * base follows. `Q2_SORT_ENTITY` and q2_sort_entity_resolve retain their old
+ * names only for source compatibility; call the latter with the projection
+ * result before asking for the next item.
  *
  * ---------------------------------------------------------------------------
  * What this means for the sort, and it is not what the port assumed
  * ---------------------------------------------------------------------------
- * The ordering-table bucket starts at 45 (0x80066978) or 43 (0x80066A3C) near
- * the top of the viewport's 51-entry slice, and is decremented in exactly one
- * place: after an entity record (0x800675E0). The node path never touches it —
+ * The camera area's full-view insertion point is seeded at bucket 45
+ * (0x80066970), then the actual opcode stream starts at 43 (0x80066A34). The
+ * latter is decremented in exactly one place: after an entity record
+ * (0x800675E0). The node path never touches it —
  * it reads the current value at 0x80067AE8 / 0x80067DB8, draws the whole node
  * into that one bucket, and stops the whole stream if the bucket has fallen
  * below 4 (0x80067B28, 0x80067DF0).
@@ -100,7 +109,7 @@
  *     not a finer-grained version of the same one.
  *   - Buckets exist to interleave ENTITIES with the world at the right depth.
  *     A run of nodes shares one bucket; the bucket steps down each time an
- *     entity is placed. That is the whole mechanism.
+ *     screen region is placed. That is the whole mechanism.
  *
  * Because a PSX ordering table is a prepend list, primitives within one bucket
  * draw in reverse insertion order, so a run of nodes in one bucket paints
@@ -113,10 +122,10 @@
 #include "level.h"
 #include "q2psx.h"
 
-/* The bucket the viewport's stream starts at. Both values occur; the setup
- * picks between them at 0x80066978 / 0x80066A3C. */
-#define Q2_SORT_BUCKET_START     45
-#define Q2_SORT_BUCKET_START_ALT  43
+/* The full-view camera area is seeded at 45; the authored stream itself starts
+ * at 43. They are two consecutive setup operations, not alternatives. */
+#define Q2_SORT_BUCKET_SEED  45
+#define Q2_SORT_BUCKET_START 43
 
 /* The stream stops when the bucket falls below this (0x80067B28). */
 #define Q2_SORT_BUCKET_FLOOR 4
@@ -151,7 +160,7 @@ typedef struct q2_sort_item {
     u32 node;        /* NODE: the Scene node index                     */
 
     s32 f1;          /* ENTITY: signed, argument 1 of the entity draw   */
-    u32 f2;          /* ENTITY: the optional payload's length in bits   */
+    u32 f2;          /* ENTITY: rejected-branch skip length in bits      */
     u32 f3, f4;      /* ENTITY: bytes, arguments 2 and 3                */
 
     u32 bucket;      /* the ordering-table bucket this item belongs in  */
@@ -205,12 +214,11 @@ u32 q2_sort_bit_position(const q2_sort_reader *r);
 /*
  * Enumerate the chunk's streams by tiling it.
  *
- * A chunk holds many streams and the viewport record that names one lives in
- * runtime state the disc does not carry (open question 7a), so a byte offset is
- * not something a port can look up. But the streams are self-delimiting: decode
- * to the end opcode, round up to the next byte, and the next one starts there.
- * That makes them enumerable, and a stream INDEX is a stable disc-derived
- * handle where a byte offset is not.
+ * This is an OFFLINE census helper, not the renderer's lookup. Runtime already
+ * has the exact byte offset on disc: PrimaryColl node +28, selected by the
+ * viewport camera's cell. Tiling remains useful for checking the bit grammar
+ * and surveying otherwise-unreferenced tails: decode the rejected entity arm
+ * to the end opcode, round up to the next byte, and start again.
  *
  * Writes up to `max` offsets and returns how many streams the chunk holds —
  * which may exceed `max`, so a caller can size an array in two passes. A stream
@@ -222,8 +230,8 @@ u32 q2_sort_bit_position(const q2_sort_reader *r);
  */
 u32 q2_sortdata_enumerate(const q2_sortdata *sd, u32 *offsets, u32 max);
 
-/* The byte offset of stream `index`, or false if the chunk has no such stream.
- * Stream 0 always starts at 0 and is what a single-stream chunk holds. */
+/* The byte offset of tiled stream `index`, or false if the chunk has no such
+ * stream. Diagnostic only; live drawing reads PrimaryColl.sort_offset. */
 bool q2_sortdata_stream_offset(const q2_sortdata *sd, u32 index, u32 *out);
 
 #endif /* Q2PSX_SORTDATA_H */

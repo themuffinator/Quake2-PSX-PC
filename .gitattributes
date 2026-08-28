@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Historical main.c contained two literal NUL bytes, so its indexed blob uses
+# unnormalised CRLF. Preserve that representation, but force textual diffs now
+# those bytes are reconstructed as portable '\0' character constants.
+src/client/main.c -text diff whitespace=cr-at-eol

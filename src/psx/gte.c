@@ -262,8 +262,10 @@ static void gte_rtp_vertex(gte_state *g, const gte_vec16 *v, bool last)
         s64 fx = (s64)quot * (s64)g->ir[0] + (s64)g->ofx;
         s64 fy = (s64)quot * (s64)g->ir[1] + (s64)g->ofy;
 
-        if (fx > (s64)0x7FFFFFFF || fx < -(s64)0x80000000LL) g->flag |= GTE_FLAG_MAC0_POS;
-        if (fy > (s64)0x7FFFFFFF || fy < -(s64)0x80000000LL) g->flag |= GTE_FLAG_MAC0_POS;
+        if (fx >  (s64)0x7FFFFFFF) g->flag |= GTE_FLAG_MAC0_POS;
+        if (fx < -(s64)0x80000000LL) g->flag |= GTE_FLAG_MAC0_NEG;
+        if (fy >  (s64)0x7FFFFFFF) g->flag |= GTE_FLAG_MAC0_POS;
+        if (fy < -(s64)0x80000000LL) g->flag |= GTE_FLAG_MAC0_NEG;
 
         sx = (s32)(fx >> Q2_FRAC_16);
         sy = (s32)(fy >> Q2_FRAC_16);

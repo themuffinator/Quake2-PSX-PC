@@ -283,6 +283,16 @@ void q2_hud_palettes_upload(const q2_hud_tables *t, struct psx_vram *vram)
     if (!t || !dst)
         return;
 
+    /*
+     * Record zero is not part of palette[]: the boot loop gives this one
+     * exceptional 256-entry palette its own LoadImage at (0, 255) before it
+     * walks the sixteen-entry records (0x80076150..0x8007619C). QFRONT's
+     * `multipics.lbm` renderer selects CLUT id zero, which is this row, so
+     * omitting it left the first ten arena previews sampling untouched VRAM.
+     */
+    for (i = 0; i < 256; i++)
+        dst->px[255][i] = t->palette256[i];
+
     for (i = 0; i < Q2_HUD_PALETTE_MAX; i++) {
         const q2_hud_palette *p = &t->palette[i];
         int e;
