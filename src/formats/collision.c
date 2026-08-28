@@ -199,7 +199,8 @@ u32 q2_collision_node_link_count(const q2_collision *c, u32 index)
 
 bool q2_collision_node_is_solid(const q2_collision *c, u32 index)
 {
-    if (!c || !c->nodes || index > c->node_count)
+    /* `>=`: index == node_count is the sentinel record, not a node. */
+    if (!c || !c->nodes || index >= c->node_count)
         return false;
 
     return (q2_rd_u16(node_rec(c, index) + 24) & Q2_COLL_SOLID) != 0;
@@ -305,8 +306,10 @@ bool q2_coll_point_in_node(const q2_collision *c, u32 index, const s32 point[3])
         if (v < q2_rd_s32(rec + 0  + i * 4)) return false;
     }
 
-    /* 0x80044190: a solid node holds nothing. */
-    if (q2_rd_u16(rec + 24) & Q2_COLL_SOLID)
+    /* 0x80044190: a solid node holds nothing. Through the accessor rather
+     * than a second copy of the same mask: one place decides what solid
+     * means, and the two cannot drift. */
+    if (q2_collision_node_is_solid(c, index))
         return false;
 
     relative_rec(rec, point, rel);
