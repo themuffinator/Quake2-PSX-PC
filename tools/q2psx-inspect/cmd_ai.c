@@ -404,7 +404,8 @@ int cmd_ai(const disc *d)
 
     /* --------------------------------------------------------------------- */
     printf("\nmonster_death_use (0x800622E8)\n");
-    check_immu(&e, 0x800622F8, (u32)(u16)~(Q2_FL_FLY | Q2_FL_SWIM),
+    check_immu(&e, 0x800622F8,
+               (u32)(u16)(~(unsigned)(Q2_FL_FLY | Q2_FL_SWIM) & 0xFFFFu),
                "a dead flyer stops flying");
     check_immu(&e, 0x80062308, Q2_AI_GOOD_GUY,
                "and keeps no ai flag but AI_GOOD_GUY");

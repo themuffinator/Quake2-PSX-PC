@@ -792,7 +792,8 @@ static void test_build(void)
     /* The world gate: bit 0 of view+144. */
     s.suppress_clear = false;
     for (i = 0; i < 4; i++)
-        s.view[i].flags &= (u16)~Q2_SCREEN_VIEW_DRAW_WORLD;
+        s.view[i].flags = (u16)(s.view[i].flags &
+                                ~(unsigned)Q2_SCREEN_VIEW_DRAW_WORLD);
     g_view_hooks = 0;
     q2_screen_frame_begin(&s, &ot);
     q2_screen_build(&s, &ot, NULL, &hooks);

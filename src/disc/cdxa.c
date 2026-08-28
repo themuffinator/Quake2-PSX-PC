@@ -151,7 +151,7 @@ void cd_sector_build(u8 out[CD_SECTOR_RAW], u32 lba,
     if (form2)
         submode |= (u8)CD_SUBMODE_FORM2;
     else
-        submode &= (u8)~CD_SUBMODE_FORM2;
+        submode = (u8)(submode & ~(unsigned)CD_SUBMODE_FORM2);
 
     out[16] = file;    out[17] = channel; out[18] = submode; out[19] = coding;
     out[20] = file;    out[21] = channel; out[22] = submode; out[23] = coding;

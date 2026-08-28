@@ -119,7 +119,7 @@ void q2_event_rt_contacts_begin(q2_event_rt *rt)
         return;
 
     for (i = 0; i < rt->record_count; i++)
-        rt->flags[i] &= (u8)~Q2_EVREC_RT1;
+        rt->flags[i] = (u8)(rt->flags[i] & ~(unsigned)Q2_EVREC_RT1);
 }
 
 bool q2_event_rt_contact(q2_event_rt *rt, u32 offset)
@@ -164,7 +164,7 @@ void q2_event_rt_contacts_end(q2_event_rt *rt)
             q2_event_rt_trigger(rt, rt->offsets[i]);
 
         /* 0x80028160..0x80028180: RT1 is copied to RT2, then RT1 is cleared. */
-        flags &= (u8)~(Q2_EVREC_RT1 | Q2_EVREC_RT2);
+        flags = (u8)(flags & ~(unsigned)(Q2_EVREC_RT1 | Q2_EVREC_RT2));
         if (now)
             flags |= Q2_EVREC_RT2;
         rt->flags[i] = flags;
@@ -193,7 +193,7 @@ static void set_disabled_on_list(q2_event_rt *rt, const q2_event_item *item,
         if (disabled)
             rt->flags[slot] |=  Q2_EVREC_DISABLED;
         else
-            rt->flags[slot] &= (u8)~Q2_EVREC_DISABLED;
+            rt->flags[slot] = (u8)(rt->flags[slot] & ~(unsigned)Q2_EVREC_DISABLED);
     }
 }
 

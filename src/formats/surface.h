@@ -278,8 +278,8 @@ Q2PSX_INLINE bool q2_scene_flags_deferred(u16 flags)
  * touched. Transcribed from 0x8002E7CC-0x8002E7D8. */
 Q2PSX_INLINE u16 q2_scene_flags_set_wibble(u16 flags, u32 value)
 {
-    return (u16)((flags & (u16)~Q2_SCENE_FLAG_WIBBLE_MASK)
-                 | (u16)((value & 0xFu) << Q2_SCENE_FLAG_WIBBLE_SHIFT));
+    return (u16)((flags & ~(unsigned)Q2_SCENE_FLAG_WIBBLE_MASK)
+                 | ((value & 0xFu) << Q2_SCENE_FLAG_WIBBLE_SHIFT));
 }
 
 /* ------------------------------------------------------------------------- */

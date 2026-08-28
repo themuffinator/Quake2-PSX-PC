@@ -373,7 +373,7 @@ bool q2_SV_movestep(q2_monster *m, const s32 move[3], bool relink)
     }
 
     if (m->flags & Q2_FL_PARTIALGROUND)
-        m->flags &= (u16)~Q2_FL_PARTIALGROUND;
+        m->flags = (u16)(m->flags & ~(unsigned)Q2_FL_PARTIALGROUND);
 
     m->on_ground = true;
 

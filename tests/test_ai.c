@@ -656,7 +656,7 @@ static void test_acquisition(void)
     q2_level_state.sight_entity_framenum = 0;
     player.flags |= Q2_FL_NOTARGET;
     check(!q2_find_target(&m), "FL_NOTARGET makes a player invisible to AI");
-    player.flags &= (u16)~Q2_FL_NOTARGET;
+    player.flags = (u16)(player.flags & ~(unsigned)Q2_FL_NOTARGET);
 
     /* A good guy never picks a fight. */
     place(&m, 0, 0, 0);

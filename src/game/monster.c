@@ -252,7 +252,7 @@ void q2_monster_death_use(q2_monster *self)
     if (!self)
         return;
 
-    self->flags  &= (u16)~(Q2_FL_FLY | Q2_FL_SWIM);
+    self->flags  = (u16)(self->flags & ~(unsigned)(Q2_FL_FLY | Q2_FL_SWIM));
     self->aiflags &= Q2_AI_GOOD_GUY;
 }
 

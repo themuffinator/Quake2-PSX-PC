@@ -24,7 +24,7 @@ static bool to_offset(u32 pointer, u32 base, size_t size, u32 *out)
  * module-local flag set. */
 static bool verb_is_valid(u8 ai)
 {
-    u8 index = (u8)(ai & (u8)~Q2_AI_LOCAL_FLAG);
+    u8 index = (u8)(ai & ~(unsigned)Q2_AI_LOCAL_FLAG);
     return index < Q2_AI_VERB_COUNT;
 }
 
