@@ -44,6 +44,8 @@ add_library(q2psx_game STATIC
     item.h
     lighting.c
     lighting.h
+    loading.c
+    loading.h
     monster.c
     monster.h
     modeldraw.c

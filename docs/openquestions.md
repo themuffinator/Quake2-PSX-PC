@@ -1892,6 +1892,9 @@ item records at run time instead of transcribing a table, so there is nothing to
       second call installs nothing at all at that moment. What `0x80079364` sets up is therefore the front
       end's **loading screen**, shown while `LEVELS/QFRONT/` streams in — which fits: it is the first thing
       `q2_menu_open`'s special case does, before the level that the title screen is drawn over exists.
+      **#135 narrows that: it is not the front end's, it is EVERY level's.** `0x80079364` is the tail of
+      `0x80079178`, which the transition opcodes call with the name of whatever is being loaded, and the
+      front end arriving is one caller of it among many.
       **And the front end's own code is not in the executable at all — it is `QFRONT`'s `LevelBin`.**
       That is why every sweep for START and OPTIONS failed, and why the item records are "filled at run
       time": the thing filling them is a relocatable module, exactly as `QMULTI.C` is for deathmatch. This
@@ -9642,3 +9645,51 @@ unit, 4095.3 mean over every part of `Blaster G`) or the GTE reaches it.
       `+28`; event category bits 08/10/20 are enter/stay/leave; and BASE2 CAGELIFT1 reads its delay/wait at
       item +18/+19. Its actual
       0/0xFF pair means drop to 1491 and remain there, not return immediately.
+
+- [x] 135. **The loading screen — there is one, #44 read half of it, and the other half is a level directory
+      nobody had accounted for.**
+
+      #44 found `0x800A3314` — `{ "LOADING", 256, 124 }`, page 46's first record — and called it *"the front
+      end's loading screen, shown while `LEVELS/QFRONT/` streams in"*. It is not the front end's. It is
+      **every level's**, and the function that puts it up is `0x80079178`, called from the event script's
+      transition opcodes with the twelve-byte name of the level being loaded:
+
+          8007917C  lw   v0, 0x800AEBCC          ; suppressed while this is set
+          8007919C  bne  v0, zero, 0x800791F4    ;   ...return 0, no screen
+          800791E0  jal  0x8006DBC0              ; the name against 0x800E465C
+          800791EC  bne  v0, zero, 0x800791FC    ;   already there: return 0
+          80079360  sw   0x8007901C, 0x800B2D90  ; the DEFERRED load, one shot
+          80079364  jal  0x8001A384 ; li a0, 46  ; enter page 46
+          80079374  jal  0x8001A474 ; li a1, 16  ; 0x800A3314, at size 16
+          80079384  jal  0x8001A474 ; li a1, 16  ; 0x800A3344 — all zeros
+          80079398  sh   1, 0x800C3638           ; drawable 0's +0x48: highlight
+
+      Three things fall out that the record alone does not say. The second install is a **NULL record**, so
+      nothing on the page is navigable and the selection bar — which #44's own capture shows behind START —
+      is not drawn: this is a pure-text page in the same sense RESTARTING is. `0x800C3638` is drawable 0's
+      `+0x48`, the highlight flag, so the word is in palette 70 rather than 68. And **the load is deferred**:
+      `0x8007901C` is a one-shot hook that clears its own slot at `0x8007916C`, so the frame carrying the
+      word goes out first and the read happens after it. Nothing is drawn during a synchronous read, which
+      makes the console's loading screen exactly one frame held for as long as the disc takes.
+
+      `0x800AEBCC` is the arming flag, written by the level selector at `0x8007C7C8` / `0x8007C7E8` from the
+      level record's `+0x20` — "always 1 on a real level" — so the screen is on for every level and off only
+      for a record that is not one.
+
+      **And `LEVELS/QDUMMY/` is what draws behind it.** Page 46 draws over whatever scene is standing, and a
+      screen meant to be up while a level is being replaced cannot borrow that level's models. QDUMMY is
+      level table record 3, `Dummy`, and it holds one model — `Q2LOGO` — one named image — `FrontEnd.lbm`,
+      the menu font atlas — and an 840-byte zone with no world in it. That is the letterforms this screen
+      writes with and the model it turns, and nothing else; every other screen map on the disc carries
+      `chars.lbm`, a world, or both. Its own `LevelBin` agrees: `module+0x96C` compares the level name
+      against `"Dummy"` and installs `module+0x2E1C`, four instructions that ask for the next state once four
+      frames have gone by.
+
+      **What is NOT settled.** The `"Dummy"` string is reachable from that module and from **nothing in the
+      executable** — `xrefs 0x800AC820` comes back empty — so which code path asked the console for it is
+      not established here. What the directory is FOR is; a port that draws the logo from it draws the same
+      pixels whatever asked for it.
+
+      FORMATS §11.13; `src/game/loading.[ch]`; the page is in `src/menu/pages.c` where
+      `q2psx-inspect menu <disc>` checks it against the executable record by record, and
+      `tests/test_loading.c` pins the behaviour the tables cannot express.

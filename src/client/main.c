@@ -110,6 +110,7 @@
 #include "creworld.h"
 #include "levelbin.h"
 #include "lighting.h"
+#include "loading.h"
 #include "rotator.h"
 #include "spacelights.h"
 /* Creatures on the biggest map plus three other players, with room to spare. */
@@ -911,6 +912,22 @@ typedef struct client {
     bool              boot_chain;      /* this run walks it                   */
     bool              no_boot;         /* --no-boot: and this one will not    */
     bool              boot_skip;       /* a press, taken on the next frame    */
+
+    /*
+     * THE LOADING SCREEN, and it is in front of everything while it is up.
+     *
+     * Raised by `client_load_zone` — every load this client makes goes through
+     * that one function, which is what keeps a level change, a zone gate, a
+     * restart and the front end's own arrival on the same screen. See
+     * loading.h for what the screen is and where its two assets come from.
+     *
+     * The console defers the LOAD by a frame and shows the screen while the
+     * disc turns; this port holds it for half a second AFTER a load that took
+     * no time at all. The order is the one thing about it that is not the
+     * console's, and it is invisible: nothing is drawn during a synchronous
+     * read on either machine.
+     */
+    q2_loading        loading;
 
     /*
      * ---------------------------------------------------------------------
@@ -4065,6 +4082,34 @@ static bool client_load_zone(client *c, const char *map, int index)
     bool placed = false;
     bool same_map_transition = c->carry_player && c->carry_same_map &&
                                c->map[0] && client_name_eq(c->map, map);
+
+    /*
+     * AND THE SCREEN GOES UP FIRST.
+     *
+     * Every load this client makes comes through here, so this is the one
+     * place that has to know a load is happening: a level change, a zone gate,
+     * a restart, a save being restored and the front end's own arrival all
+     * reach it, and on the console all of them go through the transition that
+     * raises page 46 (loading.h).
+     *
+     * Raising it does not draw anything. It arms the hold, and the main loop
+     * owns every frame that follows — which is deliberate: presenting from
+     * inside a load would swap the buffers under a frame that has not begun,
+     * and a headless capture numbers its shots by frame.
+     *
+     * NOT FOR THE LOAD THAT STARTS THE RUN, and `c->running` is exactly that
+     * test: main sets it on the line before the frame loop, so every load
+     * before it — `--map`, `--zone-probe`, the front end being opened at
+     * startup — is setup rather than a transition. Two reasons, and the second
+     * is the one that decides it. A run that is told which map to stand in was
+     * never at a doorway, so there is nothing for a screen to cover. And every
+     * capture this project takes is `--frames N --shot`, which writes the LAST
+     * frame: raising it here would make `--frames 1` photograph the loading
+     * screen instead of the level, and would cost the first half second of
+     * ticks in every run whose numbers are counted per frame (AGENTS.md).
+     */
+    if (c->running)
+        q2_loading_raise(&c->loading);
 
     /*
      * EVERY load announces itself, because a load is the only thing that can
@@ -12123,14 +12168,142 @@ static void client_draw_view(void *user, q2_screen *s, int p,
     }
 }
 
-static void client_frame(client *c)
+/*
+ * Flip, capture and put the finished buffer in the window.
+ *
+ * Split out of `client_frame` because two things now compose a frame — the
+ * ordinary one and the loading screen — and the flip, the screenshot and the
+ * window blit have to be the same for both or a capture of the loading screen
+ * would come out through a different path than every other capture.
+ */
+static void client_present(client *c)
 {
     void *pixels;
     int pitch;
     const psx_framebuffer *front;
+
+    q2_screen_present(&c->screen);
+    front = q2_screen_front(&c->screen);
+
+    /*
+     * The capture comes off the finished front buffer, before anything SDL
+     * touches it — so a headless run and a windowed one write byte-identical
+     * frames, and neither depends on a driver's idea of what a 15-bit texture
+     * looks like.
+     */
+    if (c->shot_path && c->shot_every > 0 &&
+        (c->frame_index % c->shot_every) == 0)
+        client_write_shot(c, true);
+
+    if (!c->texture || !c->renderer)
+        return;
+
+    if (SDL_LockTexture(c->texture, NULL, &pixels, &pitch)) {
+        int y;
+        for (y = 0; y < c->height; y++) {
+            memcpy((u8 *)pixels + (size_t)y * pitch,
+                   front->px + (size_t)y * c->width,
+                   (size_t)c->width * sizeof(u16));
+        }
+        SDL_UnlockTexture(c->texture);
+    }
+
+    SDL_RenderClear(c->renderer);
+    {
+        /*
+         * SCREEN POSITION, honoured — openquestions #40.
+         *
+         * The page writes `0x800B3368` / `0x800B336A` (defaults 0 and 24) and
+         * an exhaustive sweep finds **no reader anywhere in the executable**:
+         * the obvious consumer would be the display env's screen rectangle,
+         * which `SetDefDispEnv` explicitly zeroes. So on this build the page is
+         * inert, and the port must not pretend otherwise about the CONSOLE.
+         *
+         * It can still do the honest thing for the player: a control that
+         * exists and does nothing is a bug from the outside. The offset is
+         * applied here, at presentation, where it shifts the finished image the
+         * way a television's own position control would — and nowhere near the
+         * ordering table, so it cannot perturb clipping or the viewport
+         * rectangles that the reconstruction does depend on.
+         *
+         * The default y of 24 is treated as the neutral point, because that is
+         * what the reset routine writes and a fresh install must not be
+         * off-centre.
+         */
+        /*
+         * THE PICTURE'S SHAPE, which is not the buffer's.
+         *
+         * The GPU's five horizontal modes all span the same active line, so a
+         * 512-wide frame is the same picture as a 320-wide one with pixels half
+         * as wide; PAL fills the 4:3 raster with 256 lines. That makes a
+         * framebuffer pixel exactly 2:3, and blitting the buffer to fill the
+         * window — which is what this did — a 1.5x horizontal stretch.
+         *
+         * q2_screen_fit_rect does the whole of it: the largest rectangle of the
+         * right shape that fits, centred, with the rest of the window left as
+         * border. It takes any window aspect, so a 16:9 monitor pillarboxes and
+         * a tall window letterboxes without this having to know which.
+         */
+        SDL_FRect dst;
+        int out_w = 0, out_h = 0;
+        int px = 0, py = 0, pw = 0, ph = 0;
+        float sx = (float)c->settings.v[Q2_SET_SCREEN_X];
+        float sy = (float)(c->settings.v[Q2_SET_SCREEN_Y] - 24);
+
+        SDL_GetCurrentRenderOutputSize(c->renderer, &out_w, &out_h);
+        q2_screen_fit_rect(&c->screen, c->fit, out_w, out_h,
+                           &px, &py, &pw, &ph);
+
+        /*
+         * SCREEN POSITION moves the picture, so its units are buffer pixels
+         * scaled by the PICTURE's size and not by the window's — otherwise the
+         * same setting would shift by a different amount depending on how much
+         * of the window is border.
+         */
+        dst.x = (float)px + sx * (float)pw / (float)Q2_SCREEN_PAL_WIDTH;
+        dst.y = (float)py + sy * (float)ph / (float)Q2_SCREEN_PAL_HEIGHT;
+        dst.w = (float)pw;
+        dst.h = (float)ph;
+
+        SDL_RenderTexture(c->renderer, c->texture, NULL, &dst);
+    }
+    SDL_RenderPresent(c->renderer);
+}
+
+static void client_frame(client *c)
+{
     q2_screen_hooks hooks;
 
     q2_screen_frame_begin(&c->screen, &c->ot);
+
+    /*
+     * THE LOADING SCREEN OWNS THE WHOLE FRAME, and there is nothing behind it.
+     *
+     * Black, the logo turning in the corner, and the page — built into the
+     * same ordering table and composed by the same rasteriser as everything
+     * else, because both halves of it are ordinary primitives: the logo is a
+     * model and the word is a menu page (loading.h).
+     *
+     * It composes against the SCREEN'S OWN VRAM IMAGE rather than the
+     * session's. The level whose pages were resident has just been replaced,
+     * and a zone gate inside one map does not re-upload them at all — so a
+     * screen that borrowed the live image would either draw from a bank that
+     * has gone or take the map's textures away to get one.
+     *
+     * `q2_screen_build` is not called: no viewport is installed, no world is
+     * walked, and the buffer is cleared here rather than by the background env
+     * a viewport pass would have armed.
+     */
+    if (c->loading.open) {
+        psx_raster_opts lo = c->opts;
+
+        lo.textures = c->loading.textures;
+        q2_loading_build_ot(&c->loading, &c->ot, &c->gte, c->width, c->height);
+        psx_fb_clear(q2_screen_back(&c->screen), 0);
+        q2_screen_compose(&c->screen, &c->ot, c->loading.vram, &lo);
+        client_present(c);
+        return;
+    }
 
     /*
      * 0x800780C0 clears the whole screen once and turns the per-viewport clears
@@ -12462,93 +12635,9 @@ static void client_frame(client *c)
     if (c->boot_open)
         client_boot_blit(c);
 
-    q2_screen_present(&c->screen);
-    front = q2_screen_front(&c->screen);
-
-    /*
-     * The capture comes off the finished front buffer, before anything SDL
-     * touches it — so a headless run and a windowed one write byte-identical
-     * frames, and neither depends on a driver's idea of what a 15-bit texture
-     * looks like.
-     */
-    if (c->shot_path && c->shot_every > 0 &&
-        (c->frame_index % c->shot_every) == 0)
-        client_write_shot(c, true);
-
-    if (!c->texture || !c->renderer)
-        return;
-
-    if (SDL_LockTexture(c->texture, NULL, &pixels, &pitch)) {
-        int y;
-        for (y = 0; y < c->height; y++) {
-            memcpy((u8 *)pixels + (size_t)y * pitch,
-                   front->px + (size_t)y * c->width,
-                   (size_t)c->width * sizeof(u16));
-        }
-        SDL_UnlockTexture(c->texture);
-    }
-
-    SDL_RenderClear(c->renderer);
-    {
-        /*
-         * SCREEN POSITION, honoured — openquestions #40.
-         *
-         * The page writes `0x800B3368` / `0x800B336A` (defaults 0 and 24) and
-         * an exhaustive sweep finds **no reader anywhere in the executable**:
-         * the obvious consumer would be the display env's screen rectangle,
-         * which `SetDefDispEnv` explicitly zeroes. So on this build the page is
-         * inert, and the port must not pretend otherwise about the CONSOLE.
-         *
-         * It can still do the honest thing for the player: a control that
-         * exists and does nothing is a bug from the outside. The offset is
-         * applied here, at presentation, where it shifts the finished image the
-         * way a television's own position control would — and nowhere near the
-         * ordering table, so it cannot perturb clipping or the viewport
-         * rectangles that the reconstruction does depend on.
-         *
-         * The default y of 24 is treated as the neutral point, because that is
-         * what the reset routine writes and a fresh install must not be
-         * off-centre.
-         */
-        /*
-         * THE PICTURE'S SHAPE, which is not the buffer's.
-         *
-         * The GPU's five horizontal modes all span the same active line, so a
-         * 512-wide frame is the same picture as a 320-wide one with pixels half
-         * as wide; PAL fills the 4:3 raster with 256 lines. That makes a
-         * framebuffer pixel exactly 2:3, and blitting the buffer to fill the
-         * window — which is what this did — a 1.5x horizontal stretch.
-         *
-         * q2_screen_fit_rect does the whole of it: the largest rectangle of the
-         * right shape that fits, centred, with the rest of the window left as
-         * border. It takes any window aspect, so a 16:9 monitor pillarboxes and
-         * a tall window letterboxes without this having to know which.
-         */
-        SDL_FRect dst;
-        int out_w = 0, out_h = 0;
-        int px = 0, py = 0, pw = 0, ph = 0;
-        float sx = (float)c->settings.v[Q2_SET_SCREEN_X];
-        float sy = (float)(c->settings.v[Q2_SET_SCREEN_Y] - 24);
-
-        SDL_GetCurrentRenderOutputSize(c->renderer, &out_w, &out_h);
-        q2_screen_fit_rect(&c->screen, c->fit, out_w, out_h,
-                           &px, &py, &pw, &ph);
-
-        /*
-         * SCREEN POSITION moves the picture, so its units are buffer pixels
-         * scaled by the PICTURE's size and not by the window's — otherwise the
-         * same setting would shift by a different amount depending on how much
-         * of the window is border.
-         */
-        dst.x = (float)px + sx * (float)pw / (float)Q2_SCREEN_PAL_WIDTH;
-        dst.y = (float)py + sy * (float)ph / (float)Q2_SCREEN_PAL_HEIGHT;
-        dst.w = (float)pw;
-        dst.h = (float)ph;
-
-        SDL_RenderTexture(c->renderer, c->texture, NULL, &dst);
-    }
-    SDL_RenderPresent(c->renderer);
+    client_present(c);
 }
+
 
 /* ------------------------------------------------------------------------- */
 static void usage(void)
@@ -13441,6 +13530,23 @@ no_window:
         Q2_WARN("no UI tables for this build — the menu will not draw");
 
     /*
+     * THE LOADING SCREEN'S OWN ASSETS, opened once and held for the run.
+     *
+     * After the UI tables, because the palette bank is what the LOADING line is
+     * coloured by; before anything loads a level, because `client_load_zone`
+     * raises the screen and a screen that is not open yet is simply never
+     * raised. A disc without QDUMMY says so once and runs without it.
+     */
+    if (q2_loading_open(&c.loading, c.disc, &c.hud_tables, &c.settings) ==
+        Q2_OK)
+        Q2_INFO("loading screen: %s — %s%s", Q2_LOADING_MAP,
+                Q2_LOADING_MODEL,
+                c.loading.font_ready ? " and the menu font" : "");
+    else
+        Q2_INFO("loading screen: this disc has no %s — transitions cut "
+                "straight through", Q2_LOADING_MAP);
+
+    /*
      * The overlay, AFTER the tables it reads. This block used to sit above the
      * load, testing a flag that `memset(&c, 0, ...)` had just cleared, so
      * `q2_hud_init` never ran and `hud_ready` never became true — the client
@@ -13948,7 +14054,23 @@ no_window:
         client_apply_input(&c);
         client_update_grab(&c);
 
-        if (c.boot_open) {
+        if (q2_loading_step(&c.loading, (double)dt)) {
+            /*
+             * THE LOADING SCREEN IS IN FRONT OF EVEN THAT.
+             *
+             * Nothing under it runs while it is up, and that is not only
+             * tidiness: the level it is standing over has just been replaced,
+             * so a tick here would be the first tick of a level the player has
+             * not seen yet, and a press would be taken by a page they cannot
+             * see. The console has the same property for a blunter reason —
+             * its screen is up during a synchronous read, and nothing runs
+             * during one of those at all.
+             *
+             * `q2_loading_step` turns the logo and spends the hold; it goes
+             * false on the frame the half second is up, and that frame is the
+             * first one the world gets back.
+             */
+        } else if (c.boot_open) {
             /*
              * A BOOT SCREEN IS IN FRONT OF EVERYTHING AND HAS NOTHING BEHIND
              * IT. No map is loaded while one is up — the console loads a
@@ -14594,6 +14716,7 @@ no_window:
 
 done:
     client_boot_free(&c);
+    q2_loading_close(&c.loading);
     if (c.hud_tables_ready)
         q2_hud_tables_free(&c.hud_tables);
     if (c.sfx_ready)

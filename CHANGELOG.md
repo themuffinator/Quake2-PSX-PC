@@ -20,10 +20,10 @@ change; see [`docs/RELEASING.md`](docs/RELEASING.md).
 ## [Unreleased]
 
 ### Reconstruction
-- _Nothing yet._
+- The loading screen is read, and it turns out to be two things the disc keeps apart. The word is the executable's: `0x80079178` — the first act of every level transition — opens menu page 46 and installs `0x800A3314`, one record reading `{ "LOADING", 256, 124 }`, followed by a NULL one that leaves the page pure text and so keeps the selection bar off it. The load itself is deferred to a one-shot hook, which is why the console's screen is a single frame frozen for as long as the disc takes. The picture is `LEVELS/QDUMMY/`, whose whole contents are one model (`Q2LOGO`), one image (`FrontEnd.lbm`, the menu font atlas) and an empty zone — the letterforms this screen writes with and the model it turns, and nothing else. `docs/FORMATS.md` §11.13.
 
 ### Client
-- _Nothing yet._
+- The loading screen is back between levels: black, LOADING in the menu's own face, and the Quake II logo turning in the top right at the rate the front end turns it. Every load raises it — a level change, a zone gate, a restart, a save being restored, the front end's own arrival — and nothing under it ticks while it is up. Loads here are effectively free, so it is held for half a second: a floor in real time, not a frame count, so it is the same half second at 30 Hz and at 144. The load that STARTS a run is exempt — `--map` puts you in a level rather than at a doorway, and every capture this project takes is `--frames N --shot`, which would otherwise photograph the loading screen.
 
 ### Rendering and audio
 - _Nothing yet._
@@ -40,7 +40,7 @@ change; see [`docs/RELEASING.md`](docs/RELEASING.md).
 - Five megabytes of rendered frames — a title screen, a HUD test, two model renders, two level renders and an accidental screenshot of a terminal window — were tracked at the repository root while the README said the repository contains no game assets. They are gone, `.gitignore` covers them, and `scripts/check_paths.py` now fails the build on any tracked file that is an image, a sound or a film — by extension *or* by magic number, because the screenshot was a PNG named `C`.
 
 ### Documentation
-- _Nothing yet._
+- `docs/FORMATS.md` §11.13 writes up the loading screen: the transition function, the page it installs, the deferred load, and the argument that `LEVELS/QDUMMY/` is what draws behind it.
 
 ## [0.1.0] - 2026-08-28
 

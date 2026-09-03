@@ -206,6 +206,16 @@ target_link_libraries(test_mission PRIVATE
 
 add_test(NAME mission COMMAND test_mission)
 
+add_executable(test_loading test_loading.c)
+
+target_link_libraries(test_loading PRIVATE
+    q2psx_common
+    q2psx_game
+    q2psx_menu
+)
+
+add_test(NAME loading COMMAND test_loading)
+
 add_executable(test_viewweapon test_viewweapon.c)
 
 target_link_libraries(test_viewweapon PRIVATE

@@ -4719,6 +4719,66 @@ than off an instruction - the one inference on this screen.
 Reconstructed in `src/game/briefing.[ch]`; `q2psx-inspect text <map>` prints the briefing every map would
 show, and the client draws it on F12.
 
+### 11.13 The loading screen — `0x80079178` — **SOLVED**
+
+There is one, and it is a menu page. A level transition does not go straight to the loader: the event
+script's transition opcodes call `0x80079178` with the twelve-byte name of the level they want, and that
+function puts the screen up and defers the load by a frame.
+
+```
+8007917C  lw   v0, 0x800AEBCC          ; suppressed while this is set
+8007919C  bne  v0, zero, 0x800791F4    ;   ...return 0, no screen at all
+800791E0  jal  0x8006DBC0              ; the wanted name against 0x800E465C
+800791EC  bne  v0, zero, 0x800791FC    ;   already showing it: return 0
+   ...    the name -> 0x800E465C and -> 0x800E4674
+80079360  sw   0x8007901C, 0x800B2D90  ; the DEFERRED load, one shot
+80079364  jal  0x8001A384 ; li a0, 46  ; enter page 46
+80079374  jal  0x8001A474 ; li a1, 16  ; install 0x800A3314 at size 16
+80079384  jal  0x8001A474 ; li a1, 16  ; ...then 0x800A3344
+80079398  sh   1, 0x800C3638           ; drawable 0's +0x48: highlight
+```
+
+`0x800A3314` is `{ "LOADING", 256, 124 }` and `0x800A3344` is a NULL record, so this is a **pure-text page**
+in exactly the sense §10's `first` means: the last install leaves nothing navigable, so no selection bar is
+drawn. `0x800C35F0` is drawable 0 and `0x800C3638` is its `+0x48`, which §11 records as the highlight flag —
+at size 16 that selects palette 70. This is openquestions #44's second record, read there as "the front
+end's loading screen"; it is every level's.
+
+**The load is deferred, and that is the mechanism.** `0x8007901C` is installed as a one-shot per-frame hook
+and clears its own slot at `0x8007916C` once it has run, so the frame that goes out carries the word LOADING
+and the read happens after it. Nothing is drawn during a synchronous read, so the console's loading screen is
+that one frame, frozen for as long as the disc takes.
+
+`0x800AEBCC` is written by the level selector at `0x8007C7C8` / `0x8007C7E8` from the level record's `+0x20`,
+which §9 records as "always 1 on a real level" — so the screen is armed for every level and disarmed only for
+a record that is not one.
+
+**Where the picture comes from, and why `LEVELS/QDUMMY/` is on the disc.** The word is the executable's; the
+rest is not. Page 46 draws over whatever scene is standing, and a screen meant to be up *while a level is
+being replaced* cannot borrow that level's models. QDUMMY is what it borrows instead — level table record 3,
+`Dummy`, and its contents are the argument:
+
+| file | size | what is in it |
+|---|---|---|
+| `COMMON.DAT` | 39,804 | **one** model: `Q2LOGO` |
+| `SNDVRAM.DAT` | 21,332 | **one** named image: `FrontEnd.lbm` |
+| `ZONE0.DAT` | 840 | a header — there is no world in it |
+
+`FrontEnd.lbm` is the menu font atlas (§11.2, §10) and `Q2LOGO` is the title screen's logo. A directory
+carrying exactly the letterforms this screen writes with and exactly the model it turns, over an empty zone,
+is a loading screen and is not anything else: every other screen map on the disc carries `chars.lbm`, a
+world, or both. Its own `LevelBin` agrees — `module+0x96C` compares the level name against `"Dummy"` and
+installs `module+0x2E1C`, four instructions that ask for the next state once four frames have gone by.
+
+The `Dummy` record is reachable from that module and from nothing in the executable, so what asked for it on
+the console is not settled here; what the directory is for is.
+
+Reconstructed in `src/game/loading.[ch]`, with the page in `src/menu/pages.c` where
+`q2psx-inspect menu <disc>` checks it against `0x800A3314` record by record. The port loads QDUMMY once and
+holds it, which the console does not — it reads the directory every time, because reading a directory is the
+only way its engine gets to a screen — but the pixels are the same and a port whose loads are instant has no
+reason to spend one on the loading screen.
+
 ## 12. The screen — **CONFIRMED**
 
 Everything between "the game has decided what to draw" and "a field is on the television": the display and

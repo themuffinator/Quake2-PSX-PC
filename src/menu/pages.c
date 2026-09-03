@@ -189,6 +189,19 @@ static const q2_menu_item k_quitting[] = {
     { "GAME",     256, 137, Q2_ACT_NONE, Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
 };
 
+/*
+ * The loading screen — 0x800A3314, with 0x800A3344 as its empty second table.
+ *
+ * Installed by 0x80079178 at size 16 and with the highlight flag set
+ * (0x80079398 writes 1 into drawable 0's +0x48), so the one line is drawn in
+ * palette 70 — the bright one. It is a terminal page in the same sense
+ * RESTARTING is: the second call installs a NULL record, nothing is navigable,
+ * and no selection bar is drawn. See loading.h.
+ */
+static const q2_menu_item k_loading[] = {
+    { "LOADING", 256, 124, Q2_ACT_NONE, Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+};
+
 static const q2_menu_item k_no_controller[] = {
     { "PLEASE INSERT",      256,  98, Q2_ACT_NONE, Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
     { "CONTROLLER INTO",    256, 124, Q2_ACT_NONE, Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
@@ -376,6 +389,7 @@ static const q2_menu_page k_pages[] = {
     { Q2_PAGE_DEATH,            NULL,         k_death,            N(k_death),            0,                  Q2_ACT_NONE,         0x8009AB74u, 0 },
     { Q2_PAGE_VARIABLES,        "PAUSED",     k_vars_none,        N(k_vars_none),        0,                  Q2_ACT_BACK,         0x8009A6C4u, 0 },
     { Q2_PAGE_PAUSE_MP,         "PAUSED",     k_pause_mp,         N(k_pause_mp),         0,                  Q2_ACT_NONE,         0x8009A964u, 0 },
+    { Q2_PAGE_LOADING,          NULL,         k_loading,          N(k_loading),          N(k_loading),       Q2_ACT_NONE,         0x800A3314u, 0x800A3344u },
 
     /*
      * The front end.

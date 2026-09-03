@@ -97,6 +97,7 @@ static const char *page_name(int id)
     case Q2_PAGE_DEATH:            return "DEATH";
     case Q2_PAGE_VARIABLES:        return "GAME VARIABLES";
     case Q2_PAGE_PAUSE_MP:         return "PAUSE (multiplayer)";
+    case Q2_PAGE_LOADING:          return "LOADING";
     default:                       return "?";
     }
 }
