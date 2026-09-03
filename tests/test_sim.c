@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "aiworld.h"
+#include "crebind.h"   /* q2_cre_set_skill — the global sync_rules reads */
 #include "levelbin.h"
 #include "sim.h"
 #include "trig.h"
@@ -1930,6 +1931,72 @@ static void test_melee_point(void)
 }
 
 /*
+ * WHAT THE SHOT KNOWS ABOUT THE SESSION.
+ *
+ * Three inputs the fire functions and the damage function branch on reach them
+ * only through `q2_sim_fire`, and all three used to arrive as their defaults:
+ * `quad` was a hardcoded `false`, and `rules.skill` and `rules.deathmatch` were
+ * whatever `q2_combat_rules_default` left, because the only field refreshed per
+ * shot was the clock. So the quad powerup multiplied nothing, easy was as
+ * dangerous as medium, and the railgun did 100 in a deathmatch.
+ */
+static void test_session_reaches_the_shot(void)
+{
+    q2_sim sim;
+    q2_fire_result_v2 r;
+    s32 spawn[3] = { 0, 0, 0 };
+
+    printf("session rules reach the shot\n");
+
+    /* Quad, at the fire site: every function picks its second immediate while
+     * the level clock is short of the player's expiry word (client+0xAC). */
+    q2_sim_init(&sim, NULL, 30);
+    q2_sim_spawn(&sim, spawn, 0);
+    q2_sim_give_weapon(&sim, Q2_WID_SHOTGUN);
+    sim.combat.weapon_id = Q2_WID_SHOTGUN;
+    sim.combat.inv.ammo[Q2_AMMO_SHELLS] = 50;
+
+    r = q2_sim_fire(&sim);
+    check(r.fired, "the shotgun fires");
+    check_eq_i(r.shot[0].damage, 6, "for 6 a pellet with no quad");
+
+    sim.combat.inv.quad_until = sim.level_time + 9000;
+    r = q2_sim_fire(&sim);
+    check_eq_i(r.shot[0].damage, 24, "and 24 while quad is running");
+
+    sim.combat.inv.quad_until = sim.level_time;   /* the expiry tick itself */
+    r = q2_sim_fire(&sim);
+    check_eq_i(r.shot[0].damage, 6, "the comparison is strict, as 0x8004C1FC is");
+
+    /* Deathmatch, which nothing ever told the sim about: the railgun's second
+     * immediate at 0x8004D5D8 and the armour bias both hang off it. */
+    q2_sim_init(&sim, NULL, 30);
+    q2_sim_spawn(&sim, spawn, 0);
+    q2_sim_give_weapon(&sim, Q2_WID_RAILGUN);
+    sim.combat.weapon_id = Q2_WID_RAILGUN;
+    sim.combat.inv.ammo[Q2_AMMO_SLUGS] = 50;
+
+    r = q2_sim_fire(&sim);
+    check_eq_i(r.shot[0].damage, 100, "the railgun does 100 in single player");
+    check(!sim.combat.rules.deathmatch, "and the rules agree it is not a match");
+
+    sim.multiplayer = true;
+    r = q2_sim_fire(&sim);
+    check(sim.combat.rules.deathmatch,
+          "sim.multiplayer reaches the combat rules");
+    check_eq_i(r.shot[0].damage, 150, "and the railgun does 150 there");
+
+    /* Skill, from the same global the creature AI reads. */
+    q2_cre_set_skill(0);
+    q2_sim_fire(&sim);
+    check_eq_i(sim.combat.rules.skill, 0, "skill 0 reaches the combat rules");
+    q2_cre_set_skill(2);
+    q2_sim_fire(&sim);
+    check_eq_i(sim.combat.rules.skill, 2, "and so does skill 2");
+    q2_cre_set_skill(1);
+}
+
+/*
  * Picking a weapon up. The disc leaves the blaster and nothing else
  * (0x80037E78); autoswitch promotes to anything ranked higher on the console's
  * own preference list at 0x8009DB7C, and to nothing that is not on it.
@@ -2436,6 +2503,7 @@ int main(void)
     test_event_contact_categories();
     test_underwater_air();
     test_autoswitch();
+    test_session_reaches_the_shot();
     test_held_hand_grenade();
     test_tick_rate();
     test_gravity();

@@ -19,6 +19,7 @@
 #include "combat.h"
 #include "monster.h"
 #include "multiplayer.h"
+#include "playerdeath.h"
 #include "projectile.h"
 #include "trig.h"
 #include "weapon.h"
@@ -111,6 +112,51 @@ static void test_player_powerup_sync(void)
     hit = q2_combat_damage(NULL, &player, 40, Q2_MOD_LAVA, pos, &rules);
     check(!hit.blocked, "the protection expiry tick is no longer protected");
     check(player.health < 100, "damage resumes on the expiry tick");
+
+    /*
+     * WHICH ARMOUR THE PLAYER IS WEARING, which this projection used to drop:
+     * `armour_class` was written as a literal 0, so every class absorbed at
+     * jacket's 1229/4096 and none of them absorbed energy at all. The
+     * projection runs on every damage attempt, so there was no window in which
+     * the field could hold anything else.
+     */
+    q2_inventory_init(&inv);
+    inv.armour       = 200;
+    inv.armour_class = Q2_ARMOUR_BODY;
+    q2_actor_from_player(&player, &inv, pos);
+    check_eq_i(player.armour_class, Q2_ARMOUR_BODY,
+               "the armour class reaches the damage actor");
+
+    rules.level_time = 0;
+    hit = q2_combat_damage(NULL, &player, 100, Q2_MOD_BULLET, pos, &rules);
+    check_eq_i(hit.absorbed_armour, 81,
+               "body armour saves (4095 + 3277*100) >> 12, not jacket's 31");
+
+    q2_actor_from_player(&player, &inv, pos);
+    hit = q2_combat_damage(NULL, &player, 100, Q2_MOD_ENERGY_BOLT, pos, &rules);
+    check_eq_i(hit.absorbed_armour, 61,
+               "and 2458/4096 against energy, where jacket's column is zero");
+
+    /*
+     * And the two power bits. Q2_POWERUP_POWER_ARMOUR is exactly the pair of
+     * inventory flags 0x80057AC4 tests, so the whole word carries across;
+     * `powerups` used to be left at zero and the shield absorbed nothing.
+     */
+    q2_inventory_init(&inv);
+    inv.flags = Q2_INV_POWER_SHIELD;
+    inv.ammo[Q2_AMMO_CELLS] = 100;
+    q2_actor_from_player(&player, &inv, pos);
+    check_eq_i(player.powerups & Q2_POWERUP_POWER_ARMOUR, Q2_INV_POWER_SHIELD,
+               "the power shield's bit reaches the damage actor");
+
+    hit = q2_combat_damage(NULL, &player, 30, Q2_MOD_BULLET, pos, &rules);
+    check_eq_i(hit.absorbed_power, 20, "and it absorbs two thirds of the hit");
+    check_eq_i(player.cells, 90, "spending one cell per two points");
+
+    /* 0x800397FC's threshold, which playerdeath.h reads from the same
+     * instruction. This projection used to carry a disagreeing -100. */
+    check_eq_i(player.gib_health, Q2_PDEATH_GIB_HEALTH,
+               "the player's gib threshold is the one playerdeath.h names");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -307,6 +353,9 @@ static void test_damage(void)
         target.has_client = true;
         place(&attacker, 0, 0, -1000, 100);   /* no client: a creature */
 
+        /* Rounding UP, and the disc says so: 0x800582FC `addiu v0, s1, 1` into
+         * 0x80058300 `sra s1, v0, 1`, with the +1 unconditional rather than the
+         * sign-bit term a truncating `/2` would carry. 31 halves to 16. */
         q2_combat_damage(&attacker, &target, 31, Q2_MOD_BULLET, NULL, &easy);
         check_eq_i(target.health, 100 - 16, "skill 0 halves, rounding up");
 

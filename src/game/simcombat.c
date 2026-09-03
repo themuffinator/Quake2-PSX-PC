@@ -400,6 +400,35 @@ bool q2_sim_autoselect_weapon(q2_sim *sim)
  * origin + dir — so the fraction the hull returns is exactly what the entity
  * pass needs to bound itself with.
  */
+/*
+ * THE COMBAT RULES ARE SESSION STATE, and until now only the clock in them was.
+ *
+ * `q2_combat_rules_default` memsets the struct and writes skill 1, and the two
+ * call sites that touched it afterwards refreshed `level_time` and nothing
+ * else. So the other two fields were frozen at their defaults for the whole run
+ * and every rule that reads them was dead:
+ *
+ *   - `skill` never left 1, so 0x800582C8's "a monster hits you at skill 0 for
+ *     half" never fired, even though the front end already knows the skill and
+ *     hands it to the creature AI through `q2_cre_set_skill`. Easy was as
+ *     dangerous as medium.
+ *   - `deathmatch` never left false, so the railgun's 150 (0x8004D5D8) was
+ *     unreachable, armour always used the 4095 single-player bias instead of
+ *     2048, and the -3072 rocket-jump ceiling was applied inside deathmatch,
+ *     where 0x800580E8 does not apply it.
+ *
+ * Both are read from where the rest of the port already keeps them rather than
+ * from a new copy: the skill from the AI's own global, deathmatch from the
+ * `sim->multiplayer` flag that `sim->ent_world.deathmatch` is already taken
+ * from, so the item half and the combat half of deathmatch cannot disagree.
+ */
+static void sync_rules(q2_sim *sim)
+{
+    sim->combat.rules.level_time = sim->level_time;
+    sim->combat.rules.skill      = (s16)q2_cre_skill();
+    sim->combat.rules.deathmatch = sim->multiplayer;
+}
+
 static s32 world_fraction_for(q2_sim *sim, const s32 origin[3],
                               const s32 dir[3])
 {
@@ -435,7 +464,7 @@ q2_fire_result_v2 q2_sim_fire(q2_sim *sim)
     q2_sim_eye(sim, eye);
     q2_sim_aim(sim, aim);
 
-    sim->combat.rules.level_time = sim->level_time;
+    sync_rules(sim);
     q2_actor_from_player(&sim->combat.self, &sim->combat.inv, sim->player[sim->cur_player].pos);
 
     r = q2_weapon_fire(&sim->combat.inv, &sim->combat.rng, NULL,
@@ -444,7 +473,21 @@ q2_fire_result_v2 q2_sim_fire(q2_sim *sim)
                        sim->player[sim->cur_player].pitch,
                        sim->player[sim->cur_player].roll, aim,
                        sim->level_time, sim->combat.next_fire,
-                       false, sim->combat.rules.deathmatch,
+                       /*
+                        * QUAD, which was a hardcoded `false` — so the powerup
+                        * was picked up, counted down on the HUD and played
+                        * `itm_damage3` on every shot while multiplying nothing.
+                        *
+                        * Every fire function opens by comparing the level clock
+                        * against the player's own expiry word (client+0xAC,
+                        * which is `quad_until`) and picks the second immediate
+                        * on the near side of it — 8 or 32, 6 or 24, 120 or 480.
+                        * That comparison is this argument, and the view model
+                        * already forms exactly it for the sound
+                        * (`q2_vw.quad_active`).
+                        */
+                       sim->level_time < sim->combat.inv.quad_until,
+                       sim->combat.rules.deathmatch,
                        sim->combat.chaingun_bullets);
 
     sim->combat.last_shot = r;
@@ -615,7 +658,7 @@ q2_damage_result q2_sim_hurt_player(q2_sim *sim, q2_actor *attacker,
     /* Health and armour live in the inventory, everything else in the actor, so
      * the two are synchronised around the call rather than duplicated. */
     q2_actor_from_player(&sim->combat.self, &sim->combat.inv, sim->player[sim->cur_player].pos);
-    sim->combat.rules.level_time = sim->level_time;
+    sync_rules(sim);
 
     /*
      * A CONTACT HIT LANDS AT THE ATTACKER, and that is not the caller's choice

@@ -77,6 +77,15 @@
  * which is all of them except the hyperblaster, whose rate comes from its view
  * model animation loop instead. So the console does not have per-weapon fire
  * rates in the PC sense; it has one gate plus animation length.
+ *
+ * AND NOTHING READS IT BACK, which is why every `refire` in the table below is
+ * zero rather than 30. The write to client+204 is real and FORMATS.md §13.1
+ * records it; no instruction in the weapon path loads that word again. The
+ * console's idle state calls the fire function once per fire pass and then
+ * enters the FIRE clip, so the CLIP is the rate — and a port that also armed a
+ * 30-tick gate here would be adding a second, invented limiter on top of it.
+ * `Q2_WEAPON_DRY_REFIRE` is the one gate this module does arm, and it is the
+ * port's own, for the empty-trigger case the console has no deadline for.
  */
 #ifndef Q2PSX_WEAPON_H
 #define Q2PSX_WEAPON_H
