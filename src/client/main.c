@@ -6673,6 +6673,28 @@ static void client_input_simulated(client *c, float dt)
     if (c->mp_enabled)
         client_targets_for(c, 0);
 
+    /*
+     * AND THE SIM IS TOLD IT IS A DEATHMATCH, which nothing ever did.
+     *
+     * `q2_sim.multiplayer` is 0x800AEBCC, and it is read in five places — the
+     * -3072 impulse ceiling, the end-of-frame basis rebuild, and the three that
+     * derive `sim->ent_world.deathmatch` from it, which is in turn what gates
+     * doubled item amounts, weapons-stay and item respawn. `sync_rules` in
+     * simcombat.c now takes the combat half from the same flag, so the
+     * railgun's 150 and armour's 2048 bias hang off it too.
+     *
+     * The only writer it had was the save loader. A match started from the menu
+     * left it false, so every one of those rules ran in its single-player form
+     * inside a deathmatch. Written here, once a frame and before the tick,
+     * because the sims are created and reset by the zone load rather than by
+     * `client_mp_configure` — setting it there alone would not survive.
+     */
+    {
+        int si;
+        for (si = 0; si < Q2_MP_MAX_PLAYERS; si++)
+            c->sim[si].multiplayer = c->mp_enabled;
+    }
+
     q2_combat_scan_who = c->mp_enabled ? 0 : Q2_COMBAT_SCAN_OTHER;
     /*
      * WHETHER THE WORLD ACTUALLY MOVED. `q2_sim_advance` returns 0 when the

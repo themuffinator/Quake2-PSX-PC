@@ -1,5 +1,6 @@
 #include "monster.h"
 
+#include "combat.h"        /* Q2_HEALTH_FLOOR: one copy of 0x800629B4's clamp */
 #include "worldscale.h"
 
 #include <stdlib.h>
@@ -376,8 +377,12 @@ bool q2_monster_corpse_tick(q2_monster *m)
  * A corpse's health floors here rather than in the arithmetic: 0x800629B4
  * clamps to -9999 AFTER the subtraction, so a rocket into a body that is
  * already down cannot drive it arbitrarily negative and out of gib range.
+ *
+ * ONE COPY of that figure. This file used to spell it out a second time under
+ * its own name, so the two clamps in the port — this one and combat.c's — could
+ * drift apart while both looked cited.
  */
-#define Q2_MONSTER_HEALTH_FLOOR (-9999)
+#define Q2_MONSTER_HEALTH_FLOOR Q2_HEALTH_FLOOR
 
 /* Nightmare skill: five seconds on the 10 Hz clock, 0x80062B20. */
 #define Q2_PAIN_DEBOUNCE_SKILL3 Q2_AI_SECONDS(5)

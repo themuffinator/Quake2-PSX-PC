@@ -48,9 +48,12 @@ static const q2_weapon_tables k_builtin = {
     .autoswitch = { 10, 9, 8, 5, 4, 3, 2, 1, 0, 0, 0, 0 },
     .autoswitch_count = 8,   /* excludes the terminating zero */
 
-    /* muzzle — 0x800AE9C4 onward, stored (right, up, forward) with the middle
-     * component already negated as every fire function negates it. Weapons
-     * whose offset lives inside their projectile spawner read zero here. */
+    /* muzzle — 0x800AE9C4 onward, stored (right, DOWN, forward), exactly as
+     * the disc holds them. The fire function negates the middle component into
+     * the rotation (0x8004C01C) and negates the rotated Y coming out
+     * (0x8004C04C), so the two cancel and nothing here pre-negates — see the
+     * header, and the loader below, which say the same. Weapons whose offset
+     * lives inside their projectile spawner read zero here. */
     .muzzle = {
         {   0,   0,   0 },   /* 0  no weapon                                 */
         {  80,  56, 250 },   /* 1  blaster           0x800AE9C4              */

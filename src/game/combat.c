@@ -1,5 +1,7 @@
 #include "combat.h"
 
+#include "playerdeath.h"   /* Q2_PDEATH_GIB_HEALTH: one copy of 0x800397FC */
+
 #include <math.h>
 #include <string.h>
 
@@ -227,9 +229,29 @@ void q2_actor_from_player(q2_actor *a, const q2_inventory *inv,
         return;
     a->health       = inv->health;
     a->armour       = inv->armour;
-    a->armour_class = 0;
+    /*
+     * WHICH ARMOUR, not always the weakest. This was a hardcoded 0, and 0 is
+     * jacket — so a player wearing body armour absorbed 0.30 of an ordinary hit
+     * instead of 0.80, and 0.00 of an energy hit instead of 0.60. Because this
+     * runs on EVERY damage attempt the class could never survive one either:
+     * there was no path by which the field could hold anything else.
+     *
+     * `q2_item_armour_amount` (0x8003733C) is what maintains the class, and it
+     * is the same index the three-record table at 0x8009C5EC is read with.
+     */
+    a->armour_class = inv->armour_class;
     a->cells        = inv->ammo[Q2_AMMO_CELLS];
-    a->gib_health   = -100;
+    /*
+     * The power items live in the inventory's flag word, and
+     * Q2_POWERUP_POWER_ARMOUR (0x18000) is exactly Q2_INV_POWER_SHIELD |
+     * Q2_INV_POWER_SCREEN — the pair 0x80057AC4 tests together. Leaving this
+     * zero meant q2_combat_power_armour_absorb returned at its first guard, so
+     * the shield spent no cells and saved nothing.
+     */
+    a->powerups     = inv->flags;
+    /* 0x800397FC: the player's own gib threshold, which playerdeath.h reads
+     * from the same instruction. -100 here was a second, disagreeing copy. */
+    a->gib_health   = Q2_PDEATH_GIB_HEALTH;
     a->invuln_until = inv->invuln_until;
     a->protect_until = inv->enviro_until;
 }
