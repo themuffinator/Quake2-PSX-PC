@@ -353,6 +353,9 @@ static void test_damage(void)
         target.has_client = true;
         place(&attacker, 0, 0, -1000, 100);   /* no client: a creature */
 
+        /* Rounding UP, and the disc says so: 0x800582FC `addiu v0, s1, 1` into
+         * 0x80058300 `sra s1, v0, 1`, with the +1 unconditional rather than the
+         * sign-bit term a truncating `/2` would carry. 31 halves to 16. */
         q2_combat_damage(&attacker, &target, 31, Q2_MOD_BULLET, NULL, &easy);
         check_eq_i(target.health, 100 - 16, "skill 0 halves, rounding up");
 

@@ -461,6 +461,35 @@ q2_damage_result q2_combat_damage(q2_actor *attacker, q2_actor *target,
      * 0x800582C8: at skill 0, a monster hitting a player does half. The test is
      * on the ATTACKER having no client block, which is what makes it "a monster
      * hit you" rather than "you were hurt".
+     *
+     * AND IT ROUNDS UP, which is the whole of the arithmetic and was the one
+     * figure in this file carrying no instruction behind it. The prologue fixes
+     * the registers — 0x80057D5C `addu s5, a0` is the attacker, 0x80057D64
+     * `addu s2, a1` the target, 0x80057D6C `addu s1, a2` the damage, and
+     * 0x80057D94 `lw s0, 12(s2)` the target's client block — and the four
+     * guards and the halving read:
+     *
+     *     800582C8  beq   s0, zero, ...      ; the target has a client
+     *     800582D0  lh    v0, 0x800B334A     ; the skill halfword
+     *     800582D8  bne   v0, zero, ...      ; only at skill 0
+     *     800582E0  lw    v0, 748(s5)        ; attacker+0x2EC, its entity
+     *     800582E8  beq   v0, zero, ...
+     *     800582F0  lw    v0, 12(s5)         ; the attacker's client block
+     *     800582F8  bne   v0, zero, ...      ; only when it has none
+     *     800582FC  addiu v0, s1, 1          ; delay slot: damage + 1
+     *     80058300  sra   s1, v0, 1          ; damage = (damage + 1) >> 1
+     *
+     * The +1 is UNCONDITIONAL. A compiler's signed `/2` would have emitted the
+     * sign-bit idiom instead — `srl v0, x, 31; addu; sra` — and there is no
+     * such term here, so this is `(damage + 1) >> 1` in the source and not a
+     * truncating divide. 25 points of monster damage arrive as 13, not 12,
+     * which also gives id's "never rounds to nothing" for free.
+     *
+     * The third guard is the one thing not reproduced: `attacker+0x2EC` is the
+     * actor's entity back-pointer (monster.h), zeroed at 0x8007F0DC when a body
+     * stops being a creature, so the console additionally refuses the halving
+     * for an attacker that has become a corpse. `attacker != NULL` stands in
+     * for it; nothing in this port damages anyone from a detached actor.
      */
     if (rules->skill == 0 && target->has_client &&
         attacker && !attacker->has_client)
