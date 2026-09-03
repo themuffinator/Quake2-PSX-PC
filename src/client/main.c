@@ -14415,8 +14415,18 @@ no_window:
          * screen now, and the panel a level actually shows is the pop-up the
          * script raises, on its own fifteen-second deadline.
          */
-        /* The end-of-mission placard. */
-        if (c.endmis_open) {
+        /*
+         * The end-of-mission placard.
+         *
+         * NOT WHILE THE LOADING SCREEN IS OVER IT. A unit end raises the
+         * placard as part of the QENDMIS load, so for the half second the
+         * screen is up the placard exists and is not on the display — and a
+         * headless run's release is a frame count, so without this it spends a
+         * third of its wait behind something the player cannot see. Nothing
+         * under the loading screen runs; this is one of the two counters that
+         * were not under it.
+         */
+        if (c.endmis_open && !c.loading.open) {
             c.endmis_frames++;
             if (c.headless && c.endmis_frames >= Q2_INTERMISSION_HEADLESS) {
                 c.endmis_open = false;
@@ -14448,7 +14458,7 @@ no_window:
             }
         }
 
-        if (c.mission_after_map) {
+        if (c.mission_after_map && !c.loading.open) {
             c.mission_frames++;
             /*
              * HEADLESS ONLY, now that the board says how to leave it.

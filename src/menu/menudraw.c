@@ -305,7 +305,8 @@ u32 q2_menu_build_ot(const q2_menu *m, psx_ot *ot,
 
         n += q2_menu_font_print(opts->font, ot, opts->bucket,
                                 Q2_MENU_FACE_ITEM, it->x, it->y,
-                                selected, opts->origin_x, opts->origin_y,
+                                selected || opts->highlight_all,
+                                opts->origin_x, opts->origin_y,
                                 line);
 
         if (it->widget == Q2_WIDGET_SLIDER) {

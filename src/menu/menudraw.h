@@ -110,6 +110,23 @@ typedef struct q2_menu_draw_opts {
 
     int bar_colour;    /* Q2_MENU_BAR_*                                        */
 
+    /*
+     * THE DRAWABLE'S +0x48 SET ON EVERY ROW, whatever the cursor says.
+     *
+     * The engine's own loading screen wants this and nothing else does:
+     * `0x80079398` writes 1 into `0x800C3638`, which is drawable 0's `+0x48`,
+     * right after installing the LOADING record. That is the highlight flag,
+     * and at size 16 it selects palette 70 — the white-only mask — rather
+     * than 68's blue ramp (menufont.h).
+     *
+     * It cannot come from the cursor, because the page it is set on is PURE
+     * TEXT: `first == count`, so `q2_menu_item_selectable` is false for every
+     * row and no row is ever the selected one. The selection BAR follows the
+     * cursor and is left alone by this, which is what keeps the bar off a page
+     * that has nothing to select.
+     */
+    bool highlight_all;
+
     /* The backdrop the page is drawn over. The original draws the menu over
      * the frozen world with no backdrop of its own; a caller that wants one
      * asks for it here. Alpha 0 leaves the world visible. */

@@ -190,6 +190,30 @@ static u32 loading_draw_logo(const q2_loading *l, psx_ot *ot,
 
     p->kind  = PSX_PRIM_FT4;
     p->tpage = l->font.tpage_item;
+    /*
+     * PALETTE 68, THE STRIP'S OWN RAMP — and this is the one thing on this
+     * screen that is a choice rather than a reading.
+     *
+     * The sprite is authored FOR 68. Its sixty rows use exactly sixteen
+     * colours and they are 68's sixteen entries, expanded from 5-bit:
+     * `000000 002942 083152 ... ADE7E7 C6F7F7` against the bank's
+     * `000000 002840 083050 ... A8E0E0 C0F0F0`. So the ramp it was drawn
+     * against is the ramp it is drawn through, which is what any other sprite
+     * cut from this sheet gets.
+     *
+     * The alternative was tried and is worse. Palette 70 — which hudtables.h
+     * calls "a white-only mask palette the menu uses", and which the bank
+     * confirms is 0xF8F8F8 at indices 8..11 and black at the other twelve —
+     * turns a sixteen-level ramp into four, and the logo comes out as a
+     * stippled fragment rather than an outline. It is right for a GLYPH, whose
+     * art sits in that band, and wrong for this.
+     *
+     * WHAT WOULD SETTLE IT is the code that binds the CLUT for this quad, and
+     * that has not been found: the strip is data with no located reader. If a
+     * capture ever shows the logo lighter than the word beside it, the answer
+     * is a modulation on this primitive rather than another palette — there
+     * is no third white ramp in the bank.
+     */
     p->clut  = l->font.clut_text;
     p->textured_blend = true;
 
@@ -246,6 +270,17 @@ u32 q2_loading_build_ot(const q2_loading *l, psx_ot *ot, int width, int height)
         mo.origin_y = origin_y;
         mo.view_x   = 0;
         mo.view_w   = width < Q2_MENU_SCREEN_W ? width : Q2_MENU_SCREEN_W;
+
+        /*
+         * AND THE WORD IS WHITE ON THE ENGINE'S PAGE AND BLUE ON THE MODULE'S.
+         *
+         * `0x80079398` sets drawable 0's `+0x48` right after installing the
+         * LOADING record, so that page is highlighted and takes palette 70.
+         * The front end's STARTING / GAME is built by the ordinary page builder
+         * and sets nothing, so it stays on 68 — which is what the capture
+         * shows: blue rows under a white logo.
+         */
+        mo.highlight_all = (l->menu.page == q2_menu_page_find(Q2_PAGE_LOADING));
 
         n += q2_menu_build_ot(&l->menu, ot, &mo);
     }
