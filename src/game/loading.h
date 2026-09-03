@@ -38,64 +38,94 @@
  * record that is not one.
  *
  * ---------------------------------------------------------------------------
- * Where the logo comes from, and why QDUMMY is on the disc
+ * THE LOGO IS NOT A MODEL. It is a sprite strip in `frontend.lbm`
  * ---------------------------------------------------------------------------
- * The text is the executable's. The picture is not: page 46 draws over whatever
- * scene is standing, and a screen that is meant to be up while a level is being
- * replaced cannot borrow that level's models.
+ * The turning logo in the corner is a PRE-RENDERED SPRITE STRIP, and it is in
+ * the atlas this screen already writes its word with. Rows 144..203 of
+ * `frontend.lbm` — under the 32-pixel face at rows 0..109 and the 16-pixel face
+ * at 111..142, above the panel and prompt art at 213..255 — hold a **23-cell
+ * rotation of the Quake II logo** on a 32 x 20 grid, eight cells across and
+ * three rows down, with `RETRY` occupying the twenty-fourth slot.
  *
- * `LEVELS/QDUMMY/` is what it borrows instead, and its contents are the
- * argument. It is level table record 3, `Dummy`, and it holds:
+ * The cell WIDTHS are what prove both the grid and what the strip is. Read on
+ * that grid they run
  *
- *     COMMON.DAT   39,804 bytes — ONE model, `Q2LOGO`, and nothing else
- *     SNDVRAM.DAT  21,332 bytes — ONE named image, `FrontEnd.lbm`
- *     ZONE0.DAT       840 bytes — a header; there is no world in it
+ *     17 16 14 13 11 9 7 5 4 5 7 9 11 13 14 16 18 19 19 21 22 22 22
  *
- * `FrontEnd.lbm` is the menu font atlas (menufont.h) and `Q2LOGO` is the title
- * screen's logo. A directory carrying exactly the letterforms this screen
- * writes with and exactly the model it turns, over an empty zone, is a loading
- * screen and is not anything else — every other screen map on the disc carries
- * `chars.lbm`, a world, or both. Its own `LevelBin` agrees: `module+0x96C`
- * compares the level name against `"Dummy"` and installs `module+0x2E1C`, which
- * is four instructions long and asks for the next state once four frames have
- * gone by.
+ * — a smooth narrowing to a single minimum and out again, which is |cos| and
+ * is a rotation about the vertical axis. Every cell is the full 20 rows tall,
+ * because a thing turning that way does not change height.
  *
- * So this module loads QDUMMY once, into its own VRAM image, and keeps it for
- * the life of the run. That is not how the console does it — the console reads
- * the directory every time, because reading a directory is the only way its
- * engine gets to a screen — but the pixels are the same and a port whose loads
- * are instant has no reason to spend one on the loading screen.
+ * The grid was found by getting it wrong first. Read as two rows of 30 the same
+ * sixty rows give widths 17 16 14 13 12 13 14 16 / 18 19 19 21 22 22 22, which
+ * is lumpy, has its minimum in the wrong place, and makes a broadside cell 22
+ * wide by 30 tall — an aspect of 0.47 once the frame buffer's 2:3 pixel is
+ * accounted for, against the logo's own 1452:1997 = 0.73. On the 20-row grid a
+ * broadside cell is 22 by 20, which is 0.71. The row-density profile agrees:
+ * it dips to 18 lit texels at row 164 and to 8 at row 184, the two boundaries.
+ *
+ * That settles three things a model could not. It explains the COLOUR — the
+ * strip is in the menu font's own palette, so the logo is the pale blue the
+ * text is rather than the gold of the title screen's model or the mint green of
+ * `q2logowire`'s line sheet. It explains how an in-level load can show a logo
+ * AT ALL, since `frontend.lbm` is in every playable map's `SNDVRAM.DAT` and no
+ * model of the logo is. And it explains the size: 32 x 20 drawn 1:1, like every
+ * other thing cut from this sheet.
  *
  * ---------------------------------------------------------------------------
- * The turn
+ * WHAT THIS RETRACTS, TWICE
  * ---------------------------------------------------------------------------
- * `Q2_LB_SCENE_SPIN` — `yaw -= 4 * dt` with dt in the level clock's 1/300 s
- * units, which is the front end's own rate for the same model (levelbin.h,
- * module+0x9D24) and a third faster than a pickup's. A full turn takes 3.4 s.
+ * This file first argued that the screen draws `Q2LOGO` out of
+ * `LEVELS/QDUMMY/`, on the strength of what that directory holds — level table
+ * record 3, `Dummy`, with ONE model (`Q2LOGO`), ONE named image
+ * (`FrontEnd.lbm`) and an 840-byte zone with no world in it. A retail capture
+ * showed the logo HOLLOW, so the solid model was wrong; the next reading
+ * reached for `q2logowire`, QFRONT's outlined twin of the same mesh, which is
+ * the right shape, the wrong colour, and in the one directory an in-level load
+ * cannot borrow from.
  *
- * WHERE it stands is this port's. The console's own placement is in QDUMMY's
- * module, in code this port does not run, and nothing static in the module says
- * it — so the corner, the distance and the size are chosen here and marked as
- * chosen. Everything else on this screen is read.
+ * Both were models because the title screen's logo is a model. The sheet was
+ * open in front of this port the whole time — `frontend.lbm` is what the menu
+ * font is cut from — and neither pass looked at it.
+ *
+ * QDUMMY is still where the asset comes from here, and now for a reason that
+ * needs no inference: at 21,332 bytes its `SNDVRAM.DAT` is the smallest thing
+ * on the disc carrying `FrontEnd.lbm`, which is the whole of what this screen
+ * needs. Its lone `Q2LOGO` is not drawn. FORMATS §11.13 keeps the shape of that
+ * directory as an observation rather than as an argument.
+ *
+ * ---------------------------------------------------------------------------
+ * The turn, and the corner
+ * ---------------------------------------------------------------------------
+ * The strip's RATE is not on the disc — a cell index is a number some code
+ * counts, and that code has not been found — so it is set here to the one rate
+ * the disc does give for this logo, the front end's own. See
+ * Q2_LOADING_CELL_UNITS; it is in the level clock's 1/300 s units so that it is
+ * the same speed at every frame rate.
+ *
+ * WHERE it stands is measured off the capture, in the console's own 512 x 248
+ * pixels, against the two text rows as a ruler: those are `STARTING` at
+ * (256, 111) and `GAME` at (256, 137) from QFRONT's own records, so a distance
+ * in the picture is a known number of frame-buffer pixels.
  */
 #ifndef Q2PSX_LOADING_H
 #define Q2PSX_LOADING_H
 
 #include "disc.h"
 #include "gpu.h"
-#include "gte.h"
-#include "level.h"
-#include "levelbin.h"
 #include "menu.h"
 #include "menufont.h"
-#include "model.h"
 #include "q2psx.h"
 #include "vram.h"
-#include "world.h"
 
-/* The directory the screen's two assets come out of, and what they are. */
+/*
+ * Where the screen's one asset comes from.
+ *
+ * Any map carrying `frontend.lbm` would do — which is every playable one — but
+ * this screen holds its bank open for the whole run, so the smallest carrier is
+ * the right one to hold: QDUMMY's `SNDVRAM.DAT` is 21 KB against BASE0's 684.
+ */
 #define Q2_LOADING_MAP    "QDUMMY"
-#define Q2_LOADING_MODEL  "Q2LOGO"
 
 /*
  * How long the screen is held, in the level clock's 1/300 s units — the same
@@ -110,95 +140,109 @@
 #define Q2_LOADING_HOLD_UNITS  150
 
 /*
- * The logo's place, and all four numbers are the port's — see the header.
+ * The logo strip in `frontend.lbm`, measured off the decoded sheet.
  *
- * The distance and the projection are the front end's own (`engine+0x174(0,
- * 160, 4000)`, and Q2_LB_SCENE_DIST), so the logo is lit and framed by the same
- * arithmetic that puts it on the title screen; the scale takes it down to a
- * quarter and the offsets put that quarter in the top right of the console's
- * 512 x 248 screen. `Q2_LOADING_SCALE` is 1.0.12, so 1024 is a quarter.
+ * Eight cells across on a 32-texel pitch and three rows down on a 20-texel one,
+ * at v = 144; the twenty-fourth slot is the word `RETRY`, so the rotation is 23
+ * cells long. Cell content is centred horizontally and fills the full height.
  */
-#define Q2_LOADING_PROJ    160
-#define Q2_LOADING_DIST    1700
-#define Q2_LOADING_SCALE   1024
-#define Q2_LOADING_OFS_X   200   /* right of centre, in 512 x 248 pixels */
-#define Q2_LOADING_OFS_Y   -68   /* above it; screen y runs downward     */
+#define Q2_LOADING_CELL_W     32
+#define Q2_LOADING_CELL_H     20
+#define Q2_LOADING_CELL_V    144
+#define Q2_LOADING_CELL_COLS   8
+#define Q2_LOADING_CELLS      23
 
 /*
- * Turning those two pixel offsets back into world coordinates, and the factor
- * of 3/2 is the reason this is written out rather than done by eye.
+ * One cell every 22 units of the level clock.
  *
- * At distance z with projection h, one world unit is h/z pixels — which is
- * exactly the arithmetic the front end's own note uses, where the logo sitting
- * 54 units below the origin is five pixels of error at z = 1700 and h = 160.
- * That holds on the VERTICAL only. The view basis is `q2_rotation_view_
- * anamorphic`, whose row 0 is scaled by 3/2 (0x80055DE4) because a PAL
- * framebuffer pixel is 2:3 and the horizontal has to be stretched to come out
- * square on a television. So a world x reaches the screen 1.5x wider than a
- * world y does, and undoing that is the 2/3 here.
- *
- * Getting it wrong is not subtle and is how this was found: 200 pixels' worth
- * of unscaled x put the logo at 556 on a 512-wide screen, entirely off it.
+ * The atlas gives the frames and not their rate, and no code that counts a cell
+ * index has been found — so this is the port's. It is not arbitrary, though:
+ * the disc does state a rate for this logo, and it is the front end's own
+ * `yaw -= 4 * dt` (Q2_LB_SCENE_SPIN, module+0x9D24), which turns the model
+ * through 4096 in 1024 ticks. The strip's widths trace a single minimum, so its
+ * 23 cells are one HALF turn, and half of 1024 over 23 cells is 22.3 ticks a
+ * cell. Rounding to 22 makes the sprite turn at the rate the title screen turns
+ * the model it was rendered from.
  */
-#define Q2_LOADING_WORLD_X  (Q2_LOADING_OFS_X * Q2_LOADING_DIST * 2 / \
-                             (Q2_LOADING_PROJ * 3))
-#define Q2_LOADING_WORLD_Y  (Q2_LOADING_OFS_Y * Q2_LOADING_DIST / \
-                             Q2_LOADING_PROJ)
+#define Q2_LOADING_CELL_UNITS  22
+
+/*
+ * The top-left corner of the quad, in the console's 512 x 248 pixels.
+ *
+ * From the capture: the drawn logo spans x 465..488, centred on 476, and a
+ * broadside cell's own content sits at texels 5..26 of its 32 — so the cell
+ * starts at 460. Vertically it is centred on 50, and the cell is 20 tall.
+ *
+ * The capture measures 23 x 19 for that logo, against the 22 x 20 a broadside
+ * cell drawn 1:1 gives. Both halves agreeing to a pixel is what says the quad
+ * is 1:1, which is what every other thing cut from this sheet is.
+ */
+#define Q2_LOADING_X   460
+#define Q2_LOADING_Y    40
 
 /*
  * The ordering-table bucket the logo is linked into.
  *
  * Inside the overlay slice at OT[206..216] (screen.h) and BELOW the menu's own
- * OT[213], because compose walks the table in ascending order and the text has
- * to survive the model being drawn. A model is one thing in the table, not one
- * per face (modeldraw.h), so naming a bucket outright costs it no internal
- * sorting.
+ * OT[213], because compose walks the table in ascending order. The two do not
+ * overlap on screen, so this says which is furniture and which is the page
+ * rather than deciding who wins.
  */
 #define Q2_LOADING_OT_BUCKET  (210 * PSX_OT_SUBDIV)
 
-typedef struct q2_loading {
-    /*
-     * QDUMMY, held open for the life of the run. `common` owns the buffer and
-     * `bank` and `logo` point into it, so this struct must be MOVED and never
-     * assigned — the same rule q2_common_file carries (level.h).
-     */
-    q2_common_file  common;
-    q2_model_bank   bank;
-    q2_model        logo;
-    bool            have_logo;
+/*
+ * WHICH SCREEN, because there are two and they are the same furniture.
+ *
+ * LOADING is the executable's, `0x800A3314`, put up by every transition. The
+ * other is the front end's own and is the one the retail capture shows:
+ * QFRONT's module+0x0EBF4 installs `STARTING` at (256, 111) and `GAME` at
+ * (256, 137), the same two-row shape as RESTARTING / LEVEL, and it is what the
+ * half second between a difficulty being confirmed and the opening reel
+ * actually looks like. This port drew a blank front end for those fifteen
+ * frames.
+ *
+ * The module carries a third, one row reading `DEMO OF GAME` at (256, 111)
+ * (module+0x0EBC4), which belongs to the attract loop this port does not run.
+ * It is not offered here because nothing would raise it.
+ */
+typedef enum q2_loading_page {
+    Q2_LOADING_PAGE_LOADING = 0,   /* 0x800A3314, the executable's   */
+    Q2_LOADING_PAGE_STARTING       /* QFRONT module+0x0EBF4          */
+} q2_loading_page;
 
+typedef struct q2_loading {
     /*
      * Its own VRAM image rather than the live one.
      *
      * The screen is up while a map's pages are being replaced, and a zone gate
-     * inside one map does not re-upload them at all (client_load_zone) — so
-     * uploading QDUMMY's bank over the session's would take the level's
-     * textures away and not give them back. A separate 1 MB image is what makes
-     * the screen independent of whatever is being loaded behind it.
+     * inside one map does not re-upload them at all (client_load_zone) — so a
+     * screen drawing out of the session's image would be drawing out of a bank
+     * that is being taken away. A separate 1 MB image is what makes it
+     * independent of whatever is loading behind it.
      */
     psx_vram       *vram;
     q2_menu_font    font;
-    u8              clut4_count_a;
     bool            font_ready;
-    bool            textures;
 
     /* The page, through the same draw path every other page uses. A second
      * q2_menu rather than the session's, for the reason the memory-card front
      * end keeps one: it must not disturb where the player was. */
     q2_menu         menu;
 
-    bool            ready;    /* the assets are open                       */
+    bool            ready;    /* the atlas is open                           */
 
     /* Live state. */
     bool            open;
-    double          hold;     /* 1/300 s units still to run                */
-    s32             yaw;      /* 4096-step circle                          */
+    bool            timed;    /* it runs its own hold, rather than a caller's */
+    double          hold;     /* 1/300 s units still to run, when `timed`    */
+    double          spin;     /* 1/300 s units spent on the strip            */
 } q2_loading;
 
 /*
- * Open the screen's assets. Q2_ERR_NOT_FOUND when the disc has no QDUMMY, which
- * is a disc without a loading screen and not a fault: the caller carries on
- * with `ready` false and the screen is simply never raised.
+ * Open the screen's atlas. Q2_ERR_NOT_FOUND when the disc has no QDUMMY or no
+ * `frontend.lbm` in it, which is a disc without a loading screen and not a
+ * fault: the caller carries on with `ready` false and the screen is never
+ * raised.
  *
  * `tab` supplies the palette bank the font upload needs; `settings` is the one
  * the session already owns, since a q2_menu holds a pointer to it.
@@ -208,21 +252,37 @@ q2_result q2_loading_open(q2_loading *l, const disc *d,
                           q2_menu_settings *settings);
 void      q2_loading_close(q2_loading *l);
 
-/* Raise the screen, or restart its hold if it is already up. Does nothing when
- * the assets are not there. */
+/*
+ * Raise LOADING and run the half-second hold, or restart that hold if it is
+ * already up. Does nothing when the assets are not there.
+ */
 void q2_loading_raise(q2_loading *l);
 
 /*
- * Spend `dt` seconds on the hold and turn the logo. Returns true while the
- * screen still owns the frame; the caller stops ticking the world for exactly
- * as long as that is true.
+ * Put a page up with no clock of its own, for a caller that already has one —
+ * the STARTING screen rides the opening reel's beat, and two countdowns for one
+ * half second is exactly the pair that drifts apart.
+ */
+void q2_loading_show(q2_loading *l, q2_loading_page page);
+void q2_loading_hide(q2_loading *l);
+
+/*
+ * Turn the logo, and spend the hold if this screen is running one.
+ *
+ * Returns true only while the screen OWNS the frame, which a raised one does
+ * and a shown one does not: the caller that showed it is the one deciding what
+ * else runs. Call it once per frame whatever is on screen.
  */
 bool q2_loading_step(q2_loading *l, double dt);
+
+/* Which cell of the strip is up, so the turn can be checked without a
+ * framebuffer. */
+u32 q2_loading_cell(const q2_loading *l);
 
 /* Build the black screen's contents into `ot`: the logo, then the page over it.
  * `width` and `height` are the framebuffer's, so the 512 x 248 layout can be
  * centred in it. Returns the number of primitives emitted. */
-u32 q2_loading_build_ot(const q2_loading *l, psx_ot *ot, gte_state *gte,
+u32 q2_loading_build_ot(const q2_loading *l, psx_ot *ot,
                         int width, int height);
 
 #endif /* Q2PSX_LOADING_H */

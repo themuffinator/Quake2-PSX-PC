@@ -1,84 +1,70 @@
 #include "loading.h"
 
 #include "menudraw.h"
-#include "modeldraw.h"
 #include "worldscale.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Point the shadow menu at one of the two screens. Both are pure-text pages
+ * with nothing navigable, so the cursor is only ever the terminator. */
+static void loading_set_page(q2_loading *l, q2_loading_page page)
+{
+    const q2_menu_page *p =
+        q2_menu_page_find(page == Q2_LOADING_PAGE_STARTING
+                              ? Q2_PAGE_STARTING : Q2_PAGE_LOADING);
+
+    if (l->menu.page == p)
+        return;
+
+    l->menu.page   = p;
+    l->menu.cursor = p ? (int)p->first : 0;
+    l->menu.open   = (p != NULL);
+}
 
 q2_result q2_loading_open(q2_loading *l, const disc *d,
                           const q2_hud_tables *tab,
                           q2_menu_settings *settings)
 {
-    char   path[128];
-    q2_buf buf;
     q2_vram_section vs;
-    s32    index;
+    q2_result r;
 
-    if (!l || !d)
+    if (!l || !d || !tab)
         return Q2_ERR_INVALID_ARG;
 
     memset(l, 0, sizeof(*l));
 
-    snprintf(path, sizeof(path), "Q2DATA/LEVELS/%s/COMMON.DAT",
-             Q2_LOADING_MAP);
-    if (disc_read_file(d, path, &buf) != Q2_OK)
+    if (q2_vram_load(&vs, d, Q2_LOADING_MAP) != Q2_OK)
         return Q2_ERR_NOT_FOUND;
 
-    /* Takes ownership of `buf` on success; on failure the buffer is ours. */
-    if (q2_common_open(&l->common, &buf) != Q2_OK) {
-        q2_buf_free(&buf);
-        return Q2_ERR_BAD_FORMAT;
-    }
-    if (q2_model_bank_from_common(&l->bank, &l->common) != Q2_OK ||
-        l->bank.count == 0) {
-        q2_common_close(&l->common);
-        return Q2_ERR_NOT_FOUND;
-    }
-
-    /* By NAME, not by index. It is model 0 and the only one QDUMMY carries,
-     * but which index a name lands on is a property of this build. */
-    index = q2_model_bank_find(&l->bank, Q2_LOADING_MODEL);
-    if (index < 0 || q2_model_get(&l->bank, (u32)index, &l->logo) != Q2_OK) {
-        q2_common_close(&l->common);
-        return Q2_ERR_NOT_FOUND;
-    }
-    l->have_logo = true;
-
-    /*
-     * The bank, into an image of this screen's own. Both halves are optional in
-     * the sense that either can be missing on a cut-down disc — a screen with
-     * no texture page draws an untextured logo and one with no font draws no
-     * text — so neither failure stops the rest.
-     */
     l->vram = (psx_vram *)calloc(1, sizeof(psx_vram));
     if (!l->vram) {
-        q2_common_close(&l->common);
+        q2_vram_free(&vs);
         return Q2_ERR_NO_MEMORY;
     }
 
-    if (q2_vram_load(&vs, d, Q2_LOADING_MAP) == Q2_OK) {
-        l->textures      = (q2_vram_upload(&vs, l->vram) == Q2_OK);
-        l->clut4_count_a = vs.clut4_count_a;
+    /*
+     * The bank into an image of this screen's own, then the atlas out of it.
+     *
+     * Single player, one player: QDUMMY carries no icon sheet in any of the
+     * three flavours, and this screen draws no status bar to want one. The
+     * upload reports Q2_OK on the strength of `FrontEnd.lbm` alone, which is
+     * the whole of what this screen needs — the word and the logo strip are
+     * both cut from it, which is why `item_resident` is the thing checked.
+     */
+    (void)q2_vram_upload(&vs, l->vram);
+    r = q2_menu_font_upload(&l->font, tab, &vs, l->vram, false, 1);
+    q2_vram_free(&vs);
 
-        /*
-         * Single player, one player: QDUMMY carries no icon sheet in any of the
-         * three flavours, and this screen draws no status bar to want one. The
-         * upload reports Q2_OK on the strength of `FrontEnd.lbm` alone, which
-         * is the whole of what the LOADING line needs.
-         */
-        if (tab)
-            l->font_ready = (q2_menu_font_upload(&l->font, tab, &vs, l->vram,
-                                                 false, 1) == Q2_OK);
-        q2_vram_free(&vs);
+    if (r != Q2_OK || !l->font.item_resident) {
+        free(l->vram);
+        l->vram = NULL;
+        return Q2_ERR_NOT_FOUND;
     }
+    l->font_ready = true;
 
     q2_menu_init(&l->menu, settings, Q2_MENU_SCREEN_H);
-    l->menu.page   = q2_menu_page_find(Q2_PAGE_LOADING);
-    l->menu.cursor = l->menu.page ? (int)l->menu.page->first : 0;
-    l->menu.open   = (l->menu.page != NULL);
+    loading_set_page(l, Q2_LOADING_PAGE_LOADING);
 
     l->ready = true;
     return Q2_OK;
@@ -88,8 +74,6 @@ void q2_loading_close(q2_loading *l)
 {
     if (!l)
         return;
-    if (l->ready)
-        q2_common_close(&l->common);
     free(l->vram);
     memset(l, 0, sizeof(*l));
 }
@@ -99,17 +83,43 @@ void q2_loading_raise(q2_loading *l)
     if (!l || !l->ready)
         return;
 
+    loading_set_page(l, Q2_LOADING_PAGE_LOADING);
+
     /*
      * The hold RESTARTS rather than accumulating. A transition that loads twice
      * — a level change whose arrival lands in another zone — is one screen to
      * the player, and adding the two would make it linger for a second.
      */
-    l->hold = (double)Q2_LOADING_HOLD_UNITS;
-    l->open = true;
+    l->hold  = (double)Q2_LOADING_HOLD_UNITS;
+    l->timed = true;
+    l->open  = true;
+}
+
+void q2_loading_show(q2_loading *l, q2_loading_page page)
+{
+    if (!l || !l->ready)
+        return;
+
+    loading_set_page(l, page);
+    l->hold  = 0.0;
+    l->timed = false;
+    l->open  = true;
+}
+
+void q2_loading_hide(q2_loading *l)
+{
+    if (!l)
+        return;
+    l->open  = false;
+    l->timed = false;
+    l->hold  = 0.0;
 }
 
 bool q2_loading_step(q2_loading *l, double dt)
 {
+    const double cycle =
+        (double)(Q2_LOADING_CELLS * Q2_LOADING_CELL_UNITS);
+
     if (!l || !l->open)
         return false;
 
@@ -124,79 +134,116 @@ bool q2_loading_step(q2_loading *l, double dt)
      * keeps `open` in step with what this returns, which matters because the
      * frame loop reads the return and `client_frame` reads the flag.
      */
-    if (l->hold <= 0.0) {
-        l->hold = 0.0;
-        l->open = false;
+    if (l->timed && l->hold <= 0.0) {
+        q2_loading_hide(l);
         return false;
     }
 
-    /* `yaw -= 4 * dt` — module+0x9D24, in the same 1/300 s units the hold is
-     * spent in, so the turn and the countdown read one clock. */
-    l->yaw = (s32)(s16)(l->yaw - Q2_LB_SCENE_SPIN * (s32)(dt * Q2_DT_HZ));
+    /* The strip runs on the level clock whoever is holding the screen up, so a
+     * screen the caller is timing turns at the same rate; only the countdown
+     * belongs to one of them. */
+    l->spin += dt * (double)Q2_DT_HZ;
+    while (l->spin >= cycle)
+        l->spin -= cycle;
+
+    if (!l->timed)
+        return false;
 
     l->hold -= dt * (double)Q2_DT_HZ;
     return true;
 }
 
-u32 q2_loading_build_ot(const q2_loading *l, psx_ot *ot, gte_state *gte,
-                        int width, int height)
+u32 q2_loading_cell(const q2_loading *l)
 {
-    q2_model_instance   inst;
-    q2_model_draw_stats stats;
-    q2_camera           cam;
-    q2_menu_draw_opts   mo;
-    u32 n = 0;
+    u32 cell;
 
-    if (!l || !l->open || !ot || !gte)
+    if (!l || l->spin < 0.0)
         return 0;
 
-    /*
-     * The camera is the front end's: the world origin, no rotation, looking
-     * down +z with projection 160 (`engine+0x174(0, 160, 4000)`). Everything
-     * this screen shows stands in front of it, so nothing else about a viewport
-     * applies and none of it is installed.
-     */
-    if (l->have_logo) {
-        memset(&cam, 0, sizeof(cam));
-        cam.projection = Q2_LOADING_PROJ;
-        cam.far_z      = 4000;
-        cam.sort_range = Q2_CAMERA_SORT_RANGE;
+    cell = (u32)(l->spin / (double)Q2_LOADING_CELL_UNITS);
+    return cell < Q2_LOADING_CELLS ? cell : Q2_LOADING_CELLS - 1;
+}
 
-        gte_init(gte);
-        gte_set_projection(gte, cam.projection, width / 2, height / 2);
-        gte->zsf3 = (s16)(Q2_ONE_12 / 3);
-        gte->zsf4 = (s16)(Q2_ONE_12 / 4);
+/*
+ * The logo, as one textured quad off the menu's own atlas.
+ *
+ * A POLY_FT4 rather than the gouraud quad `q2_menu_draw_icon` emits, because
+ * nothing modulates this: the strip is already the colour it should be.
+ * `Q2_MENU_MOD_NORMAL` on all four corners is unity for a modulated primitive,
+ * which is the same thing said the way the hardware says it (menufont.h).
+ */
+static u32 loading_draw_logo(const q2_loading *l, psx_ot *ot,
+                             int origin_x, int origin_y)
+{
+    psx_prim *p;
+    u32 cell = q2_loading_cell(l);
+    u8  u = (u8)((cell % Q2_LOADING_CELL_COLS) * Q2_LOADING_CELL_W);
+    u8  v = (u8)(Q2_LOADING_CELL_V +
+                 (cell / Q2_LOADING_CELL_COLS) * Q2_LOADING_CELL_H);
+    int x = origin_x + Q2_LOADING_X;
+    int y = origin_y + Q2_LOADING_Y;
+    int i;
 
-        q2_model_instance_init(&inst);
-        inst.model = &l->logo;
-        inst.yaw   = l->yaw;
-        inst.scale = Q2_LOADING_SCALE;
-        inst.clut4_count_a = l->clut4_count_a;
-        inst.bucket_override = Q2_LOADING_OT_BUCKET;
+    p = psx_ot_add_bucket(ot, Q2_LOADING_OT_BUCKET);
+    if (!p)
+        return 0;
 
-        /* The corner, in world units — see Q2_LOADING_WORLD_X for the 3/2 the
-         * horizontal carries and why it is not the same divide as the
-         * vertical. */
-        inst.origin[0] = Q2_LOADING_WORLD_X;
-        inst.origin[1] = Q2_LOADING_WORLD_Y;
-        inst.origin[2] = Q2_LOADING_DIST;
+    p->kind  = PSX_PRIM_FT4;
+    p->tpage = l->font.tpage_item;
+    p->clut  = l->font.clut_text;
+    p->textured_blend = true;
 
-        /* No light environment, so the vertices take `tint` — the neutral 128
-         * a modulated primitive wants (modeldraw.h). The title screen's logo is
-         * lit by QFRONT's own lights; this one has no level to be lit by. */
-        memset(&stats, 0, sizeof(stats));
-        n += q2_model_build_ot(&inst, &cam, ot, gte, &stats);
+    p->xy[0].x = (s16)x;
+    p->xy[0].y = (s16)y;
+    p->xy[1].x = (s16)(x + Q2_LOADING_CELL_W);
+    p->xy[1].y = (s16)y;
+    p->xy[2].x = (s16)(x + Q2_LOADING_CELL_W);
+    p->xy[2].y = (s16)(y + Q2_LOADING_CELL_H);
+    p->xy[3].x = (s16)x;
+    p->xy[3].y = (s16)(y + Q2_LOADING_CELL_H);
+
+    p->uv[0].u = u;
+    p->uv[0].v = v;
+    p->uv[1].u = (u8)(u + Q2_LOADING_CELL_W);
+    p->uv[1].v = v;
+    p->uv[2].u = (u8)(u + Q2_LOADING_CELL_W);
+    p->uv[2].v = (u8)(v + Q2_LOADING_CELL_H);
+    p->uv[3].u = u;
+    p->uv[3].v = (u8)(v + Q2_LOADING_CELL_H);
+
+    for (i = 0; i < 4; i++) {
+        p->rgb[i].r = Q2_MENU_MOD_NORMAL;
+        p->rgb[i].g = Q2_MENU_MOD_NORMAL;
+        p->rgb[i].b = Q2_MENU_MOD_NORMAL;
     }
+    return 1;
+}
+
+u32 q2_loading_build_ot(const q2_loading *l, psx_ot *ot, int width, int height)
+{
+    q2_menu_draw_opts mo;
+    int origin_x, origin_y;
+    u32 n = 0;
+
+    if (!l || !l->open || !ot || !l->font_ready)
+        return 0;
+
+    /* The console's 512 x 248 block, centred in whatever this buffer is — the
+     * same placement the session's own menu gets (client_menu_origin). */
+    origin_x = (width  - Q2_MENU_SCREEN_W) / 2;
+    origin_y = (height - Q2_MENU_SCREEN_H) / 2;
+
+    n += loading_draw_logo(l, ot, origin_x, origin_y);
 
     /*
      * And the page over it, through the same builder every other page goes
      * through — this one IS a menu page (0x800A3314), so it gets the menu's
      * font, the menu's centring and the menu's bucket.
      */
-    if (l->font_ready && l->menu.page) {
+    if (l->menu.page) {
         q2_menu_draw_opts_default(&mo, &l->font);
-        mo.origin_x = (width  - Q2_MENU_SCREEN_W) / 2;
-        mo.origin_y = (height - Q2_MENU_SCREEN_H) / 2;
+        mo.origin_x = origin_x;
+        mo.origin_y = origin_y;
         mo.view_x   = 0;
         mo.view_w   = width < Q2_MENU_SCREEN_W ? width : Q2_MENU_SCREEN_W;
 

@@ -914,6 +914,28 @@ typedef struct client {
     bool              boot_skip;       /* a press, taken on the next frame    */
 
     /*
+     * NO MUSIC UNTIL THE MENU IS UP, and this is the port's problem rather
+     * than the console's.
+     *
+     * On the console the boot chain is three LEVELS — QLOGOS2, QLOGOS and then
+     * QFMV — and none of the three has a playlist: the level table's records 1,
+     * 2 and 10 carry no track ids at all, so nothing is playing over the logos
+     * or under the intro film, and QFront's record 0 starts the front end's one
+     * looping track when the front end is loaded.
+     *
+     * This port loads QFRONT FIRST, before the chain, because the logo screens
+     * here are two decoded images rather than levels and the front end needs
+     * something to stand on when the film ends. That load took QFRONT's
+     * playlist with it, so the menu track played over the legal screen, the
+     * two logo pairs and the whole of TAKE1BP.STX.
+     *
+     * So the load that arms the chain holds the music, and
+     * `client_enter_front_end` — which is where the chain ends, whether through
+     * the film or past it — is what lets go.
+     */
+    bool              music_held;
+
+    /*
      * THE LOADING SCREEN, and it is in front of everything while it is up.
      *
      * Raised by `client_load_zone` — every load this client makes goes through
@@ -5810,6 +5832,19 @@ static void client_music_for_level(client *c, bool force)
     if (!c->level_table_ready || !c->music_table_ready)
         return;
 
+    /*
+     * HELD, which is not the same as "this level has no playlist".
+     *
+     * See `music_held`: the boot chain's QFRONT load happens before the logo
+     * screens rather than after them, and its playlist must not start until the
+     * front end it is standing on is actually showing. `c->level` is left alone
+     * so the forced call that lifts the hold still sees a change.
+     */
+    if (c->music_held) {
+        c->music_open = false;
+        return;
+    }
+
     lv = q2_level_find(&c->level_table, c->map);
     if (lv == c->level && !force)
         return;                 /* same level: a zone gate, or nothing moved */
@@ -8543,6 +8578,15 @@ static void client_menu_requests(client *c)
          */
         q2_sim_scene_page(&c->sim[0], false, false);
         c->start_beat = (double)Q2_START_BEAT_UNITS;
+        /*
+         * AND THE BLANK FRONT END IS NOT BLANK. It is `STARTING` / `GAME` over
+         * black with the wire logo turning in the corner — QFRONT's own page at
+         * module+0x0EBF4, which is the screen a retail capture of this half
+         * second shows. `q2_loading_show` rather than `q2_loading_raise`,
+         * because the beat above is already the clock and two countdowns for
+         * one half second are two things that can drift.
+         */
+        q2_loading_show(&c->loading, Q2_LOADING_PAGE_STARTING);
         break;
     case Q2_MREQ_CREDITS: {
         /*
@@ -10540,6 +10584,7 @@ static void client_enter_front_end(client *c)
     c->film_is_start = false;
     c->start_beat    = 0.0;
     c->mp_scoreboard = false;
+    q2_loading_hide(&c->loading);
     q2_menu_set_multiplayer(&c->menu, false);
     q2_screen_set_layout(&c->screen, Q2_SCREEN_LAYOUT_ONE, 1);
 
@@ -10589,6 +10634,20 @@ static void client_enter_front_end(client *c)
      * selection bar and the same font as every other page. */
     q2_menu_open(&c->menu);
     q2_menu_goto(&c->menu, Q2_PAGE_FRONT_TITLE);
+
+    /*
+     * AND THE MUSIC STARTS HERE, if it was held for the boot chain.
+     *
+     * This is the point the console's own front-end load reaches: the title
+     * screen is up, the logos are behind it and the film has been played. The
+     * force is what makes the track start from the top — the load above may
+     * not have re-selected anything, because coming out of the film the map is
+     * QFMV and going nowhere at all leaves it QFRONT.
+     */
+    if (c->music_held) {
+        c->music_held = false;
+        client_music_for_level(c, true);
+    }
 }
 
 /*
@@ -10805,6 +10864,7 @@ static void client_start_game(client *c)
     c->film_is_start = false;
     c->film_to_front = false;
     c->start_beat    = 0.0;
+    q2_loading_hide(&c->loading);
 
     /*
      * A NEW GAME is the one thing that empties the mission table, and it is
@@ -10842,6 +10902,7 @@ static void client_start_beat(client *c, float dt)
     if (c->start_beat > 0.0)
         return;
     c->start_beat = 0.0;
+    q2_loading_hide(&c->loading);
 
     if (!client_film_start(c, Q2_START_REEL)) {
         Q2_WARN("front end: no opening reel — starting the game without it");
@@ -12297,8 +12358,8 @@ static void client_frame(client *c)
     if (c->loading.open) {
         psx_raster_opts lo = c->opts;
 
-        lo.textures = c->loading.textures;
-        q2_loading_build_ot(&c->loading, &c->ot, &c->gte, c->width, c->height);
+        lo.textures = true;
+        q2_loading_build_ot(&c->loading, &c->ot, c->width, c->height);
         psx_fb_clear(q2_screen_back(&c->screen), 0);
         q2_screen_compose(&c->screen, &c->ot, c->loading.vram, &lo);
         client_present(c);
@@ -13539,9 +13600,8 @@ no_window:
      */
     if (q2_loading_open(&c.loading, c.disc, &c.hud_tables, &c.settings) ==
         Q2_OK)
-        Q2_INFO("loading screen: %s — %s%s", Q2_LOADING_MAP,
-                Q2_LOADING_MODEL,
-                c.loading.font_ready ? " and the menu font" : "");
+        Q2_INFO("loading screen: the logo strip and the word, out of %s's "
+                "frontend.lbm", Q2_LOADING_MAP);
     else
         Q2_INFO("loading screen: this disc has no %s — transitions cut "
                 "straight through", Q2_LOADING_MAP);
@@ -13619,8 +13679,12 @@ no_window:
         c.in_front_end = true;
         map = "QFRONT";
         zone_index = 0;
-        if (!c.headless && !c.no_boot)
+        if (!c.headless && !c.no_boot) {
             c.boot_chain = true;
+            /* Before the QFRONT load below, which is the one that would
+             * otherwise start the menu track over the logo screens. */
+            c.music_held = true;
+        }
     }
 
     /*

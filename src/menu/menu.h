@@ -279,7 +279,16 @@ typedef enum q2_menu_page_id {
      * needed a number. So this is the port's own numbering, above every id the
      * executable uses, exactly as the six front-end pages are.
      */
-    Q2_PAGE_LOADING          = 207
+    Q2_PAGE_LOADING          = 207,
+
+    /*
+     * The front end's own version of it, and the module has no id for this one
+     * either. `module+0x0EBF4` installs `STARTING` at (256, 111) and `GAME` at
+     * (256, 137) — two rows on the same 26-pixel pitch every other front-end
+     * page uses, and the same shape as RESTARTING / LEVEL. It is what the half
+     * second between a confirmed difficulty and the opening reel looks like.
+     */
+    Q2_PAGE_STARTING         = 208
 } q2_menu_page_id;
 
 /*

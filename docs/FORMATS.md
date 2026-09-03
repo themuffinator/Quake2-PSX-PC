@@ -4753,10 +4753,33 @@ that one frame, frozen for as long as the disc takes.
 which §9 records as "always 1 on a real level" — so the screen is armed for every level and disarmed only for
 a record that is not one.
 
-**Where the picture comes from, and why `LEVELS/QDUMMY/` is on the disc.** The word is the executable's; the
-rest is not. Page 46 draws over whatever scene is standing, and a screen meant to be up *while a level is
-being replaced* cannot borrow that level's models. QDUMMY is what it borrows instead — level table record 3,
-`Dummy`, and its contents are the argument:
+**Where the picture comes from: it is a SPRITE STRIP, not a model.** The word is the executable's and so is
+the logo turning beside it — both are cut from `frontend.lbm`, the atlas §11.2 already reads the menu's
+letterforms out of. Rows 144..203 of that sheet, under the 16-pixel face and above the panel art, hold a
+**23-cell rotation of the Quake II logo on a 32 x 20 grid**, eight cells across and three rows down, with
+`RETRY` in the twenty-fourth slot.
+
+The cell widths are what prove the grid and what the strip is. Read on it they run
+
+```
+17 16 14 13 11 9 7 5 4 5 7 9 11 13 14 16 18 19 19 21 22 22 22
+```
+
+— a smooth narrowing to a single minimum and out again, which is |cos| and is a rotation about the vertical
+axis; every cell is the full 20 rows tall, because a thing turning that way does not change height. Read
+instead as two rows of 30 the same sixty rows give `17 16 14 13 12 13 14 16 / 18 19 19 21 22 22 22`, which is
+lumpy, puts its minimum in the wrong place, and makes a broadside cell 22 x 30 — an aspect of 0.47 once the
+frame buffer's 2:3 pixel is accounted for, against the logo's own 1452:1997 = 0.73. On the 20-row grid a
+broadside cell is 22 x 20, which is 0.71. The row-density profile agrees: it dips to 18 lit texels at row 164
+and to 8 at row 184, exactly the two boundaries.
+
+Three things follow that a model cannot give. The logo is in the **menu font's own palette**, so it is the
+pale blue the word is rather than the gold of the title screen's model. An **in-level** load can show it at
+all, because `frontend.lbm` is in every playable map's `SNDVRAM.DAT` and no model of the logo is. And it is
+**32 x 20 drawn 1:1**, like every other thing cut from this sheet.
+
+**What that retracts, and what survives it.** An earlier pass here argued the picture comes from
+`LEVELS/QDUMMY/` — level table record 3, `Dummy` — on the strength of what that directory holds:
 
 | file | size | what is in it |
 |---|---|---|
@@ -4764,20 +4787,42 @@ being replaced* cannot borrow that level's models. QDUMMY is what it borrows ins
 | `SNDVRAM.DAT` | 21,332 | **one** named image: `FrontEnd.lbm` |
 | `ZONE0.DAT` | 840 | a header — there is no world in it |
 
-`FrontEnd.lbm` is the menu font atlas (§11.2, §10) and `Q2LOGO` is the title screen's logo. A directory
-carrying exactly the letterforms this screen writes with and exactly the model it turns, over an empty zone,
-is a loading screen and is not anything else: every other screen map on the disc carries `chars.lbm`, a
-world, or both. Its own `LevelBin` agrees — `module+0x96C` compares the level name against `"Dummy"` and
-installs `module+0x2E1C`, four instructions that ask for the next state once four frames have gone by.
+A retail capture of the front end's `STARTING` / `GAME` screen shows the logo **hollow**, so the solid
+`Q2LOGO` was wrong; a second pass reached for `q2logowire`, QFRONT's outlined twin of the same mesh (6 parts,
+306 vertices, 281 faces, differing only in the texture id its faces name — 4 against 0), which is the right
+shape, the wrong colour, and in the one directory an in-level load cannot borrow from. Both readings were
+models because the title screen's logo is a model, and neither looked at the sheet the same screen was
+already writing its word out of.
 
-The `Dummy` record is reachable from that module and from nothing in the executable, so what asked for it on
-the console is not settled here; what the directory is for is.
+What survives is the observation and not the argument. QDUMMY's shape is still striking, its `LevelBin` still
+compares the level name against `"Dummy"` at `module+0x96C` and installs `module+0x2E1C` — four instructions
+that ask for the next state once four frames have gone by — and the `Dummy` record is still reachable from
+that module and from nothing in the executable. What the directory is FOR is not settled here.
 
 Reconstructed in `src/game/loading.[ch]`, with the page in `src/menu/pages.c` where
-`q2psx-inspect menu <disc>` checks it against `0x800A3314` record by record. The port loads QDUMMY once and
-holds it, which the console does not — it reads the directory every time, because reading a directory is the
-only way its engine gets to a screen — but the pixels are the same and a port whose loads are instant has no
-reason to spend one on the loading screen.
+`q2psx-inspect menu <disc>` checks it against `0x800A3314` record by record. The port opens QDUMMY's
+`SNDVRAM.DAT` once and holds its VRAM image for the run — not because that directory is special, but because
+at 21 KB it is the smallest thing on the disc carrying `frontend.lbm`, and a screen that is up *while a map's
+pages are being replaced* cannot draw out of the live image.
+
+### 11.13.1 `STARTING` / `GAME`, and the third page — **SOLVED**
+
+The same furniture carries the front end's own version, and it is what a capture of the half second between a
+confirmed difficulty and the opening reel shows. `0x80101E4C` — the handler all three difficulty records call
+— opens with `module+0x3414(NULL, 19)`, so the screen is **module page 19** built by the ordinary front-end
+page builder with no banner, and the records are at `module+0x0EBF4`:
+
+| record | text | x | y |
+|---|---|---|---|
+| `module+0x0EBF4` | `STARTING` | 256 | 111 |
+| `module+0x0EC0C` | `GAME` | 256 | 137 |
+
+— two rows on the 26-pixel pitch, the same shape as RESTARTING / LEVEL. A third page at `module+0x0EBC4` is
+one row reading `DEMO OF GAME` at (256, 111) and belongs to the attract loop.
+
+Those two rows are also the RULER the logo's corner was measured with: they are the only things in the
+capture whose frame-buffer coordinates are known, so the distance between them fixes the scale of the
+picture and everything else in it can be read off in the console's own 512 x 248 pixels.
 
 ## 12. The screen — **CONFIRMED**
 

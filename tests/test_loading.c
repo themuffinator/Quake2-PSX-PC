@@ -180,29 +180,47 @@ static void test_never_raised_without_assets(void)
 static void test_spin(void)
 {
     q2_loading l;
-    s32 first;
+    u32 seen[Q2_LOADING_CELLS];
+    u32 i, distinct = 0;
 
     armed(&l);
     q2_loading_raise(&l);
 
-    /*
-     * `yaw -= 4 * dt` with dt in 1/300 s units — module+0x9D24, the front end's
-     * own rate for the same model, and a third faster than a pickup's
-     * Q2_ITEM_SPIN_RATE of 3. One 1/30 s frame is 10 units of clock, so 40 of
-     * the circle's 4096.
-     */
-    (void)q2_loading_step(&l, 1.0 / 30.0);
-    first = l.yaw;
-    CHECK(first == (s32)(s16)(0 - Q2_LB_SCENE_SPIN * 10),
-          "one frame turned it to %d, not %d", (int)first,
-          (int)(s16)(0 - Q2_LB_SCENE_SPIN * 10));
+    CHECK(q2_loading_cell(&l) == 0, "a fresh screen starts at cell %u",
+          q2_loading_cell(&l));
 
-    /* And it keeps turning the same way. A full 4096 takes 3.4 s, which is
-     * longer than the screen is up — so the logo never repeats a pose. */
-    (void)q2_loading_step(&l, 1.0 / 30.0);
-    CHECK(l.yaw == (s32)(s16)(first - Q2_LB_SCENE_SPIN * 10),
-          "the second frame turned it to %d", (int)l.yaw);
-    CHECK(l.yaw != 0, "two frames left the logo where it started");
+    /*
+     * One cell every Q2_LOADING_CELL_UNITS of the level clock. At the headless
+     * 1/30 s step a frame is 10 of those units, so the cell index is the frame
+     * count times 10 over the pitch.
+     */
+    for (i = 1; i <= 8; i++) {
+        u32 want = (u32)(i * 10) / Q2_LOADING_CELL_UNITS;
+
+        (void)q2_loading_step(&l, 1.0 / 30.0);
+        CHECK(q2_loading_cell(&l) == want,
+              "after %u frames the strip is on cell %u, not %u", i,
+              q2_loading_cell(&l), want);
+    }
+
+    /* Every cell of the strip is reached, and none outside it: an index past
+     * the fifteenth is the word RETRY, which is in the sixteenth slot. */
+    memset(seen, 0, sizeof(seen));
+    armed(&l);
+    q2_loading_show(&l, Q2_LOADING_PAGE_LOADING);
+    for (i = 0; i < 400; i++) {
+        u32 c = q2_loading_cell(&l);
+
+        CHECK(c < Q2_LOADING_CELLS, "cell %u is off the end of the strip", c);
+        if (c < Q2_LOADING_CELLS && !seen[c]) {
+            seen[c] = 1;
+            distinct++;
+        }
+        (void)q2_loading_step(&l, 1.0 / 60.0);
+    }
+    CHECK(distinct == Q2_LOADING_CELLS,
+          "%u of the strip's %u cells were reached", distinct,
+          (u32)Q2_LOADING_CELLS);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -211,47 +229,104 @@ static void test_spin(void)
 static void test_logo_lands_in_the_top_right(void)
 {
     /*
-     * Project the world position back the way the frame does and check it comes
-     * out at the pixel offsets the constants ask for.
-     *
-     * x carries the 3/2 of `q2_rotation_view_anamorphic`'s row 0 and y does
-     * not, which is the whole reason this is worth a test: the same divide on
-     * both axes put 200 pixels of x at 300 and the logo 44 pixels off the right
-     * edge of a 512-wide screen, where it drew nothing and looked like a
-     * missing model.
+     * The quad is 32 x 30 texels drawn 1:1 in the console's own 512 x 248
+     * pixels, so this is a rectangle check and not a projection: it has to be
+     * in the top right, inside the screen, and clear of the word.
      */
-    int sx = Q2_LOADING_WORLD_X * 3 / 2 * Q2_LOADING_PROJ / Q2_LOADING_DIST;
-    int sy = Q2_LOADING_WORLD_Y * Q2_LOADING_PROJ / Q2_LOADING_DIST;
+    int x0 = Q2_LOADING_X;
+    int y0 = Q2_LOADING_Y;
+    int x1 = x0 + Q2_LOADING_CELL_W;
+    int y1 = y0 + Q2_LOADING_CELL_H;
 
-    CHECK(sx >= Q2_LOADING_OFS_X - 2 && sx <= Q2_LOADING_OFS_X + 2,
-          "x projects to %d, not %d", sx, Q2_LOADING_OFS_X);
-    CHECK(sy >= Q2_LOADING_OFS_Y - 2 && sy <= Q2_LOADING_OFS_Y + 2,
-          "y projects to %d, not %d", sy, Q2_LOADING_OFS_Y);
+    CHECK(x0 > Q2_MENU_SCREEN_W / 2, "the logo is not in the right half");
+    CHECK(y1 < Q2_MENU_SCREEN_H / 2, "the logo is not in the top half");
+    CHECK(x0 >= 0 && x1 <= Q2_MENU_SCREEN_W,
+          "the logo spans %d..%d across a %d-wide screen", x0, x1,
+          Q2_MENU_SCREEN_W);
+    CHECK(y0 >= 0 && y1 <= Q2_MENU_SCREEN_H,
+          "the logo spans %d..%d down a %d-tall screen", y0, y1,
+          Q2_MENU_SCREEN_H);
 
-    /* Top RIGHT, and inside the screen: the logo is a quarter scale, so its
-     * posed half-extents reach 182 world units across and 250 down. */
-    {
-        int half_w = 727 * Q2_LOADING_SCALE / Q2_ONE_12 * 3 / 2 *
-                     Q2_LOADING_PROJ / Q2_LOADING_DIST;
-        int half_h = 1081 * Q2_LOADING_SCALE / Q2_ONE_12 *
-                     Q2_LOADING_PROJ / Q2_LOADING_DIST;
-        int cx = Q2_MENU_SCREEN_W / 2 + sx;
-        int cy = Q2_MENU_SCREEN_H / 2 + sy;
+    /* Clear of both rows either screen can carry: LOADING is centred at y=124
+     * and STARTING at y=111, each in an 11-pixel cell. */
+    CHECK(y1 < 111 - 6, "the logo reaches y %d and STARTING starts at 105", y1);
+}
 
-        CHECK(sx > 0 && sy < 0, "the logo is not in the top right");
-        CHECK(cx - half_w >= 0 && cx + half_w < Q2_MENU_SCREEN_W,
-              "the logo spans %d..%d across a %d-wide screen",
-              cx - half_w, cx + half_w, Q2_MENU_SCREEN_W);
-        CHECK(cy - half_h >= 0 && cy + half_h < Q2_MENU_SCREEN_H,
-              "the logo spans %d..%d down a %d-tall screen",
-              cy - half_h, cy + half_h, Q2_MENU_SCREEN_H);
+/* ------------------------------------------------------------------------- */
+/* The strip's cells                                                          */
+/* ------------------------------------------------------------------------- */
+static void test_cells_stay_on_the_sheet(void)
+{
+    u32 i;
 
-        /* And clear of the word it shares the screen with, which is centred at
-         * y = 124 in an 11-pixel cell. */
-        CHECK(cy + half_h < 124 - 8,
-              "the logo reaches y %d and LOADING starts at 116",
-              cy + half_h);
+    /*
+     * A 4bpp texture page is 256 texels square and a POLY_FT4's uv are BYTES,
+     * so a cell that runs past 255 does not clip, it WRAPS — and the strip's
+     * last column ends at exactly 256. Checking the far corner of every cell is
+     * what says the grid and the sheet agree.
+     */
+    for (i = 0; i < Q2_LOADING_CELLS; i++) {
+        int u = (int)(i % Q2_LOADING_CELL_COLS) * Q2_LOADING_CELL_W;
+        int v = Q2_LOADING_CELL_V +
+                (int)(i / Q2_LOADING_CELL_COLS) * Q2_LOADING_CELL_H;
+
+        CHECK(u + Q2_LOADING_CELL_W <= 256,
+              "cell %u runs to u %d", i, u + Q2_LOADING_CELL_W);
+        CHECK(v + Q2_LOADING_CELL_H <= 256,
+              "cell %u runs to v %d", i, v + Q2_LOADING_CELL_H);
     }
+
+    /*
+     * And clear of the letterforms, which are what the rest of the sheet is:
+     * the 32-pixel face runs to row 109 and the 16-pixel face to 142
+     * (menufont.h), so the strip starting at 144 is the first free row.
+     */
+    CHECK(Q2_LOADING_CELL_V > 142,
+          "the strip starts at row %d, inside the 16-pixel face",
+          Q2_LOADING_CELL_V);
+    CHECK(Q2_LOADING_CELL_V + 3 * Q2_LOADING_CELL_H <= 213,
+          "the strip reaches row %d, into the panel art at 213",
+          Q2_LOADING_CELL_V + 3 * Q2_LOADING_CELL_H);
+}
+
+/* ------------------------------------------------------------------------- */
+/* The two pages                                                              */
+/* ------------------------------------------------------------------------- */
+static void test_starting_page(void)
+{
+    const q2_menu_page *p = q2_menu_page_find(Q2_PAGE_STARTING);
+    q2_loading l;
+
+    CHECK(p != NULL, "no page for Q2_PAGE_STARTING");
+    if (p) {
+        CHECK(p->count == 2, "the page holds %u records, not 2", p->count);
+        CHECK(p->first == p->count, "the page is navigable");
+        CHECK(strcmp(p->items[0].label, "STARTING") == 0 &&
+              strcmp(p->items[1].label, "GAME") == 0,
+              "the rows read \"%s\" / \"%s\"", p->items[0].label,
+              p->items[1].label);
+        CHECK(p->items[0].x == 256 && p->items[0].y == 111 &&
+              p->items[1].x == 256 && p->items[1].y == 137,
+              "the rows are at (%d,%d) and (%d,%d)",
+              (int)p->items[0].x, (int)p->items[0].y,
+              (int)p->items[1].x, (int)p->items[1].y);
+    }
+
+    /*
+     * A SHOWN screen does not own the frame, which is the whole difference
+     * between the two ways of raising one: the opening reel's beat is the clock
+     * for this page, so `q2_loading_step` must turn the logo and then hand the
+     * frame back rather than swallowing it.
+     */
+    armed(&l);
+    q2_loading_show(&l, Q2_LOADING_PAGE_STARTING);
+    CHECK(l.open, "showing it did not open it");
+    CHECK(!q2_loading_step(&l, 1.0 / 30.0), "a shown screen owns the frame");
+    CHECK(l.open, "...and stepping it took it down");
+    CHECK(l.menu.page == p, "the shown page is not STARTING");
+
+    q2_loading_hide(&l);
+    CHECK(!l.open, "hiding it left it up");
 }
 
 int main(void)
@@ -263,6 +338,8 @@ int main(void)
     test_never_raised_without_assets();
     test_spin();
     test_logo_lands_in_the_top_right();
+    test_cells_stay_on_the_sheet();
+    test_starting_page();
 
     if (g_fail) {
         printf("\n%d loading-screen check%s failed\n", g_fail,

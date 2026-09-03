@@ -9676,19 +9676,49 @@ unit, 4095.3 mean over every part of `Blaster G`) or the GTE reaches it.
       level record's `+0x20` — "always 1 on a real level" — so the screen is on for every level and off only
       for a record that is not one.
 
-      **And `LEVELS/QDUMMY/` is what draws behind it.** Page 46 draws over whatever scene is standing, and a
-      screen meant to be up while a level is being replaced cannot borrow that level's models. QDUMMY is
-      level table record 3, `Dummy`, and it holds one model — `Q2LOGO` — one named image — `FrontEnd.lbm`,
-      the menu font atlas — and an 840-byte zone with no world in it. That is the letterforms this screen
-      writes with and the model it turns, and nothing else; every other screen map on the disc carries
-      `chars.lbm`, a world, or both. Its own `LevelBin` agrees: `module+0x96C` compares the level name
-      against `"Dummy"` and installs `module+0x2E1C`, four instructions that ask for the next state once four
-      frames have gone by.
+      **And the logo beside it is a SPRITE STRIP, not a model.** This entry said `LEVELS/QDUMMY/` draws
+      behind the word, on the strength of that directory holding one model (`Q2LOGO`), one named image
+      (`FrontEnd.lbm`, the menu font atlas) and an 840-byte zone with no world in it — "the letterforms this
+      screen writes with and the model it turns, and nothing else". **That is wrong, and a retail capture is
+      what says so.** The logo in the capture is HOLLOW, and `Q2LOGO` is solid.
 
-      **What is NOT settled.** The `"Dummy"` string is reachable from that module and from **nothing in the
-      executable** — `xrefs 0x800AC820` comes back empty — so which code path asked the console for it is
-      not established here. What the directory is FOR is; a port that draws the logo from it draws the same
-      pixels whatever asked for it.
+      The correction is in the sheet the screen was already writing its word out of. Rows 144..203 of
+      `frontend.lbm` hold a **23-cell rotation of the logo on a 32 x 20 grid**, eight across and three down,
+      with `RETRY` in the twenty-fourth slot. The cell widths on that grid run
+
+          17 16 14 13 11 9 7 5 4 5 7 9 11 13 14 16 18 19 19 21 22 22 22
+
+      — a smooth narrowing to one minimum and out again, which is |cos|, and every cell is the full 20 rows
+      tall, which is what a rotation about the vertical axis looks like and what a tumble does not. The grid
+      is checkable two more ways: the row-density profile dips to 18 lit texels at row 164 and 8 at row 184,
+      the two boundaries; and a broadside cell of 22 x 20 is an aspect of 0.71 once the frame buffer's 2:3
+      pixel is accounted for, against the logo's own 1452:1997 = 0.73, where the 30-row reading gives 0.47.
+
+      Three things follow that no model gives. The logo is in the **menu font's palette**, so it is the pale
+      blue the word is — which is what the capture shows and what neither `Q2LOGO`'s gold nor
+      `q2logowire`'s mint green is. An **in-level** load can show it at all, because `frontend.lbm` is in
+      every playable map's `SNDVRAM.DAT` and no model of the logo is. And it is 32 x 20 drawn 1:1.
+
+      **Two wrong answers, and why.** The first was `Q2LOGO` from QDUMMY; the second, after the capture ruled
+      that out on shape, was `q2logowire` — QFRONT's outlined twin of the same mesh, identical part for part
+      (6 parts, 306 vertices, 281 faces) and differing only in the texture id its faces name, 4 against 0.
+      Right shape, wrong colour, and in the one directory an in-level load cannot borrow from. Both were
+      models because the title screen's logo is a model. Neither pass opened the atlas.
+
+      **What is NOT settled.** The rate the strip runs at: a cell index is a number some code counts and that
+      code has not been found. The port sets it to the one rate the disc does give for this logo — the front
+      end's own `yaw -= 4 * dt`, 1024 ticks a revolution — which over 23 cells of a half turn is 22 ticks a
+      cell. And the `"Dummy"` string is still reachable from QDUMMY's module and from **nothing in the
+      executable** (`xrefs 0x800AC820` comes back empty), so what asked the console for that directory is
+      still open; the port opens its `SNDVRAM.DAT` only because at 21 KB it is the smallest carrier of
+      `frontend.lbm` on the disc.
+
+      **`STARTING` / `GAME` came out of the same capture.** `0x80101E4C`, the handler all three difficulty
+      records call, opens with `module+0x3414(NULL, 19)` — module page 19, built by the ordinary front-end
+      page builder — and its records are `module+0x0EBF4` `STARTING` (256, 111) and `module+0x0EC0C` `GAME`
+      (256, 137). A third page at `module+0x0EBC4` is one row, `DEMO OF GAME` at (256, 111), and belongs to
+      the attract loop. Those two rows are also the ruler the logo's corner was measured with: they are the
+      only things in the capture whose frame-buffer coordinates are known.
 
       FORMATS §11.13; `src/game/loading.[ch]`; the page is in `src/menu/pages.c` where
       `q2psx-inspect menu <disc>` checks it against the executable record by record, and
