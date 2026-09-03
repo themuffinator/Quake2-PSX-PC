@@ -4777,7 +4777,14 @@ Two things follow that a model cannot give. An **in-level** load can show the lo
 `frontend.lbm` is in every playable map's `SNDVRAM.DAT` and no model of the logo is. And it is **32 x 20
 drawn 1:1**, like every other thing cut from this sheet.
 
-**The palette is the one thing here that is measured rather than read**, because the strip is data with no
+**Two things here are measured rather than read**, because the strip is data with no located reader: which
+palette it is drawn through, and which end of it the animation starts at. The screen is up for half a second
+and the strip runs at a cell every 22 ticks, so a player sees about seven of the twenty-three — which end
+those seven come from is most of what the rotation ever is. Read forwards the widths open at 17 of a 4..22
+range and are edge-on within the half second; read backwards they open at 22, broadside, and turn away. The
+capture's logo is a wide one, so the port walks the strip backwards.
+
+**The palette**, likewise, because the strip is data with no
 located reader — nothing found so far binds a CLUT for this quad. A capture shows the logo GREY, and the
 bank has exactly one palette for that: built-in id 4, `000000 080808 181818 ... D8D8D8 E8E8E8`, a monotonic
 sixteen-step grey ramp. The strip is authored against palette 68, whose sixteen entries are a blue ramp in

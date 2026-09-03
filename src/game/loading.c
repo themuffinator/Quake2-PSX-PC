@@ -153,15 +153,33 @@ bool q2_loading_step(q2_loading *l, double dt)
     return true;
 }
 
+/*
+ * BACKWARDS ALONG THE SHEET, so the first thing on screen is the logo facing
+ * the player.
+ *
+ * The strip's direction is not read from anything — nothing found binds this
+ * quad, let alone counts its index — so it comes off the capture, and the
+ * capture is decisive. Read forwards the widths run 17 16 14 13 11 9 7 5 4 ...,
+ * which starts a THIRD of the way into the turn and is edge-on within half a
+ * second; read backwards they run 22 22 22 21 19 19 18 17 16 ..., which starts
+ * broadside and turns away. A screen that is up for half a second shows about
+ * seven cells at this rate, and the retail capture's logo is a wide one — so
+ * the seven it shows are the wide end, not the narrow.
+ *
+ * It also makes the strip a half turn that begins where a half turn begins:
+ * broadside, to edge-on at cell 8, to nearly broadside again.
+ */
 u32 q2_loading_cell(const q2_loading *l)
 {
-    u32 cell;
+    u32 step;
 
     if (!l || l->spin < 0.0)
-        return 0;
+        return Q2_LOADING_CELLS - 1;
 
-    cell = (u32)(l->spin / (double)Q2_LOADING_CELL_UNITS);
-    return cell < Q2_LOADING_CELLS ? cell : Q2_LOADING_CELLS - 1;
+    step = (u32)(l->spin / (double)Q2_LOADING_CELL_UNITS);
+    if (step >= Q2_LOADING_CELLS)
+        step = Q2_LOADING_CELLS - 1;
+    return (Q2_LOADING_CELLS - 1) - step;
 }
 
 /*

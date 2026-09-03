@@ -13679,12 +13679,8 @@ no_window:
         c.in_front_end = true;
         map = "QFRONT";
         zone_index = 0;
-        if (!c.headless && !c.no_boot) {
+        if (!c.headless && !c.no_boot)
             c.boot_chain = true;
-            /* Before the QFRONT load below, which is the one that would
-             * otherwise start the menu track over the logo screens. */
-            c.music_held = true;
-        }
     }
 
     /*
@@ -13753,6 +13749,18 @@ no_window:
             snprintf(c.first_map, sizeof(c.first_map), "%s", map);
         }
     }
+
+    /*
+     * THE MUSIC IS HELD FOR EXACTLY THE RUNS THAT WALK THE CHAIN.
+     *
+     * The same condition the chain itself is started under, further down, and
+     * it is here rather than beside `boot_chain` because that flag is set in
+     * two places: `--boot` sets it while the arguments are being read, long
+     * before any of this. Arming the hold next to one of them left the other
+     * playing the menu track over the legal screen, which is the bug this was
+     * meant to fix. See `music_held`.
+     */
+    c.music_held = (c.boot_chain && c.in_front_end);
 
     /* A static question about the map, asked and answered without playing it. */
     if (zone_probe) {

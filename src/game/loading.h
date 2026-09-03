@@ -103,6 +103,12 @@
  * Q2_LOADING_CELL_UNITS; it is in the level clock's 1/300 s units so that it is
  * the same speed at every frame rate.
  *
+ * Its DIRECTION is not on the disc either, and the capture settles it: the
+ * strip is walked BACKWARDS, from the last cell to the first, so the screen
+ * opens on the logo facing the player. See `q2_loading_cell`. At this rate half
+ * a second is about seven cells, so which end it starts from is most of what
+ * the player ever sees of the rotation.
+ *
  * WHERE it stands is measured off the capture, in the console's own 512 x 248
  * pixels, against the two text rows as a ruler: those are `STARTING` at
  * (256, 111) and `GAME` at (256, 137) from QFRONT's own records, so a distance

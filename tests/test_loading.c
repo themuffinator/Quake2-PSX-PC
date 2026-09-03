@@ -186,8 +186,11 @@ static void test_spin(void)
     armed(&l);
     q2_loading_raise(&l);
 
-    CHECK(q2_loading_cell(&l) == 0, "a fresh screen starts at cell %u",
-          q2_loading_cell(&l));
+    /* Backwards along the sheet: a fresh screen starts at the LAST cell, which
+     * is the broadside one. See q2_loading_cell. */
+    CHECK(q2_loading_cell(&l) == Q2_LOADING_CELLS - 1,
+          "a fresh screen starts at cell %u, not %u", q2_loading_cell(&l),
+          (u32)Q2_LOADING_CELLS - 1);
 
     /*
      * One cell every Q2_LOADING_CELL_UNITS of the level clock. At the headless
@@ -195,7 +198,8 @@ static void test_spin(void)
      * count times 10 over the pitch.
      */
     for (i = 1; i <= 8; i++) {
-        u32 want = (u32)(i * 10) / Q2_LOADING_CELL_UNITS;
+        u32 want = Q2_LOADING_CELLS - 1 -
+                   (u32)(i * 10) / Q2_LOADING_CELL_UNITS;
 
         (void)q2_loading_step(&l, 1.0 / 30.0);
         CHECK(q2_loading_cell(&l) == want,

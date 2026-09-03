@@ -9698,7 +9698,14 @@ unit, 4095.3 mean over every part of `Blaster G`) or the GTE reaches it.
       `frontend.lbm` is in every playable map's `SNDVRAM.DAT` and no model of the logo is. And it is
       32 x 20 drawn 1:1.
 
-      **The palette is measured, not read.** Nothing found so far binds a CLUT for this quad, so the strip
+      **Two things are measured, not read**, because nothing found so far binds a CLUT for this quad or
+      counts its index. The first is which END of the strip the animation starts at. The screen is up for
+      half a second and the strip runs at a cell every 22 ticks, so about seven of the twenty-three are ever
+      seen; read forwards the widths open at 17 of a 4..22 range and reach edge-on inside that half second,
+      read backwards they open at 22 — broadside — and turn away. The capture's logo is a wide one, so the
+      port walks it backwards.
+
+      **And the palette.** Nothing found so far binds a CLUT for this quad, so the strip
       is data with no reader. The capture shows the logo GREY, and the bank has one palette for that:
       built-in id 4, `000000 080808 181818 ... D8D8D8 E8E8E8`. The strip is authored against 68 — its sixty
       rows use exactly 68's sixteen entries, a blue ramp — so 4 is the same image in the same index order
