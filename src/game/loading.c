@@ -191,30 +191,29 @@ static u32 loading_draw_logo(const q2_loading *l, psx_ot *ot,
     p->kind  = PSX_PRIM_FT4;
     p->tpage = l->font.tpage_item;
     /*
-     * PALETTE 68, THE STRIP'S OWN RAMP — and this is the one thing on this
-     * screen that is a choice rather than a reading.
+     * PALETTE 4, THE GREY RAMP — not the sheet's own blue one.
      *
-     * The sprite is authored FOR 68. Its sixty rows use exactly sixteen
-     * colours and they are 68's sixteen entries, expanded from 5-bit:
-     * `000000 002942 083152 ... ADE7E7 C6F7F7` against the bank's
-     * `000000 002840 083050 ... A8E0E0 C0F0F0`. So the ramp it was drawn
-     * against is the ramp it is drawn through, which is what any other sprite
-     * cut from this sheet gets.
+     * The logo is GREY on the console, and the bank has exactly the palette for
+     * that. The sprite is authored against 68: its sixty rows use sixteen
+     * colours and they are 68's sixteen entries, a monotonic blue ramp dark to
+     * light. Palette 4 is the same shape with the colour taken out —
+     * `000000 080808 181818 ... D8D8D8 E8E8E8`, sixteen evenly spaced greys in
+     * the same index order — so drawing the strip through it gives the same
+     * image, same weight, same anti-aliasing, in grey. Nothing else in the bank
+     * does: 75 is the same ramp stopped at 0x78 and comes out too dark, 76 runs
+     * bright-to-dark and inverts the art, and 73 is a flat white.
      *
-     * The alternative was tried and is worse. Palette 70 — which hudtables.h
-     * calls "a white-only mask palette the menu uses", and which the bank
-     * confirms is 0xF8F8F8 at indices 8..11 and black at the other twelve —
-     * turns a sixteen-level ramp into four, and the logo comes out as a
-     * stippled fragment rather than an outline. It is right for a GLYPH, whose
-     * art sits in that band, and wrong for this.
+     * Palette 70 was tried and is wrong here for a reason worth keeping:
+     * hudtables.h calls it "a white-only mask palette the menu uses" and the
+     * bank confirms 0xF8F8F8 at indices 8..11 with the other twelve black, so
+     * it turns a sixteen-level ramp into four and the logo comes out a stippled
+     * fragment. It is right for a GLYPH, whose art sits in that band.
      *
-     * WHAT WOULD SETTLE IT is the code that binds the CLUT for this quad, and
-     * that has not been found: the strip is data with no located reader. If a
-     * capture ever shows the logo lighter than the word beside it, the answer
-     * is a modulation on this primitive rather than another palette — there
-     * is no third white ramp in the bank.
+     * WHICH palette the console binds is not read — the strip is data with no
+     * located reader — so this is chosen to match the capture, the same way the
+     * corner and the size are.
      */
-    p->clut  = l->font.clut_text;
+    p->clut  = q2_hud_palette_clut(l->font.tab, Q2_LOADING_PALETTE);
     p->textured_blend = true;
 
     p->xy[0].x = (s16)x;
@@ -271,16 +270,6 @@ u32 q2_loading_build_ot(const q2_loading *l, psx_ot *ot, int width, int height)
         mo.view_x   = 0;
         mo.view_w   = width < Q2_MENU_SCREEN_W ? width : Q2_MENU_SCREEN_W;
 
-        /*
-         * AND THE WORD IS WHITE ON THE ENGINE'S PAGE AND BLUE ON THE MODULE'S.
-         *
-         * `0x80079398` sets drawable 0's `+0x48` right after installing the
-         * LOADING record, so that page is highlighted and takes palette 70.
-         * The front end's STARTING / GAME is built by the ordinary page builder
-         * and sets nothing, so it stays on 68 — which is what the capture
-         * shows: blue rows under a white logo.
-         */
-        mo.highlight_all = (l->menu.page == q2_menu_page_find(Q2_PAGE_LOADING));
 
         n += q2_menu_build_ot(&l->menu, ot, &mo);
     }

@@ -113,6 +113,7 @@
 
 #include "disc.h"
 #include "gpu.h"
+#include "hudtables.h"
 #include "menu.h"
 #include "menufont.h"
 #include "q2psx.h"
@@ -179,6 +180,16 @@
  */
 #define Q2_LOADING_X   460
 #define Q2_LOADING_Y    40
+
+/*
+ * The palette the logo is drawn through — the executable's built-in bank, id 4.
+ *
+ * A monotonic sixteen-step grey ramp, `000000 080808 181818 ... D8D8D8 E8E8E8`.
+ * The strip is authored against palette 68, whose sixteen entries are a blue
+ * ramp in the same index order, so 4 is the same picture with the colour taken
+ * out. See loading.c for why the other greys in the bank are not it.
+ */
+#define Q2_LOADING_PALETTE  4
 
 /*
  * The ordering-table bucket the logo is linked into.

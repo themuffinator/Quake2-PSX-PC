@@ -4773,10 +4773,20 @@ frame buffer's 2:3 pixel is accounted for, against the logo's own 1452:1997 = 0.
 broadside cell is 22 x 20, which is 0.71. The row-density profile agrees: it dips to 18 lit texels at row 164
 and to 8 at row 184, exactly the two boundaries.
 
-Three things follow that a model cannot give. The logo is in the **menu font's own palette**, so it is the
-pale blue the word is rather than the gold of the title screen's model. An **in-level** load can show it at
-all, because `frontend.lbm` is in every playable map's `SNDVRAM.DAT` and no model of the logo is. And it is
-**32 x 20 drawn 1:1**, like every other thing cut from this sheet.
+Two things follow that a model cannot give. An **in-level** load can show the logo at all, because
+`frontend.lbm` is in every playable map's `SNDVRAM.DAT` and no model of the logo is. And it is **32 x 20
+drawn 1:1**, like every other thing cut from this sheet.
+
+**The palette is the one thing here that is measured rather than read**, because the strip is data with no
+located reader — nothing found so far binds a CLUT for this quad. A capture shows the logo GREY, and the
+bank has exactly one palette for that: built-in id 4, `000000 080808 181818 ... D8D8D8 E8E8E8`, a monotonic
+sixteen-step grey ramp. The strip is authored against palette 68, whose sixteen entries are a blue ramp in
+the same index order — the sixty rows of the strip use exactly those sixteen colours — so 4 is the same
+image with the colour taken out, at the same weight and with its anti-aliasing intact. The other greys in
+the bank are not it: 75 is the same ramp stopped at 0x78 and comes out too dark, 76 runs bright-to-dark and
+inverts the art, 73 is a flat white, and 70 — which §11 calls the white-only mask — has four live levels
+out of sixteen and leaves a stippled fragment rather than an outline. 70 is right for a GLYPH, whose art
+sits in that band, and that is what it is there for.
 
 **What that retracts, and what survives it.** An earlier pass here argued the picture comes from
 `LEVELS/QDUMMY/` — level table record 3, `Dummy` — on the strength of what that directory holds:

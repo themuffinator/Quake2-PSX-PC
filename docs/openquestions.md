@@ -9694,10 +9694,17 @@ unit, 4095.3 mean over every part of `Blaster G`) or the GTE reaches it.
       the two boundaries; and a broadside cell of 22 x 20 is an aspect of 0.71 once the frame buffer's 2:3
       pixel is accounted for, against the logo's own 1452:1997 = 0.73, where the 30-row reading gives 0.47.
 
-      Three things follow that no model gives. The logo is in the **menu font's palette**, so it is the pale
-      blue the word is — which is what the capture shows and what neither `Q2LOGO`'s gold nor
-      `q2logowire`'s mint green is. An **in-level** load can show it at all, because `frontend.lbm` is in
-      every playable map's `SNDVRAM.DAT` and no model of the logo is. And it is 32 x 20 drawn 1:1.
+      Two things follow that no model gives. An **in-level** load can show the logo at all, because
+      `frontend.lbm` is in every playable map's `SNDVRAM.DAT` and no model of the logo is. And it is
+      32 x 20 drawn 1:1.
+
+      **The palette is measured, not read.** Nothing found so far binds a CLUT for this quad, so the strip
+      is data with no reader. The capture shows the logo GREY, and the bank has one palette for that:
+      built-in id 4, `000000 080808 181818 ... D8D8D8 E8E8E8`. The strip is authored against 68 — its sixty
+      rows use exactly 68's sixteen entries, a blue ramp — so 4 is the same image in the same index order
+      with the colour taken out. 75 is that ramp stopped at 0x78 and too dark, 76 runs bright-to-dark and
+      inverts the art, 73 is flat white, and 70 (the white-only mask) has four live levels out of sixteen
+      and stipples it. 70 is right for a GLYPH, whose art sits in that band.
 
       **Two wrong answers, and why.** The first was `Q2LOGO` from QDUMMY; the second, after the capture ruled
       that out on shape, was `q2logowire` — QFRONT's outlined twin of the same mesh, identical part for part
