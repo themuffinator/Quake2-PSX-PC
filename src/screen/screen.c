@@ -147,19 +147,34 @@ static void view_common(q2_screen *s, q2_screen_view *v, u16 aspect_divisor)
 }
 
 /*
+ * SetDefDispEnv, 0x8008AD5C: `disp` from the arguments, and everything after it
+ * — the whole `screen` rectangle and the four flag bytes — zeroed.
+ */
+static void set_def_disp_env(q2_screen_dispenv *e, int x, int y, int w, int h)
+{
+    memset(e, 0, sizeof(*e));
+    e->disp_x = (s16)x;
+    e->disp_y = (s16)y;
+    e->disp_w = (s16)w;
+    e->disp_h = (s16)h;
+}
+
+/*
  * 0x80077454's second half — the display envs, cross paired so that the env
  * `PutDispEnv` is handed (the one belonging to the buffer being DRAWN) shows
  * the other buffer's rectangle. It is not part of any layout: the bring-up
  * calls it once (0x80076598) and a session start calls it again (0x8007CACC)
  * alongside installing the layout, which is what puts the pairing back after
- * the boot layout has flattened both envs to (0,0).
+ * the boot layout has flattened both envs to (0,0). Config_InstallVideo
+ * follows at 0x800774B8, so the envs come out already carrying SCREEN POSITION.
  */
 static void display_envs_cross(q2_screen *s)
 {
-    s->disp.env[0].x = (s16)s->disp.width;   /* SetDefDispEnv(db0+10940, 512, 0, ..) */
-    s->disp.env[0].y = 0;
-    s->disp.env[1].x = 0;                    /* SetDefDispEnv(db1+10940,   0, 0, ..) */
-    s->disp.env[1].y = 0;
+    set_def_disp_env(&s->disp.env[0], s->disp.width, 0,
+                     s->disp.width, s->disp.height);   /* db0+10940: 512, 0 */
+    set_def_disp_env(&s->disp.env[1], 0, 0,
+                     s->disp.width, s->disp.height);   /* db1+10940:   0, 0 */
+    q2_screen_install_video(s, s->disp.pos_x, s->disp.pos_y);
 }
 
 /* 0x80077D0C — one player, the whole framebuffer, double buffered. */
@@ -206,10 +221,14 @@ static void layout_full_single(q2_screen *s)
      * 0x800776D4 / 0x800776F8: this is the only layout that calls
      * SetDefDispEnv, and it hands each buffer's env that buffer's OWN origin —
      * both (0,0) here. The cross pairing the boot function set up is undone,
-     * which is precisely what makes this layout single buffered.
+     * which is precisely what makes this layout single buffered. It calls
+     * Config_InstallVideo next (0x80077700), as SetupDrawDisplay3D does.
      */
-    s->disp.env[0] = s->disp.buf[0];
-    s->disp.env[1] = s->disp.buf[1];
+    set_def_disp_env(&s->disp.env[0], s->disp.buf[0].x, s->disp.buf[0].y,
+                     s->disp.width, s->disp.height);
+    set_def_disp_env(&s->disp.env[1], s->disp.buf[1].x, s->disp.buf[1].y,
+                     s->disp.width, s->disp.height);
+    q2_screen_install_video(s, s->disp.pos_x, s->disp.pos_y);
 
     v->x = 0;  v->y = 0;
     v->w = (s16)s->disp.width;
@@ -543,7 +562,7 @@ const char *q2_screen_fit_name(q2_screen_fit fit)
 static void picture_aspect(const q2_screen *s, q2_screen_fit fit,
                            int *wn, int *wd)
 {
-    int pn = 1, pd = 1;
+    int pn = 1, pd = 1, pw = 0, ph = 0;
 
     switch (fit) {
     case Q2_SCREEN_FIT_SQUARE:
@@ -557,8 +576,10 @@ static void picture_aspect(const q2_screen *s, q2_screen_fit fit,
         return;
     }
 
-    *wn = (int)s->disp.width  * pn;
-    *wd = (int)s->disp.height * pd;
+    /* The displayed picture, not the buffer: 240 of its 248 lines. */
+    q2_screen_picture_size(s, &pw, &ph);
+    *wn = pw * pn;
+    *wd = ph * pd;
 }
 
 void q2_screen_fit_rect(const q2_screen *s, q2_screen_fit fit,
@@ -607,14 +628,14 @@ void q2_screen_fit_rect(const q2_screen *s, q2_screen_fit fit,
 void q2_screen_window_size(const q2_screen *s, q2_screen_fit fit, int scale,
                            int *w, int *h)
 {
-    int wn, wd, ww, wh;
+    int wn, wd, ww, wh, pw = 0, ph = 0;
 
     if (scale < 1)
         scale = 1;
 
     if (!s || s->disp.width == 0 || s->disp.height == 0) {
-        if (w) *w = 512 * scale;
-        if (h) *h = 248 * scale;
+        if (w) *w = Q2_SCREEN_PAL_WIDTH  * scale;
+        if (h) *h = Q2_SCREEN_DISP_LINES * scale;
         return;
     }
 
@@ -625,11 +646,12 @@ void q2_screen_window_size(const q2_screen *s, q2_screen_fit fit, int scale,
      * the 512-wide mode was chosen for, and throwing a third of it away to get
      * the aspect right would be a strange trade.
      */
-    ww = (int)s->disp.width * scale;
+    q2_screen_picture_size(s, &pw, &ph);
+    ww = pw * scale;
 
     if (fit == Q2_SCREEN_FIT_STRETCH) {
         if (w) *w = ww;
-        if (h) *h = (int)s->disp.height * scale;
+        if (h) *h = ph * scale;
         return;
     }
 
@@ -639,6 +661,236 @@ void q2_screen_window_size(const q2_screen *s, q2_screen_fit fit, int scale,
 
     if (w) *w = ww;
     if (h) *h = wh;
+}
+
+/* ------------------------------------------------------------------------- */
+/* SCREEN POSITION — Config_InstallVideo, and what PutDispEnv makes of it      */
+/* ------------------------------------------------------------------------- */
+/*
+ * The data PutDispEnv (0x80083BCC) works from. The {start, end} pairs are the
+ * halfword table at 0x800A5280, which the library indexes `(pad0 * 5 + mode)`
+ * with pad0 the mode GetVideoMode returns — so NTSC's five come first. The
+ * clamps are immediates in the two arms that follow the table read, PAL's at
+ * 0x80083F10 and NTSC's at 0x80083FA0.
+ */
+const q2_screen_disp_limits q2_screen_disp_limits_by_std[2] = {
+    {   /* NTSC */
+        16,  16, 257, 258,  500, 3250, 3290,
+        { { 590, 3150 }, { 600, 3160 }, { 539, 3227 }, { 615, 3175 }, { 620, 3180 } }
+    },
+    {   /* PAL */
+        19,  19, 303, 305,  540, 3220, 3260,
+        { { 610, 3170 }, { 624, 3184 }, { 560, 3248 }, { 635, 3195 }, { 640, 3200 } }
+    },
+};
+
+const u8 q2_screen_disp_dot[5] = { 10, 8, 7, 5, 4 };
+
+static int clamp_int(int v, int lo, int hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* The width PutDispEnv files `disp.w` under: 256, 320, 368, 512 or 640
+ * (0x80083E64..0x80083E94 — the same thresholds as the GP1(08h) arm). */
+static int disp_width_mode(int w)
+{
+    if (w < 281) return 0;
+    if (w < 353) return 1;
+    if (w < 401) return 2;
+    if (w < 561) return 3;
+    return 4;
+}
+
+/* Config_InstallVideo's writes into one env. `height` stands for the immediate
+ * 248 at 0x8001C30C / 0x8001C330 — see the header. */
+static void install_env(q2_screen_dispenv *e, int x, int y, int height)
+{
+    e->screen_x = (s16)x;                    /* 0x8001C2B0 / 0x8001C2D0 */
+    e->screen_y = (s16)y;                    /* 0x8001C2C0 / 0x8001C2E4 */
+    if (y < 0) {
+        e->disp_y = (s16)-y;                 /* 0x8001C2F0 / 0x8001C300 */
+        e->disp_h = (s16)(y + height);       /* 0x8001C30C, delay slot  */
+    } else {
+        e->disp_y = 0;                       /* 0x8001C318 / 0x8001C328 */
+        e->disp_h = (s16)height;             /* 0x8001C330              */
+    }
+}
+
+void q2_screen_install_video(q2_screen *s, int x, int y)
+{
+    if (!s)
+        return;
+
+    s->disp.pos_x = (s16)x;
+    s->disp.pos_y = (s16)y;
+
+    /* Both buffers, every time: db+10940 and db+32408+10940. */
+    install_env(&s->disp.env[0], x, y, s->disp.height);
+    install_env(&s->disp.env[1], x, y, s->disp.height);
+}
+
+void q2_screen_put_dispenv(const q2_screen *s, const q2_screen_dispenv *e,
+                           q2_screen_range *out)
+{
+    const q2_screen_disp_limits *lim;
+    int mode, dot, start, span, x1, x2, y1, y2;
+
+    if (!out)
+        return;
+    memset(out, 0, sizeof(*out));
+    if (!s || !e)
+        return;
+
+    lim   = &q2_screen_disp_limits_by_std[s->disp.video_mode == 1 ? 1 : 0];
+    mode  = disp_width_mode(e->disp_w);
+    dot   = q2_screen_disp_dot[mode];
+    start = lim->span[mode][0];
+    span  = lim->span[mode][1] - start;
+
+    /*
+     * Both far edges come from the start BEFORE it is clamped — s2 is formed at
+     * 0x80083E54/58 and the x end at 0x80083F00, and only then are the starts
+     * clamped. It is what makes a negative screen.y shrink the window rather
+     * than slide it, and what Config_InstallVideo's disp.y works against.
+     */
+    x1 = start + e->screen_x * dot;
+    x2 = x1 + (e->screen_w ? (span * e->screen_w) >> 8 : span);
+    y1 = e->screen_y + lim->y_base;
+    y2 = y1 + (e->screen_h ? e->screen_h : Q2_SCREEN_DISP_LINES);
+
+    x1 = clamp_int(x1, lim->x1_min, lim->x1_max);
+    if (x2 < x1 + 4 * dot)
+        x2 = x1 + 4 * dot;
+    else if (x2 > lim->x2_max)
+        x2 = lim->x2_max;
+
+    y1 = clamp_int(y1, lim->y1_min, lim->y1_max);
+    if (y2 < y1 + 2)
+        y2 = y1 + 2;
+    else if (y2 > lim->y2_max)
+        y2 = lim->y2_max;
+
+    out->vram_x = e->disp_x;
+    out->vram_y = e->disp_y;
+    out->x1 = x1;  out->x2 = x2;
+    out->y1 = y1;  out->y2 = y2;
+    out->dot = dot;
+
+    out->gp1_05 = 0x05000000u | ((u32)(e->disp_y & 0x3FF) << 10)
+                              |  (u32)(e->disp_x & 0x3FF);
+    out->gp1_06 = 0x06000000u | ((u32)(x2 & 0xFFF) << 12) | (u32)(x1 & 0xFFF);
+    out->gp1_07 = 0x07000000u | ((u32)(y2 & 0x3FF) << 10) | (u32)(y1 & 0x3FF);
+}
+
+void q2_screen_shown_range(const q2_screen *s, q2_screen_range *out)
+{
+    if (!s) {
+        q2_screen_put_dispenv(NULL, NULL, out);
+        return;
+    }
+    q2_screen_put_dispenv(s, &s->disp.env[s->disp.draw_buffer & 1], out);
+}
+
+void q2_screen_range_at(const q2_screen *s, int x, int y, q2_screen_range *out)
+{
+    q2_screen_dispenv e;
+
+    if (!s) {
+        q2_screen_put_dispenv(NULL, NULL, out);
+        return;
+    }
+    set_def_disp_env(&e, s->disp.env[s->disp.draw_buffer & 1].disp_x, 0,
+                     s->disp.width, s->disp.height);
+    install_env(&e, x, y, s->disp.height);
+    q2_screen_put_dispenv(s, &e, out);
+}
+
+void q2_screen_picture_size(const q2_screen *s, int *w, int *h)
+{
+    q2_screen_range r;
+    q2_screen_dispenv e;
+
+    if (!s || s->disp.width == 0 || s->disp.height == 0) {
+        if (w) *w = Q2_SCREEN_PAL_WIDTH;
+        if (h) *h = Q2_SCREEN_DISP_LINES;
+        return;
+    }
+
+    /* An env exactly as SetDefDispEnv leaves it: nothing moved, nothing sized. */
+    set_def_disp_env(&e, 0, 0, s->disp.width, s->disp.height);
+    q2_screen_put_dispenv(s, &e, &r);
+
+    if (w) *w = (r.x2 - r.x1) / r.dot;
+    if (h) *h = r.y2 - r.y1;
+}
+
+void q2_screen_place(const q2_screen *s, q2_screen_fit fit, int win_w, int win_h,
+                     const q2_screen_range *neutral,
+                     const q2_screen_range *shown,
+                     q2_screen_placement *out)
+{
+    int fx = 0, fy = 0, fw = 0, fh = 0;
+    int cols, rows, c1, r0, r1;
+    double kx, ky, px, py;
+
+    if (!out)
+        return;
+    memset(out, 0, sizeof(*out));
+    if (!s || !neutral || !shown || shown->dot <= 0 ||
+        neutral->x2 <= neutral->x1 || neutral->y2 <= neutral->y1)
+        return;
+
+    q2_screen_fit_rect(s, fit, win_w, win_h, &fx, &fy, &fw, &fh);
+
+    /* Window pixels per GPU clock and per raster line, measured on the picture
+     * at the neutral position — the one the fit rectangle is. */
+    kx = (double)fw / (double)(neutral->x2 - neutral->x1);
+    ky = (double)fh / (double)(neutral->y2 - neutral->y1);
+
+    /* Where the shown range begins, by its distance from the neutral one. */
+    px = (double)fx + (double)(shown->x1 - neutral->x1) * kx;
+    py = (double)fy + (double)(shown->y1 - neutral->y1) * ky;
+
+    /*
+     * What it scans: `cols` pixels from the start of its buffer's row, `rows`
+     * rows from vram_y. Every buffer in this game sits at VRAM y = 0, so vram_y
+     * is a row of the buffer — it is Config_InstallVideo's -y when that is
+     * negative. Anything scanned past the buffer's edge would be other VRAM; the
+     * ranges above never reach it (a negative y shortens the window by exactly
+     * the rows it skips), and it is clipped rather than invented if they did.
+     */
+    cols = (shown->x2 - shown->x1) / shown->dot;
+    rows = shown->y2 - shown->y1;
+
+    c1 = cols < (int)s->disp.width ? cols : (int)s->disp.width;
+    r0 = shown->vram_y > 0 ? shown->vram_y : 0;
+    r1 = shown->vram_y + rows;
+    if (r1 > (int)s->disp.height)
+        r1 = (int)s->disp.height;
+    if (c1 <= 0 || r1 <= r0)
+        return;
+
+    out->src_x = 0;
+    out->src_y = r0;
+    out->src_w = c1;
+    out->src_h = r1 - r0;
+    out->dst_x = (float)px;
+    out->dst_y = (float)(py + (double)(r0 - shown->vram_y) * ky);
+    out->dst_w = (float)((double)c1 * shown->dot * kx);
+    out->dst_h = (float)((double)(r1 - r0) * ky);
+}
+
+bool q2_screen_window_to_buffer(const q2_screen_placement *p, double wx,
+                                double wy, double *bx, double *by)
+{
+    if (!p || p->src_w <= 0 || p->src_h <= 0 ||
+        p->dst_w <= 0.0f || p->dst_h <= 0.0f)
+        return false;
+
+    if (bx) *bx = (double)p->src_x + (wx - p->dst_x) * p->src_w / p->dst_w;
+    if (by) *by = (double)p->src_y + (wy - p->dst_y) * p->src_h / p->dst_h;
+    return true;
 }
 
 void q2_screen_view_fov(const q2_screen *s, const q2_screen_view *v,
@@ -1657,12 +1909,14 @@ bool q2_screen_single_buffered(const q2_screen *s)
 {
     if (!s)
         return false;
-    return s->disp.env[0].x == s->disp.env[1].x &&
-           s->disp.env[0].y == s->disp.env[1].y;
+    return s->disp.env[0].disp_x == s->disp.env[1].disp_x &&
+           s->disp.env[0].disp_y == s->disp.env[1].disp_y;
 }
 
 void q2_screen_display_rect(const q2_screen *s, int *x, int *y, int *w, int *h)
 {
+    q2_screen_range r;
+
     if (!s) {
         if (x) *x = 0;
         if (y) *y = 0;
@@ -1672,11 +1926,12 @@ void q2_screen_display_rect(const q2_screen *s, int *x, int *y, int *w, int *h)
     }
 
     /* PutDispEnv is handed the env of the buffer being drawn (0x800185AC takes
-     * 0x800B2754), so this is that env's rectangle. */
-    if (x) *x = s->disp.env[s->disp.draw_buffer].x;
-    if (y) *y = s->disp.env[s->disp.draw_buffer].y;
-    if (w) *w = s->disp.width;
-    if (h) *h = s->disp.height;
+     * 0x800B2754), so this is that env — as the GPU scans it. */
+    q2_screen_shown_range(s, &r);
+    if (x) *x = r.vram_x;
+    if (y) *y = r.vram_y;
+    if (w) *w = (r.x2 - r.x1) / r.dot;
+    if (h) *h = r.y2 - r.y1;
 }
 
 const psx_framebuffer *q2_screen_front(const q2_screen *s)

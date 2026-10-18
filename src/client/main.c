@@ -8022,9 +8022,29 @@ static void client_menu_origin(const client *c, int *ox, int *oy)
 }
 
 /*
+ * Where the finished frame goes in a window of `out_w` x `out_h`: the part of
+ * the framebuffer the television shows, and where. SCREEN POSITION is already
+ * in the display envs (client_frame installs it), so this only has to say what
+ * "unmoved" is — the reset routine's position, which the fit rectangle stands
+ * for. One function because the frame and the pointer must agree to the pixel.
+ */
+static void client_place(const client *c, int out_w, int out_h,
+                         q2_screen_placement *pl)
+{
+    q2_menu_settings reset;
+    q2_screen_range neutral, shown;
+
+    q2_menu_reset_video(&reset);                      /* 0x8001FA18: 0, 24 */
+    q2_screen_range_at(&c->screen, reset.v[Q2_SET_SCREEN_X],
+                       reset.v[Q2_SET_SCREEN_Y], &neutral);
+    q2_screen_shown_range(&c->screen, &shown);
+    q2_screen_place(&c->screen, c->fit, out_w, out_h, &neutral, &shown, pl);
+}
+
+/*
  * The pointer in menu space, undoing the two transforms the frame applied on
- * the way out: the window fit (q2_screen_fit_rect plus SCREEN POSITION, exactly
- * as client_frame composes them) and then the menu block's origin.
+ * the way out: the placement (client_place, exactly as client_frame blits it)
+ * and then the menu block's origin.
  *
  * False when there is no pointer to speak of — headless, or grabbed for
  * mouselook, in which case its motion is look input and its position is
@@ -8033,27 +8053,18 @@ static void client_menu_origin(const client *c, int *ox, int *oy)
 static bool client_menu_pointer_pos(const client *c, int *mx, int *my)
 {
     int out_w = 0, out_h = 0;
-    int px = 0, py = 0, pw = 0, ph = 0;
     int ox = 0, oy = 0;
-    double sx, sy, fx, fy;
+    double fx = 0.0, fy = 0.0;
+    q2_screen_placement pl;
 
     if (c->headless || !c->renderer || !c->pointer_valid || c->mouse_grabbed)
         return false;
 
     SDL_GetCurrentRenderOutputSize(c->renderer, &out_w, &out_h);
-    q2_screen_fit_rect(&c->screen, c->fit, out_w, out_h, &px, &py, &pw, &ph);
-    if (pw <= 0 || ph <= 0)
+    client_place(c, out_w, out_h, &pl);
+    if (!q2_screen_window_to_buffer(&pl, (double)c->pointer_x,
+                                    (double)c->pointer_y, &fx, &fy))
         return false;
-
-    sx = (double)c->settings.v[Q2_SET_SCREEN_X];
-    sy = (double)(c->settings.v[Q2_SET_SCREEN_Y] - 24);
-
-    fx = ((double)c->pointer_x -
-          ((double)px + sx * (double)pw / (double)Q2_SCREEN_PAL_WIDTH)) *
-         (double)c->width / (double)pw;
-    fy = ((double)c->pointer_y -
-          ((double)py + sy * (double)ph / (double)Q2_SCREEN_PAL_HEIGHT)) *
-         (double)c->height / (double)ph;
 
     client_menu_origin(c, &ox, &oy);
 
@@ -12484,6 +12495,16 @@ static void client_frame(client *c)
     if (c->boot_open)
         client_boot_blit(c);
 
+    /*
+     * SCREEN POSITION into the display envs, as Config_InstallVideo
+     * (0x8001C29C) puts it there — openquestions #40. The console calls it from
+     * the SCREEN POSITION page every frame it is up, after the video reset and a
+     * settings load, and from both functions that set the envs up; the settings
+     * cannot change anywhere else, so doing it once a frame here, before the env
+     * is put, shows exactly what those calls would.
+     */
+    q2_screen_install_video(&c->screen, c->settings.v[Q2_SET_SCREEN_X],
+                            c->settings.v[Q2_SET_SCREEN_Y]);
     q2_screen_present(&c->screen);
     front = q2_screen_front(&c->screen);
 
@@ -12513,26 +12534,6 @@ static void client_frame(client *c)
     SDL_RenderClear(c->renderer);
     {
         /*
-         * SCREEN POSITION, honoured — openquestions #40.
-         *
-         * The page writes `0x800B3368` / `0x800B336A` (defaults 0 and 24) and
-         * an exhaustive sweep finds **no reader anywhere in the executable**:
-         * the obvious consumer would be the display env's screen rectangle,
-         * which `SetDefDispEnv` explicitly zeroes. So on this build the page is
-         * inert, and the port must not pretend otherwise about the CONSOLE.
-         *
-         * It can still do the honest thing for the player: a control that
-         * exists and does nothing is a bug from the outside. The offset is
-         * applied here, at presentation, where it shifts the finished image the
-         * way a television's own position control would — and nowhere near the
-         * ordering table, so it cannot perturb clipping or the viewport
-         * rectangles that the reconstruction does depend on.
-         *
-         * The default y of 24 is treated as the neutral point, because that is
-         * what the reset routine writes and a fresh install must not be
-         * off-centre.
-         */
-        /*
          * THE PICTURE'S SHAPE, which is not the buffer's.
          *
          * The GPU's five horizontal modes all span the same active line, so a
@@ -12541,33 +12542,28 @@ static void client_frame(client *c)
          * framebuffer pixel exactly 2:3, and blitting the buffer to fill the
          * window — which is what this did — a 1.5x horizontal stretch.
          *
-         * q2_screen_fit_rect does the whole of it: the largest rectangle of the
-         * right shape that fits, centred, with the rest of the window left as
-         * border. It takes any window aspect, so a 16:9 monitor pillarboxes and
-         * a tall window letterboxes without this having to know which.
+         * AND THE PICTURE'S EXTENT, which is not the buffer's either. What
+         * reaches the television is what PutDispEnv programs from the display
+         * env: 240 lines of the 248 drawn, starting where SCREEN POSITION —
+         * installed above, as Config_InstallVideo installs it — says. So this
+         * blits the part of the buffer the ranges scan, where they put it,
+         * measured from the picture at the reset routine's position; the fit
+         * rectangle is that picture. See q2_screen_place.
          */
-        SDL_FRect dst;
+        SDL_FRect src, dst;
         int out_w = 0, out_h = 0;
-        int px = 0, py = 0, pw = 0, ph = 0;
-        float sx = (float)c->settings.v[Q2_SET_SCREEN_X];
-        float sy = (float)(c->settings.v[Q2_SET_SCREEN_Y] - 24);
+        q2_screen_placement pl;
 
         SDL_GetCurrentRenderOutputSize(c->renderer, &out_w, &out_h);
-        q2_screen_fit_rect(&c->screen, c->fit, out_w, out_h,
-                           &px, &py, &pw, &ph);
+        client_place(c, out_w, out_h, &pl);
 
-        /*
-         * SCREEN POSITION moves the picture, so its units are buffer pixels
-         * scaled by the PICTURE's size and not by the window's — otherwise the
-         * same setting would shift by a different amount depending on how much
-         * of the window is border.
-         */
-        dst.x = (float)px + sx * (float)pw / (float)Q2_SCREEN_PAL_WIDTH;
-        dst.y = (float)py + sy * (float)ph / (float)Q2_SCREEN_PAL_HEIGHT;
-        dst.w = (float)pw;
-        dst.h = (float)ph;
-
-        SDL_RenderTexture(c->renderer, c->texture, NULL, &dst);
+        if (pl.src_w > 0 && pl.src_h > 0) {
+            src.x = (float)pl.src_x;  src.y = (float)pl.src_y;
+            src.w = (float)pl.src_w;  src.h = (float)pl.src_h;
+            dst.x = pl.dst_x;         dst.y = pl.dst_y;
+            dst.w = pl.dst_w;         dst.h = pl.dst_h;
+            SDL_RenderTexture(c->renderer, c->texture, &src, &dst);
+        }
     }
     SDL_RenderPresent(c->renderer);
 }
