@@ -41,21 +41,20 @@ ROOT = Path(__file__).resolve().parents[1]
 #: downloads it.
 EXECUTABLES = ["q2psx", "q2psx-inspect", "stx2avi"]
 
-#: Documentation, as ``source -> path inside the archive``. README and the
-#: changelog sit at the top where someone unpacking will see them; the reference
-#: documents keep their own directory.
+#: Release-facing documents only. The repository README and technical references
+#: contain contributor paths that do not exist in a binary download. The HTML
+#: player guide and short README.txt are generated separately below.
 DOCUMENTS = {
-    "README.md": "README.md",
     "CHANGELOG.md": "CHANGELOG.md",
     # GPL-2.0 section 1 requires the licence to travel with the binary. This is
     # not documentation and it is not optional.
     "LICENSE": "LICENSE",
-    "docs/ARCHITECTURE.md": "docs/ARCHITECTURE.md",
-    "docs/FIDELITY.md": "docs/FIDELITY.md",
-    "docs/FORMATS.md": "docs/FORMATS.md",
-    "docs/openquestions.md": "docs/openquestions.md",
-    "docs/RELEASING.md": "docs/RELEASING.md",
+    "CREDITS.md": "CREDITS.md",
 }
+
+WINDOWS_LAUNCHERS = {"scripts/Play.cmd": "Play.cmd", "scripts/Play.vbs": "Play.vbs"}
+GUIDE_NAME = "USER-GUIDE.html"
+GUIDE_VERSION_MARKER = '<span id="build-version">Development edition</span>'
 
 #: Runtime libraries the executables need beside them. SDL3 is the only one, and
 #: only when it was fetched and built rather than found on the system.
@@ -69,11 +68,42 @@ class PackageError(Exception):
     """A release archive could not be assembled from what was built."""
 
 
+def render_user_guide(version: str) -> str:
+    """Stamp the standalone source guide with this archive's release version."""
+    version = version_mod.format_version(version_mod.parse(version))
+    source = ROOT / GUIDE_NAME
+    if not source.is_file():
+        raise PackageError(f"{GUIDE_NAME} is missing from the repository")
+    guide = source.read_text(encoding="utf-8")
+    if guide.count(GUIDE_VERSION_MARKER) != 1:
+        raise PackageError(f"{GUIDE_NAME} must have exactly one version marker")
+    return guide.replace(GUIDE_VERSION_MARKER, f'<span id="build-version">Version {version}</span>')
+
+
+def release_readme(version: str, platform: str) -> str:
+    launch = ("On Windows, double-click q2psx.exe." if platform.startswith("windows")
+              else "Open a terminal in this folder and run ./q2psx.")
+    return (
+        f"Q2PSX-PC {version}\n\n"
+        "A native PC recreation of Quake II for the PlayStation.\n"
+        "You need your own PlayStation disc or image; no game data is included.\n\n"
+        "START HERE: Open USER-GUIDE.html in your browser. It works offline.\n\n"
+        "Extract the whole archive and keep the runtime libraries beside the program.\n"
+        f"{launch}\n"
+        "Choose BROWSE IMAGE, open your CUE, then select START GAME. Keep the CUE\n"
+        "and every BIN track it references together with their original filenames.\n\n"
+        "The guide covers controls, saves, local multiplayer and troubleshooting.\n"
+        "CHANGELOG.md contains release history; CREDITS.md contains acknowledgements.\n"
+        "The source-code licence is in LICENSE.\n\n"
+        "Source and support: https://github.com/themuffinator/Quake2-PSX-PC\n"
+    )
+
+
 def executable_name(target: str, platform: str) -> str:
     return f"{target}.exe" if platform.startswith("windows") else target
 
 
-def find_runtime_libraries(build_dir: Path) -> list[Path]:
+def find_runtime_libraries(build_dir: Path, config: str | None = None) -> list[Path]:
     """Locate shared libraries that must ship beside the executables.
 
     ``bin/`` is checked first because that is where the build puts them; the
@@ -82,8 +112,9 @@ def find_runtime_libraries(build_dir: Path) -> list[Path]:
     turning into three copies of one library.
     """
     found: dict[str, Path] = {}
+    bindir = build_dir / "bin" / config if config else build_dir / "bin"
     for pattern in RUNTIME_LIBRARY_PATTERNS:
-        candidates = sorted(build_dir.glob(f"bin/{pattern}")) or sorted(build_dir.rglob(pattern))
+        candidates = sorted(bindir.glob(pattern)) or sorted(build_dir.rglob(pattern))
         for candidate in candidates:
             if candidate.is_file() and candidate.name not in found:
                 found[candidate.name] = candidate
@@ -121,15 +152,16 @@ def stage(
     version: str,
     platform: str,
     expect: list[str],
+    config: str | None = None,
 ) -> Path:
     """Copy the release files into ``out_dir/<name>/`` and return that path."""
     name = f"{version_mod.archive_prefix_for(version)}-{platform}"
     staging = out_dir / name
     if staging.exists():
         shutil.rmtree(staging)
-    (staging / "docs").mkdir(parents=True)
+    staging.mkdir(parents=True)
 
-    bindir = build_dir / "bin"
+    bindir = build_dir / "bin" / config if config else build_dir / "bin"
     for target in expect:
         source = bindir / executable_name(target, platform)
         if not source.is_file():
@@ -138,10 +170,13 @@ def stage(
         print(f"  {source.name}")
 
     if "q2psx" in expect:
-        for library in find_runtime_libraries(build_dir):
+        for library in find_runtime_libraries(build_dir, config):
             print(f"  {copy_runtime_library(library, staging / library.name)}")
 
-    for source_rel, dest_rel in DOCUMENTS.items():
+    documents = dict(DOCUMENTS)
+    if platform.startswith("windows") and "q2psx" in expect:
+        documents.update(WINDOWS_LAUNCHERS)
+    for source_rel, dest_rel in documents.items():
         source = ROOT / source_rel
         if not source.is_file():
             raise PackageError(f"{source_rel} is missing from the repository")
@@ -149,6 +184,10 @@ def stage(
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
         print(f"  {dest_rel}")
+
+    (staging / GUIDE_NAME).write_text(render_user_guide(version), encoding="utf-8", newline="\n")
+    (staging / "README.txt").write_text(release_readme(version, platform), encoding="utf-8", newline="\n")
+    print(f"  {GUIDE_NAME}\n  README.txt")
 
     return staging
 
@@ -212,6 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     stage_cmd = sub.add_parser("stage", help="assemble and archive one platform's release")
     stage_cmd.add_argument("--build-dir", type=Path, default=ROOT / "build")
+    stage_cmd.add_argument("--config", help="multi-configuration build subdirectory, e.g. Release")
     stage_cmd.add_argument("--out-dir", type=Path, default=ROOT / "dist")
     stage_cmd.add_argument("--version", default=None, help="defaults to the VERSION file")
     stage_cmd.add_argument("--platform", required=True, help="e.g. windows-x64, linux-x64, macos-arm64")
@@ -252,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
             version=version,
             platform=args.platform,
             expect=expect,
+            config=args.config,
         )
 
         if args.no_archive:

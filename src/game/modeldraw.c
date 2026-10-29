@@ -1,4 +1,7 @@
 #include "modeldraw.h"
+#include "effect.h"
+#include "trace.h"
+#include "worldscale.h"
 
 #include "trig.h"
 #include "vram.h"
@@ -387,8 +390,9 @@ static bool emit_shadow(const q2_model_instance *inst, const q2_camera *cam,
     for (i = 0; i < count; i++) {
         s32 v[3];
 
-        if (!inst->shadow_vertex ||
-            !shadow_pose_vertex(inst->model, inst->pose,
+        if (!inst->shadow_vertex || inst->shadow_vertex[i] == 0xFFFFu)
+            break;
+        if (!shadow_pose_vertex(inst->model, inst->pose,
                                 inst->shadow_vertex[i], v))
             continue;
         if (v[0] < min_x) min_x = v[0];
@@ -479,6 +483,72 @@ void q2_model_instance_init(q2_model_instance *inst)
     inst->bucket_override = -1;
     inst->shadow_clut = psx_make_clut(Q2_MODEL_SHADOW_CLUT_X,
                                       Q2_MODEL_SHADOW_CLUT_Y);
+}
+
+void q2_model_shadow_ground(q2_model_instance *inst,
+                            const q2_collision *primary,
+                            const q2_collision *secondary,
+                            const q2_move_world *movers,
+                            const s32 origin[3], bool grounded)
+{
+    q2_collision query;
+    const q2_collision *hull = secondary;
+    s32 node = -1, end[3], hit[3];
+    s32 floor_offset = Q2_EYE_BASE;
+    q2_coll_plane plane;
+
+    if (!inst || !origin)
+        return;
+    inst->shadow_enabled = false;
+    memcpy(inst->shadow_origin, origin, sizeof(inst->shadow_origin));
+    inst->shadow_origin[1] += Q2_EYE_BASE;
+    inst->shadow_height = 0;
+    if (grounded) {
+        inst->shadow_enabled = true;
+        return;
+    }
+
+    if (hull)
+        node = q2_coll_find_node(hull, origin, -1, true);
+    if (node < 0) {
+        hull = primary;
+        floor_offset = 0;
+        if (hull)
+            node = q2_coll_find_node(hull, origin, -1, true);
+    }
+    if (hull && node >= 0) {
+        query = *hull;
+        memcpy(end, origin, sizeof(end));
+        end[1] += 3 * Q2_BODY_RADIUS;
+        if (!q2_coll_move(&query, origin, end, node, hit, &node) && node >= 0 &&
+            query.hit_plane_index >= 0 &&
+            q2_collision_get_plane(&query, (u32)query.hit_plane_index, &plane) &&
+            plane.ny > 0) {
+            inst->shadow_origin[1] = hit[1] + floor_offset;
+            inst->shadow_enabled = true;
+        }
+    }
+
+    /* Mover boxes are physical surfaces, so cast from the feet without hull
+     * inflation. A lift above the map floor wins; liquid/trigger volumes are
+     * excluded by q2_move_clip_segment's solid-entity gate. */
+    if (movers) {
+        q2_move_seg_hit contact;
+        s32 feet[3] = { origin[0], origin[1] + Q2_EYE_BASE, origin[2] };
+        const s32 inflate[3] = {0, 0, 0};
+        memcpy(end, feet, sizeof(end));
+        end[1] += 3 * Q2_BODY_RADIUS;
+        /* Start just above a contact: a ray beginning exactly on the box
+         * top is classified as inside and has no entry normal. */
+        feet[1]--;
+        if (q2_move_clip_segment(movers, feet, end, inflate, &contact) &&
+            contact.normal[1] > 0 &&
+            (!inst->shadow_enabled || contact.pos[1] < inst->shadow_origin[1])) {
+            inst->shadow_origin[1] = contact.pos[1];
+            inst->shadow_enabled = true;
+        }
+    }
+    inst->shadow_height = inst->shadow_origin[1] - origin[1] - Q2_EYE_BASE;
 }
 
 u32 q2_model_build_ot(const q2_model_instance *inst,
@@ -929,15 +999,13 @@ u32 q2_model_build_ot(const q2_model_instance *inst,
                 for (i = 0; i < 4; i++)
                     screen[i] = window[f.v[i]].xy;
                 /*
-                 * The linker's escape at `bltz t3` (0x800B2498) is NOT fed from
-                 * block A. That block is the face DRAW ORDER (model.h), and
-                 * what this code used to read as its per-face `force` bits were
-                 * the four pad bytes of each order record — which is exactly
-                 * why they were zero in all 13,784 entries of all 1,723 models.
-                 * Whatever does feed `t3` is still unread, so the test applies
-                 * unconditionally.
+                 * 0x800B22FC/230C advances the eight-byte part pointer;
+                 * 0x800B242C loads its +4 word into t3. BLTZ at 0x800B2498
+                 * bypasses both NCLIPs and its delay slot shifts t3 left.
+                 * The mask restarts per part and runs out after 32 faces.
                  */
-                if (!q2_model_quad_faces_camera(gte, screen)) {
+                if (!(v < 32 && (p.force_draw & (0x80000000u >> v))) &&
+                    !q2_model_quad_faces_camera(gte, screen)) {
                     if (stats)
                         stats->faces_rejected_back++;
                     continue;
@@ -1093,6 +1161,17 @@ u32 q2_model_build_ot(const q2_model_instance *inst,
 
     if (emit_shadow(inst, cam, ot, gte, view, bucket, batch, stats))
         emitted++;
+
+    if (inst->glint) {
+        u32 n = q2_fx_glint_draw_attached(inst->glint, inst->origin,
+                         (const s16 (*)[3])spin_unscaled, inst->sort_area,
+                         batch, cam, ot, gte);
+        emitted += n;
+        if (stats) {
+            stats->glint_emitted += n;
+            stats->glint_draws++;
+        }
+    }
 
     return emitted;
 }

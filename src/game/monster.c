@@ -9,6 +9,7 @@
 
 #include "ai.h"
 #include "aimove.h"
+#include "crebind.h"
 #include "modelent.h"      /* q2_gib_monster_corpse: the corpse tick's dispatch */
 #include "trig.h"
 
@@ -25,13 +26,17 @@ void q2_level_reset(void)
 
 void q2_monster_init(q2_monster *m)
 {
+    static u32 audio_generation;
     if (!m)
         return;
 
     memset(m, 0, sizeof(*m));
+    if (++audio_generation == 0) ++audio_generation;
+    m->audio_generation = audio_generation;
 
     m->class_id    = 0;
     m->speed_scale = 10;      /* neutral: the frame scale is /10 */
+    m->render_scale = Q2_ONE_12;
 
     /*
      * YAW_SPEED STARTS UNSET, and that is the whole point of the `bne`.
@@ -514,9 +519,7 @@ void q2_monster_drop_record(const q2_monster *self)
 
         g_drop_queue[i].used      = true;              /* 0x80020DB0 */
         g_drop_queue[i].pop_class = self->pop_class_id; /* 0x80020DB4 */
-        g_drop_queue[i].pos[0]    = self->pos[0];
-        g_drop_queue[i].pos[1]    = self->pos[1];
-        g_drop_queue[i].pos[2]    = self->pos[2];
+        memcpy(g_drop_queue[i].pos, q2_cre_origin(self), sizeof(g_drop_queue[i].pos));
         return;
     }
 
@@ -639,6 +642,9 @@ void q2_monster_bind_hit_size(q2_monster *m, bool has_model,
     if (!m)
         return;
 
+    m->live_hit_radius = has_model ? ext0 : 286;
+    m->live_hit_height = has_model ? ext1 : 600;
+
     if (has_model) {
         m->hit_radius = ext0;
         m->hit_height = ext1;
@@ -679,6 +685,7 @@ void q2_monster_corpse_detach(q2_monster *m)
         return;
 
     m->corpse = true;
+    m->view_height = 0; /* Medic's native corpse proxy has no eye offset. */
 
     /*
      * The class becomes 47 and the old one is kept — 0x8007F0F0..0x8007F100.
@@ -772,6 +779,9 @@ static void corpse_free(q2_monster *m)
 }
 
 bool q2_monster_corpse_tick(q2_monster *m)
+{ return q2_monster_corpse_tick_dt(m, Q2_AI_TICK_DT); }
+
+bool q2_monster_corpse_tick_dt(q2_monster *m, s32 dt)
 {
     q2_corpse_dissolve arm;
 
@@ -787,13 +797,11 @@ bool q2_monster_corpse_tick(q2_monster *m)
      * actor-list append and no gib test, so there is no gib test here either,
      * and no frame driver: nothing in the handler advances one.
      *
-     * The console drains by its frame dt; this tick runs on the AI clock and
-     * drains by what one of its ticks is worth, Q2_AI_TICK_DT. So the body
-     * goes on the third tick after the gate's, 0.3 s where the console's
-     * six frames at the nominal 12 take 0.24 s.
+     * The live client supplies its 300 Hz frame delta. The AI-only wrapper
+     * supplies one AI interval for callers which still tick whole frames.
      */
     if (m->dissolve_arm != Q2_CORPSE_DISSOLVE_NONE) {
-        m->dissolve = q2_corpse_dissolve_drain(m->dissolve, Q2_AI_TICK_DT);
+        m->dissolve = q2_corpse_dissolve_drain(m->dissolve, dt);
         if (m->dissolve > 0)                /* 0x8005B420 `bgtz` */
             return false;
         corpse_free(m);                     /* 0x8005B428 -> 0x8006D280 */
@@ -1072,7 +1080,7 @@ void q2_class_verb_set(u32 class_id, u32 verb_index, q2_class_method fn)
 /* ------------------------------------------------------------------------- */
 /* M_MoveFrame — 0x8006175C                                                   */
 /* ------------------------------------------------------------------------- */
-void q2_M_MoveFrame(q2_monster *m)
+static void monster_move_frame(q2_monster *m)
 {
     const q2_mmove *move;
     const q2_mframe *frame;
@@ -1151,13 +1159,14 @@ void q2_M_MoveFrame(q2_monster *m)
     if (index < 0 || index > move->last_frame - move->first_frame)
         return;
 
+    q2_ai_native_s2 = (u32)index; /* 0x8006188C */
     frame = &move->frames[index];
 
     if (frame->ai & Q2_AI_LOCAL_FLAG) {
         /* The creature's own verb. It gets no distance: a creature that steers
          * itself does not want the frame's. 0x800618B8. */
         q2_class_method fn =
-            q2_class_method_get(m->class_id,
+            q2_cre_method_for(m,
                                 Q2_CLASS_VERB_BASE + (frame->ai & 0x7Fu));
         if (fn)
             fn(m);
@@ -1168,10 +1177,18 @@ void q2_M_MoveFrame(q2_monster *m)
     }
 
     if (frame->think) {
-        q2_class_method fn = q2_class_method_get(m->class_id, frame->think);
+        q2_class_method fn = q2_cre_method_for(m, frame->think);
         if (fn)
             fn(m);
     }
+}
+
+void q2_M_MoveFrame(q2_monster *m)
+{
+    u32 saved = q2_ai_native_s2;
+    q2_ai_native_s2 = 0; /* live handler 0x8007EE08, before the think call */
+    monster_move_frame(m);
+    q2_ai_native_s2 = saved;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1368,8 +1385,8 @@ void q2_monster_swim_start_go(q2_monster *m)
  * It reads what the module installed, which is why it cannot run in
  * q2_creature_spawn ahead of the module's spawn hook, where most of what this
  * port models of monster_start runs. The `sh` sits in the delay slot of `jal
- * 0x8007F474`, which hands the new frame to the render object; the port has no
- * render object, so that call has no counterpart here.
+ * 0x8007F474`, which seeds the physical actor's animation. The client resolves
+ * that frame against the loaded model before the actor's first update.
  */
 static void monster_start_frame(q2_monster *m)
 {
@@ -1393,6 +1410,8 @@ static void monster_start_frame(q2_monster *m)
         return;
 
     m->frame = (s16)(u16)((u32)(u16)mv->first_frame + (u32)(r % span));
+    m->motion.seed_frame = m->frame;
+    m->motion.seed_pending = true;
 }
 
 void q2_monster_walk_start(q2_monster *m)
@@ -1426,11 +1445,21 @@ void q2_monster_start_go(q2_monster *m)
     if (!m)
         return;
 
+    if (!m->spawn_initialized && m->cre_bind) {
+        u32 variant = 0;
+        const q2_creature *cre = m->cre_bind->cre;
+        while (variant + 1 < cre->class_count && cre->class_byte[variant] != m->class_byte)
+            variant++;
+        q2_creature_spawn(m->cre_bind, m, variant);
+    }
+
     /*
      * Whichever go-routine the wrapper parked at entity+0x94. None of the
      * three writes the flags word — that was the wrapper's, at spawn.
      */
     switch (m->start_kind) {
+    case Q2_CRE_START_SCRIPT:
+        return; /* The module already installed its timer and direct think. */
     case Q2_CRE_START_FLY:
         q2_monster_fly_start_go(m);
         return;

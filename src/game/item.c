@@ -631,13 +631,16 @@ bool q2_item_pickup_caption(q2_inventory *inv, s32 level_time,
 /* ------------------------------------------------------------------------- */
 /* Spawning                                                                   */
 /* ------------------------------------------------------------------------- */
-q2_entity *q2_item_spawn(q2_entity_set *set, const q2_pop_place *place,
+static q2_entity *item_spawn(q2_entity_set *set, const q2_pop_place *place,
                          const q2_item_table *table, s16 model_offset,
-                         q2_collision *coll)
+                         q2_collision *coll, bool *outside)
 {
     const q2_item_def *def;
     q2_entity *e;
     u32 i;
+    s32 pos[3], node;
+
+    if (outside) *outside = false;
 
     if (!set || !place)
         return NULL;
@@ -649,6 +652,15 @@ q2_entity *q2_item_spawn(q2_entity_set *set, const q2_pop_place *place,
     def = q2_item_find(table, (s32)place->id);
     if (!def)
         return NULL;
+
+    pos[0] = place->x; pos[1] = place->y - Q2_ITEM_SPAWN_LIFT; pos[2] = place->z;
+    if (!q2_entity_drop_to_floor(coll, NULL, pos,
+           (def->flags & Q2_ITEM_NO_DROP) ? 0 : Q2_ENTITY_DROP_DIST, &node)) {
+        /* 0x800588C0 rejects a placement outside the resident hull. Do not
+         * retain an unlinked pickup or misreport this as an allocation error. */
+        if (outside) *outside = true;
+        return NULL;
+    }
 
     e = q2_entity_alloc(set);
     if (!e)
@@ -688,26 +700,8 @@ q2_entity *q2_item_spawn(q2_entity_set *set, const q2_pop_place *place,
      * the table's 0x100 flag is set, which is the no-drop flag Quake II's own
      * items carry. See q2_entity_drop_to_floor.
      */
-    e->pos[0] = place->x;
-    e->pos[1] = place->y - Q2_ITEM_SPAWN_LIFT;
-    e->pos[2] = place->z;
-
-    /*
-     * 0x800588C0 frees an entity the hull cannot place. This port does NOT,
-     * and the difference is the same one the creature spawner makes: this
-     * runs over the whole map's Population while a session holds one zone, so
-     * most of what fails to place is an item standing in another zone's rooms
-     * — and the zone filter above has already decided which those are. An
-     * item that fails here keeps the height the record gave it, which is
-     * exactly where every item was before this drop existed.
-     *
-     * Discarding them instead made four maps report "places no items".
-     */
-    if (!q2_entity_drop_to_floor(coll, e->pos,
-                                 (def->flags & Q2_ITEM_NO_DROP)
-                                     ? 0 : Q2_ENTITY_DROP_DIST,
-                                 &e->node))
-        e->node = -1;
+    memcpy(e->pos, pos, sizeof(pos));
+    e->node = node;
 
     /* 0x80058930: the low twelve bits are the heading. The list walker has
      * already consumed the difficulty exclusions above it. */
@@ -750,6 +744,13 @@ q2_entity *q2_item_spawn(q2_entity_set *set, const q2_pop_place *place,
     return e;
 }
 
+q2_entity *q2_item_spawn(q2_entity_set *set, const q2_pop_place *place,
+                         const q2_item_table *table, s16 model_offset,
+                         q2_collision *coll)
+{
+    return item_spawn(set, place, table, model_offset, coll, NULL);
+}
+
 static q2_result spawn_group_places(q2_entity_set *set,
                                     const q2_population *pop,
                                     const q2_pop_group *g,
@@ -764,6 +765,7 @@ static q2_result spawn_group_places(q2_entity_set *set,
     for (slot = 0; ; slot++) {
         q2_pop_place place;
         q2_entity *e;
+        bool outside;
 
         if (!q2_pop_get_place(pop, g, slot, &place))
             break;
@@ -779,9 +781,11 @@ static q2_result spawn_group_places(q2_entity_set *set,
             continue;
         }
 
-        e = q2_item_spawn(set, &place, table, 0, coll);
+        e = item_spawn(set, &place, table, 0, coll, &outside);
         if (!e) {
-            if (q2_item_find(table, (s32)place.id))
+            if (outside)
+                stats->no_placement++;
+            else if (q2_item_find(table, (s32)place.id))
                 stats->no_memory++;
             else
                 stats->no_def++;
@@ -845,10 +849,10 @@ q2_result q2_item_spawn_zone(q2_entity_set *set, const q2_population *pop,
             continue;
         }
 
-        /* Resident Zone<N> groups are the fallback, exactly as in the creature
-         * startup pass. A group that names no zone is a script batch unless the
-         * LevelBin's selector call explicitly names it. */
-        if (zone >= 0 && claims < 0) {
+        /* Only the exact Zone<N> group is resident startup population.
+         * Zone0Room2, Zone1Key and similar suffixes are separately selected
+         * CREBATCH groups on the disc, just like unzoned ambushes. */
+        if (zone >= 0 && !q2_pop_group_is_zone(&g)) {
             u32 si;
             u32 n = selected_count < 32 ? selected_count : 32;
 
@@ -980,7 +984,7 @@ static void item_collected(q2_entity *e, q2_entity_world *w, u32 player,
     u32 i;
 
     /* 0x8005B6C0: the pickup particle burst, in both branches. */
-    q2_ent_burst_at(&w->events, e->origin, e->glow, e->model_index);
+    q2_ent_burst_at(&w->events, e->origin, e->glow, e->model_index, e->model_bank);
 
     /*
      * THE KEPT BRANCH TOUCHES NOTHING ELSE. 0x8005998C is two instructions —
@@ -1058,7 +1062,7 @@ void q2_item_think(q2_entity *e, q2_entity_world *w)
     if (flags & Q2_ITEM_MATERIALISE) {
         if (e->scale != (s16)Q2_ONE_12) {
             if (e->scale == 0)
-                q2_ent_sound_at(&w->events, Q2_SND_TELEPORT, e->origin);
+                q2_ent_sound_entity(&w->events, Q2_SND_TELEPORT, e);
 
             e->scale = (s16)(e->scale + Q2_ITEM_SCALE_RATE * w->dt);
             if (e->scale > (s16)Q2_ONE_12) {
@@ -1266,6 +1270,17 @@ bool q2_item_drop_velocity(const q2_entity *e, s16 out[3])
     return true;
 }
 
+bool q2_item_drop_restore(const q2_entity_set *set, u32 slot, const s16 vel[3])
+{
+    item_toss *t;
+    if (!set || slot >= set->count || !vel) return false;
+    t = toss_claim(set, slot);
+    if (!t) return false;
+    t->set = set; t->slot = slot; t->used = true;
+    memcpy(t->vel, vel, sizeof(t->vel));
+    return true;
+}
+
 /* The draw origin every frame after the first: +0xA4 = +0x54, y lowered by
  * 286 and raised by the bias (0x80020CC0..0x80020CF0, and the identical tail
  * at 0x80020D20..0x80020D4C). */
@@ -1328,6 +1343,7 @@ q2_entity *q2_item_drop_spawn(q2_entity_set *set, const q2_item_table *table,
     e->think = q2_item_drop_think;          /* 0x800208B8: 0x80020C48        */
     e->kind  = Q2_ENT_KIND_ITEM;            /* 0x800208C4: 46                */
     e->def   = def;
+    e->place_id = item_id; /* Native identity for rebinding the item table after a zone load. */
 
     memcpy(e->model, def->model, sizeof(e->model));
     /* 0x80020954 `sw v1, 4(v0)` — the record's +16 list becomes the model

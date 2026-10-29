@@ -1,5 +1,6 @@
 #include "random.h"
 #include "creworld.h"
+#include "modelent.h"
 
 #include "worldscale.h"
 
@@ -51,6 +52,7 @@ static bool module_take(q2_creature_world *w, const u8 *bin, u32 boff, u32 bnext
 {
     q2_creature_module *m;
     q2_reloc_stats rs;
+    const q2_cre_impl *impl;
     char nm[13];
     size_t body;
 
@@ -59,6 +61,11 @@ static bool module_take(q2_creature_world *w, const u8 *bin, u32 boff, u32 bnext
 
     if (module_index(w, nm) >= 0)
         return true;                    /* already have it */
+    impl = q2_cre_impl_find(nm);
+    /* Generic action fragments do not reproduce control flow. Keep an
+     * unsupported module out of the gameplay registry until transcribed. */
+    if (!impl || impl == &q2_cre_generic)
+        return true;
     if (w->mod_count >= Q2_CREWORLD_MAX_MODULES)
         return false;
 
@@ -92,30 +99,14 @@ static bool module_take(q2_creature_world *w, const u8 *bin, u32 boff, u32 bnext
         return false;
     }
 
-    /*
-     * The actions each think index performs, decoded from the module's own
-     * code. Without these a creature animates and does nothing; with them the
-     * six modules that have no hand transcription still make their sounds and
-     * swing their claws.
-     */
+    /* Keep decoded actions for diagnostics. Gameplay uses the native methods
+     * of the registered implementation; unknown modules were excluded above. */
     q2_creature_decode_thinks(&m->cre, m->image, m->size, Q2_CREWORLD_BASE,
                               m->think, Q2_CLASS_METHOD_COUNT);
 
-    m->ready = q2_creature_bind(&m->bind, &m->cre, q2_cre_impl_find(nm));
+    m->ready = q2_creature_bind(&m->bind, &m->cre, impl);
 
-    /*
-     * AFTER the bind, not before. `q2_creature_bind` opens with
-     * `memset(b, 0, sizeof(*b))`, so installing the think table first handed it
-     * over and then wiped it two lines later — `q2_cre_run_think` found
-     * `b->think` NULL and returned, every time, for every creature on the disc.
-     *
-     * The cost was not subtle and was invisible: six of the seven modules run
-     * entirely on decoded actions, so none of them made a sound, swung a claw,
-     * jumped a frame or set an AI flag. They walked and chased and did nothing,
-     * and it looked exactly like the "not transcribed yet" state it was
-     * supposed to be an improvement on. Counted on COMMAND: 31 thinks run, 31
-     * unbound.
-     */
+    /* Attach after q2_creature_bind, which clears the bind before building it. */
     q2_creature_bind_thinks(&m->bind, m->think, Q2_CLASS_METHOD_COUNT);
 
     /*
@@ -141,24 +132,34 @@ static bool module_take(q2_creature_world *w, const u8 *bin, u32 boff, u32 bnext
     return true;
 }
 
-static void modules_load(q2_creature_world *w, const q2_common_file *common)
+static void modules_load(q2_creature_world *w, const dat_chunk *bin,
+                           const dat_chunk *rel)
 {
-    const dat_chunk *bin = common->chunk[q2_common_chunk_index("CreAIBin")];
-    const dat_chunk *rel = common->chunk[q2_common_chunk_index("CreAIRel")];
     u32 boff = 0, roff = 0;
 
     if (!bin || !rel || bin->size <= Q2_RELOC_CREAI_PREAMBLE)
         return;
 
-    while (boff + Q2_RELOC_CREAI_PREAMBLE < bin->size &&
-           roff + Q2_RELOC_CREAI_PREAMBLE < rel->size) {
+    while (boff < bin->size && roff < rel->size &&
+           bin->size - boff > Q2_RELOC_CREAI_PREAMBLE &&
+           rel->size - roff > Q2_RELOC_CREAI_PREAMBLE) {
         u32 bnext = q2_rd_u32(bin->data + boff + 12);
         u32 rnext = q2_rd_u32(rel->data + roff + 12);
+        u32 bend = bnext ? bnext : bin->size;
+        u32 rend = rnext ? rnext : rel->size;
 
-        module_take(w, bin->data, boff, bnext, bin->size,
-                    rel->data, roff, rnext, rel->size);
+        if (bend > bin->size || rend > rel->size ||
+            bend <= boff + Q2_RELOC_CREAI_PREAMBLE ||
+            rend <= roff + Q2_RELOC_CREAI_PREAMBLE ||
+            memcmp(bin->data + boff, rel->data + roff, 12) != 0) {
+            Q2_WARN("invalid creature binary/relocation pair at %u/%u", boff, roff);
+            return;
+        }
 
-        if (bnext <= boff || bnext >= bin->size)
+        module_take(w, bin->data, boff, bend, bin->size,
+                    rel->data, roff, rend, rel->size);
+
+        if (bend == bin->size || rend == rel->size)
             break;
         boff = bnext;
         roff = rnext;
@@ -166,24 +167,147 @@ static void modules_load(q2_creature_world *w, const q2_common_file *common)
 }
 
 /*
- * The maps that ship creature modules, most-carrying first.
- *
- * Eight of the disc's levels ship an EMPTY `CreAIBin` — four bytes — and still
- * place creatures: JAIL2, JAIL3 and JAIL4 have Infantry, SECURITY, WASTE2,
- * BIGGUN, BOSS1 and BOSS2 likewise. Their spawn records name classes that the
- * class table resolves perfectly well; what is missing is the module, so the
- * port used to place nothing at all on them.
- *
- * A module is taken from a donor map when this map ships none. That rests on a
- * module of a given name being the same wherever it appears, which is what the
- * disc-wide census has relied on all along — it finds fifteen module instances
- * and reports seven DISTINCT, deduplicating by name — and which is the same
- * argument that settled `QMULTI.C`, byte-identical on all thirteen arenas.
- * It is an assumption, and it is written down here rather than buried.
+ * COMMON.DAT donors for the seven implemented creatures. Many maps keep their
+ * modules in ZONE*.DAT instead. Load the active zone before borrowing, so its
+ * native implementation and module variant take precedence over donors.
+ * The census hashes every relocated copy. Campaign copies match; MAGDEMO's
+ * Soldier and Flyer differ. A map's own COMMON module wins over a donor.
  */
 static const char *const k_module_donors[] = {
     "WASTE4", "POWER1", "BASE0", "COMMAND", "WASTE3", "LAB", "POWER2", NULL
 };
+
+/* Jorg owns a second class implementation. Keep its code/data separate from
+ * the standalone Rider even though both use class byte 83 and the Rider model. */
+static bool embedded_rider_load(q2_creature_world *w)
+{
+    extern const q2_cre_impl q2_cre_jorg_rider;
+    s32 ji = module_index(w, "Jorg"), ri = module_index(w, "Rider");
+    q2_creature_module *m;
+    u32 i, n = 0;
+    if (ji < 0 || ri < 0) return true;
+    if (w->mod_count >= Q2_CREWORLD_MAX_MODULES) return false;
+    m = &w->mod[w->mod_count];
+    memset(m, 0, sizeof(*m));
+    strcpy(m->name, "JorgRider");
+    m->size = w->mod[ji].size;
+    m->image = malloc(m->size);
+    if (!m->image) return false;
+    memcpy(m->image, w->mod[ji].image, m->size);
+    if (!q2_creature_decode_entry(&m->cre, m->image, m->size,
+            Q2_CREWORLD_BASE, m->name, Q2_CREWORLD_BASE + 0x3AF0, Q2_CLASS_RIDER)) {
+        free(m->image); m->image = NULL; return false;
+    }
+    /* The export-3 table belongs to Jorg's model. Rider's own table supplies
+     * the names for its matching frame ranges, not Jorg's overlapping ones. */
+    for (i = 0; i < m->cre.move_count; i++) {
+        const q2_cre_move *mv = &m->cre.move[i];
+        u32 k;
+        if (mv->clip_piece) continue;
+        for (k = 0; k < w->mod[ri].cre.move_count; k++) {
+            const q2_cre_move *r = &w->mod[ri].cre.move[k];
+            if (!r->clip_piece && r->first_frame == mv->first_frame &&
+                r->last_frame == mv->last_frame) {
+                m->cre.move[n] = *mv;
+                m->move_name[n++] = w->mod[ri].move_name[k];
+                break;
+            }
+        }
+    }
+    m->cre.move_count = n;
+    m->cre.class_count = 1; m->cre.class_byte[0] = Q2_CLASS_RIDER;
+    m->cre.class_method_table[0] = m->cre.method_table_addr;
+    m->frame_name_count = w->mod[ri].frame_name_count;
+    memcpy(m->frame_name, w->mod[ri].frame_name, sizeof(m->frame_name));
+    m->ready = q2_creature_bind(&m->bind, &m->cre, &q2_cre_jorg_rider);
+    q2_creature_bind_move_names(&m->bind, m->move_name, n);
+    w->mod_count++;
+    return m->ready;
+}
+
+/* Reserve one stable actor slot per first-stage boss before the client builds
+ * model/combat arrays. No live pointer is invalidated when the rider appears. */
+static bool reserve_boss_children(q2_creature_world *w)
+{
+    u32 i, count = w->set.count, extra = 0;
+    q2_monster *resized;
+    if (module_index(w, "JorgRider") < 0) return true;
+    for (i = 0; i < count; i++) if (w->set.monsters[i].class_id == 13) extra++;
+    if (!extra) return true;
+    resized = realloc(w->set.monsters, (count + extra) * sizeof(*resized));
+    if (!resized) return false;
+    w->set.monsters = resized; w->set.capacity = count + extra;
+    for (i = 0; i < count; i++) {
+        q2_monster *m, *parent = &resized[i];
+        if (parent->class_id != 13) continue;
+        m = &resized[w->set.count++]; q2_monster_init(m);
+        m->class_id = 14;
+        /* A second namespace of authored group/slot keys keeps this child
+         * stable across zone loads, even when another zone has fewer classes
+         * available. A roster index is not a persistent identity. */
+        m->group = (u16)(w->pop.group_count + parent->group);
+        m->population_slot = parent->population_slot; m->owner = parent;
+        memcpy(m->pos, parent->pos, sizeof(m->pos));
+    }
+    return true;
+}
+
+static q2_monster *spawn_child(q2_monster *parent, u8 pop_class, void *user)
+{
+    q2_creature_world *w = user;
+    const q2_class_entry *e = q2_class_find(&w->classes, pop_class);
+    u32 i;
+    if (!e) return NULL;
+    for (i = 0; i < w->set.count; i++) {
+        q2_monster *m = &w->set.monsters[i];
+        if (m->group < w->pop.group_count || m->owner != parent || m->pop_class_id != pop_class ||
+            m->population_active) continue;
+        memcpy(m->pos, parent->pos, sizeof(m->pos));
+        m->angles[2] = 1024;
+        m->health = m->max_health = e->health; m->gib_health = e->gib_health;
+        m->spawn_pending = false; m->population_active = true;
+        q2_creature_spawn(m->cre_bind, m, 0);
+        return m;
+    }
+    return NULL;
+}
+
+/* Medic+0x174C creates a fresh creature from the body's original class.
+ * Reuse its stable host slot; all renderer/combat/save references retain
+ * their identity while the edict state is rebuilt from export 0. */
+static bool revive_corpse(q2_monster *medic, q2_monster *corpse, void *user)
+{
+    q2_creature_world *w = user;
+    q2_monster old = *corpse;
+    const q2_class_entry *e = q2_class_find(&w->classes, old.pop_class_id);
+    q2_monster *enemy = old.oldenemy;
+    if (!e || !old.cre_bind || old.cre_bind->impl->scripted) return false;
+    /* Medic+0x1994 lowers the replaced actor to its gib threshold, then
+     * reinstalls corpse_think. Dispatch that body's destruction while its
+     * original posed mesh and combat actor still occupy this stable slot. */
+    q2_gib_monster_corpse(corpse);
+    q2_monster_init(corpse);
+    memcpy(corpse->pos, old.pos, sizeof(corpse->pos));
+    corpse->angles[2] = old.angles[2];
+    corpse->pop_class_id = old.pop_class_id; corpse->group = old.group;
+    corpse->population_slot = old.population_slot; corpse->population_active = true;
+    corpse->model_ext2 = old.model_ext2;
+    corpse->on_ground = old.on_ground; corpse->ground_height = old.ground_height;
+    q2_monster_bind_hit_size(corpse, old.live_hit_height != 0,
+                              old.live_hit_radius, old.live_hit_height);
+    corpse->health = corpse->max_health = e->health;
+    corpse->gib_health = e->gib_health;
+    q2_creature_spawn(old.cre_bind, corpse, w->class_variant[old.pop_class_id]);
+    corpse->spawnflags &= 0xF803FFFFu;
+    corpse->aiflags = 0; corpse->target = corpse->targetname = corpse->combattarget = 0;
+    corpse->owner = NULL;
+    q2_monster_start_go(corpse);
+    if (enemy && enemy->client && q2_ent_inuse(enemy)) {
+        corpse->enemy = enemy; q2_found_target(corpse);
+    }
+    (void)medic; /* Its corpse reference now resolves to the rebuilt edict. */
+    return true;
+}
 
 /*
  * Load modules from donor maps until every class the table names has one, or
@@ -225,7 +349,7 @@ static void modules_borrow(q2_creature_world *w, const disc *d)
             continue;
         }
 
-        modules_load(w, &cf);
+        modules_load(w, cf.chunk[Q2_COMMON_CRE_AI_BIN], cf.chunk[Q2_COMMON_CRE_AI_REL]);
         q2_common_close(&cf);
     }
 }
@@ -565,7 +689,8 @@ static void creworld_touch(q2_monster *m, void *user)
 q2_result q2_creature_world_load(q2_creature_world *w, const disc *d,
                                  const q2_build_id *id,
                                  const q2_common_file *common,
-                                 q2_collision *coll)
+                                 const q2_zone_file *zone,
+                                 q2_collision *coll, const q2_move_world *world)
 {
     q2_population pop;
     u32 i;
@@ -575,6 +700,8 @@ q2_result q2_creature_world_load(q2_creature_world *w, const disc *d,
 
     q2_creature_world_free(w);
     memset(w, 0, sizeof(*w));
+    w->placement_coll = coll;
+    w->placement_world = world;
 
     /*
      * The method table and the level clock are global — the engine's are too —
@@ -589,8 +716,11 @@ q2_result q2_creature_world_load(q2_creature_world *w, const disc *d,
     if (!w->classes_ready)
         Q2_WARN("no entity class table for this build — no creatures");
 
-    modules_load(w, common);
+    modules_load(w, common->chunk[Q2_COMMON_CRE_AI_BIN], common->chunk[Q2_COMMON_CRE_AI_REL]);
+    if (zone)
+        modules_load(w, zone->chunk[Q2_ZONE_CRE_AI_BIN], zone->chunk[Q2_ZONE_CRE_AI_REL]);
     modules_borrow(w, d);
+    if (!embedded_rider_load(w)) return Q2_ERR_NO_MEMORY;
     classes_bind(w);
 
     if (q2_population_parse(&pop, common) != Q2_OK)
@@ -599,8 +729,9 @@ q2_result q2_creature_world_load(q2_creature_world *w, const disc *d,
     w->pop       = pop;
     w->pop_ready = true;
 
-    if (q2_spawn_from_population(&w->set, &pop, coll, &w->stats) != Q2_OK)
+    if (q2_spawn_from_population(&w->set, &pop, coll, world, &w->stats) != Q2_OK)
         return Q2_ERR_NO_MEMORY;
+    if (!reserve_boss_children(w)) return Q2_ERR_NO_MEMORY;
 
     /*
      * THE PATROL ROUTES, AND THE RESOLVER THAT REACHES THEM.
@@ -623,10 +754,8 @@ q2_result q2_creature_world_load(q2_creature_world *w, const disc *d,
 
     /*
      * And the step's touch stage, which is what advances a creature from one
-     * corner to the next. Nothing in this port installs a LINK hook — the
-     * renderer reads the monster directly and q2_link_entity is a no-op — so
-     * passing NULL there costs nothing today; a future link hook has to be
-     * installed through this same call.
+     * corner to the next. q2_link_entity updates the physical actor's target
+     * directly; no additional world-specific link callback is needed.
      */
     q2_ai_set_link_hooks(NULL, creworld_touch, w);
 
@@ -648,6 +777,8 @@ q2_result q2_creature_world_load(q2_creature_world *w, const disc *d,
         s32 mi = w->class_module[pop_class];
         const q2_class_entry *e;
 
+        if (m->group >= w->pop.group_count) mi = module_index(w, "JorgRider");
+
         if (mi < 0)
             continue;
 
@@ -660,6 +791,7 @@ q2_result q2_creature_world_load(q2_creature_world *w, const disc *d,
          * method table across several class bytes dispatches on the ROW, and
          * the row is the only thing that says which variant this is. */
         m->pop_class_id = (u8)pop_class;
+        if (e) m->class_id = m->class_byte = e->class_byte;
 
         /*
          * THE CLASS ROW FIRST, THE MODULE SECOND — which is the order the
@@ -682,9 +814,14 @@ q2_result q2_creature_world_load(q2_creature_world *w, const disc *d,
                                                 : -e->health / 2);
         }
 
-        q2_creature_spawn(&w->mod[mi].bind, m, w->class_variant[pop_class]);
+        q2_creature_prepare(&w->mod[mi].bind, m, w->class_variant[pop_class]);
+        if (m->group >= w->pop.group_count) {
+            m->in_use = false; m->spawn_pending = true; m->population_active = false;
+            m->next_think = 0;
+        }
     }
 
+    q2_cre_set_lifecycle_hooks(w->set.monsters, w->set.count, spawn_child, revive_corpse, w);
     w->ready = true;
     return Q2_OK;
 }
@@ -756,12 +893,25 @@ void q2_creature_world_wake(q2_creature_world *w, const s32 player_origin[3],
     w->sight.client      = true;     /* entity+0x0C != NULL: this is a player */
     w->sight.health      = player_health;
     w->sight.max_health  = 100;
+    w->sight.hit_radius = 286;
+    w->sight.hit_height = 572;
     /* The eye the console's `visible` reconstructs from the origin: the
      * origin is feet - 286 and the eye is feet - 576, so -290. */
     w->sight.view_height = -(s16)(Q2_VIEW_STAND - Q2_EYE_BASE);
     sight_place(w, player_origin);
 
     q2_monster_set_wake(&w->set, &w->sight);
+}
+
+void q2_creature_world_actor_tick(q2_creature_world *w)
+{
+    u32 i;
+    if (!w || !w->ready) return;
+    for (i = 0; i < w->set.count; i++) {
+        q2_monster *m = &w->set.monsters[i];
+        if (m->in_use && m->corpse && m->think == q2_cre_medic_revive)
+            q2_cre_medic_revive(m);
+    }
 }
 
 u32 q2_creature_world_tick(q2_creature_world *w, const s32 player_origin[3],
@@ -962,6 +1112,12 @@ static const q2_creature_module *module_for(const q2_creature_world *w,
     if (!w || !m)
         return NULL;
 
+    if (m->cre_bind) {
+        for (i = 0; i < w->mod_count; i++)
+            if (&w->mod[i].bind == m->cre_bind) return &w->mod[i];
+        return NULL;
+    }
+
     for (i = 0; i < w->mod_count; i++) {
         if (!w->mod[i].ready)
             continue;
@@ -973,27 +1129,104 @@ static const q2_creature_module *module_for(const q2_creature_world *w,
     return NULL;
 }
 
+static bool module_sound_requests(q2_creature_module *mod,
+    bool (*bank_has)(const char *, void *), void *user,
+    q2_sfx_request *(*lookup)(const char *, void *))
+{
+    u32 i, fault;
+    if (!mod->sounds_ready) {
+        if (q2_creature_init_sound_requests(mod->image, mod->size, Q2_CREWORLD_BASE,
+                bank_has, user, lookup, mod->sound_bind, 128, &mod->sound_count, &fault) != Q2_OK ||
+            mod->sound_count > 128) {
+            Q2_WARN("%s sound requests failed at %08X", mod->name, fault);
+            return false;
+        }
+        for (i = 0; i < mod->sound_count; i++) {
+            const q2_cre_sound_bind *b = &mod->sound_bind[i];
+            if (!b->request_id || b->request_id > 128) return false;
+            mod->sound_request[b->request_id - 1] = b->request;
+        }
+        mod->sounds_ready = true;
+    }
+    return true;
+}
+
+void q2_creature_world_init_sound_requests(q2_creature_world *w,
+    bool (*bank_has)(const char *, void *), void *user,
+    q2_sfx_request *(*lookup)(const char *, void *))
+{
+    u32 i;
+    for (i = 0; i < w->mod_count; i++)
+        if (w->mod[i].ready) module_sound_requests(&w->mod[i], bank_has, user, lookup);
+}
+
+q2_sfx_request *q2_creature_world_sound_request(q2_creature_world *w,
+    const q2_monster *m, u32 addr, const char *registered,
+    bool (*bank_has)(const char *, void *), void *user,
+    q2_sfx_request *(*lookup)(const char *, void *), const char **name)
+{
+    const q2_creature_module *found = module_for(w, m);
+    q2_creature_module *mod;
+    u32 i;
+    if (name) *name = NULL;
+    if (!found) return NULL;
+    mod = &w->mod[found - w->mod];
+    if (!module_sound_requests(mod, bank_has, user, lookup)) return NULL;
+    if (addr < Q2_CREWORLD_BASE && registered) {
+        q2_cre_sound_bind trace[128];
+        u32 n = q2_creature_sound_bindings(mod->image, mod->size, Q2_CREWORLD_BASE,
+                                           trace, 128);
+        for (i = 0; i < n && i < 128; i++)
+            if (!strcmp(trace[i].name, registered)) { addr = trace[i].addr; break; }
+    }
+    for (i = 0; i < mod->sound_count; i++) {
+        const q2_cre_sound_bind *b = &mod->sound_bind[i];
+        if (b->addr != addr) continue;
+        if (name) *name = b->name;
+        if (!b->cloned && lookup) return lookup(b->name, user);
+        return &mod->sound_request[b->request_id - 1];
+    }
+    return NULL;
+}
+
 const char *q2_creature_world_sound_for_addr(const q2_creature_world *w,
                                              const q2_monster *m, u32 addr)
 {
-    static q2_cre_sound_bind binds[48];
+    return q2_creature_world_sound_resolve(w, m, addr, NULL, NULL);
+}
+
+const char *q2_creature_world_sound_resolve(const q2_creature_world *w,
+                                            const q2_monster *m, u32 addr,
+                                            bool (*bank_has)(const char *, void *),
+                                            void *user)
+{
+    static q2_cre_sound_bind binds[128];
     const q2_creature_module *mod = module_for(w, m);
-    u32 n;
-
-    if (!mod)
+    u32 n, fault;
+    if (!mod) return NULL;
+    if (q2_creature_init_sounds(mod->image, mod->size, Q2_CREWORLD_BASE,
+            bank_has, user, binds, Q2PSX_ARRAY_COUNT(binds), &n, &fault) != Q2_OK) {
+        Q2_WARN("%s sound initializer failed at %08X", mod->name, fault);
         return NULL;
-
-    /*
-     * `Q2_CREWORLD_BASE` is where the loader relocates a module, and the
-     * registrations store absolute addresses — so the decode and the play
-     * site's `addr` are already in the same space and nothing has to be
-     * rebased.
-     */
-    n = q2_creature_sound_bindings(mod->image, mod->size, Q2_CREWORLD_BASE,
-                                   binds,
-                                   (u32)(sizeof(binds) / sizeof(binds[0])));
-
+    }
+    if (n > Q2PSX_ARRAY_COUNT(binds)) return NULL;
     return q2_creature_sound_for_addr(binds, n, addr);
+}
+
+const char *q2_creature_world_sound_resolve_name(const q2_creature_world *w,
+        const q2_monster *m, const char *registered,
+        bool (*bank_has)(const char *, void *), void *user)
+{
+    q2_cre_sound_bind binds[128];
+    const q2_creature_module *mod = module_for(w, m);
+    u32 i, n;
+    if (!mod || !registered) return NULL;
+    n = q2_creature_sound_bindings(mod->image, mod->size, Q2_CREWORLD_BASE,
+                                  binds, Q2PSX_ARRAY_COUNT(binds));
+    if (n > Q2PSX_ARRAY_COUNT(binds)) return NULL;
+    for (i = 0; i < n; i++) if (!strcmp(binds[i].name, registered))
+        return q2_creature_world_sound_resolve(w, m, binds[i].addr, bank_has, user);
+    return NULL;
 }
 
 const char *q2_creature_world_sound_name(const q2_creature_world *w,
@@ -1051,10 +1284,26 @@ u32 q2_creature_world_summon(q2_creature_world *w, const char *group)
         for (i = 0; i < w->set.count; i++) {
             q2_monster *m = &w->set.monsters[i];
 
-            if (m->group != gi || m->in_use || m->dead)
+            if (m->group != gi || !m->spawn_pending)
+                continue;
+            /* Retail creates this record at CREBATCH time. The port keeps a
+             * dormant placeholder, whose load-time floor can be stale after a
+             * lift moves or a hatch disappears. Recompute from the authored
+             * record, never by dropping the already-dropped position again.
+             * Resumed actors and revived bodies retain their runtime origin. */
+            if (!m->in_use && !m->dead && !m->spawn_initialized && w->placement_coll) {
+                q2_pop_spawn rec;
+                s32 origin[3];
+                if (!q2_pop_get_spawn(&w->pop, &g, m->population_slot, &rec) ||
+                    !q2_spawn_place(&rec, w->placement_coll, w->placement_world, origin))
+                    continue;
+                memcpy(m->pos, origin, sizeof(m->pos));
+            }
+            m->spawn_pending = false;
+            if (m->in_use || m->dead)
                 continue;
             m->in_use = true;
-
+            m->population_active = true;
             /*
              * A held batch missed `q2_monster_set_wake`: that sweep quite
              * correctly skips records whose in-use latch is clear. Merely
@@ -1079,8 +1328,9 @@ u32 q2_creature_world_summon(q2_creature_world *w, const char *group)
     return woke;
 }
 
-u32 q2_creature_world_hold_batches(q2_creature_world *w, int resident_zone,
-                                   const u8 *levelbin, u32 levelbin_size)
+static u32 hold_groups(q2_creature_world *w, int resident_zone,
+                        const u8 *levelbin, u32 levelbin_size,
+                        const u8 *groups, u32 group_count)
 {
     u32 i, held = 0;
     u32 sel[32];
@@ -1104,11 +1354,21 @@ u32 q2_creature_world_hold_batches(q2_creature_world *w, int resident_zone,
 
         zone = q2_pop_group_zone(&g);
 
+        if (groups) {
+            if (m->group < group_count && groups[m->group] &&
+                (zone < 0 || zone == resident_zone))
+                continue;
+            m->in_use = false;
+            m->spawn_pending = true;
+            held++;
+            continue;
+        }
+
         /*
          * The module's own answer first: a group its init SELECTS is one the
-         * level starts with, whatever the group is called. That is what makes
-         * JAIL3's `Jail4Return` reachable at all — the naming rule below would
-         * hold it back for ever, since no CREBATCH names it either.
+         * level starts with, whatever the group is called. The client resolves
+         * conditional calls and supplies their shared item/creature selection
+         * through hold_selected; this scan is the standalone fallback.
          */
         if (sel_count) {
             u32 k;
@@ -1131,17 +1391,34 @@ u32 q2_creature_world_hold_batches(q2_creature_world *w, int resident_zone,
                 continue;
         }
 
-        /* A group named after THIS zone is the level's own population. One
-         * named after another zone is that zone's business. Anything else is a
-         * batch and waits to be called for. */
-        if (zone == resident_zone)
+        /* Ownership is not selection: e.g. JAIL4's Zone1Key is an ambush,
+         * while Zone1 is the ordinary population. Both belong to zone 1. */
+        if (zone == resident_zone && q2_pop_group_is_zone(&g))
             continue;
 
         m->in_use = false;
+        /* CREBATCH selects by exact name, without a zone-name test. Only the
+         * earlier geometric/module/skill filters decide eligibility here:
+         * overlapping zones can legitimately summon a differently named group. */
+        m->spawn_pending = true;
         held++;
     }
 
     return held;
+}
+
+u32 q2_creature_world_hold_batches(q2_creature_world *w, int resident_zone,
+                                   const u8 *levelbin, u32 levelbin_size)
+{
+    return hold_groups(w, resident_zone, levelbin, levelbin_size, NULL, 0);
+}
+
+u32 q2_creature_world_hold_selected(q2_creature_world *w, int resident_zone,
+                                     const u8 *selected, u32 count)
+{
+    if (!selected)
+        return 0;
+    return hold_groups(w, resident_zone, NULL, 0, selected, count);
 }
 
 void q2_creature_world_free(q2_creature_world *w)
@@ -1150,6 +1427,8 @@ void q2_creature_world_free(q2_creature_world *w)
 
     if (!w)
         return;
+
+    q2_cre_set_lifecycle_hooks(NULL, 0, NULL, NULL, NULL);
 
     for (i = 0; i < w->mod_count; i++) {
         free(w->mod[i].image);
@@ -1183,4 +1462,6 @@ void q2_creature_world_free(q2_creature_world *w)
         q2_level_state.sight_client = NULL;
 
     w->ready = false;
+    w->placement_coll = NULL;
+    w->placement_world = NULL;
 }

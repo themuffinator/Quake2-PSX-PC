@@ -201,3 +201,31 @@ void q2_zone_close(q2_zone_file *f)
     dat_close(&f->ar);
     memset(f, 0, sizeof(*f));
 }
+
+bool q2_common_resources(const q2_common_file *f, const char *zone_name,
+                         q2_zone_resources *out)
+{
+    const dat_chunk *chunk = f ? f->chunk[Q2_COMMON_RESOURCES] : NULL;
+    const char *name = zone_name ? strrchr(zone_name, '/') : NULL;
+    u32 at;
+    name = name ? name + 1 : zone_name;
+    if (!out || !name || !chunk || !chunk->data || chunk->size < 32) return false;
+    for (at = 0; at <= chunk->size - 32 && chunk->data[at]; at += 32) {
+        const u8 *raw = chunk->data + at;
+        u32 j;
+        for (j = 0; j < 12; j++) {
+            int a = raw[j], b = (unsigned char)name[j];
+            if (a >= 'a' && a <= 'z') a -= 'a' - 'A';
+            if (b >= 'a' && b <= 'z') b -= 'a' - 'A';
+            if (a != b || !a) break;
+        }
+        if ((j < 12 && raw[j] == 0 && name[j] == 0) ||
+            (j == 12 && name[j] == 0)) {
+            out->packet_control = q2_rd_s32(raw + 12);
+            out->particle_groups = q2_rd_s32(raw + 24);
+            out->subdiv_meshes = q2_rd_s32(raw + 28);
+            return true;
+        }
+    }
+    return false;
+}

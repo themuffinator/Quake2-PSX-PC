@@ -3,13 +3,15 @@
  *
  * These checks pin the byte-state transitions at 0x80071BF8/0x80073B14/
  * 0x8007270C and the two integer truncations at 0x800724EC/0x80071CA0.
- * No fixture or host audio device is involved.
+ * CD register fixtures come from executing the PAL setup/SDK routines.
+ * No host audio device is involved.
  */
 #include <stdio.h>
 #include <string.h>
 
 #include "vag.h"
 #include "xa.h"
+#include "fixtures/audio_register_reference.h"
 
 static int g_checks;
 static int g_failures;
@@ -253,19 +255,19 @@ static void test_cd_mix_stereo_fold(void)
 
     puts("CD mix and the STEREO fold");
 
-    /* Stereo at unity is the identity: 255 is full scale and 0x800719D0's
-     * clamp is what makes it the ceiling. */
+    /* The CD controller's unity byte is 128; the game's ceiling 255 is
+     * nearly double gain, so it can saturate before reaching the SPU. */
     pcm[0] = 1000; pcm[1] = -1000; pcm[2] = 32767; pcm[3] = -32768;
-    q2_xa_cd_mix(pcm, 4, 255, true);
-    check_eq_s32(pcm[0],  1000, "stereo at 255 leaves the left channel");
-    check_eq_s32(pcm[1], -1000, "stereo at 255 leaves the right channel");
-    check_eq_s32(pcm[3], -32768, "stereo at 255 leaves the extreme");
+    q2_xa_cd_mix(pcm, 4, 128, true);
+    check_eq_s32(pcm[0],  1000, "stereo at 128 leaves the left channel");
+    check_eq_s32(pcm[1], -1000, "stereo at 128 leaves the right channel");
+    check_eq_s32(pcm[3], -32768, "stereo at 128 leaves the extreme");
 
     /* Stereo below unity scales the two independently and keeps them apart. */
     pcm[0] = 1000; pcm[1] = -1000;
     q2_xa_cd_mix(pcm, 2, 96, true);
-    check_eq_s32(pcm[0],  376, "stereo at 96 scales the left channel");
-    check_eq_s32(pcm[1], -376, "stereo at 96 scales the right channel");
+    check_eq_s32(pcm[0],  750, "stereo at 96 scales the left channel");
+    check_eq_s32(pcm[1], -750, "stereo at 96 scales the right channel");
 
     /*
      * Mono sums both channels at half level, so a hard-panned pair collapses
@@ -273,30 +275,75 @@ static void test_cd_mix_stereo_fold(void)
      * symptom: with STEREO off the effects went centre and the music did not.
      */
     pcm[0] = 1000; pcm[1] = -1000;
-    q2_xa_cd_mix(pcm, 2, 255, false);
+    q2_xa_cd_mix(pcm, 2, 128, false);
     check_eq_s32(pcm[0], 0, "mono cancels an out-of-phase pair, left");
     check_eq_s32(pcm[1], 0, "mono cancels an out-of-phase pair, right");
 
     pcm[0] = 1000; pcm[1] = 0;
     q2_xa_cd_mix(pcm, 2, 96, false);
-    check_eq_s32(pcm[0], 188, "mono at 96 sums a hard-left pair");
-    check_eq_s32(pcm[1], 188, "...into both outputs");
+    check_eq_s32(pcm[0], 375, "mono at 96 sums a hard-left pair");
+    check_eq_s32(pcm[1], 375, "...into both outputs");
 
     /*
      * AND THE HALVING IS ON THE VOLUME, not on the sum. 0x80071A08 computes
      * volume/2 truncated toward zero and writes that byte four times, so an odd
-     * volume loses half a unit: 1000 in both channels at 255 comes back as 996
-     * and not 1000. Transcribed rather than tidied — the tidy version would be
-     * a mono fold half a percent louder than the console's.
+     * volume loses half a unit. Each input's fixed-point product truncates
+     * before summation; an out-of-phase pair can therefore retain a -1 LSB.
      */
     pcm[0] = 1000; pcm[1] = 1000;
     q2_xa_cd_mix(pcm, 2, 255, false);
-    check_eq_s32(pcm[0], 996, "the odd-volume truncation is the console's");
+    check_eq_s32(pcm[0], 1984, "odd volume halves the register before multiplication");
 
     /* A zero-length buffer and a null one are both no-ops rather than faults. */
     q2_xa_cd_mix(pcm, 0, 96, false);
-    check_eq_s32(pcm[0], 996, "an empty buffer is untouched");
+    check_eq_s32(pcm[0], 1984, "an empty buffer is untouched");
     q2_xa_cd_mix(NULL, 2, 96, false);
+
+    pcm[0] = 1000; pcm[1] = -1000;
+    q2_xa_cd_mix(pcm, 2, 255, true);
+    check_eq_s32(pcm[0], 1992, "255 is nearly double gain");
+    check_eq_s32(pcm[1], -1993, "negative products use arithmetic truncation");
+    pcm[0] = 20000; pcm[1] = -20000;
+    q2_xa_cd_mix(pcm, 2, 255, true);
+    check_eq_s32(pcm[0], 32767, "CD matrix saturates positive overflow");
+    check_eq_s32(pcm[1], -32768, "CD matrix saturates negative overflow");
+}
+
+static s32 reference_cd_product(s32 sample, u8 gain)
+{
+    s32 product = sample * gain;
+    return product >= 0 ? product / 128 : -((127 - product) / 128);
+}
+
+static void test_native_cd_registers(void)
+{
+    static const s16 input[][2] = {
+        {1000,-1000}, {0,32767}, {-32768,0}, {16384,16384},
+        {-16384,16384}, {1,-1}, {129,-129}, {12345,-23456}
+    };
+    u32 stereo, volume, i, ch;
+    puts("512 native CD register matrices with fixed-point scaling and saturation");
+    check(audio_reference_main[0] == 0x3fc0 && audio_reference_main[1] == 0x3fc0,
+          "retail SDK writes both main volume registers");
+    check(audio_reference_cd_input[0] == 0x7fff && audio_reference_cd_input[1] == 0x7fff,
+          "retail SDK writes both CD input volume registers");
+    for (stereo = 0; stereo < 2; stereo++) for (volume = 0; volume < 256; volume++) {
+        const u8 *atv = audio_reference_atv[stereo][volume];
+        for (i = 0; i < Q2PSX_ARRAY_COUNT(input); i++) {
+            s16 pcm[2] = {input[i][0], input[i][1]};
+            s32 expected[2] = {
+                reference_cd_product(input[i][0], atv[0]) + reference_cd_product(input[i][1], atv[3]),
+                reference_cd_product(input[i][0], atv[1]) + reference_cd_product(input[i][1], atv[2])
+            };
+            q2_xa_cd_mix(pcm, 2, (s32)volume, stereo != 0);
+            for (ch = 0; ch < 2; ch++) {
+                s32 value = expected[ch];
+                if (value > 32767) value = 32767;
+                if (value < -32768) value = -32768;
+                check_eq_s32(pcm[ch], value, "native ATV bytes produce the expected channel");
+            }
+        }
+    }
 }
 
 /*
@@ -359,6 +406,7 @@ int main(void)
     test_request_volume();
     test_cd_volume_ramp();
     test_cd_mix_stereo_fold();
+    test_native_cd_registers();
 
     if (g_failures) {
         printf("\n%d/%d sound-pitch checks failed\n", g_failures, g_checks);

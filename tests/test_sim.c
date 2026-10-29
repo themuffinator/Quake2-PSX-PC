@@ -15,10 +15,14 @@
 #include "levelbin.h"
 #include "multiplayer.h"  /* q2_mp_batches — what an arena spawns */
 #include "playerdeath.h"   /* q2_player_die — where the killer byte is read */
+#include "random.h"
 #include "rotator.h"
 #include "shock.h"     /* the sink a detonation would call */
 #include "sim.h"
 #include "trig.h"
+#include "fixtures/combat_camera_reference.h"
+#include "fixtures/actor_light_reference.h"
+#include "fixtures/bolt_reference.h"
 
 static int g_failures;
 static int g_checks;
@@ -263,6 +267,118 @@ static bool sound_raised(const q2_sim *sim, q2_ent_sound which)
     return false;
 }
 
+static void test_environment_burn_sounds(void)
+{
+    q2_sim *s = calloc(1, sizeof(*s));
+    const s32 feet[3] = {100, 600, 300};
+    q2_damage_result hit;
+    q2_inventory loadout;
+    int i;
+    if (!s) exit(2);
+    printf("acid and lava damage sound admission\n");
+    q2_sim_init(s, NULL, 50);
+    q2_sim_spawn(s, feet, 0);
+    s->combat.inv.health = 1000;
+    /* Retail's counter starts at 3: the first, fifth and ninth admitted
+     * hits sound. Attempts refused by the time gate do not consume it. */
+    for (i = 0; i < 9; i++) {
+        s->level_time = 1000 + i * 101;
+        q2_ent_events_clear(&s->ent_world.events);
+        hit = q2_sim_hurt_player(s, NULL, 1, Q2_MOD_LAVA, NULL);
+        check(!hit.blocked && hit.taken == 1, "lava attempt is admitted");
+        check(sound_raised(s, Q2_SND_BURN) == (i % 4 == 0), "lava first-hit/four-hit cadence");
+        if (s->ent_world.events.count) {
+            const q2_ent_event *e = &s->ent_world.events.e[0];
+            check(e->sound_player == 0 && e->pos[0] == feet[0] &&
+                  e->pos[1] == q2_sim_origin_y(feet[1]) && e->pos[2] == feet[2],
+                  "burn sound belongs to the player's entity origin");
+        }
+        q2_ent_events_clear(&s->ent_world.events);
+        hit = q2_sim_hurt_player(s, NULL, 1, Q2_MOD_LAVA, NULL);
+        check(hit.blocked && !sound_raised(s, Q2_SND_BURN), "throttled lava stays silent");
+    }
+    s->level_time = 3000;
+    q2_ent_events_clear(&s->ent_world.events);
+    hit = q2_sim_hurt_player(s, NULL, 1, Q2_MOD_ACID, NULL);
+    check(!hit.blocked && sound_raised(s, Q2_SND_BURN), "acid sounds on every admitted hit");
+    q2_ent_events_clear(&s->ent_world.events);
+    s->level_time = 3400;
+    hit = q2_sim_hurt_player(s, NULL, 1, Q2_MOD_ACID, NULL);
+    check(hit.blocked && !sound_raised(s, Q2_SND_BURN), "exact acid deadline is still silent");
+    s->level_time++;
+    s->combat.inv.enviro_until = 5000;
+    hit = q2_sim_hurt_player(s, NULL, 1, Q2_MOD_ACID, NULL);
+    check(hit.blocked && !sound_raised(s, Q2_SND_BURN), "suit prevents the acid sound");
+    s->combat.inv.enviro_until = 0;
+    s->combat.inv.invuln_until = 5000;
+    hit = q2_sim_hurt_player(s, NULL, 1, Q2_MOD_ACID, NULL);
+    check(hit.blocked && !sound_raised(s, Q2_SND_BURN), "invulnerability prevents the acid sound");
+    s->combat.inv.invuln_until = 0;
+    s->combat.inv.armour = 100;
+    s->combat.inv.armour_class = Q2_ARMOUR_BODY;
+    hit = q2_sim_hurt_player(s, NULL, 1, Q2_MOD_ACID, NULL);
+    check(!hit.blocked && hit.taken == 0 && sound_raised(s, Q2_SND_BURN),
+          "fully absorbed acid still makes its burn request");
+    q2_ent_events_clear(&s->ent_world.events);
+    s->level_time += 401;
+    hit = q2_sim_hurt_player(s, NULL, 0, Q2_MOD_ACID, NULL);
+    check(!hit.blocked && hit.taken == 0 && sound_raised(s, Q2_SND_BURN),
+          "zero player damage still visits the environmental stage");
+    q2_sim_free(s);
+
+    q2_sim_init(s, NULL, 50);
+    q2_sim_spawn(s, feet, 0);
+    s->combat.inv.enviro_until = s->combat.inv.invuln_until = 5000;
+    s->level_time = 1000;
+    hit = q2_sim_hurt_player(s, NULL, 30, Q2_MOD_LAVA, NULL);
+    check(hit.blocked && hit.taken == 0 && sound_raised(s, Q2_SND_BURN),
+          "lava requests its sound before general invulnerability");
+    q2_sim_free(s);
+
+    q2_sim_init(s, NULL, 50);
+    q2_sim_spawn(s, feet, 0);
+    loadout = s->combat.inv;
+    q2_sim_select_player(s, 1);
+    q2_sim_spawn(s, feet, 0);
+    q2_sim_player_loadout(s, 1, &loadout, 1);
+    for (i = 0; i < 5; i++) {
+        int owner = i == 4 ? 1 : i % 2;
+        q2_sim_select_player(s, owner);
+        q2_ent_events_clear(&s->ent_world.events);
+        s->level_time = 1000 + i * 101;
+        hit = q2_sim_hurt_player(s, NULL, 1, Q2_MOD_LAVA, NULL);
+        check(!hit.blocked, "different players have independent damage deadlines");
+        check(sound_raised(s, Q2_SND_BURN) == (i % 4 == 0), "players share the lava sound counter");
+        if (sound_raised(s, Q2_SND_BURN))
+            check(s->ent_world.events.e[0].sound_player == owner, "shared counter preserves victim ownership");
+    }
+    s->level_time += 101;
+    s->lava_burn_calls = 0;
+    s->ent_world.events.count = Q2_ENT_EVENTS_MAX;
+    s->ent_world.events.dropped = 0;
+    q2_sim_hurt_player(s, NULL, 1, Q2_MOD_LAVA, NULL);
+    check(s->lava_burn_calls == 1 && s->ent_world.events.dropped == 1,
+          "a dropped sound still consumes the shared cadence");
+    q2_ent_events_clear(&s->ent_world.events);
+    s->level_time += 101;
+    s->settling = true;
+    q2_sim_hurt_player(s, NULL, 1, Q2_MOD_LAVA, NULL);
+    check(s->lava_burn_calls == 1 && !sound_raised(s, Q2_SND_BURN),
+          "host spawn settling cannot consume a live sound phase");
+    s->settling = false;
+    s->lava_burn_calls = UINT32_MAX;
+    s->level_time += 101;
+    q2_sim_hurt_player(s, NULL, 1, Q2_MOD_LAVA, NULL);
+    check(s->lava_burn_calls == 0 && !sound_raised(s, Q2_SND_BURN),
+          "shared counter wraps without a premature sound");
+    s->level_time += 101;
+    q2_sim_hurt_player(s, NULL, 1, Q2_MOD_LAVA, NULL);
+    check(s->lava_burn_calls == 1 && sound_raised(s, Q2_SND_BURN),
+          "shared counter retains cadence after wrapping");
+    q2_sim_free(s);
+    free(s);
+}
+
 typedef struct fx_probe {
     u32 count;
     s16 mod;
@@ -282,7 +398,8 @@ static void on_fx(void *user, const q2_event_item *item)
 /* ------------------------------------------------------------------------- */
 /* Opcode 0x13 is not an effect-group: the retail dispatcher turns it directly
  * into T_Damage for the player who entered the record. Its eight-byte shape is
- * confirmed by all seven PAL items; this one is WASTE3's mod 0, damage 65. */
+ * confirmed by all nine PAL copies (seven ZONE, two COMMON); this one is
+ * WASTE3's mod 0, damage 65. */
 static void test_script_fx_damage(void)
 {
     static const u8 raw[] = {
@@ -498,16 +615,32 @@ static void test_underwater_air(void)
     sim.combat.inv.armour = 200;
     health = sim.combat.inv.health;
 
-    /* Twelve hundred dt units is where `air >> 10` first becomes one on the
-     * 300-tick drowning pass. Armour must not absorb MOD 8. */
-    for (i = 0; i < 130; i++)
+    /* Below 3601 air the 300-tick pass takes the ambience arm and hurts
+     * nobody (0x8003D358 branches to 0x8003D3E0): twelve seconds of breath. */
+    for (i = 0; i < 290; i++)
         q2_sim_tick(&sim, &in, Q2_DT_NOMINAL);
-    check(sim.player[0].water_air >= 1200,
+    check(sim.player[0].water_air >= 1200 && sim.player[0].water_air < 3601,
           "submersion accumulates the engine dt into air");
-    check(sim.combat.inv.health < health,
-          "the drowning clock eventually applies damage");
+    check_eq_i(sim.combat.inv.health, health,
+               "a held breath under 3601 costs no health");
+
+    /* Past it, the pass drowns at `air >> 10`, at least 3 and at most 7, and
+     * armour must not absorb MOD 8. */
+    for (i = 0; i < 160; i++)
+        q2_sim_tick(&sim, &in, Q2_DT_NOMINAL);
+    check(sim.player[0].water_air >= 3601,
+          "the breath runs out after twelve seconds of dt");
+    check(sim.combat.inv.health < health && sim.combat.inv.health >= health - 7 * 7,
+          "and the drowning clock then applies three to seven a pass");
     check_eq_i(sim.combat.inv.armour, 200,
                "drowning bypasses armour through MOD 8");
+    {
+        s16 before = sim.combat.inv.health;
+        for (i = 0; i < 200; i++)
+            q2_sim_tick(&sim, &in, Q2_DT_NOMINAL);
+        check(sim.combat.inv.health < before,
+              "and keeps applying it for as long as the player stays under");
+    }
 
     /* A new life starts a fresh breath and splash sequence.  This also makes
      * command-line placement in an authored water volume deterministic. */
@@ -980,6 +1113,7 @@ static void test_jump(void)
     check(sim.player[0].vel[1] > Q2_IMPULSE_CEILING,
           "so a plain jump stays inside the impulse ceiling");
     check(!sim.player[0].on_ground, "and the ground flag is dropped");
+    check(sim.player[0].jumped_this_tick, "a successful impulse requests the jump animation");
     check_eq_i(sim.player[0].jump_hold, Q2_JUMP_HOLD, "the hold timer is armed");
 
     /*
@@ -993,6 +1127,7 @@ static void test_jump(void)
 
     /* Holding the button must not produce a second jump while rising. */
     q2_sim_tick(&sim, &in, Q2_DT_NOMINAL);
+    check(!sim.player[0].jumped_this_tick, "remaining airborne does not request another jump animation");
     check(sim.player[0].jump_hold != Q2_JUMP_HOLD,
           "holding the button does not re-arm the jump");
 
@@ -2520,16 +2655,47 @@ static void test_four_players(void)
 
 /* ------------------------------------------------------------------------- */
 /*
- * A creature's contact hit lands AT THE CREATURE.
- *
- * `0x800612F0` passes the attacker's own origin as the damage point, which is
- * the one line `q2_combat_melee` is, and `q2_sim_hurt_player` now enforces it
- * rather than trusting whatever point the caller supplies. The client used to
- * supply the player's own position, and this is the test that would have caught
- * it: with the point at the player, the difference the roll is computed from is
- * the zero vector, so every claw rolled the view the same way whichever side it
- * came from.
+ * Execute native damage/feedback/view vectors independently of the port's
+ * implementation. Hits preserve the amplitudes consumed by the view reader.
  */
+static void test_native_damage_view_state(void)
+{
+    u32 i;
+    for (i = 0; i < sizeof(combat_camera_reference) / sizeof(combat_camera_reference[0]); i++) {
+        const s32 *v = combat_camera_reference[i];
+        q2_sim sim;
+        q2_actor attacker;
+        s32 point[3] = { v[4] * 1000, 0, 0 }, angles[3];
+        char label[80];
+        q2_sim_init(&sim, NULL, 50);
+        q2_actor_init(&attacker);
+        attacker.health = 100;
+        sim.level_time = 1000;
+        sim.combat.inv.health = 100;
+        sim.combat.inv.armour_class = Q2_ARMOUR_BODY;
+        sim.combat.inv.armour = v[2] ? 100 : 0;
+        sim.combat.inv.ammo[Q2_AMMO_CELLS] = v[2] == 2 ? 100 : 0;
+        sim.combat.inv.flags = v[2] == 2 ? Q2_POWERUP_POWER_ARMOUR : 0;
+        sim.player[0].hurt_kick[0] = (s16)v[5];
+        sim.player[0].hurt_kick[1] = (s16)v[6];
+        q2_cre_set_skill((int)v[3]);
+        q2_sim_hurt_player(&sim, &attacker, (s16)v[0], (s16)v[1], v[4] ? point : NULL);
+        snprintf(label, sizeof(label), "native damage vector %u preserves amplitudes", i);
+        check(sim.player[0].hurt_kick[0] == v[5] && sim.player[0].hurt_kick[1] == v[6], label);
+        snprintf(label, sizeof(label), "native damage vector %u health and inventory", i);
+        check(sim.combat.inv.health == v[7] && sim.combat.inv.armour == v[8] &&
+              sim.combat.inv.ammo[Q2_AMMO_CELLS] == v[9], label);
+        /* Native PlayerThink's feedback deadline, measured in the same fixture.
+         * The composition remains valid for explicitly seeded/saved amplitudes. */
+        sim.player[0].pain_time = v[10];
+        q2_sim_view_angles(&sim, angles);
+        snprintf(label, sizeof(label), "native damage vector %u composes view offsets", i);
+        check(angles[0] == v[11] && angles[1] == v[12] && angles[2] == v[13], label);
+        q2_sim_free(&sim);
+    }
+    q2_cre_set_skill(1);
+}
+
 static void test_melee_point(void)
 {
     q2_sim   sim;
@@ -2557,33 +2723,27 @@ static void test_melee_point(void)
     right = left;
     right.origin[0] = sim.player[0].pos[0] + 500;
 
-    /* Both are handed the SAME deliberately wrong point — the player's own
-     * position — so anything but an override gives both the same roll. */
+    wrong_point[0] = left.origin[0] + 100;
     q2_sim_hurt_player(&sim, &left, 20, Q2_MOD_MELEE, wrong_point);
     roll_left = sim.player[0].hurt_kick[1];
 
     q2_sim_init(&sim, NULL, 50);
     sim.player[0].yaw = 0;
-    q2_sim_hurt_player(&sim, &right, 20, Q2_MOD_MELEE, wrong_point);
+    wrong_point[0] = right.origin[0] - 100;
+    q2_sim_hurt_player(&sim, &left, 20, Q2_MOD_MELEE, wrong_point);
     roll_right = sim.player[0].hurt_kick[1];
 
-    check(roll_left != 0 && roll_right != 0, "a claw that lands rolls the view");
-    check((roll_left > 0) != (roll_right > 0),
-          "and the two sides roll it opposite ways, so the point was overridden");
+    check(roll_left == 0 && roll_right == 0, "a claw does not assign weapon roll");
+    check_eq_i(sim.combat.inv.health, 80, "the claw still delivers its damage");
     printf("  roll from the left %d, from the right %d\n",
            (int)roll_left, (int)roll_right);
 
-    /*
-     * The control. A melee with no attacker has no origin to take, so the
-     * caller's point stands and both sides collapse to the same answer — which
-     * is exactly the behaviour the client had for every claw in the game.
-     */
+    /* A world-owned hit also preserves the weapon offset. */
     q2_sim_init(&sim, NULL, 50);
     sim.player[0].yaw = 0;
     q2_sim_hurt_player(&sim, NULL, 20, Q2_MOD_MELEE, wrong_point);
-    check(sim.player[0].hurt_kick[1] == roll_left ||
-          sim.player[0].hurt_kick[1] == roll_right,
-          "with no attacker the caller's point stands, as it must for lava");
+    check(sim.player[0].hurt_kick[1] == 0,
+          "a hit without an attacker does not invent weapon roll");
 
     /* And the killer is recorded, which is what the scoring rule reads. */
     q2_sim_init(&sim, NULL, 50);
@@ -2597,105 +2757,108 @@ static void test_melee_point(void)
 /*
  * AND A CREATURE'S SHOT ARRIVES FROM SOMEWHERE TOO.
  *
- * The creature hooks hand the damage path the sight client's position, and the
- * sight client is pinned to the player, so the "hit point" of every creature
- * bullet, rail, rocket and grenade was the player's own origin. Those four mods
- * ARE in the knockback set (0x80057ED0..0x80057EE8), and `apply_knockback`
- * forms `target->origin - point`: with the player's actor carrying the FEET and
- * the point 286 above them, the direction came out (0, +286, 0) — straight
- * down, +Y being down — on every hit. So every shot shoved the player into the
- * floor, none of them pushed away from the shooter, and the flinch's roll had
- * the same sign whichever side the shot came from.
+ * The round's point is where it entered the player's cylinder: 0x800544EC
+ * writes it back over the trace's end and 0x80048970 hands it to DoDamage,
+ * which forms the knockback against the entity origin, +0x54, mid-body
+ * (0x80057EF0..0x80057F28). So a level round shoves the player straight away
+ * from the shooter, and one that comes down from above shoves back AND down,
+ * +Y being down.
  *
- * `q2_sim_hurt_player` now rebuilds the point the way the console's swept
- * hitscan produces it (0x8004874C hands T_Damage the trace's own endpoint):
- * on the player, displaced one hull half-extent back along the shot.
+ * The port once handed the damage path the player's own origin, and the actor
+ * carried the feet, so every round pushed straight down; the repair rebuilt a
+ * level point from it, so every round then pushed purely sideways. Both were
+ * the port's. The real entry point and the real origin need neither.
  */
 static void test_shot_point(void)
 {
     q2_sim   sim;
     q2_actor left, right;
-    s32      sight_point[3];
+    s32      origin[3], from[3], dir[3];
     s16      roll_left, roll_right;
     s16      push_left, push_right, push_down;
+    int      k;
 
     printf("a creature's shot\n");
 
     q2_sim_init(&sim, NULL, 50);
     sim.player[0].yaw = 0;
-
-    /* What the client passes: the sight client, which `sight_place` puts at
-     * the player's x/z and the player's feet minus Q2_EYE_BASE. */
-    sight_point[0] = sim.player[0].pos[0];
-    sight_point[1] = q2_sim_origin_y(sim.player[0].pos[1]);
-    sight_point[2] = sim.player[0].pos[2];
+    origin[0] = sim.player[0].pos[0];
+    origin[1] = q2_sim_origin_y(sim.player[0].pos[1]);
+    origin[2] = sim.player[0].pos[2];
 
     q2_actor_init(&left);
     left.health    = 100;
     left.owner     = -1;
-    left.origin[0] = sim.player[0].pos[0] - 2000;
-    left.origin[1] = sim.player[0].pos[1];
-    left.origin[2] = sim.player[0].pos[2];
+    left.origin[0] = origin[0] - 2000;
+    left.origin[1] = origin[1];
+    left.origin[2] = origin[2];
 
     right = left;
-    right.origin[0] = sim.player[0].pos[0] + 2000;
+    right.origin[0] = origin[0] + 2000;
 
-    q2_sim_hurt_player(&sim, &left, 20, Q2_MOD_BULLET, sight_point);
+    /* Level, from the left: the round enters at x = origin - 286. */
+    for (k = 0; k < 3; k++) {
+        from[k] = left.origin[k];
+        dir[k]  = (origin[k] - from[k]) * 2;
+    }
+    check_eq_i(q2_sim_creature_hitscan(&sim, &left, from, dir, 20,
+                                       Q2_MOD_BULLET, false, NULL),
+               Q2_SIM_HIT_PLAYER, "a level round from the left enters the player");
     roll_left = sim.player[0].hurt_kick[1];
     push_left = sim.player[0].impulse[0];
     push_down = sim.player[0].impulse[1];
+    check_eq_i(sim.combat.inv.health, 80, "the bullet still delivers its damage");
 
     q2_sim_init(&sim, NULL, 50);
     sim.player[0].yaw = 0;
-    q2_sim_hurt_player(&sim, &right, 20, Q2_MOD_BULLET, sight_point);
+    for (k = 0; k < 3; k++) {
+        from[k] = right.origin[k];
+        dir[k]  = (origin[k] - from[k]) * 2;
+    }
+    q2_sim_creature_hitscan(&sim, &right, from, dir, 20, Q2_MOD_BULLET,
+                            false, NULL);
     roll_right = sim.player[0].hurt_kick[1];
     push_right = sim.player[0].impulse[0];
 
-    check(roll_left != 0 && roll_right != 0, "a bullet that lands rolls the view");
-    check((roll_left > 0) != (roll_right > 0),
-          "and the two sides roll it opposite ways");
+    check(roll_left == 0 && roll_right == 0, "a bullet does not assign weapon roll");
 
     /*
      * The impulse, not the knockback: `player_damage_impulse` drains
      * `knockback[]` into `player.impulse[]` and zeroes it inside the same call.
      */
-    check(push_left != 0 && push_right != 0,
-          "and it shoves the player horizontally");
-    check((push_left > 0) != (push_right > 0),
-          "away from the shooter, whichever side it stood on");
-    check_eq_i((int)push_down, 0,
-               "and no longer straight down, which used to be the whole of it");
+    check(push_left > 0 && push_right < 0,
+          "a level round shoves the player away from whichever side it came");
+    check_eq_i((int)push_down, 0, "and, being level, neither up nor down");
     printf("  roll %d/%d, shove %d/%d, vertical %d\n",
            (int)roll_left, (int)roll_right, (int)push_left, (int)push_right,
            (int)push_down);
 
-    /*
-     * The control, and the reason the rebuild is conditional: a caller that
-     * computed a real impact point keeps it. A point off to one side is left
-     * exactly where it was, so the player's own splash and any traced shot are
-     * untouched.
-     */
-    {
-        s32 real_point[3];
-
-        real_point[0] = sim.player[0].pos[0] + 143;
-        real_point[1] = q2_sim_origin_y(sim.player[0].pos[1]);
-        real_point[2] = sim.player[0].pos[2];
-
-        q2_sim_init(&sim, NULL, 50);
-        sim.player[0].yaw = 0;
-        q2_sim_hurt_player(&sim, &left, 20, Q2_MOD_BULLET, real_point);
-        check(sim.player[0].impulse[0] < 0,
-              "a point the caller really computed is used as given");
-    }
-
-    /* And with no attacker there is no direction to take, so nothing changes:
-     * that is the lava and crusher path. */
+    /* From above and to the left, the round enters high on the body, and the
+     * shove leans down as well as away. */
     q2_sim_init(&sim, NULL, 50);
     sim.player[0].yaw = 0;
-    q2_sim_hurt_player(&sim, NULL, 20, Q2_MOD_BULLET, sight_point);
+    from[0] = origin[0] - 2000;
+    from[1] = origin[1] - 1200;
+    from[2] = origin[2];
+    dir[0] = 4000;
+    dir[1] = 2000;
+    dir[2] = 0;
+    check_eq_i(q2_sim_creature_hitscan(&sim, &left, from, dir, 20,
+                                       Q2_MOD_BULLET, false, NULL),
+               Q2_SIM_HIT_PLAYER, "a round from above enters the player");
+    printf("  from above: shove %d, vertical %d\n",
+           (int)sim.player[0].impulse[0], (int)sim.player[0].impulse[1]);
+    check(sim.player[0].impulse[0] > 0 && sim.player[0].impulse[1] > 0,
+          "and shoves back and down, against the mid-body origin");
+
+    /* A point at the origin itself has no direction to give, so nothing
+     * moves: the lava and crusher paths pass no point at all. */
+    q2_sim_init(&sim, NULL, 50);
+    sim.player[0].yaw = 0;
+    q2_sim_hurt_player(&sim, NULL, 20, Q2_MOD_BULLET, origin);
     check_eq_i((int)sim.player[0].impulse[0], 0,
-               "with no attacker the caller's point stands");
+               "a point at the entity origin gives no shove");
+    check_eq_i((int)sim.player[0].impulse[1], 0, "in any direction");
 }
 
 /*
@@ -3792,13 +3955,29 @@ static void test_glass_solidity_lifetime(void)
                "even when the map has zero movers to arm the entity pass");
     check_eq_i(tr.end[2], bmin[2], "the trace stops at the pane's near face");
 
-    (void)q2_sim_breakable_shot(&sim, from, to, 9);
+    {
+        q2_fire_result_v2 shot = {0};
+        s32 index;
+        shot.fired = true; shot.shot_count = 1; shot.kind = Q2_FK_GRENADE;
+        memcpy(shot.shot[0].origin, from, sizeof(from));
+        shot.shot[0].dir[2] = 32000; shot.shot[0].damage = 120;
+        shot.projectile_timer = 900;
+        index = q2_projectile_launch(&sim.combat.projectiles, &shot, 0, 0);
+        sim.cur_dt = 20; sim.gravity = 0; sim.level_time = 20;
+        q2_sim_combat_tick(&sim);
+        check(index >= 0 && sim.combat.projectiles.p[index].in_use &&
+              sim.combat.projectiles.p[index].bounced, "a grenade rebounds off intact glass");
+        check_eq_i(b->health, 7, "toss contact applies the native 3 points, not blast damage");
+        check(!b->broken && pane.active, "a surviving grenade contact retains glass solidity");
+        q2_projectiles_init(&sim.combat.projectiles);
+    }
+    (void)q2_sim_breakable_shot(&sim, from, to, 6);
     check(!b->broken, "a surviving hit leaves the pane intact");
     check(pane.active, "and leaves its solid box active");
 
     (void)q2_sim_breakable_shot(&sim, from, to, 1);
     check(b->broken, "the fatal hit shatters the pane");
-    check_eq_i(sim.breakable_hits, 2,
+    check_eq_i(sim.breakable_hits, 3,
                "each shot reaching the pane is counted exactly once");
     check(!pane.active, "and frees its solid box in the same call");
     check(q2_move_sweep_world(&sim.move_world, from, to, &hit),
@@ -4062,6 +4241,7 @@ static void splash_once(q2_sim *sim, s32 owner, const s32 at[3],
     p = &sim->combat.projectiles.p[0];
     p->in_use        = true;
     p->kind          = Q2_PROJ_GRENADE;
+    p->flags         = Q2_PROJ_TOSS_REST; /* isolate a stationary fuse blast */
     p->pos[0]        = at[0];
     p->pos[1]        = at[1];
     p->pos[2]        = at[2];
@@ -4923,25 +5103,47 @@ static void test_actor_ambient_fade(void)
 {
     q2_sim sim;
     q2_actor cre;
-    q2_actor *list[1];
+    q2_actor *list[4];
+    q2_inventory inv;
+    int i, k, frame;
+    u8 expected[2][3];
 
     printf("the actor ambient takes the energy colour and eases back\n");
 
     q2_sim_init(&sim, NULL, 50);
     q2_actor_init(&cre);
     cre.health = 100;
-    check(cre.ambient[0] == Q2_ACTOR_AMBIENT_DEFAULT &&
-          cre.ambient[1] == Q2_ACTOR_AMBIENT_DEFAULT &&
-          cre.ambient[2] == Q2_ACTOR_AMBIENT_DEFAULT,
-          "an actor starts at its own fade target");
+    for (k = 0; k < 3; k++) {
+        check_eq_i(cre.ambient[k], native_actor_ambient, "native allocator ambient");
+        check_eq_i(sim.combat.self.ambient[k], native_player_ambient, "native initial player ambient");
+    }
+
+    /* Every channel value is checked against executed PAL and US fade code. */
+    for (i = 0; i < 2; i++) for (k = 0; k < 256; k++) {
+        u8 current[3] = {(u8)k, (u8)k, (u8)k};
+        u8 target[3];
+        memset(target, i ? native_player_ambient : native_actor_ambient, 3);
+        q2_light_glow_fade(current, target, 7);
+        check(current[0] == native_actor_fade[i][k] &&
+              current[1] == native_actor_fade[i][k] &&
+              current[2] == native_actor_fade[i][k], "native ambient fade vector");
+    }
+
+    q2_inventory_init(&inv);
+    for (i = 0; i < 4; i++) {
+        q2_actor *a;
+        q2_sim_player_loadout(&sim, i, &inv, Q2_WID_BLASTER);
+        a = i ? &sim.pcombat[i].self : &sim.combat.self;
+        for (k = 0; k < 3; k++) check_eq_i(a->ambient[k], native_player_ambient, "native player spawn ambient");
+        if (i) list[i] = a;
+    }
 
     list[0] = &cre;
-    q2_sim_set_targets(&sim, list, 1);
+    q2_sim_set_targets(&sim, list, 4);
 
-    /* A steady actor does not drift: fading a value that is already the target
-     * is a no-op, which is what keeps this change invisible until a hit. */
+    /* A steady actor holds its native target. */
     q2_sim_combat_tick(&sim);
-    check_eq_i(cre.ambient[1], Q2_ACTOR_AMBIENT_DEFAULT,
+    check_eq_i(cre.ambient[1], native_actor_ambient,
                "an unhit actor holds its ambient");
 
     /* An energy hit stores 3 in effect[1] (0x8005859C). The tick that sees it
@@ -4953,19 +5155,38 @@ static void test_actor_ambient_fade(void)
           cre.ambient[2] == Q2_ENERGY_LIGHT_B,
           "the >= 3 arm puts the energy colour on the body");
 
-    /*
-     * The next tick fades FIRST, and the two directions are not symmetric:
-     * green is 0x30 - 255 = -207, below the step count, and lands outright,
-     * while red and blue climb by 48 / 7 = 6.
-     */
-    q2_sim_combat_tick(&sim);
-    check_eq_i(cre.ambient[1], Q2_ACTOR_AMBIENT_DEFAULT,
-               "green falls to the target in one call (signed compare)");
-    check_eq_i(cre.ambient[0], 6, "red eases up by diff / 7");
-    check_eq_i(cre.ambient[2], 6, "and so does blue");
-
-    q2_sim_combat_tick(&sim);
-    check_eq_i(cre.ambient[0], 12, "and again from where it got to");
+    for (i = 0; i < 4; i++) {
+        q2_actor *a = i ? &sim.pcombat[i].self : &sim.combat.self;
+        memcpy(a->ambient, cre.ambient, 3);
+    }
+    memcpy(expected[0], cre.ambient, 3);
+    memcpy(expected[1], cre.ambient, 3);
+    for (frame = 0; frame < 32; frame++) {
+        q2_monster monster;
+        q2_monster_init(&monster);
+        monster.health = 100;
+        q2_actor_from_monster(&cre, &monster);
+        for (i = 0; i < 4; i++) {
+            q2_actor *a = i ? &sim.pcombat[i].self : &sim.combat.self;
+            q2_actor_from_player(a, &inv, NULL);
+            check(memcmp(a->ambient, expected[1], 3) == 0, "player refresh preserves hit colour");
+        }
+        check(memcmp(cre.ambient, expected[0], 3) == 0, "creature refresh preserves hit colour");
+        for (i = 0; i < 2; i++) for (k = 0; k < 3; k++)
+            expected[i][k] = native_actor_fade[i][expected[i][k]];
+        q2_sim_combat_tick(&sim);
+        check(memcmp(cre.ambient, expected[0], 3) == 0, "creature recovery matches native fade sequence");
+        for (i = 0; i < 4; i++) {
+            const q2_actor *a = i ? &sim.pcombat[i].self : &sim.combat.self;
+            check(memcmp(a->ambient, expected[1], 3) == 0, "each player recovers toward the native player target");
+        }
+    }
+    for (i = 0; i < 4; i++) {
+        q2_actor *a = i ? &sim.pcombat[i].self : &sim.combat.self;
+        memset(a->ambient, 255, 3);
+        q2_sim_player_loadout(&sim, i, &inv, Q2_WID_BLASTER);
+        for (k = 0; k < 3; k++) check_eq_i(a->ambient[k], native_player_ambient, "respawn clears the previous body's hit colour");
+    }
 
     q2_sim_set_targets(&sim, NULL, 0);
     q2_sim_free(&sim);
@@ -5514,6 +5735,34 @@ static void test_bfg_beams_damage(void)
     check(own_hits == 0 && own_health == 100,
           "the ball never beams or hurts its own owner");
 
+    /*
+     * THE FAR END IS THE MIDDLE OF THE HULL: 0x80048D4C..0x80048D74 adds
+     * (572 - height) / 2 to the target's +0x58, truncated toward zero. A
+     * 1000-high creature therefore takes the beam 214 units above its origin
+     * (Y grows downward), and a 573-high one at its origin exactly.
+     */
+    {
+        static const s16 heights[] = { 1000, 600, 573, 0 };
+        size_t h;
+        memset(&g_splash_tab, 0, sizeof(g_splash_tab)); g_splash_tab.loaded = true;
+        q2_sim_attach_effects(&sim, &g_splash_tab, 1);
+        for (h = 0; h < sizeof(heights) / sizeof(heights[0]); h++) {
+            splash_victim(&cre, 1300);
+            cre.height = heights[h];
+            list[0] = &cre;
+            memset(sim.fx.timed, 0, sizeof(sim.fx.timed));
+            q2_sim_set_world_targets(&sim, list, 1);
+            bfg_ball_at(&sim, room_a, -1);
+            sim.cur_dt = 12;
+            q2_sim_combat_tick(&sim);
+            q2_sim_set_world_targets(&sim, NULL, 0);
+            check(q2_fx_timed_live(&sim.fx) == 1 &&
+                  sim.fx.timed[0].to[1] == 300 + (572 - heights[h]) / 2 &&
+                  sim.fx.timed[0].to[0] == 1300 && sim.fx.timed[0].to[2] == 500,
+                  "the beam ends at the hull's middle, not the bare origin");
+        }
+    }
+
     q2_sim_free(&sim);
 }
 
@@ -5666,12 +5915,314 @@ static void test_bolt_trail(void)
           "(0x800482B4)");
 }
 
+static u32 bolt_group_motion_hash(const q2_fx_group *g)
+{
+    u32 hash = 2166136261u, i;
+    int k;
+    for (i = 0; i < g->count; i++) for (k = 0; k < 6; k++) {
+        s16 value = k < 3 ? (s16)(g->vel[k] + (i ? g->rel_vel[i - 1][k] : 0))
+                            : (i ? g->offset[i - 1][k - 3] : 0);
+        hash = (hash ^ ((u16)value & 255u)) * 16777619u;
+        hash = (hash ^ ((u16)value >> 8)) * 16777619u;
+    }
+    return hash;
+}
+
+static void test_bolt_native_sequence(void)
+{
+    u32 row;
+    printf("native bolt expiry, contact, effect placement and shared RNG sequence\n");
+    memset(&g_kill_tab, 0, sizeof(g_kill_tab));
+    g_kill_tab.loaded = true;
+    for (row = 0; row < Q2PSX_ARRAY_COUNT(native_bolts); row++) {
+        const native_bolt_case *r = &native_bolts[row];
+        q2_sim sim;
+        q2_actor victim, *targets[1];
+        q2_move_target wall = {0};
+        q2_projectile *p;
+        q2_fire_result_v2 shot = {0};
+        s32 feet[3] = {0, 286, 0};
+        u32 e, lights = 0, groups = 0;
+        int k, failures_before = g_failures;
+        q2_sim_init(&sim, NULL, 50);
+        q2_sim_spawn(&sim, feet, 0);
+        q2_sim_attach_effects(&sim, &g_kill_tab, r->seed);
+        sim.cur_dt = sim.level_time = r->dt;
+        q2_actor_init(&victim);
+        victim.origin[0] = 600; victim.radius = 50; victim.height = 572;
+        victim.health = 1000; victim.takedamage = Q2_DAMAGE_YES;
+        targets[0] = &victim;
+        if (r->mode == 1 || r->mode == 2) q2_sim_set_world_targets(&sim, targets, 1);
+        if (r->mode == 2) {
+            wall.min[0] = 400; wall.max[0] = 420;
+            wall.min[1] = wall.min[2] = -1000;
+            wall.max[1] = wall.max[2] = 1000;
+            wall.kind = Q2_MOVE_KIND_ENTITY; wall.active = true;
+            sim.move_world.targets = &wall; sim.move_world.count = 1;
+        }
+        if (r->mode == 3) {
+            check(open_box_hull(&sim.coll_primary), "bolt fixture opens its point hull");
+            hwr32(g_hull + 4 + 12, 600);
+            hwr16(g_hull + 4 + 2 * Q2_COLL_NODE_SIZE + Q2_COLL_PLANE_SIZE, 600);
+            sim.coll_primary_ready = true;
+        }
+        shot.fired = true; shot.shot_count = 1; shot.kind = Q2_FK_BOLT;
+        shot.mod = Q2_MOD_BOLT;
+        memcpy(shot.shot[0].origin, r->start, sizeof(r->start));
+        memcpy(shot.shot[0].dir, r->velocity, sizeof(r->velocity));
+        shot.shot[0].damage = 10;
+        check_eq_i(q2_projectile_launch(&sim.combat.projectiles, &shot, 0, 0), 0,
+                   "native bolt case launches");
+        p = &sim.combat.projectiles.p[0];
+        p->flags = (u16)r->flags; p->expires = r->remaining;
+        q2_rng_seed(&sim.combat.rng, r->seed);
+        q2_random_seed(r->seed);
+        q2_sim_combat_tick(&sim);
+        check_eq_i(p->in_use, r->live, "native bolt liveness");
+        check_eq_i(sim.combat.rng.state, r->rng, "native bolt RNG after the whole sweep");
+        check_eq_i(victim.health, 1000 - r->damage * 10, "entity contact shields the actor");
+        for (k = 0; k < 3; k++) check_eq_i(p->pos[k], r->position[k], "native bolt final position");
+        for (e = 0; e < sim.ent_world.events.count; e++) {
+            const q2_ent_event *light = &sim.ent_world.events.e[e];
+            if (light->kind != Q2_ENT_EVENT_LIGHT) continue;
+            if (lights < (u32)r->light_count) {
+                for (k = 0; k < 3; k++) {
+                    check_eq_i(light->pos[k], r->lights[lights].position[k], "native flight light position");
+                    check_eq_i(light->glow[k], (r->lights[lights].colour >> (k * 8)) & 255,
+                               "native flight light colour");
+                }
+                check_eq_i(light->inner_radius, r->lights[lights].radii & 65535, "native flight light inner radius");
+                check_eq_i(light->radius, r->lights[lights].radii >> 16, "native flight light outer radius");
+            }
+            lights++;
+        }
+        check_eq_i(lights, r->light_count, "native flight light count");
+        for (e = 0; e < sim.fx.group_count; e++) {
+            const q2_fx_group *g = &sim.fx.group[e];
+            if (!g->life) continue;
+            if (groups < (u32)r->group_count) {
+                for (k = 0; k < 3; k++) {
+                    check_eq_i(g->origin[k], r->groups[groups].origin[k], "native effect anchor");
+                    check_eq_i(g->vel[k], r->groups[groups].velocity[k], "native effect velocity");
+                }
+                for (k = 0; k < 2; k++) check(g->ramp[k] == q2_fx_ramp_at(&g_kill_tab, r->groups[groups].ramps[k]),
+                                              "native impact/trail colour ramp");
+                check_eq_i(g->count, r->groups[groups].count, "native particle count");
+                check_eq_i(g->life, r->groups[groups].life, "native particle lifetime");
+                check_eq_i(g->size, r->groups[groups].size, "native particle size");
+                check_eq_i(g->accel[1], r->groups[groups].accel_y, "native particle acceleration");
+                check_eq_i(bolt_group_motion_hash(g), r->groups[groups].motion_hash,
+                           "all particle velocities and offsets match native arguments");
+            }
+            groups++;
+        }
+        check_eq_i(groups, r->group_count, "native effect group count");
+        if (g_failures != failures_before) printf("  bolt case %u flags=%d mode=%d remaining=%d\n",
+                                                  row, r->flags, r->mode, r->remaining);
+        q2_sim_free(&sim);
+    }
+}
+
 /*
  * A creature's bolt and rocket are the player's projectiles with the
  * creature's own velocity rule (0x80062000: aim / 64; 0x8006210C: aim * 3/2),
  * and the player is a target of them. The bolt starts inside its shooter's
  * cylinder, which it must not hit.
  */
+static void test_creature_rail(void)
+{
+    q2_sim sim;
+    q2_actor shooter, victims[2];
+    q2_actor *targets[3] = { &shooter, &victims[0], &victims[1] };
+    const s32 feet[3] = { 0, 0, 6000 };
+    const s32 start[3] = { 0, -286, 0 };
+    const s32 dir[3] = { 0, 0, 16384 };
+    q2_cre_rail_result hit;
+    int i;
+
+    printf("creature rails stop in one body, miss off-axis and stop at walls\n");
+    q2_cre_set_skill(1);
+    q2_sim_init(&sim, NULL, 50);
+    q2_sim_spawn(&sim, feet, 0);
+    q2_actor_init(&shooter);
+    shooter.health = 100;
+    memcpy(shooter.origin, start, sizeof(start));
+    for (i = 0; i < 2; i++) {
+        q2_actor_init(&victims[i]);
+        victims[i].health = 100;
+        victims[i].takedamage = Q2_DAMAGE_AIM;
+        victims[i].origin[1] = -286;
+        victims[i].origin[2] = (i + 1) * 2000;
+    }
+    q2_sim_set_targets(&sim, targets, 3);
+    hit = q2_sim_creature_rail(&sim, &shooter, start, dir, 50);
+    /* 0x80049318 asks the native query once and 0x80049334 deals ONE
+     * DoDamage: the nearest body takes the rail and shields the rest. */
+    check(hit.creatures_hit == 1 && !hit.player_hit,
+          "a rail stops in the first creature on its line");
+    check(victims[0].health == 50 && victims[1].health == 100 &&
+          sim.combat.inv.health == 100 && shooter.health == 100,
+          "which alone takes the hit; the shooter is excluded");
+    check_eq_i(hit.end[2], 16384, "the beam is still drawn to the world's end");
+
+    /* Clear the line and the player behind is the first body. */
+    victims[0].origin[0] = victims[1].origin[0] = 3000;
+    hit = q2_sim_creature_rail(&sim, &shooter, start, dir, 50);
+    check(hit.creatures_hit == 0 && hit.player_hit && sim.combat.inv.health == 50,
+          "with the creatures off its line the rail reaches the player");
+    victims[0].origin[0] = victims[1].origin[0] = 0;
+
+    sim.player[0].pos[0] = 2000;
+    hit = q2_sim_creature_rail(&sim, &shooter, start, dir, 10);
+    check(!hit.player_hit && sim.combat.inv.health == 50,
+          "stepping out of the saved rail aim avoids its damage");
+
+    check(two_room_hull(&sim.coll, 12, 34), "the rail's two-room hull parses");
+    sim.coll_ready = true;
+    for (i = 0; i < 2; i++) {
+        victims[i].health = 100;
+        victims[i].origin[0] = 1500;
+        victims[i].origin[1] = 300;
+        victims[i].origin[2] = 500;
+        victims[i].radius = 50;
+    }
+    {
+        const s32 from[3] = { 500, 300, 500 };
+        const s32 across[3] = { 3000, 0, 0 };
+        hit = q2_sim_creature_rail(&sim, &shooter, from, across, 50);
+    }
+    check(hit.creatures_hit == 0 && !hit.player_hit && hit.end[0] <= 1000,
+          "the wall stops both damage and the visible beam");
+    check(victims[0].health == 100 && victims[1].health == 100,
+          "creatures behind cover remain unhurt");
+    q2_sim_free(&sim);
+}
+
+static void test_creature_laser(void)
+{
+    q2_sim sim;
+    q2_actor shooter, victims[2];
+    q2_actor *targets[3] = { &shooter, &victims[0], &victims[1] };
+    const s32 feet[3] = { 0, 0, 6000 }, start[3] = { 0, -286, 0 };
+    const s32 aim[3] = { 0, 0, 4096 };
+    q2_cre_rail_result hit;
+    int i;
+    printf("Strider laser selects one body and keeps its beam to the wall\n");
+    q2_cre_set_skill(1); q2_sim_init(&sim, NULL, 50); q2_sim_spawn(&sim, feet, 0);
+    memset(&g_splash_tab, 0, sizeof(g_splash_tab)); g_splash_tab.loaded = true;
+    q2_sim_attach_effects(&sim, &g_splash_tab, 1);
+    q2_actor_init(&shooter); shooter.health = 100;
+    memcpy(shooter.origin, start, sizeof(start));
+    for (i = 0; i < 2; i++) {
+        q2_actor_init(&victims[i]); victims[i].health = 100;
+        victims[i].takedamage = Q2_DAMAGE_AIM;
+        victims[i].origin[1] = -286; victims[i].origin[2] = (i + 1) * 2000;
+    }
+    q2_sim_set_targets(&sim, targets, 3);
+    hit = q2_sim_creature_laser(&sim, &shooter, start, aim, 50);
+    check(hit.creatures_hit == 1 && !hit.player_hit && victims[0].health == 50 &&
+          victims[1].health == 100 && shooter.health == 100,
+          "only the nearest body takes the laser's 50 damage");
+    check(hit.end[2] == 32768 && sim.fx.beam_count == 1 &&
+          sim.fx.beam[0].to[2] == 32768 && sim.fx.beam[0].radius == 32,
+          "the native eight-times aim draws a radius-32 beam beyond the body");
+    victims[0].origin[0] = victims[1].origin[0] = 2000;
+    hit = q2_sim_creature_laser(&sim, &shooter, start, aim, 50);
+    check(hit.player_hit && sim.combat.inv.health == 50,
+          "the player behind displaced creatures becomes the nearest target");
+    check(two_room_hull(&sim.coll, 12, 34), "the laser test hull parses");
+    sim.coll_ready = true;
+    for (i = 0; i < 2; i++) {
+        victims[i].health = 100; victims[i].origin[0] = 1500;
+        victims[i].origin[1] = 300; victims[i].origin[2] = 500; victims[i].radius = 50;
+    }
+    {
+        const s32 from[3] = { 500, 300, 500 }, across[3] = { 4096, 0, 0 };
+        memcpy(shooter.origin, from, sizeof(from));
+        hit = q2_sim_creature_laser(&sim, &shooter, from, across, 50);
+    }
+    check(!hit.creatures_hit && !hit.player_hit && hit.end[0] <= 1000 &&
+          victims[0].health == 100 && victims[1].health == 100,
+          "PrimaryColl limits both body selection and beam range");
+    q2_sim_free(&sim);
+}
+
+static void test_mission_laser(void)
+{
+    q2_sim sim;
+    q2_move_target door = {0};
+    q2_actor creature;
+    q2_actor *targets[1] = { &creature };
+    const s32 feet[3] = {2000, 300 + Q2_EYE_BASE, 3000};
+    const s32 from[3] = {2000, 300, 500}, to[3] = {2000, 300, 3500};
+    const s32 dir[3] = {0, 0, 3000}, short_to[3] = {2000, 300, 2500};
+    printf("mission beams sweep actors across their authored segment\n");
+    q2_sim_init(&sim, NULL, 50);
+    q2_sim_spawn(&sim, feet, 0);
+    check(open_box_hull(&sim.coll), "the mission beam room parses");
+    sim.coll_ready = true;
+    door.min[2] = 2000;
+    door.max[0] = HULL_SX; door.max[1] = HULL_SY; door.max[2] = 2200;
+    door.kind = Q2_MOVE_KIND_ENTITY; door.active = true;
+    sim.move_world.targets = &door; sim.move_world.count = 1;
+    check(q2_sim_creature_hitscan(&sim, NULL, from, dir, 1, Q2_MOD_BULLET,
+                                  false, NULL) == -1 && sim.combat.inv.health == 100,
+          "an ordinary bullet stops at the closed door");
+    check(q2_sim_mission_laser(&sim, from, to, 1, 16) == Q2_SIM_HIT_PLAYER &&
+          sim.combat.inv.health == 99,
+          "the mission beam follows the actor-only retail sweep past that door");
+    check(q2_sim_mission_laser(&sim, from, short_to, 1, 16) == -1 &&
+          sim.combat.inv.health == 99,
+          "the authored endpoint still limits the damage segment");
+    q2_actor_init(&creature); creature.health = 100;
+    creature.takedamage = Q2_DAMAGE_AIM;
+    creature.origin[0] = 2000; creature.origin[1] = 300; creature.origin[2] = 2500;
+    creature.radius = 50;
+    q2_sim_set_targets(&sim, targets, 1);
+    check(q2_sim_mission_laser(&sim, from, to, 1, 16) == 0 &&
+          creature.health == 99 && sim.combat.inv.health == 99,
+          "only the nearest body is damaged, whether creature or player");
+    q2_sim_set_targets(&sim, NULL, 0);
+    q2_sim_free(&sim);
+}
+
+static void test_creature_grenade(void)
+{
+    q2_sim sim;
+    q2_actor shooter;
+    const s32 start[3] = { 0, -286, 2000 };
+    const s32 aim[3] = { 0, 0, 4096 };
+    s32 index;
+    q2_projectile *p;
+
+    printf("Gunner grenades toss, belong to the shooter and have a 600-tick fuse\n");
+    q2_sim_init(&sim, NULL, 50);
+    q2_actor_init(&shooter);
+    q2_random_seed(1234);
+    index = q2_sim_creature_launch(&sim, &shooter, Q2_FK_GRENADE,
+                                    start, aim, 50, 0, 600, 0);
+    check(index >= 0, "a grenade is a projectile, not instant damage");
+    if (index >= 0) {
+        p = &sim.combat.projectiles.p[index];
+        check(p->kind == Q2_PROJ_GRENADE && p->shooter == &shooter &&
+              p->owner == -1 && p->damage == 50 && p->mod == Q2_MOD_GRENADE,
+              "the projectile retains its creature, damage and weapon kind");
+        check_eq_i(p->expires - sim.level_time, 600,
+                   "the creature fuse is two seconds, not the player's three");
+        check_eq_i(q2_projectile_raw_velocity(p, 2), 6184,
+                   "the seeded right spread follows retail vectoangles' axial yaw");
+        check(q2_projectile_raw_velocity(p, 1) < -1900 &&
+              q2_projectile_raw_velocity(p, 1) > -2200,
+              "the wrapper supplies the randomized upward toss");
+        check_eq_i(sim.combat.inv.health, 100,
+                   "spawning a grenade does not immediately hurt the player");
+    }
+    check(q2_sim_creature_launch(&sim, &shooter, Q2_FK_GRENADE,
+                                  start, aim, 50, 0, 0, 0) < 0,
+          "an invalid grenade speed cannot divide by zero");
+    q2_sim_free(&sim);
+}
+
 static void test_creature_launch(void)
 {
     q2_sim   sim;
@@ -5708,14 +6259,14 @@ static void test_creature_launch(void)
     q2_sim_set_targets(&sim, targets, 1);
 
     rocket = q2_sim_creature_launch(&sim, &cre, Q2_FK_ROCKET, start, aim, 50,
-                                    0);
+                                    0, 550, 0);
     check(rocket >= 0, "the rocket takes a slot");
     check_eq_i(q2_projectile_raw_velocity(&sim.combat.projectiles.p[rocket],
                                           2), -6144,
                "at half again the aim, where the player's launcher doubles");
     q2_projectiles_init(&sim.combat.projectiles);
 
-    bolt = q2_sim_creature_launch(&sim, &cre, Q2_FK_BOLT, start, aim, 16, 0);
+    bolt = q2_sim_creature_launch(&sim, &cre, Q2_FK_BOLT, start, aim, 16, 0, 800, 0);
     check(bolt >= 0, "the bolt takes a slot");
     check(sim.combat.projectiles.p[bolt].shooter == &cre &&
           sim.combat.projectiles.p[bolt].owner == -1,
@@ -5794,6 +6345,238 @@ static void test_rocket_attitude(void)
     q2_sim_free(&sim);
 }
 
+static void test_projectile_contacts(void)
+{
+    static const q2_fire_kind kinds[] = {Q2_FK_GRENADE, Q2_FK_HAND_GRENADE,
+                                         Q2_FK_ROCKET, Q2_FK_BOLT, Q2_FK_BFG};
+    int kind, scenario;
+    printf("native projectile owner exclusion, immune contacts and return hits\n");
+    for (kind = 0; kind < 5; kind++) for (scenario = 0; scenario < (kind < 2 ? 4 : 2); scenario++) {
+        q2_sim sim;
+        q2_fire_result_v2 shot = {0};
+        q2_actor first, second, *targets[3];
+        q2_projectile *p;
+        s32 spawn[3] = {0, 286, 0}, slot;
+        q2_sim_init(&sim, NULL, 50);
+        q2_sim_spawn(&sim, spawn, 0);
+        sim.gravity = 0; sim.cur_dt = 20; sim.level_time = 20;
+        sim.combat.inv.health = 1000; sim.combat.inv.armour = 0;
+        sim.combat.inv.invuln_until = 0;
+        q2_actor_init(&first); q2_actor_init(&second);
+        first.origin[0] = kind == 4 ? 50 : scenario == 0 ? 600 : 400;
+        second.origin[0] = kind == 4 ? 150 : 800;
+        first.radius = second.radius = 50;
+        first.health = second.health = 1000;
+        first.takedamage = scenario == 1 ? Q2_DAMAGE_NO : Q2_DAMAGE_YES;
+        second.takedamage = Q2_DAMAGE_YES;
+        targets[0] = scenario == 0 ? &sim.combat.self : &first;
+        targets[1] = scenario == 0 ? &first : &second;
+        if (scenario < 2) q2_sim_set_world_targets(&sim, targets, 2);
+        shot.fired = true; shot.shot_count = 1;
+        shot.kind = kinds[kind];
+        shot.mod = kind < 2 ? Q2_MOD_GRENADE : kind == 2 ? Q2_MOD_ROCKET :
+                     kind == 4 ? Q2_MOD_ENERGY_BOLT : Q2_MOD_BOLT;
+        shot.projectile_timer = 1200;
+        shot.shot[0].damage = 120;
+        shot.shot[0].origin[0] = scenario == 0 ? -100 : scenario >= 2 ? 500 : 0;
+        shot.shot[0].dir[0] = scenario >= 2 ? -8000 : kind == 3 ? 50 : kind == 4 ? 4096 : 16000;
+        slot = q2_projectile_launch(&sim.combat.projectiles, &shot, 0, 0);
+        check(slot >= 0, "contact fixture launches");
+        if (slot < 0) { q2_sim_free(&sim); continue; }
+        if (kind == 1) q2_projectile_hand_release(&sim.combat.projectiles, 0,
+                                            shot.shot[0].origin, shot.shot[0].dir);
+        p = &sim.combat.projectiles.p[slot];
+        if (scenario == 3) sim.invulnerable = true;
+        q2_sim_combat_tick(&sim);
+        check(!p->in_use && sim.projectile_blasts == (kind < 3 ? 1u : 0u),
+              "actor contact consumes the shot and creates its own explosion kind");
+        /* These exact clipped coordinates come from PAL 0x800544EC execution;
+         * truncation leaves the contact one unit outside the ideal cylinder. */
+        check_eq_i(p->pos[0], kind == 4 ? (scenario == 0 ? -1 : 0) :
+                             scenario == 0 ? 549 : scenario == 1 ? 349 : 287,
+                   "damage and explosion retain the native clipped contact");
+        if (scenario == 0)
+            check_eq_i(first.health, 880, "ignoring the owner does not hide the next body");
+        if (scenario == 1) {
+            check_eq_i(first.health, 1000, "an immune collision body takes no damage");
+            check(kind == 3 ? second.health == 1000 : second.health > 880 && second.health < 1000,
+                  "the shielded body receives only splash when the shot has a blast");
+        }
+        if (scenario >= 2)
+            check_eq_i(sim.combat.inv.health, scenario == 2 ? 946 : 1000,
+                       "a returning grenade applies only half self-splash, respecting capture god mode");
+        q2_sim_free(&sim);
+    }
+}
+
+static void test_grenade_owner_slots_and_fuse(void)
+{
+    int owner, hand;
+    printf("returning grenades retain every player and creature owner; creature fuses reach single player\n");
+    for (owner = 0; owner < 5; owner++) for (hand = 0; hand < (owner == 4 ? 1 : 2); hand++) {
+        q2_sim sim;
+        q2_actor creature, *targets[5], *attacker;
+        q2_fire_result_v2 shot = {0};
+        s32 slot, spawn[3] = {0, 286, 0};
+        int pi;
+        q2_sim_init(&sim, NULL, 50);
+        for (pi = 0; pi < 4; pi++) {
+            q2_sim_select_player(&sim, pi);
+            spawn[0] = pi * 5000;
+            q2_sim_spawn(&sim, spawn, 0);
+            sim.combat.inv.health = 1000; sim.combat.inv.armour = 0;
+            sim.combat.inv.invuln_until = 0;
+            q2_sim_player_loadout(&sim, pi, &sim.combat.inv, Q2_WID_BLASTER);
+        }
+        q2_sim_select_player(&sim, 0);
+        q2_actor_init(&creature);
+        creature.origin[0] = 20000; creature.health = 1000;
+        creature.takedamage = Q2_DAMAGE_YES;
+        targets[0] = &sim.combat.self;
+        for (pi = 1; pi < 4; pi++) targets[pi] = &sim.pcombat[pi].self;
+        targets[4] = &creature; attacker = targets[owner];
+        q2_sim_set_world_targets(&sim, targets, 5);
+        sim.gravity = 0; sim.cur_dt = 20; sim.level_time = 20;
+        shot.kind = hand ? Q2_FK_HAND_GRENADE : Q2_FK_GRENADE;
+        shot.fired = true; shot.shot_count = 1; shot.mod = Q2_MOD_GRENADE;
+        shot.projectile_timer = 1200; shot.shot[0].damage = 120;
+        shot.shot[0].origin[0] = owner * 5000 + 500;
+        shot.shot[0].dir[0] = -8000;
+        slot = q2_projectile_launch(&sim.combat.projectiles, &shot, owner < 4 ? owner : -1, 0);
+        check(slot >= 0, "owner-slot fixture launches");
+        if (slot < 0) { q2_sim_free(&sim); continue; }
+        if (hand) q2_projectile_hand_release(&sim.combat.projectiles, owner,
+                                            shot.shot[0].origin, shot.shot[0].dir);
+        if (owner == 4) sim.combat.projectiles.p[slot].shooter = &creature;
+        q2_sim_combat_tick(&sim);
+        check(!sim.combat.projectiles.p[slot].in_use, "every owner's returning grenade hits");
+        check_eq_i(attacker->health, 946, "each owner takes only self splash");
+        if (owner < 4)
+            check_eq_i(owner ? sim.pcombat[owner].inv.health : sim.combat.inv.health,
+                       946, "the correct owner's inventory receives the damage");
+        q2_sim_free(&sim);
+    }
+    for (owner = 0; owner < 2; owner++) {
+        q2_sim sim;
+        q2_actor shooter;
+        q2_fire_result_v2 shot = {0};
+        s32 spawn[3] = {0, 286, 0}, slot;
+        q2_cre_set_skill(1);
+        q2_sim_init(&sim, NULL, 50); q2_sim_spawn(&sim, spawn, 0);
+        q2_actor_init(&shooter); shooter.origin[0] = 5000;
+        sim.combat.inv.health = 1000; sim.combat.inv.armour = 0;
+        sim.invulnerable = owner != 0;
+        sim.gravity = 0; sim.cur_dt = 20; sim.level_time = 20;
+        shot.kind = Q2_FK_GRENADE; shot.fired = true; shot.shot_count = 1;
+        shot.mod = Q2_MOD_GRENADE; shot.projectile_timer = 20;
+        shot.shot[0].origin[0] = 400; shot.shot[0].dir[0] = 1;
+        shot.shot[0].damage = 120;
+        slot = q2_projectile_launch(&sim.combat.projectiles, &shot, -1, 0);
+        check(slot >= 0, "creature fuse fixture launches");
+        if (slot < 0) { q2_sim_free(&sim); continue; }
+        sim.combat.projectiles.p[slot].shooter = &shooter;
+        q2_sim_combat_tick(&sim);
+        check_eq_i(sim.combat.inv.health, owner ? 1000 : 896,
+                   "a creature's expired grenade reaches the single player unless capture god mode is on");
+        q2_sim_free(&sim);
+    }
+}
+
+static void test_grenade_geometry(void)
+{
+    int hand;
+    printf("grenade geometry bounce, rest, actor priority and fuse ordering\n");
+    for (hand = 0; hand < 2; hand++) {
+        q2_sim sim;
+        q2_fire_result_v2 shot = {0};
+        q2_move_target wall = {0};
+        q2_actor victim, *targets[1];
+        q2_projectile *p;
+        s32 at[3], slot;
+        u32 rng;
+        q2_sim_init(&sim, NULL, 50);
+        sim.gravity = 0; sim.cur_dt = 20; sim.level_time = 20;
+        wall.min[0] = 50; wall.max[0] = 60;
+        wall.min[1] = wall.min[2] = -1000;
+        wall.max[1] = wall.max[2] = 1000;
+        wall.kind = Q2_MOVE_KIND_ENTITY; wall.active = true;
+        sim.move_world.targets = &wall; sim.move_world.count = 1;
+        splash_victim(&victim, 40);
+        targets[0] = &victim;
+        q2_sim_set_world_targets(&sim, targets, 1);
+        shot.fired = true; shot.shot_count = 1;
+        shot.kind = hand ? Q2_FK_HAND_GRENADE : Q2_FK_GRENADE;
+        shot.shot[0].origin[1] = 300; shot.shot[0].origin[2] = 500;
+        shot.shot[0].dir[0] = 1000;
+        shot.shot[0].damage = 120; shot.mod = Q2_MOD_GRENADE;
+        shot.projectile_timer = 200;
+        slot = q2_projectile_launch(&sim.combat.projectiles, &shot, 0, 0);
+        check(slot >= 0, "a grenade exists for the integration test");
+        if (slot < 0) { q2_sim_free(&sim); continue; }
+        if (hand) check(q2_projectile_hand_release(&sim.combat.projectiles, 0,
+                       shot.shot[0].origin, shot.shot[0].dir), "release the held grenade");
+        p = &sim.combat.projectiles.p[slot];
+        q2_random_seed(1);
+        q2_sim_combat_tick(&sim);
+        check(p->in_use && p->bounced, "entity geometry rebounds without detonating");
+        check_eq_i(p->pos[0], -13, "entity hit withdraws the full delta and unit push");
+        check_eq_i(q2_projectile_raw_velocity(p, 0), -561, "quantized SDK speed reverses velocity");
+        check((p->flags & Q2_PROJ_TOSS_REST) != 0, "a slow rebound rests");
+        check_eq_i(victim.health, 100, "geometry suppresses the actor sweep and splash");
+        check_eq_i(sim.projectile_blasts, 0, "a rebound makes no fireball");
+        check(q2_model_ent_sound_next(&sim.grenade_bounce_sounds, at) && same3(at, p->pos),
+              "bounce sound uses the post-contact position");
+        check(!q2_model_ent_sound_next(&sim.grenade_bounce_sounds, at), "one sound per contact");
+        rng = q2_random_state();
+        sim.level_time = 40;
+        q2_sim_combat_tick(&sim);
+        check_eq_i(p->pos[0], -13, "resting grenades remain fixed");
+        check_eq_i(q2_random_state(), rng, "resting tosses consume no tumble RNG");
+        check_eq_i(sim.grenade_bounce_sounds.count, 0, "rest does not repeat contact sounds");
+        sim.level_time = p->expires;
+        q2_sim_combat_tick(&sim);
+        check(!p->in_use && sim.projectile_blasts == 1, "a resting fuse still detonates once");
+
+        q2_projectiles_init(&sim.combat.projectiles);
+        sim.projectile_blasts = 0;
+        q2_sim_set_world_targets(&sim, NULL, 0);
+        slot = q2_projectile_launch(&sim.combat.projectiles, &shot, 0, 0);
+        if (hand) q2_projectile_hand_release(&sim.combat.projectiles, 0,
+                       shot.shot[0].origin, shot.shot[0].dir);
+        p = &sim.combat.projectiles.p[slot];
+        p->expires = 20; sim.level_time = 20;
+        q2_sim_combat_tick(&sim);
+        check(!p->in_use && sim.projectile_blasts == 1, "contact on the fuse tick detonates");
+        check_eq_i(p->pos[0], -13, "expiry occurs at the rebound point, after movement");
+        check_eq_i(sim.grenade_bounce_sounds.count, 1, "that final contact still sounds");
+
+        q2_projectiles_init(&sim.combat.projectiles);
+        q2_model_ent_sounds_clear(&sim.grenade_bounce_sounds);
+        sim.projectile_blasts = 0; sim.move_world.count = 0;
+        slot = q2_projectile_launch(&sim.combat.projectiles, &shot, 0, 0);
+        if (hand) q2_projectile_hand_release(&sim.combat.projectiles, 0,
+                       shot.shot[0].origin, shot.shot[0].dir);
+        p = &sim.combat.projectiles.p[slot]; p->expires = 20;
+        q2_sim_combat_tick(&sim);
+        check(!p->in_use, "an unobstructed fuse expires too");
+        check_eq_i(p->pos[0], 62, "a clear expiry tick also commits movement first");
+        check_eq_i(sim.grenade_bounce_sounds.count, 0, "clear movement has no bounce sound");
+
+        q2_projectiles_init(&sim.combat.projectiles);
+        sim.projectile_blasts = 0;
+        q2_sim_set_world_targets(&sim, targets, 1);
+        slot = q2_projectile_launch(&sim.combat.projectiles, &shot, 0, 0);
+        if (hand) q2_projectile_hand_release(&sim.combat.projectiles, 0,
+                       shot.shot[0].origin, shot.shot[0].dir);
+        p = &sim.combat.projectiles.p[slot];
+        q2_sim_combat_tick(&sim);
+        check(!p->in_use && victim.health < 100, "an unobstructed actor contact still damages");
+        check_eq_i(sim.projectile_blasts, 1, "actor contact detonates");
+        check_eq_i(sim.grenade_bounce_sounds.count, 0, "actor contact is not a geometry bounce");
+        q2_sim_free(&sim);
+    }
+}
+
 /* ------------------------------------------------------------------------- */
 int main(void)
 {
@@ -5802,6 +6585,7 @@ int main(void)
     test_item_group_selection();
     test_mode_picks_the_batches();
     test_script_fx_damage();
+    test_environment_burn_sounds();
     test_death_voice();
     test_event_contact_categories();
     test_underwater_air();
@@ -5812,6 +6596,9 @@ int main(void)
     test_kick_fields();
     test_muzzle_clip();
     test_held_hand_grenade();
+    test_projectile_contacts();
+    test_grenade_owner_slots_and_fuse();
+    test_grenade_geometry();
     test_tick_rate();
     test_gravity();
     test_scene_lights();
@@ -5836,6 +6623,7 @@ int main(void)
     test_variable_dt();
     test_four_players();
     test_player_weapon_context();
+    test_native_damage_view_state();
     test_melee_point();
     test_shot_point();
     test_train();
@@ -5862,7 +6650,12 @@ int main(void)
     test_bfg_beams_damage();
     test_kill_raises_no_burst();
     test_bolt_trail();
+    test_bolt_native_sequence();
     test_creature_launch();
+    test_creature_grenade();
+    test_creature_rail();
+    test_creature_laser();
+    test_mission_laser();
     test_rocket_attitude();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);

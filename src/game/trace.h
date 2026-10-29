@@ -516,6 +516,20 @@ bool q2_move_step(q2_collision *coll, q2_move_ent *ent, const s16 delta[3],
                   const q2_move_bodies *bodies, s32 self_id,
                   const s16 mins[3], const s16 maxs[3], struct q2_rng *rng);
 
+/* The live creature passes a3=1 for walkers, even while airborne. Players
+ * pass zero. The body pass runs only on the final (integrating) call. */
+bool q2_move_actor(q2_collision *coll, q2_move_ent *ent, const s16 delta[3],
+                  const q2_move_world *world, const q2_move_bodies *bodies,
+                  s32 self_id, const s16 mins[3], const s16 maxs[3],
+                  struct q2_rng *rng, bool force_step);
+
+/* Shared actor physics, 0x800459E8 and 0x80045E74..0x80046200. Velocity,
+ * displacement and impulse are separate signed-halfword records. */
+void q2_move_ground_project(q2_move_ent *ent, s16 velocity[3]);
+void q2_move_integrate(q2_move_ent *ent, s16 velocity[3], s16 impulse[3],
+                       u32 *actor_flags, s32 gravity, s32 dt, bool multiplayer,
+                       s16 delta[3]);
+
 /* 0x80045880: 216 unless the entity's flags carry 0x600, then 108. */
 s32 q2_move_step_height(u32 flags);
 

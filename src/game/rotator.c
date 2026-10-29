@@ -821,3 +821,16 @@ bool q2_rotators_node_transform(const q2_rotator_set *set, u32 node,
 
     return false;
 }
+
+void q2_rotators_node_offset(const q2_rotator_set *set, u32 node, s32 out[3])
+{
+    u32 i;
+    out[0] = out[1] = out[2] = 0;
+    if (!set) return;
+    for (i = 0; i < set->count; i++)
+        if (set->rotators[i].node >= 0 && (u32)set->rotators[i].node == node) {
+            int k;
+            for (k = 0; k < 3; k++) out[k] = set->rotators[i].offset[k];
+            return;
+        }
+}

@@ -604,8 +604,7 @@ static void test_scoreboard(void)
     CHECK(strstr(lines[4], "PLAYER 4") != NULL,
           "the last line is a player, not a prompt: '%s'", lines[4]);
 
-    /* A team mode adds the module's own "%s TEAM SCORED %d" for each team
-     * with a score, after the players. */
+    /* Team headings precede their players, ordered by team total. */
     q2_mp_session_init(&s, Q2_MP_TEAM_DEATHMATCH, 2);
     s.frags[0] = 4;
     s.team_frags[0] = 4;
@@ -615,8 +614,8 @@ static void test_scoreboard(void)
           lines[0]);
     CHECK(strcmp(lines[3], "BLUE TEAM SCORED 4") == 0,
           "blue team line, got '%s'", lines[3]);
-    CHECK(strcmp(lines[4], "RED TEAM SCORED 9") == 0,
-          "red team line, got '%s'", lines[4]);
+    CHECK(strcmp(lines[1], "RED TEAM SCORED 9") == 0,
+          "red team line, got '%s'", lines[1]);
 
     /* VERSUS scores ROUNDS, which live in the team array. */
     q2_mp_session_init(&s, Q2_MP_VERSUS, 2);
@@ -640,6 +639,56 @@ static void test_scoreboard(void)
     q2_mp_session_init(&s, Q2_MP_DEATHMATCH, 4);
     n = q2_mp_scoreboard(&s, NULL, lines, 2);
     CHECK(n == 2, "the line count is a limit, got %u", n);
+}
+
+static void test_retail_teams_and_results(void)
+{
+    q2_mp_session s;
+    q2_mp_score_row rows[Q2_MP_SCORE_ROWS];
+    u32 n;
+    int i;
+    q2_mp_session_init(&s, Q2_MP_TEAM_DEATHMATCH, 4);
+    for (i = 0; i < 4; i++)
+        CHECK(s.team[i] == (i & 1), "retail default team for player %d", i);
+    q2_mp_player_killed(&s, 2, 0);
+    CHECK(s.frags[2] == -1 && s.team_frags[0] == -1,
+          "default blue teammates incur both penalties");
+    q2_mp_player_killed(&s, 3, 0);
+    CHECK(s.frags[3] == 1 && s.team_frags[1] == 1,
+          "player four contributes to red's score");
+    n = q2_mp_score_rows(&s, NULL, 1u << 3, rows, Q2_MP_SCORE_ROWS);
+    CHECK(n == 6, "four players plus both team headings, got %u", n);
+    CHECK(rows[0].player == -1 && rows[0].colour == 1 && rows[0].y == 76,
+          "leading red team is the first heading at retail y");
+    CHECK(rows[1].player == 3 && rows[2].player == 1 &&
+          rows[4].player == 0 && rows[5].player == 2,
+          "teams and their members sort by signed score");
+    CHECK(strstr(rows[1].text, "READY") && !strstr(rows[2].text, "READY"),
+          "READY follows player four after sorting");
+    CHECK(rows[3].y == 136 && rows[5].y == 166,
+          "15-pixel team gap and rows clear the fixed prompts");
+    s.team_frags[0] = 0;
+    CHECK(q2_mp_score_rows(&s, NULL, 0, rows, Q2_MP_SCORE_ROWS) == 6 &&
+          strcmp(rows[3].text, "BLUE TEAM SCORED 0") == 0,
+          "an active zero-scoring team stays on the board");
+
+    q2_mp_session_init(&s, Q2_MP_DEATHMATCH, 4);
+    s.frags[0] = -1; s.frags[1] = 5; s.frags[2] = 9; s.frags[3] = 5;
+    n = q2_mp_score_rows(&s, NULL, 1u << 3, rows, Q2_MP_SCORE_ROWS);
+    CHECK(n == 4 && rows[0].player == 2 && rows[1].player == 1 &&
+          rows[2].player == 3 && rows[3].player == 0,
+          "descending player scores, stable ties and negative scores");
+    CHECK(rows[0].y == 104 && rows[3].y == 149 && rows[0].highlight,
+          "four-player DM layout and coloured bands");
+    CHECK(strlen(rows[2].text) == 31 && !strncmp(rows[2].text + 2, "READY", 5) &&
+          !strncmp(rows[2].text + 12, "PLAYER 4", 8) && rows[2].text[26] == '5',
+          "retail fixed name, score and readiness columns");
+    s.mode = Q2_MP_VERSUS;
+    s.team_frags[0] = 2;
+    q2_mp_score_rows(&s, NULL, 0, rows, Q2_MP_SCORE_ROWS);
+    CHECK(rows[0].player == 0, "Versus sorts rounds won rather than frags");
+    CHECK(q2_mp_score_rows(&s, NULL, 0, rows, 1) == 1,
+          "bounded row buffer");
 }
 
 int main(void)
@@ -668,6 +717,7 @@ int main(void)
     test_hud_set();
     test_defaults();
     test_scoreboard();
+    test_retail_teams_and_results();
 
     if (g_fail) {
         printf("\n%d multiplayer check%s failed\n", g_fail,

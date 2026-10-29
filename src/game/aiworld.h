@@ -145,6 +145,7 @@ typedef struct q2_ai_world_bind {
     const q2_move_bodies    *bodies;
     const struct q2_monster *body_owner_base;   /* the creature set's array   */
     u32                      body_owner_count;
+    struct q2_monster       *player_owner; /* body id -2, the AI sight client */
 
     /* How far below a creature ground may be and still count. The step height,
      * because a creature that can climb a step can also stand off one. */

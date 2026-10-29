@@ -278,6 +278,7 @@ typedef struct q2_model_ent_sounds {
 } q2_model_ent_sounds;
 
 void q2_model_ent_sounds_clear(q2_model_ent_sounds *q);
+void q2_model_ent_sound_push(q2_model_ent_sounds *q, const s32 at[3]);
 
 /* Take the oldest queued position, or false when there is none. In the order
  * the spawns happened, which is the order their voices were allocated. */
@@ -640,6 +641,7 @@ typedef struct q2_gib_body {
 
 /* The body of an entity in the attached set, or NULL. */
 q2_gib_body *q2_gib_body_of(const q2_entity *e);
+bool q2_gib_body_restore(const q2_entity_set *set, u32 slot, const q2_gib_body *body);
 
 /* The arm 0x8007CEB4 takes for a body of this class. */
 q2_gib_arm q2_gib_arm_for_class(u16 cls, u16 was_class);

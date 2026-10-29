@@ -35,17 +35,17 @@ void q2_save_ui_rescan(q2_save_ui *ui)
     if (!ui)
         return;
 
-    if (ui->mode == Q2_SAVE_UI_SETTINGS_SAVE ||
+    if (ui->mode == Q2_SAVE_UI_UNLOCK_SAVE ||
+        ui->mode == Q2_SAVE_UI_SETTINGS_SAVE ||
         ui->mode == Q2_SAVE_UI_SETTINGS_LOAD) {
-        bool used[Q2_SAVE_SLOTS];
-
-        q2_settings_slots_scan(used, Q2_SAVE_SLOTS);
         for (i = 0; i < Q2_SAVE_SLOTS; i++) {
+            q2_settings_blob settings;
+            bool used = q2_settings_slot_read(&settings, i) == Q2_OK;
             memset(&ui->info[i], 0, sizeof(ui->info[i]));
-            ui->info[i].used = used[i];
-            if (used[i])
-                snprintf(ui->row[i], sizeof(ui->row[i]), "%d MULTIPLAYER",
-                         i + 1);
+            ui->info[i].used = used;
+            if (used)
+                snprintf(ui->row[i], sizeof(ui->row[i]), "%d %s", i + 1,
+                         settings.unlock_file ? "MULTI UNLOCK" : "MULTIPLAYER");
             else
                 ui->row[i][0] = '\0';
         }
@@ -109,6 +109,16 @@ void q2_save_ui_open_settings_load(q2_save_ui *ui)
     open_common(ui, Q2_SAVE_UI_SETTINGS_LOAD);
     ui->source = NULL;
     memset(&ui->settings_source, 0, sizeof(ui->settings_source));
+}
+
+void q2_save_ui_open_unlock_save(q2_save_ui *ui,
+                                 const q2_settings_blob *settings)
+{
+    if (!ui || !settings) return;
+    open_common(ui, Q2_SAVE_UI_UNLOCK_SAVE);
+    ui->source = NULL;
+    ui->settings_source = *settings;
+    ui->settings_source.unlock_file = true;
 }
 
 void q2_save_ui_close(q2_save_ui *ui)
@@ -250,7 +260,8 @@ static void do_save(q2_save_ui *ui)
 {
     q2_result rc;
 
-    if (ui->mode == Q2_SAVE_UI_SETTINGS_SAVE) {
+    if (ui->mode == Q2_SAVE_UI_SETTINGS_SAVE ||
+        ui->mode == Q2_SAVE_UI_UNLOCK_SAVE) {
         char where[Q2_SAVE_UI_MSG_MAX];
 
         rc = q2_settings_slot_write(&ui->settings_source, ui->slot);
@@ -264,7 +275,8 @@ static void do_save(q2_save_ui *ui)
         }
         ui->status = Q2_SAVE_UI_SAVED;
         snprintf(where, sizeof(where), "TO SLOT %d", ui->slot + 1);
-        set_message(ui, "SETTINGS SAVED", where);
+        set_message(ui, ui->mode == Q2_SAVE_UI_UNLOCK_SAVE ? "UNLOCK FILE SAVED"
+                                                          : "SETTINGS SAVED", where);
         q2_save_ui_rescan(ui);
         return;
     }
@@ -316,7 +328,8 @@ static void do_load(q2_save_ui *ui)
         }
         ui->have_settings_loaded = true;
         ui->status = Q2_SAVE_UI_LOADED;
-        set_message(ui, "SETTINGS LOADED", "MULTIPLAYER");
+        set_message(ui, "SETTINGS LOADED",
+                    ui->settings_loaded.unlock_file ? "MULTI UNLOCK" : "MULTIPLAYER");
         return;
     }
 
@@ -354,6 +367,7 @@ q2_save_ui_status q2_save_ui_update(q2_save_ui *ui)
         ui->status = Q2_SAVE_UI_FAILED;
         set_message(ui, "FAILED", "NO SLOT CHOSEN");
     } else if (ui->mode == Q2_SAVE_UI_SAVE ||
+               ui->mode == Q2_SAVE_UI_UNLOCK_SAVE ||
                ui->mode == Q2_SAVE_UI_SETTINGS_SAVE) {
         do_save(ui);
     } else {

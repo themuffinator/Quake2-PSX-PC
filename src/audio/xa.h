@@ -2,7 +2,7 @@
  * xa.h — CD-XA ADPCM: the streamed music in Q2DATA/AUD/QUAKE_[A-E].XAI.
  *
  * This is a completely different codec from the SPU-ADPCM in vag.h. Both are
- * 4-bit ADPCM with a four-tap predictor, and there the similarity ends: XA uses
+ * 4-bit ADPCM with a two-tap predictor; XA uses
  * 128-byte "sound groups" carrying eight interleaved blocks, decodes stereo, and
  * runs at 37800 Hz off the CD rather than out of sound RAM.
  *
@@ -71,9 +71,11 @@
 /* Every audio sector on this disc reports stereo / 37800 Hz / 4-bit. */
 #define XA_SAMPLE_RATE        37800
 #define XA_CHANNELS           2
+#define XA_OUTPUT_RATE        44100u
 
 /* Frames (stereo sample pairs) produced by one sector. */
 #define XA_FRAMES_PER_SECTOR  (XA_GROUPS_PER_SECTOR * XA_BLOCKS_PER_GROUP * XA_SAMPLES_PER_BLOCK / 2)
+#define XA_OUTPUT_FRAMES_PER_SECTOR (XA_FRAMES_PER_SECTOR / 6 * 7)
 
 #define XAI_CHANNEL_COUNT     4
 
@@ -85,6 +87,21 @@ typedef struct q2_xa_decoder {
 } q2_xa_decoder;
 
 void q2_xa_decoder_reset(q2_xa_decoder *dec);
+
+/* CD controller interpolation, before its volume matrix. One 37,800 Hz
+ * sector produces 2,352 stereo frames on the SPU's 44,100 Hz clock.
+ * Initialize with reset, retain history across sectors, and reset on stream
+ * changes. Input and output buffers must not overlap. */
+typedef struct q2_xa_resampler {
+    s16 history[XA_CHANNELS][32];
+    u32 position, phase;
+} q2_xa_resampler;
+
+void q2_xa_resampler_reset(q2_xa_resampler *resampler);
+/* Capacities and return value are stereo FRAMES, unlike the decoder below.
+ * Insufficient output capacity leaves both state and output untouched. */
+u32 q2_xa_resample_sector(q2_xa_resampler *resampler, const s16 *input,
+                         s16 *output, u32 output_capacity);
 
 /*
  * Decode one sector's 2304 ADPCM bytes into interleaved stereo PCM16.
@@ -190,7 +207,9 @@ s16 q2_xa_cd_volume_step(s16 live, s16 target);
  * (0x800719F4..0x80071A04). Zero: ALL FOUR carry volume/2, so each output is
  * the sum of both channels at half level (0x80071A08..0x80071A1C) — a fold to
  * mono, which is what SetCDVolume's own pair of arms at 0x80071BB0/0x80071BC4
- * does too. 255 is unity; the console's own clamp is at 0x800719D0.
+ * does too. The controller's unity byte is 128; 255 is nearly double gain.
+ * Each product truncates seven fractional bits before summation and 16-bit
+ * saturation. This is the CD matrix only, before the SPU's CD/main gains.
  */
 void q2_xa_cd_mix(s16 *pcm, u32 samples, s32 volume, bool stereo);
 

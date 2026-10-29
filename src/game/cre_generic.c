@@ -1,28 +1,11 @@
 /*
  * cre_generic.c — the fallback for a creature the port has not transcribed.
  *
- * Six of the disc's seven creature modules — Tankcomm, Gunner, Arachner,
- * Infantry, Berserk and Insane — have their structure decoded but not their
- * think functions. This is what they run on, and what it does is deliberately
- * narrow: it plays the animations the disc says they have, in the order the
- * disc says, driven by the real AI.
- *
- * So a Tank Commander stands, notices the player, turns, walks, breaks into its
- * run, chases through the level, and plays its attack animation — and it acts
- * while it does: every think index runs through `q2_cre_run_think`, which
- * executes the sound, the melee, the frame jump and the AI flag the decoder
- * read out of that very function, and now the projectile spawners too.
- *
- * (This comment used to end "it does not fire, because firing is a think
- * function and this does not have one". That stopped being true when the
- * trampolines below were added, and stayed in the file afterwards. What was
- * still true until recently is narrower: firing goes through the module's
- * IMPORT table, and an unclassified import did nothing. Five of them are now
- * named — see cre_actions.c.)
- *
- * What remains is per-creature: `q2psx-inspect creatures` prints which think
- * indices each module uses and which import each unclassified call wanted, so
- * the gap has an address rather than a shrug.
+ * This supplies decoded animation and action fragments for development. It
+ * does not implement arbitrary branch conditions, projectile arguments or
+ * special behavior. The seven native creatures no longer rely on this for
+ * their frame methods. The full COMMON/ZONE census finds 22 module names;
+ * generic callback availability must not be reported as working behavior.
  *
  * ---------------------------------------------------------------------------
  * How it picks an animation without knowing the creature
@@ -31,11 +14,10 @@
  * move, straight out of the module's own code, so "the move this creature's
  * stand callback installs" is a fact rather than an inference. The first move
  * a callback installs is the one taken; a creature that picks between several
- * at random will always take the same one here, which is the one respect in
- * which this is less than the disc.
+ * at random will always take the same one here. That is one of several known
+ * limitations, not a faithful implementation of that callback.
  */
 #include "ai.h"
-#include "crebind.h"
 #include "crebind.h"
 #include "monster.h"
 

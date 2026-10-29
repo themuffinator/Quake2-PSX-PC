@@ -178,6 +178,11 @@ q2_result q2_scene_parse(q2_scene *out, const q2_zone_file *zone);
 /* Decode node `index`. Returns false if out of range. */
 bool q2_scene_get_node(const q2_scene *s, u32 index, q2_scene_node *out);
 
+/* Native LevelBin handlers can replace a node's runtime culling bounds.
+ * Write through the owning, in-memory archive, never the source disc file. */
+bool q2_scene_set_bounds(q2_zone_file *zone, u32 index,
+                          const s32 min[3], const s32 max[3]);
+
 /* Locate node `index`'s polygon record. Returns false if malformed. */
 bool q2_scene_get_mapmod(const q2_scene *s, u32 index, q2_mapmod_rec *out);
 

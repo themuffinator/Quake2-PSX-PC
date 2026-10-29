@@ -54,6 +54,13 @@ compile_commands.json
 # Ready-to-launch local client, runtime files and the user's disc/configuration.
 /.install/
 
+# Original commercial branding and promotional reference material.
+/.branding/originals/
+# Local illustrated design references contain original commercial artwork.
+/.branding/design/
+# Local reconstructed typefaces and specimens derived from retail references.
+/.branding/fonts/
+
 # Agent build logs, captures and temporary test profiles.
 /.agents/tmp/
 

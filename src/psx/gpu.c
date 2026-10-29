@@ -317,6 +317,24 @@ psx_prim *psx_ot_batch_add(psx_ot *ot, s32 batch)
     return prim;
 }
 
+bool psx_ot_batch_append_prim(psx_ot *ot, s32 batch, psx_prim *prim)
+{
+    psx_ot_batch *b;
+    s32 idx;
+    if (!ot || !prim || batch < 0 || (u32)batch >= ot->batch_count ||
+        prim < ot->prims || prim >= ot->prims + ot->prim_count)
+        return false;
+    b = &ot->batch[batch];
+    idx = (s32)(prim - ot->prims);
+    ot->next[idx] = -1;
+    if (b->tail >= 0)
+        ot->next[b->tail] = idx;
+    else
+        b->head = idx;
+    b->tail = idx;
+    return true;
+}
+
 /* 0x800473C4. Strict AABB overlap followed by a midpoint split on the axis
  * with the smallest penetration. The temporary split is what gives two
  * intersecting boxes a usable painter relation without pretending they do not

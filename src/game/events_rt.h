@@ -502,6 +502,9 @@ bool q2_event_rt_trigger(q2_event_rt *rt, u32 offset);
 /* Queue a record by its name in the Events directory. */
 bool q2_event_rt_trigger_named(q2_event_rt *rt, const char *name);
 
+/* 0x80027B04: change a named record's DISABLED bit without triggering it. */
+bool q2_event_rt_disable_named(q2_event_rt *rt, const char *name, bool disabled);
+
 /*
  * Feed one frame of trigger-volume contact into the record flags.
  *

@@ -59,6 +59,7 @@ static void close_client(client *c)
     if (c->level_table_ready) q2_level_table_free(&c->level_table);
     q2_save_free(&c->snapshot);
     q2_event_store_free(&c->event_store);
+    q2_zone_history_free(&c->zone_history);
     q2_gib_attach(NULL);
     q2_sim_free(&c->sim[0]);
     q2_common_close(&c->common);
@@ -134,6 +135,7 @@ static void test_disc_restore(const char *disc, const char *output)
     char path[1024];
 
     CHECK(client_load_zone(c, "BASE0", 0));
+    q2_menu_set_cheat_level(&c->menu, 3);
     /* BASE0's armour crate has an otherwise unreachable CREBATCH/INSECRET
      * tail. Run that real script, including its one-shot latches and effects. */
     for (i = 0; i < c->explosives.count; i++) {
@@ -197,6 +199,7 @@ static void test_disc_restore(const char *disc, const char *output)
     /* A different session has no resident latches or in-memory EVE_ block. */
     cold = open_client(disc);
     CHECK(client_apply_save(cold, &after));
+    CHECK(cold->menu.cheat_level == 3);
     CHECK(cold->node_hidden[node]);
     CHECK(!node_blocks(cold, node, 0));
     photograph(cold, &camera, output, "restored-destroyed");
@@ -402,6 +405,32 @@ static bool same_weapon(q2_viewweapon a, q2_viewweapon b)
     return memcmp(&a, &b, sizeof(a)) == 0;
 }
 
+static bool same_projectiles(const q2_projectile *a, const q2_projectile *b)
+{
+    u32 i;
+    for (i = 0; i < Q2_PROJ_MAX; i++) {
+        q2_projectile x = a[i], y = b[i];
+        if (x.in_use != y.in_use) return false;
+        if (!x.in_use) continue; /* Free slots have no state to resume. */
+        if ((x.shooter == NULL) != (y.shooter == NULL) ||
+            (x.node == Q2_PROJ_NODE_HELD) != (y.node == Q2_PROJ_NODE_HELD)) return false;
+        /* A cold load rebuilds collision caches and actor addresses. */
+        x.shooter = y.shooter = NULL;
+        x.node = y.node = Q2_PROJ_NODE_UNKNOWN;
+        if (memcmp(&x, &y, sizeof(x))) return false;
+    }
+    return true;
+}
+
+static void weapon_frame(client *c, bool attack)
+{
+    client_advance_view_weapon(c, attack, 10);
+    /* Production advances the mixer every frame, including headless runs.
+     * Without this, one-shots never finish and the fixture fills 24 voices;
+     * the cold client then alone draws pitch RNG for successful starts. */
+    client_audio_pump(c, 1.0 / 30.0);
+}
+
 static void test_disc_weapon_restore(const char *disc, const char *output)
 {
     static const int weapons[] = { Q2_WID_BLASTER, Q2_WID_CHAINGUN,
@@ -428,23 +457,24 @@ static void test_disc_weapon_restore(const char *disc, const char *output)
         client_reset_view_model(c, 0);
         CHECK(c->vw_model_ready[0]);
         for (i = 0; i < 120 && c->vw[0].state != Q2_VM_IDLE; i++)
-            client_advance_view_weapon(c, false, 1.0f / 30.0f);
+            weapon_frame(c, false);
         CHECK(c->vw[0].state == Q2_VM_IDLE);
         if (ci == 3) {
             c->sim[0].combat.weapon_id = weapons[ci];
             c->sim[0].combat.inv.current_weapon = (s8)weapons[ci];
-            client_advance_view_weapon(c, false, 1.0f / 30.0f);
+            weapon_frame(c, false);
             CHECK(c->vw[0].pending != c->vw[0].weapon);
         } else {
             int steps = ci == 0 ? 2 : (ci == 1 ? 24 : 80);
             for (i = 0; i < steps && (ci != 2 || !c->vw[0].cook); i++)
-                client_advance_view_weapon(c, true, 1.0f / 30.0f);
+                weapon_frame(c, true);
             CHECK(c->vw[0].state == Q2_VM_FIRE);
             if (ci == 2) {
                 CHECK(c->vw[0].cook);
                 CHECK(q2_projectile_hand_held_index(&c->sim[0].combat.projectiles, 0) >= 0);
             }
         }
+        CHECK(c->voice_dropped == 0);
         camera = c->cam;
         snprintf(name, sizeof(name), "weapon-%u-saved", ci);
         photograph(c, &camera, output, name);
@@ -456,13 +486,14 @@ static void test_disc_weapon_restore(const char *disc, const char *output)
         CHECK(q2_save_write(&c->snapshot, path) == Q2_OK);
         CHECK(q2_save_read(&saved, path) == Q2_OK);
         for (i = 0; i < 45; i++) {
-            client_advance_view_weapon(c, i < 10, 1.0f / 30.0f);
+            weapon_frame(c, i < 10);
             timeline[i] = c->vw[0];
             random_after[i] = q2_random_state();
             serial_after[i] = c->sim[0].combat.shot_serial;
             memcpy(ammo_after[i], c->sim[0].combat.inv.ammo, sizeof(ammo_after[i]));
             memcpy(projectiles[i], c->sim[0].combat.projectiles.p, sizeof(projectiles[i]));
         }
+        CHECK(c->voice_dropped == 0);
         close_client(c);
         cold = open_client(disc);
         CHECK(client_apply_save(cold, &saved));
@@ -475,16 +506,22 @@ static void test_disc_weapon_restore(const char *disc, const char *output)
         snprintf(name, sizeof(name), "weapon-%u-restored", ci);
         photograph(cold, &camera, output, name);
         for (i = 0; i < 45; i++) {
-            client_advance_view_weapon(cold, i < 10, 1.0f / 30.0f);
+            weapon_frame(cold, i < 10);
             if (!same_weapon(cold->vw[0], timeline[i]) ||
                 q2_random_state() != random_after[i] ||
                 cold->sim[0].combat.shot_serial != serial_after[i] ||
                 memcmp(ammo_after[i], cold->sim[0].combat.inv.ammo,
                        sizeof(ammo_after[i])) != 0 ||
-                memcmp(projectiles[i], cold->sim[0].combat.projectiles.p,
-                       sizeof(projectiles[i])) != 0) matches = false;
+                !same_projectiles(projectiles[i], cold->sim[0].combat.projectiles.p)) {
+                if (matches) fprintf(stderr,
+                    "weapon continuation mismatch: weapon %d step %d, RNG %u/%u, shot serial %u/%u\n",
+                    weapons[ci], i, q2_random_state(), random_after[i],
+                    cold->sim[0].combat.shot_serial, serial_after[i]);
+                matches = false;
+            }
         }
         CHECK(matches);
+        CHECK(cold->voice_dropped == 0);
         if (ci == 3) {
             saved.viewweapon_present = false;
             CHECK(q2_save_write(&saved, path) == Q2_OK);

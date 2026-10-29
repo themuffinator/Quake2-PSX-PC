@@ -251,25 +251,41 @@ static void bound_trace(void *user, const s32 start[3], const s16 mins[3],
         s32 ignore_id = -1;
         u32 i;
 
-        if (ignore && b->body_owner_base && b->body_owner_count) {
-            ptrdiff_t k = ignore - b->body_owner_base;
-
-            if (k >= 0 && (u32)k < b->body_owner_count)
-                ignore_id = (s32)k;
+        if (ignore && ignore == b->player_owner) ignore_id = -2;
+        else if (ignore && b->body_owner_base && b->body_owner_count) {
+            for (i = 0; i < b->body_owner_count; i++)
+                if (ignore == &b->body_owner_base[i]) { ignore_id = (s32)i; break; }
         }
 
         for (i = 0; i < b->bodies->count; i++) {
             const q2_move_body *o = &b->bodies->list[i];
+            q2_move_body corpse_body;
             s32 hit[3];
 
-            if (!o->solid || o->id == ignore_id)
-                continue;
+            if (o->id == ignore_id) continue;
+            if (!o->solid) {
+                const q2_monster *corpse;
+                /* Medic import+0xF4 passes 0x06000003, whose extra bit
+                 * includes dead actors. They remain non-solid to walkers. */
+                if (!(mask & 0x04000000u) || !b->body_owner_base || o->id < 0 ||
+                    (u32)o->id >= b->body_owner_count) continue;
+                corpse = &b->body_owner_base[o->id];
+                if (!corpse->in_use || !corpse->corpse || corpse->dissolve_arm) continue;
+                corpse_body = *o;
+                memcpy(corpse_body.pos, corpse->pos, sizeof(corpse_body.pos));
+                corpse_body.sweep_radius = corpse->hit_radius;
+                corpse_body.height = corpse->hit_height;
+                o = &corpse_body;
+            }
             if (!body_clip_segment(start, pos, o, hit))
                 continue;
 
             pos[0] = hit[0];
             pos[1] = hit[1];
             pos[2] = hit[2];
+            out->ent = o->id == -2 ? b->player_owner :
+                       (o->id >= 0 && (u32)o->id < b->body_owner_count)
+                         ? (q2_monster *)&b->body_owner_base[o->id] : NULL;
             b->stats.trace_blocked_body++;
         }
     }
@@ -278,7 +294,6 @@ static void bound_trace(void *user, const s32 start[3], const s16 mins[3],
     out->endpos[1] = pos[1];
     out->endpos[2] = pos[2];
     out->fraction  = travelled_fraction(start, end, pos);
-    out->ent       = NULL;
     if (out->fraction >= Q2_TRACE_ONE)
         b->stats.trace_clear++;
 }

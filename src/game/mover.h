@@ -277,6 +277,12 @@ enum {
 /* `prim` for a mover built from a MOVER_A/B/C opcode rather than a CALL. */
 #define Q2_MOVER_PRIM_OPCODE 0xFFu
 
+enum {
+    Q2_MV_EXTERNAL_NONE,
+    Q2_MV_EXTERNAL_CRATES, /* BASE0: drawn offset moves, constructor hull stays */
+    Q2_MV_EXTERNAL_HELD    /* SECURITY: lift and hull stay at the held offset */
+};
+
 typedef struct q2_mover {
     s16 node[Q2_MOVER_MAX_PARTS];   /* Scene nodes this group translates */
     u32 part_count;
@@ -325,7 +331,9 @@ typedef struct q2_mover {
      * each obj+0x2C tick callback and writes obj+0x14 itself. `external` keeps
      * the generic seven-state mover from consuming that object; `external_part`
      * is the original slot index, because the handler gives slots 0/1 and 2/3
-     * different speeds.
+     * different speeds. SECURITY's HexLift also loses its tick callback after
+     * reaching the upper landing, but keeps its displaced hull. The external
+     * mode distinguishes that held pose from the crates' pristine hull.
      */
     u8  external;
     u8  external_part;

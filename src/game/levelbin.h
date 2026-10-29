@@ -61,6 +61,7 @@
 
 #include "../build/itemtable.h"     /* Q2_ITEM_COUNT — the scene's id list */
 #include "../formats/collision.h"
+#include "../formats/scene.h"
 #include "../formats/trigger.h"   /* q2_teleports_build walks TrigBounds */
 #include "effect.h"
 #include "events.h"
@@ -68,6 +69,7 @@
 #include "population.h"
 #include "userfuncs.h"
 #include "q2psx.h"
+#include "credits.h"
 
 /* The group selector, `0x80056C60`. See the sweep above. */
 #define Q2_LEVELBIN_SLOT_SELECT 36
@@ -97,7 +99,11 @@ bool q2_levelbin_names_group(const u8 *module, u32 size, const q2_pop_group *g);
  */
 
 /*
- * Groups the module SELECTS, by decoding the calls rather than the strings.
+ * Names at the module's selector call sites, rather than every string mention.
+ * This is a static scan, not executed control flow: it cannot decide a branch
+ * or see both arms that feed one call (BASE3's Zone1/Zone1a). The client resolves
+ * BASE3/MAGDEMO, JAIL3 and COMMAND's mission-dependent selections separately;
+ * SECURITY and BOSS2 also select groups from their per-frame callbacks.
  *
  * The shape, from BASE1's init:
  *
@@ -115,6 +121,10 @@ bool q2_levelbin_names_group(const u8 *module, u32 size, const q2_pop_group *g);
  *     +28     1 / 20
  *     +32     1 / 20
  *     everything else  0 / n
+ *
+ * These are static candidate counts, not decoded control-flow coverage. For
+ * example, SECURITY's Boss1 call copies its name before a later immediate 1,
+ * which the nearest-ADDIU heuristic can mistake for a string pointer.
  *
  * One offset accounts for essentially every hit and the rest for none, which is
  * what makes this a measurement rather than a guess. 36 = 4 * 9, so §15.5's
@@ -222,34 +232,23 @@ u32 q2_levelbin_menu_pages(const u8 *module, u32 size, u32 load_base,
                            q2_lb_menu_page *out, u32 max);
 
 /* ------------------------------------------------------------------------- */
-/* VIEW CREDITS — the one front-end page whose text is not in a page array     */
+/* VIEW CREDITS — QFRONT's two 24-byte row tables                            */
 /* ------------------------------------------------------------------------- */
 /*
- * The title screen offers VIEW CREDITS and this port bounced straight back off
- * it. The words are all there: QFRONT's text pool carries the whole credit roll
- * as a contiguous run of strings, from `HAMMERHEAD LTD` to just before
- * `PLEASE WAIT WHILE` — which is the disc-swap prompt and the first string past
- * the end of it.
+ * PAL +35C8 installs DEVELOPED BY from +FAF4 and sets its streaming cursor to
+ * +FB24. +36A0 advances that cursor BEFORE reading each subsequent row, so
+ * +FB24 is a sentinel and +FB3C supplies the first streamed blank. Blank text
+ * is a real row; a NULL text pointer terminates the table. The general menu
+ * scanner deliberately rejects empty labels and single-row tables, which is
+ * why scanning its results previously missed these records.
  *
- * They are NOT a page array. `q2_levelbin_menu_pages` finds 45 pages and 186
- * rows in this module and exactly one of them mentions the credits: the row
- * labelled `VIEW CREDITS` on the OPTIONS page. So there is no `{text, x, y}`
- * record for a credit line anywhere, and the arrangement — how the roll is
- * paged or scrolled, which lines are headings and which are names — is in the
- * module's CODE, which this port does not run.
- *
- * So the words are the module's and the LAYOUT IS THIS PORT'S, exactly as it is
- * for the deathmatch scoreboard (#106), and it is marked here rather than left
- * to be discovered. What the port does not do is guess at the pairing: the run
- * is presented in module order, which is the order the roll was written in.
- *
- * Anchored on the two strings rather than on offsets, so a build that moves the
- * pool still finds it.
+ * This reader anchors on the initial label and validates the two adjacent
+ * tables, preserving every blank and repeated label. Pass base=0 for a raw
+ * LevelBin, or its relocation base for a loaded module. Returned text is
+ * borrowed from the module. Returns the total count; max bounds output.
  */
-#define Q2_LB_CREDITS_MAX 256
-
-u32 q2_levelbin_credits(const u8 *module, u32 size,
-                        const char **out, u32 max);
+u32 q2_levelbin_credits(const u8 *module, u32 size, u32 load_base,
+                        q2_credit_row *out, u32 max);
 
 /* ------------------------------------------------------------------------- */
 /* The title screen's SCENE — what the menu is drawn over                     */
@@ -562,8 +561,10 @@ u32 q2_levelbin_movies(const u8 *module, u32 size,
  *     8002EEBC  jal  0x80089E18     ; the fifth argument, zeroed on the stack
  *     8002EED0  jal  0x80048DC8     ; q2_fx_laser(from, to, area, kind, 0)
  *
- * and the zeroed fifth argument is why a level's beams do not spit particles:
- * `ends = 0`, so neither end burst fires. Only the tube is drawn.
+ * The zeroed fifth argument suppresses endpoint bursts, not damage.
+ * 0x80048F64..0x80048FB8 still sweeps actors and calls T_Damage with the
+ * kind's damage/mod. q2_laserbeams_draw only queues the visual; the client's
+ * shared logic stage performs that hit test and drains creature reactions.
  *
  * `gp+0x421C` decides register-or-act, and LASERWALL is what proves it: the
  * same flag, read at 0x8002E228, sends it to the same kind of list when set and
@@ -624,6 +625,28 @@ u32 q2_laserbeams_build(q2_laserbeam_set *out, const q2_events *events,
  */
 u32 q2_laserbeams_draw(const q2_laserbeam_set *set, const q2_event_rt *rt,
                        q2_fx_world *w, q2_rng *rng);
+
+/* LASERWALL registers at 0x8002E1F0 and draws at 0x8002A02C. Unlike a
+ * LASERBEAM, its endpoints follow a Scene node's current bounding box. The
+ * resident zone's signed object index is -1 where the wall is absent. */
+#define Q2_LASERWALL_MAX 8
+typedef struct q2_laserwall {
+    u32 raiser;
+    s16 scene_node, rise, length, spread, offset[3];
+    u8 axis, rows;
+} q2_laserwall;
+
+typedef struct q2_laserwall_set {
+    q2_laserwall wall[Q2_LASERWALL_MAX];
+    u32 count, declined;
+} q2_laserwall_set;
+
+u32 q2_laserwalls_build(q2_laserwall_set *out, const q2_events *events,
+                       const q2_userfuncs *uf, const q2_uf_operands *ops);
+/* Row zero supplies the collision cell for every row. The client submits
+ * kind 0, ends 0 through the damaging beam API, once per shared logic tick. */
+bool q2_laserwall_segment(const q2_laserwall *wall, const q2_scene *scene,
+                         u32 row, s32 from[3], s32 to[3]);
 
 /* ------------------------------------------------------------------------- */
 /* TELEPORT — the pads a zone marks with a particle column                    */

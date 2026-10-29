@@ -101,7 +101,14 @@ typedef enum q2_menu_setting {
     Q2_SET_FALLING_DAMAGE,    /* 0x800B3366  variables toggle */
     Q2_SET_ONE_SHOT_KILL,     /* 0x800B336C  variables toggle */
 
-    Q2_SET_COUNT
+    /* Host-only settings are appended to keep saved retail indices stable. */
+    Q2_SET_CRT,
+    Q2_SET_BLOOM,
+    /* Append the other players' seven controller fields. Existing settings
+     * files retain their indices and leave absent profiles at defaults. */
+    Q2_SET_EXTRA_PAD_FIRST,
+    Q2_SET_COUNT = Q2_SET_EXTRA_PAD_FIRST + 3 *
+                   (Q2_SET_MOUSE_SPEED - Q2_SET_PAD_STYLE + 1)
 } q2_menu_setting;
 
 /* Sliders are clamped by the adjust loop at 0x8001C1B8: below zero snaps to
@@ -112,6 +119,10 @@ typedef enum q2_menu_setting {
 typedef struct q2_menu_settings {
     s16 v[Q2_SET_COUNT];
 } q2_menu_settings;
+
+/* Only the controller fields belong to the selected player's 34-byte retail
+ * config record. Video, sound, crosshair and autocentre remain shared. */
+q2_menu_setting q2_menu_player_setting(q2_menu_setting id, int player);
 
 /* The reset routines the menu exposes separately: 0x8001FA18 (video),
  * 0x8001FA50 (sound), 0x8001BDA8 (player), 0x8002048C (game variables).
@@ -212,6 +223,8 @@ typedef enum q2_menu_action {
     Q2_ACT_MP_SETTINGS,        /* module+0xD148 / +0xD1FC                     */
     Q2_ACT_GAME_VARIABLES,     /* module+0x49F8                               */
     Q2_ACT_PROCEED,            /* module+0x59CC                               */
+    Q2_ACT_UNLOCK_SAVE,        /* module+0xD2C4  save the campaign reward      */
+    Q2_ACT_PAGE_FRONT_TITLE,   /* module+0xCEE0                               */
     Q2_ACT_COUNT
 } q2_menu_action;
 
@@ -323,7 +336,9 @@ typedef enum q2_menu_page_id {
      * 14 collides with nothing here only because this port numbers the front
      * end from 200, as the note above explains.
      */
-    Q2_PAGE_FRONT_RULES      = 209
+    Q2_PAGE_FRONT_RULES      = 209,
+    Q2_PAGE_FRONT_PLAYERS    = 210, /* QFRONT's independently controlled panels */
+    Q2_PAGE_FRONT_UNLOCK     = 211  /* QFRONT page 17, +4454 completion reward */
 } q2_menu_page_id;
 
 /*
@@ -356,6 +371,8 @@ const q2_menu_page *q2_menu_page_find(int id);
 /* Pages whose installed table depends on live state. */
 const q2_menu_page *q2_menu_variables_page(int cheat_level); /* 0x8001D510 */
 const q2_menu_page *q2_menu_video_page(bool multiplayer);    /* 0x800202B0 */
+/* Host extension; the original tables above remain available to disc audits. */
+const q2_menu_page *q2_menu_video_host_page(bool multiplayer);
 /*
  * CONTROLLER is the same page in both images with four of its five labels
  * abbreviated: the executable's table (0x8009AFDC) reads VIBRATION / SWAP Y
@@ -432,15 +449,16 @@ typedef enum q2_menu_request {
     Q2_MREQ_LOAD_GAME,   /* LOAD GAME: enter the card front end   */
     Q2_MREQ_MP_LOAD_SETTINGS,
     Q2_MREQ_MP_SAVE_SETTINGS,
-    Q2_MREQ_MP_PROCEED  /* begin the configured local match       */
+    Q2_MREQ_MP_PROCEED, /* all players READY: begin the configured match */
+    Q2_MREQ_UNLOCK_SAVE /* completion reward's YES */
 } q2_menu_request;
 
 #define Q2_MENU_MAX_ITEMS 12
 #define Q2_MENU_TEXT_MAX  40   /* the original's per-object text buffer is 32 */
 
 /*
- * The front end stores option INDICES and converts them only when PROCEED is
- * pressed (QFRONT+0x59CC). Mode values are QMULTI's own 0, 1 and 5; keeping
+ * The front end stores option INDICES and converts them when all players are
+ * READY (QFRONT+0x1F60, after +0x59CC's setup). Modes are QMULTI's 0, 1 and 5; keeping
  * them numeric here avoids making the menu library depend back on game code.
  */
 #define Q2_MENU_MP_DEATHMATCH       0
@@ -478,6 +496,25 @@ typedef struct q2_menu_mp_setup {
     s16 frag_option;   /* index into its nine-value table            */
     s16 round_option;  /* index into its five-value table            */
 } q2_menu_mp_setup;
+
+/* QFRONT +0x128C/+0x13FC: input and drawing dispatch the same seven states. */
+typedef enum q2_menu_player_page {
+    Q2_MP_PLAYER_MAIN, Q2_MP_PLAYER_OPTIONS, Q2_MP_PLAYER_NAME,
+    Q2_MP_PLAYER_COLOUR, Q2_MP_PLAYER_CONTROLLER, Q2_MP_PLAYER_READY,
+    Q2_MP_PLAYER_DISCONNECTED
+} q2_menu_player_page;
+
+typedef struct q2_menu_player_panel {
+    u16 previous;
+    u8 page, cursor, letter;
+    u8 resume_page, resume_cursor;
+} q2_menu_player_panel;
+
+typedef struct q2_menu_player_row {
+    char text[64];
+    s16 y, size;
+    bool selected, disabled;
+} q2_menu_player_row;
 
 typedef struct q2_menu {
     q2_menu_settings   *set;          /* not owned                            */
@@ -557,6 +594,10 @@ typedef struct q2_menu {
     int                 pauser;
     s16                 mp_team[Q2_MENU_MP_MAX_PLAYERS];    /* config +2  */
     s16                 mp_colour[Q2_MENU_MP_MAX_PLAYERS];  /* config +4  */
+    char                mp_name[Q2_MENU_MP_MAX_PLAYERS][9]; /* config +24 */
+    q2_menu_player_panel mp_panel[Q2_MENU_MP_MAX_PLAYERS];
+    bool                mp_panel_settle;
+    bool                mp_host_mouse; /* one host mouse, owned by player one */
     s16                 mp_mode;      /* 0x800B3354 — 1 is TEAM DEATHMATCH */
 
     /*
@@ -692,6 +733,15 @@ void q2_menu_set_multiplayer(q2_menu *m, bool on);
  */
 void q2_menu_set_pauser(q2_menu *m, int player);
 void q2_menu_set_player_colour(q2_menu *m, int player, int team, int colour);
+void q2_menu_reset_identities(q2_menu *m);
+void q2_menu_players_begin(q2_menu *m);
+void q2_menu_advance_players(q2_menu *m, const u16 pad[4], u32 connected);
+/* The page wrapper consumes -1 (back) and +1 (all ready). */
+int q2_menu_players_step(q2_menu *m, const u16 pad[4], u32 connected);
+bool q2_menu_players_two_teams(const q2_menu *m);
+int q2_menu_player_rows(const q2_menu *m, int player, q2_menu_player_row out[7]);
+void q2_menu_player_origin(const q2_menu *m, int player, int *x, int *y);
+bool q2_menu_player_point_at(q2_menu *m, int index);
 void q2_menu_set_mp_mode(q2_menu *m, int mode);
 
 /*

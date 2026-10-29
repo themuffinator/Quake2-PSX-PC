@@ -62,6 +62,25 @@ bool q2_scene_get_node(const q2_scene *s, u32 index, q2_scene_node *out)
     return true;
 }
 
+bool q2_scene_set_bounds(q2_zone_file *zone, u32 index,
+                          const s32 min[3], const s32 max[3])
+{
+    const dat_chunk *chunk;
+    u8 *rec;
+    int i;
+    if (!zone || !min || !max || !(chunk = zone->chunk[Q2_ZONE_SCENE]) ||
+        index >= chunk->size / Q2_SCENE_NODE_SIZE || !zone->ar.buf.data ||
+        chunk->offset > zone->ar.buf.size ||
+        chunk->size > zone->ar.buf.size - chunk->offset) return false;
+    for (i = 0; i < 3; i++) if (min[i] > max[i]) return false;
+    rec = zone->ar.buf.data + chunk->offset + index * Q2_SCENE_NODE_SIZE;
+    for (i = 0; i < 3; i++) {
+        q2_wr_u32(rec + 16 + 4*i, (u32)min[i]);
+        q2_wr_u32(rec + 28 + 4*i, (u32)max[i]);
+    }
+    return true;
+}
+
 void q2_scene_node_bounds(const q2_scene_node *n, s32 min_out[3], s32 max_out[3])
 {
     int i;

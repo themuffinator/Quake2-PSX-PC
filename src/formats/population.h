@@ -256,6 +256,10 @@ bool q2_pop_group_is_path(const q2_pop_group *g);
  */
 int q2_pop_group_zone(const q2_pop_group *g);
 
+/* True only for an exact Zone<digits> name. A suffix still identifies the
+ * owning zone, but denotes a separate script batch, not startup population. */
+bool q2_pop_group_is_zone(const q2_pop_group *g);
+
 /*
  * Walk a group's lists. `slot` counts from 0; each returns false at the list's
  * terminator, at the end of the chunk, or when the group has no such list.

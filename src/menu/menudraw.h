@@ -137,6 +137,12 @@ typedef struct q2_menu_draw_opts {
 
 void q2_menu_draw_opts_default(q2_menu_draw_opts *o, const q2_menu_font *font);
 
+/* Runtime text objects used by QMULTI and QMRESULT. A highlighted object
+ * draws its colour band unless colour is Q2_MENU_BAR_NONE. */
+void q2_menu_draw_text_row(psx_ot *ot, const q2_menu_draw_opts *opts,
+                           int size, int x, int y, bool highlight,
+                           int colour, const char *text);
+
 /*
  * Build the current page into `ot`. Does nothing when the menu is closed.
  * Returns the number of primitives emitted.

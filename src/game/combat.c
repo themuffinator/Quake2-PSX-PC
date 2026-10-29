@@ -2,6 +2,8 @@
 
 #include "playerdeath.h"   /* Q2_PDEATH_GIB_HEALTH: one copy of 0x800397FC */
 #include "shock.h"         /* SetShockData, the hit on a player's tail      */
+#include "sdkmath.h"
+#include "trig.h"
 
 #include <math.h>
 #include <string.h>
@@ -166,6 +168,7 @@ void q2_actor_init(q2_actor *a)
         return;
     memset(a, 0, sizeof(*a));
     a->owner         = -1;      /* not a player until a caller says so */
+    a->entity_kind   = 48;      /* unspecified non-client actor */
     /*
      * "Not a player", as 0x8003DDF8 places every player: 0x8003DE24 `addiu v0,
      * zero, 4` / 0x8003DE34 `sb v0, 222(s1)`. This was -1, the one value the
@@ -189,8 +192,7 @@ void q2_actor_init(q2_actor *a)
     for (k = 0; k < 3; k++) {
         a->mins[k] = -286;
         a->maxs[k] =  286;
-        /* entity+0x2AC seeded at its own fade target, so a body nobody has hit
-         * draws at the ambient the draws used to hardcode. */
+        /* Native allocator seeds both current and target ambient to 0x40. */
         a->ambient[k] = Q2_ACTOR_AMBIENT_DEFAULT;
     }
 }
@@ -235,14 +237,17 @@ void q2_actor_from_monster(q2_actor *a, const q2_monster *m)
     memcpy(a->ambient, ambient, sizeof(ambient));
     a->last_attacker = killer;
 
-    a->origin[0] = m->pos[0];
-    a->origin[1] = m->pos[1];
-    a->origin[2] = m->pos[2];
+    memcpy(a->origin, q2_cre_origin(m), sizeof(a->origin));
+    for (k = 0; k < 3; k++) a->knockback[k] = m->motion.impulse[k];
+    a->knocked = (m->motion.flags & 0x4000u) != 0;
     a->health     = m->health;
     a->gib_health = m->gib_health;
     a->has_client = false;
+    a->entity_kind = (s16)m->pop_class_id;
     a->is_monster = (m->svflags & Q2_SVF_MONSTER) != 0;
     a->has_enemy  = (m->enemy != NULL);
+    a->godmode = (m->flags & Q2_FL_GODMODE) != 0;
+    a->no_knockback = (m->flags & Q2_FL_NO_KNOCKBACK) != 0;
 
     /*
      * THE MOVEMENT HULL AND THE HIT CYLINDER ARE TWO DIFFERENT VOLUMES, and
@@ -289,9 +294,13 @@ void q2_actor_from_monster(q2_actor *a, const q2_monster *m)
 
 void q2_actor_to_monster(const q2_actor *a, q2_monster *m)
 {
+    int k;
     if (!a || !m)
         return;
+    if (!m->motion.ready) q2_cre_motion_init(m);
     m->health = a->health;
+    for (k = 0; k < 3; k++) m->motion.impulse[k] = (s16)a->knockback[k];
+    m->motion.flags = (m->motion.flags & ~0x4000u) | (a->knocked ? 0x4000u : 0u);
 
     /* The damage-effect bytes, entity+0x2F0..0x2F5, for the corpse tick's
      * dissolve gate (0x8007F728 jal 0x8005B2A8, monster.c). The actor is
@@ -379,9 +388,14 @@ void q2_actor_from_player(q2_actor *a, const q2_inventory *inv,
         u32 serial  = a->damage_serial;
         u8  effect[sizeof(a->effect)];
         u8  ambient[sizeof(a->ambient)];
+        bool existing_player = a->has_client;
 
         memcpy(effect, a->effect, sizeof(effect));
         memcpy(ambient, a->ambient, sizeof(ambient));
+        /* 0x8003B444 replaces the allocator's 0x40 with 0x20 for a new
+         * gameplay body. Later refreshes retain any transient hit colour. */
+        if (!existing_player)
+            memset(ambient, Q2_PLAYER_AMBIENT_DEFAULT, sizeof(ambient));
         q2_actor_init(a);
         a->env_next      = env;
         a->last_attacker = killer;
@@ -398,6 +412,7 @@ void q2_actor_from_player(q2_actor *a, const q2_inventory *inv,
         a->origin[2] = pos[2];
     }
     a->has_client = true;
+    a->entity_kind = 47;
 
     /*
      * A PLAYER IS DAMAGEABLE, and once the sweep honours `takedamage` that has
@@ -458,7 +473,7 @@ void q2_actor_to_player(const q2_actor *a, q2_inventory *inv)
 const u8 q2_actor_fade_power_rgb[3]  = { 0x00, 0x80, 0x20 };
 const u8 q2_actor_fade_armour_rgb[3] = { 0x80, 0x80, 0x80 };
 
-s16 q2_combat_power_armour_absorb(q2_actor *a, s16 damage)
+s16 q2_combat_power_armour_absorb(q2_actor *a, s32 damage)
 {
     s32 save, cap;
 
@@ -473,23 +488,25 @@ s16 q2_combat_power_armour_absorb(q2_actor *a, s16 damage)
      */
     a->armour_fade = Q2_ACTOR_FADE_NONE;
 
-    if (damage <= 0 || !a->has_client)
+    if (damage == 0 || !a->has_client)
         return 0;
     /* 0x80057AC0: both power items live in one bit pair of the powerup word. */
     if (!(a->powerups & Q2_POWERUP_POWER_ARMOUR))
         return 0;
-    if (a->cells <= 0)
+    if (a->cells == 0)
         return 0;
 
     /* 0x80057AE0: `(damage * 2) / 3`, signed, truncating. */
-    save = ((s32)damage * Q2_POWER_ARMOUR_NUM) / Q2_POWER_ARMOUR_DEN;
+    save = (s32)((u32)damage * Q2_POWER_ARMOUR_NUM) / Q2_POWER_ARMOUR_DEN;
 
-    /* 0x80057AF4: capped at twice the cells held. */
-    cap = (s32)a->cells * 2;
+    /* 0x80057AF4..0x80057B10 compares the SIGNED HALFWORD of twice the
+     * cells. The later guards test zero, not positivity: negative damage
+     * can restore cells, and the halfword stores wrap without a clamp. */
+    cap = (s16)((u32)(u16)a->cells * 2u);
     if (save >= cap)
         save = cap;
     save = (s16)save;
-    if (save <= 0)
+    if (save == 0)
         return 0;
 
     /*
@@ -502,13 +519,10 @@ s16 q2_combat_power_armour_absorb(q2_actor *a, s16 damage)
 
     /* 0x80057B8C: one cell per two points absorbed, truncating. */
     a->cells = (s16)(a->cells - (save / Q2_POWER_ARMOUR_CELLS));
-    if (a->cells < 0)
-        a->cells = 0;
-
     return (s16)save;
 }
 
-s16 q2_combat_armour_absorb(q2_actor *a, s16 damage, bool energy,
+s16 q2_combat_armour_absorb(q2_actor *a, s32 damage, bool energy,
                             bool power_armour_fired,
                             const q2_combat_rules *rules)
 {
@@ -516,9 +530,9 @@ s16 q2_combat_armour_absorb(q2_actor *a, s16 damage, bool energy,
     const q2_wt_armour *cls;
     s32 bias, factor, save;
 
-    if (!a || damage <= 0 || !a->has_client)
+    if (!a || damage == 0 || !a->has_client)
         return 0;
-    if (a->armour <= 0)
+    if (a->armour == 0)
         return 0;
     if (a->armour_class >= Q2_WT_ARMOUR_CLASSES)
         return 0;
@@ -543,13 +557,15 @@ s16 q2_combat_armour_absorb(q2_actor *a, s16 damage, bool energy,
     cls    = &t->armour[a->armour_class];
     factor = energy ? cls->energy_protection : cls->normal_protection;
 
-    /* 0x80057C7C: `(bias + factor * damage) >> 12`, a LOGICAL shift of a value
-     * that cannot be negative here because both terms are non-negative. */
-    save = (bias + factor * (s32)damage) >> 12;
-    if (save > a->armour)
+    /* 0x80057C7C..0x80057CAC: low 32-bit product and logical shift, then
+     * SIGN-EXTEND the low halfword before comparing with held armour.
+     * Negative amounts are not refused: their negative absorption is
+     * subtracted from armour, restoring it. Keep the full incoming word;
+     * the preceding power stage can leave more than a signed halfword. */
+    save = (s16)(((u32)bias + (u32)factor * (u32)damage) >> 12);
+    if (save >= a->armour)
         save = a->armour;
-    save = (s16)save;
-    if (save <= 0)
+    if (save == 0)
         return 0;
 
     /*
@@ -628,8 +644,8 @@ static void apply_knockback(q2_actor *attacker, q2_actor *target,
          * part of the impulse's magnitude. That is why the s16 clamps below are
          * reachable: anything past about 123 points of damage saturates.
          */
-        s64 v = (s64)scale * dir[i];
-        v = (v * damage) / Q2_KNOCKBACK_DIVISOR;
+        s32 v = (s32)((u32)scale * (u32)dir[i]);
+        v = (s32)((u32)v * (u32)(s32)damage) / Q2_KNOCKBACK_DIVISOR;
         v >>= Q2_KNOCKBACK_SHIFT;
 
         /* 0x800580E8: only the vertical component is floored, and only outside
@@ -639,15 +655,16 @@ static void apply_knockback(q2_actor *attacker, q2_actor *target,
         if (i == 1 && !(rules && rules->deathmatch) && v < -3072)
             v = -3072;
 
-        /* 0x800580F8..0x80058188: each component is clamped into s16. */
-        if (v >  32767) v =  32767;
+        /* Retail writes +32768 on positive overflow, then stores a halfword.
+         * This wraps to -32768; saturating to +32767 changes the native hit. */
+        if (v >  32767) v =  32768;
         if (v < -32768) v = -32768;
 
         /* 0x80058188: a living target accumulates, a dead one is overwritten. */
         if (target->health > 0)
-            target->knockback[i] += (s32)v;
+            target->knockback[i] = (s16)(target->knockback[i] + v);
         else
-            target->knockback[i]  = (s32)v;
+            target->knockback[i] = (s16)v;
     }
 
     if (target->health > 0)
@@ -682,6 +699,7 @@ q2_damage_result q2_combat_damage(q2_actor *attacker, q2_actor *target,
      * every path through here, and the live player's think consumes it as its
      * PAIN animation request. See the note on the field. */
     target->damage_serial++;
+    target->damage_source = attacker;
 
     /*
      * Who did it, so a scoring hook has a killer as well as a victim.
@@ -776,19 +794,17 @@ q2_damage_result q2_combat_damage(q2_actor *attacker, q2_actor *target,
     /* else 0x80057E6C..0x80057E84: the print, and no store. */
 
     /*
-     * NOT RETAIL, and kept as a known difference: the console has no exit for
-     * a zero or negative amount. 0x80057EC0 `beq s4, zero, 0x80058208` skips
-     * only the knockback, so a zero hit still runs the acid and lava arms, the
-     * ONE SHOT KILL store, the hit sound and the effect tail, and T_Damage
-     * meets it at 0x80062940 `beq s0, zero, 0x80062AAC` (no subtraction, no
-     * die, but the reaction call). Reproducing that means carrying T_Damage's
-     * zero arm and the armour stages' behaviour below zero, neither of which
-     * this port transcribes; until then a hit worth nothing does nothing
-     * beyond recording who and how.
+     * T_Damage's zero arm at 0x80062940 skips subtraction/death but reaches
+     * M_ReactToDamage. Preserve that event even though health did not change.
+     * Player zero damage still runs the outer protection/cheat/sound stages:
+     * 0x80057EC0 skips only knockback. Negative damage is nonzero and reaches
+     * the same signed absorption, subtraction and effect stages as a hit.
      */
-    if (amount <= 0)
-        return out;
-
+    if (amount == 0 && !target->has_client) {
+        if (target->takedamage)
+            target->damage_reaction_pending = true;
+        goto effect_tail;
+    }
     /*
      * Knockback comes first and does not care about armour: 0x80057EC0 runs
      * before any absorption. Its only two guards are 0x80057EC0 `beq s4, zero`
@@ -799,7 +815,7 @@ q2_damage_result q2_combat_damage(q2_actor *attacker, q2_actor *target,
      * gates T_Damage's own knockback argument instead, which its single caller
      * passes as zero. See combat.h's note on `no_knockback`.
      */
-    if (point && q2_mod_knocks_back(mod))
+    if (damage != 0 && point && q2_mod_knocks_back(mod))
         apply_knockback(attacker, target, damage, point, rules);
 
     /*
@@ -925,11 +941,12 @@ q2_damage_result q2_combat_damage(q2_actor *attacker, q2_actor *target,
          * both words are below 0x80000000; past it a deadline reads as the
          * distant past, and a clock as before everything.
          *
-         * Not modelled: the burn sound. 0x8005826C `lw a0, 40(s0)` takes the
+         * The burn sound: 0x8005826C `lw a0, 40(s0)` takes the
          * client's entity and, when there is one, 0x8005827C `jal 0x8003DEE4`
          * plays the handle at gp+17116 (0x800B28DC) on it through 0x8007270C,
-         * on every acid hit the throttle lets through. There is no mixer here
-         * to hand it to (see `set_hit_sound`).
+         * on every acid hit the throttle lets through. The world hook below
+         * resolves that owner and queues the request, even if armour later
+         * absorbs all damage.
          */
         if ((u32)rules->level_time < (u32)target->protect_until) {
             out.blocked = true;
@@ -948,6 +965,8 @@ q2_damage_result q2_combat_damage(q2_actor *attacker, q2_actor *target,
             return out;
         }
         target->env_next = rules->level_time + Q2_ENV_THROTTLE_ACID;
+        if (rules->environment_sound)
+            rules->environment_sound(rules->environment_sound_user, target, mod);
     } else if (mod == Q2_MOD_LAVA && target->has_client) {
         /*
          * 0x8005828C..0x800582C4 reads NEITHER timer — the throttle alone,
@@ -956,15 +975,19 @@ q2_damage_result q2_combat_damage(q2_actor *attacker, q2_actor *target,
          * invulnerability test below can refuse the damage, which is a real
          * asymmetry with the acid arm and not a transcription slip.
          *
-         * Not modelled, as acid's: 0x800582C0 `jal 0x8003DF0C`, which bumps
+         * 0x800582C0 `jal 0x8003DF0C` bumps
          * the counter at 0x800AE898 and plays the same gp+17116 handle only
-         * when `andi 3` leaves zero (0x8003DF20) — every fourth lava hit.
+         * when `andi 3` leaves zero (0x8003DF20). It starts at 3, so the
+         * first admitted hit sounds, then every fourth. The world hook owns
+         * this process-wide cadence across players and level loads.
          */
         if (!((u32)target->env_next < (u32)rules->level_time)) {
             out.blocked = true;
             return out;
         }
         target->env_next = rules->level_time + Q2_ENV_THROTTLE_LAVA;
+        if (rules->environment_sound)
+            rules->environment_sound(rules->environment_sound_user, target, mod);
     }
 
     /*
@@ -983,10 +1006,10 @@ q2_damage_result q2_combat_damage(q2_actor *attacker, q2_actor *target,
 
     /* Armour. Mod 8 is the one class that skips both stages (0x80058358). */
     if (mod != Q2_MOD_NO_ARMOUR) {
-        saved_power = q2_combat_power_armour_absorb(target, (s16)amount);
+        saved_power = q2_combat_power_armour_absorb(target, amount);
         amount -= saved_power;
 
-        saved_armour = q2_combat_armour_absorb(target, (s16)amount,
+        saved_armour = q2_combat_armour_absorb(target, amount,
                                                q2_mod_is_energy(mod),
                                                saved_power != 0, rules);
         amount -= saved_armour;
@@ -994,6 +1017,8 @@ q2_damage_result q2_combat_damage(q2_actor *attacker, q2_actor *target,
 
     out.absorbed_power  = saved_power;
     out.absorbed_armour = saved_armour;
+    if (!target->has_client)
+        target->damage_reaction_pending = true;
 
     /*
      * NO EXIT WHEN ARMOUR TAKES IT ALL. 0x80058390 `subu s1, s1, v0` runs
@@ -1124,8 +1149,8 @@ q2_damage_result q2_combat_damage(q2_actor *attacker, q2_actor *target,
 effect_tail:
     /*
      * 0x800585A4..0x80058604, which every path reaches bar the refusals that
-     * branch to 0x80058608 (see the takedamage gate above) and, in this port
-     * only, the zero-amount return: a fully absorbed hit, a target T_Damage
+     * branch to 0x80058608 (see the takedamage gate above): a fully absorbed
+     * or zero/negative hit, a target T_Damage
      * turned away, and a godmode body all arm the mod's byte.
      */
     {
@@ -1582,10 +1607,14 @@ static s32 nearest_hit(const s32 origin[3], const s32 dir[3],
          * Filtering on health here threw that away and made the corpse
          * untouchable, which is why nothing could ever be gibbed.
          *
-         * Filtering the sweep on `takedamage` is the two rules composed: the
-         * console's sweep has no filter and its T_Damage rejects on this bit,
-         * so rejecting here reaches the same set without calling damage on a
-         * target that would refuse it.
+         * This older query still filters on `takedamage`. That is NOT
+         * equivalent to rejecting damage after native collision: an immune
+         * body can stop a shot and shield another candidate. The independent
+         * contact fixtures measure this and the old arithmetic differences.
+         * q2_combat_trace_actors implements the measured query, and every
+         * live shot now goes through it (q2_combat_hitscan). This one is
+         * kept for the tests that pin its geometry; the AI's body clip still
+         * uses its cylinder arithmetic (aiworld.c), an open audit item.
          */
         if (!t->takedamage) {
             SCAN_BUMP(dead);
@@ -1624,7 +1653,8 @@ static s32 nearest_hit(const s32 origin[3], const s32 dir[3],
 }
 
 q2_damage_result q2_combat_melee(q2_actor *attacker, q2_actor *target,
-                                 s16 damage, const q2_combat_rules *rules)
+                                 s16 damage, const s32 point[3],
+                                 const q2_combat_rules *rules)
 {
     q2_damage_result out;
 
@@ -1632,30 +1662,169 @@ q2_damage_result q2_combat_melee(q2_actor *attacker, q2_actor *target,
     if (!attacker || !target)
         return out;
 
-    /*
-     * 0x800612F0 passes the attacker's own origin as the damage point, so a
-     * melee hit lands with mod 7 — which is not in the knockback set, and so
-     * T_Damage moves nothing on this path.
-     *
-     * THAT IS NOT THE SAME AS "a claw moves nothing", and this comment used to
-     * say so. `fire_hit` applies the module's kick ITSELF, after T_Damage
-     * returns and outside it entirely:
-     *
-     *     800613B0  jal   0x8005C634        ; VectorNormalize(hit -> centre)
-     *     800613B8  lui   a0, 0x800A
-     *     800613BC  addiu a0, a0, -1052     ; 0x8009FBE4, a vec3 of zeroes
-     *     800613C8  lw    a1, 204(sp)       ; the module's kick
-     *     800613CC  jal   0x8005C460        ; VectorMA
-     *     800613D0  addiu a3, a3, 104       ; -> enemy+0x68, the velocity
-     *
-     * — so a Berserk's 400-kick SETS the victim's velocity to `kick * unit`,
-     * with none of apply_knockback's mass scaling and no accumulation. The
-     * port has no path that writes a player's velocity like that, so the
-     * shove is missing; it is missing because nobody has reconstructed it, not
-     * because mod 7 is outside the knockback set.
-     */
+    /* 0x800612E4 passes sp+88, the contact built by AngleVectors/VectorMA.
+     * Mod 7 has no damage-function knockback; fire_hit adds its own kick. */
     return q2_combat_damage(attacker, target, damage, Q2_MOD_MELEE,
-                            attacker->origin, rules);
+                            point, rules);
+}
+
+/* 0x800B11D8 retains a wrapping 32-bit accumulator while producing at most
+ * sixteen fractional bits. Exact division can finish early. A plain 64-bit
+ * multiply/divide misses its signed overflow for long exit roots. */
+static s32 native_root_fraction(s32 numerator, s32 denominator)
+{
+    u32 remainder = numerator < 0 ? 0u - (u32)numerator : (u32)numerator;
+    u32 divisor = denominator < 0 ? 0u - (u32)denominator : (u32)denominator;
+    u32 accumulator = 0, shift = 0;
+    s32 result;
+    if (!remainder || !divisor) return 0;
+    for (;;) {
+        if ((s32)remainder >= (s32)divisor) {
+            accumulator += (remainder / divisor) * 2048u;
+            remainder %= divisor;
+            if (!remainder) break;
+        }
+        accumulator <<= 1;
+        remainder <<= 1;
+        if (++shift == 16) break;
+    }
+    result = (s32)accumulator >> shift;
+    return (numerator < 0) != (denominator < 0) ? (s32)(0u - (u32)result) : result;
+}
+
+/* 0x80056084 reduces its signed 64-bit discriminant before taking the
+ * engine's twice-refined SDK root. Replacing this with exact sqrt changes
+ * accepted fractions, especially when a nearer candidate shortens the ray. */
+static bool native_cylinder_roots(s32 a, s32 b, s32 c, s32 *first, s32 *last)
+{
+    u64 discriminant = (u64)((s64)b * b) - ((u64)((s64)a * c) << 2);
+    u32 shift = 0, root;
+    s32 low, high;
+    if ((s64)discriminant < 0) return false;
+    while (discriminant > 0x7FFFFFFFu) { discriminant >>= 2; shift++; }
+    root = q2_sdk_sqrt_refined((u32)discriminant) << shift;
+    low = (s32)(0u - (u32)b - root);
+    high = (s32)(root - (u32)b);
+    low = native_root_fraction(low, a);
+    high = native_root_fraction(high, a);
+    *first = a > 0 ? low : high;
+    *last = a > 0 ? high : low;
+    return true;
+}
+
+s32 q2_combat_trace_actors(const s32 from[3], const s32 to[3],
+                            const q2_actor *ignore, q2_actor *const *targets,
+                            u32 count, s32 out[3])
+{
+    s32 point[3], delta[3], length, best = -1;
+    u32 squared = 0, i;
+    int k;
+    if (!from || !to) return -1;
+    for (k = 0; k < 3; k++) {
+        point[k] = to[k];
+        delta[k] = (s32)((u32)to[k] - (u32)from[k]);
+        squared += (u32)delta[k] * (u32)delta[k];
+    }
+    length = (s32)q2_sdk_sqrt_refined(squared);
+    for (i = 0; targets && i < count; i++) {
+        const q2_actor *actor = targets[i];
+        s32 radius, low[3], high[3], rel[3], dot, cross;
+        s32 enter = 0, leave = 4096, y_enter = 0, y_leave = 4096;
+        u32 dot_bits = 0;
+        bool overlaps = true;
+        if (!actor || actor == ignore) continue;
+        radius = (s16)actor->radius;
+        low[0] = (s32)((u32)actor->origin[0] - (u32)radius);
+        high[0] = (s32)((u32)actor->origin[0] + (u32)radius);
+        low[2] = (s32)((u32)actor->origin[2] - (u32)radius);
+        high[2] = (s32)((u32)actor->origin[2] + (u32)radius);
+        high[1] = (s32)((u32)actor->origin[1] + 286u);
+        low[1] = (s32)((u32)high[1] - (u32)(s32)actor->height);
+        for (k = 0; k < 3; k++) {
+            s32 minimum = from[k] < point[k] ? from[k] : point[k];
+            s32 maximum = from[k] > point[k] ? from[k] : point[k];
+            if (maximum < low[k] || minimum > high[k]) overlaps = false;
+            rel[k] = (s32)((u32)from[k] - (u32)actor->origin[k]);
+            dot_bits += (u32)delta[k] * (u32)rel[k];
+        }
+        if (!overlaps) continue;
+        dot = (s32)dot_bits;
+        if (dot >= 0) continue;
+        cross = (s32)((u32)rel[2] * ((u32)point[0] - (u32)actor->origin[0]) -
+                      (u32)rel[0] * ((u32)point[2] - (u32)actor->origin[2]));
+        if (cross < 0) cross = (s32)(0u - (u32)cross);
+        if (cross >= (s32)((u32)radius * (u32)length)) continue;
+        {
+            s32 a = (s32)((u32)delta[0] * (u32)delta[0] +
+                          (u32)delta[2] * (u32)delta[2]);
+            s32 b = (s32)(2u * ((u32)delta[0] * (u32)rel[0] +
+                                (u32)delta[2] * (u32)rel[2]));
+            s32 c = (s32)((u32)rel[0] * (u32)rel[0] +
+                          (u32)rel[2] * (u32)rel[2] - (u32)radius * (u32)radius);
+            if (a && !native_cylinder_roots(a, b, c, &enter, &leave)) continue;
+        }
+        if (enter < 0 && leave >= 0) enter = 0;
+        if ((u32)enter >= 4096u) continue;
+        if (delta[1]) {
+            s32 near_y = delta[1] > 0 ? low[1] : high[1];
+            s32 far_y = delta[1] > 0 ? high[1] : low[1];
+            s32 numerator = (s32)(((u32)near_y - (u32)from[1]) << 12);
+            y_enter = (s32)((s64)numerator / delta[1]);
+            numerator = (s32)(((u32)far_y - (u32)from[1]) << 12);
+            y_leave = (s32)((s64)numerator / delta[1]);
+        } else if (from[1] < low[1] || from[1] > high[1]) continue;
+        if (enter > y_enter) y_enter = enter;
+        if (leave < y_leave) y_leave = leave;
+        if (y_leave < y_enter || y_enter > 4096) continue;
+        best = (s32)i;
+        if (!out) return best;
+        squared = 0;
+        for (k = 0; k < 3; k++) {
+            s32 product = (s32)((u32)delta[k] * (u32)y_enter);
+            delta[k] = product / 4096;
+            point[k] = (s32)((u32)from[k] + (u32)delta[k]);
+            squared += (u32)delta[k] * (u32)delta[k];
+        }
+        length = (s32)q2_sdk_sqrt_refined(squared);
+    }
+    if (out) memcpy(out, point, sizeof(point));
+    return best;
+}
+
+s32 q2_combat_find_target(const s32 eye[3], const s32 angles[3],
+                          const q2_actor *ignore, q2_actor *const *targets,
+                          u32 count, q2_aim_visible_fn visible, void *user,
+                          s16 direction[3], s16 *pitch)
+{
+    s16 matrix[3][3];
+    s32 local_y = 0, ray[3], end[3], point[3], normal[3];
+    int attempt, k;
+    if (!eye || !angles || !direction || !pitch) return -1;
+    q2_rotation_euler(matrix, angles[0], angles[1], angles[2]);
+    for (attempt = 0; attempt < 11; attempt++) {
+        for (k = 0; k < 3; k++) {
+            ray[k] = ((s32)matrix[k][1] * local_y +
+                      (s32)matrix[k][2] * 8192) >> 12;
+            if (k == 1) ray[k] = -ray[k];
+            end[k] = (s32)((u32)eye[k] + (u32)ray[k]);
+            /* The no-target direction is half the unnormalised first ray.
+             * Native narrows to a signed halfword BEFORE truncating / 2. */
+            if (!attempt) direction[k] = (s16)((s16)ray[k] / 2);
+        }
+        {
+            s32 hit = q2_combat_trace_actors(eye, end, ignore, targets, count, point);
+            if (hit >= 0 && (!visible || visible(user, eye, point, attempt))) {
+                *pitch = (s16)q2_ratan2(-local_y, 8192);
+                q2_sdk_vector_normal(ray, normal);
+                for (k = 0; k < 3; k++) direction[k] = (s16)normal[k];
+                return hit;
+            }
+        }
+        local_y = -local_y;
+        if (!(attempt & 1)) local_y += 512;
+    }
+    *pitch = 0;
+    return -1;
 }
 
 s32 q2_combat_nearest_on_segment(const s32 origin[3], const s32 dir[3],
@@ -1682,39 +1851,51 @@ s32 q2_combat_nearest_hit(const s32 origin[3], const s32 dir[3],
                        count, (u32)-1, out_along);
 }
 
+s32 q2_combat_hitscan(q2_actor *attacker, const s32 origin[3],
+                      const s32 dir[3], s16 damage, s16 mod,
+                      s32 world_fraction, q2_actor **targets, u32 count,
+                      const q2_combat_rules *rules, q2_damage_result *out,
+                      s32 point[3])
+{
+    s32 stop[3], at[3], idx;
+    int k;
+
+    if (out)
+        memset(out, 0, sizeof(*out));
+    if (!origin || !dir)
+        return -1;
+    if (world_fraction <= 0 || world_fraction > 4096)
+        world_fraction = (world_fraction <= 0) ? 0 : 4096;
+
+    for (k = 0; k < 3; k++)
+        stop[k] = origin[k] + (s32)(((s64)dir[k] * world_fraction) >> 12);
+
+    idx = q2_combat_trace_actors(origin, stop, attacker, targets,
+                                 targets ? count : 0, at);
+    if (point)
+        memcpy(point, at, sizeof(at));
+    if (idx < 0)
+        return -1;
+
+    {
+        q2_damage_result r = q2_combat_damage(attacker, targets[idx], damage,
+                                              mod, at, rules);
+        if (out)
+            *out = r;
+    }
+    return idx;
+}
+
 s32 q2_combat_fire_bullet(q2_actor *attacker, const s32 origin[3],
                           const s32 dir[3], s16 damage, s32 world_fraction,
                           s32 fallback_radius, q2_actor **targets, u32 count,
                           const q2_combat_rules *rules,
                           q2_damage_result *out)
 {
-    s32 idx;
-    s64 along = 0;
-    s32 point[3];
-    int k;
-
-    if (out)
-        memset(out, 0, sizeof(*out));
-    if (!origin || !dir || !targets)
-        return -1;
-    if (world_fraction <= 0 || world_fraction > 4096)
-        world_fraction = (world_fraction <= 0) ? 0 : 4096;
-
-    idx = nearest_hit(origin, dir, world_fraction, fallback_radius,
-                      targets, count, (u32)-1, &along);
-    if (idx < 0)
-        return -1;
-
-    for (k = 0; k < 3; k++)
-        point[k] = origin[k] + (s32)(((s64)dir[k] * along) / 4096);
-
-    {
-        q2_damage_result r = q2_combat_damage(attacker, targets[idx], damage,
-                                              Q2_MOD_BULLET, point, rules);
-        if (out)
-            *out = r;
-    }
-    return idx;
+    (void)fallback_radius;
+    return q2_combat_hitscan(attacker, origin, dir, damage, Q2_MOD_BULLET,
+                             world_fraction, targets, count, rules, out,
+                             NULL);
 }
 
 u32 q2_combat_fire_rail(q2_actor *attacker, const s32 origin[3],
@@ -1722,41 +1903,8 @@ u32 q2_combat_fire_rail(q2_actor *attacker, const s32 origin[3],
                         s32 fallback_radius, q2_actor **targets, u32 count,
                         const q2_combat_rules *rules)
 {
-    u32 hit = 0, i;
-
-    if (!origin || !dir || !targets)
-        return 0;
-    if (world_fraction <= 0 || world_fraction > 4096)
-        world_fraction = (world_fraction <= 0) ? 0 : 4096;
-
-    /* The rail does not stop in this port: retain its established target-list
-     * order while replacing only the volume test. */
-    for (i = 0; i < count; i++) {
-        q2_actor *t = targets[i];
-        s64 along = 0, leave = 0;
-        s32 point[3];
-        int k;
-
-        /* The same rule as `nearest_hit` above, and for the same reason. */
-        if (!t || !t->takedamage)
-            continue;
-
-        if (!actor_centre_is_ahead(origin, dir, t))
-            continue;
-        if (!actor_cylinder_interval(origin, dir, t, fallback_radius,
-                                     &along, &leave) || leave <= 0)
-            continue;
-        if (along < 0)
-            along = 0;
-        if (along > world_fraction || along > 4096)
-            continue;
-
-        for (k = 0; k < 3; k++)
-            point[k] = origin[k] + (s32)(((s64)dir[k] * along) / 4096);
-
-        q2_combat_damage(attacker, t, damage, Q2_MOD_RAIL, point, rules);
-        hit++;
-    }
-
-    return hit;
+    (void)fallback_radius;
+    return q2_combat_hitscan(attacker, origin, dir, damage, Q2_MOD_RAIL,
+                             world_fraction, targets, count, rules, NULL,
+                             NULL) >= 0 ? 1u : 0u;
 }

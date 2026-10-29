@@ -98,7 +98,8 @@
  * setup proves why this cannot be a filename lookup: two distinct request
  * records for `wep_machgf1b` get different ranges, and the +24/+16 clone is
  * subsequently played through the DIRECT path, which bypasses its variation.
- * Creature modules can own still more request records for that same filename.
+ * SoundIndex aliases the bank's request across core and creature callers;
+ * explicit clones can own still more request records for that same filename.
  *
  * This state deliberately carries no name. A later caller must reconstruct
  * which RETAIL REQUEST and which START PATH raised an event; assigning pitch by
@@ -115,6 +116,22 @@ typedef struct q2_sfx_pitch {
     u8   lower;
     bool varying;
 } q2_sfx_pitch;
+
+/* A retail request is persistent and distinct from both its sample and voices.
+ * Copies are independent clones; aliases must share this object. */
+typedef struct q2_sfx_request {
+    q2_sfx_pitch pitch;
+    u8 volume, volume_upper, volume_lower, parameter;
+    bool vary_volume;
+} q2_sfx_request;
+
+void q2_sfx_request_init(q2_sfx_request *request);
+void q2_sfx_request_params(q2_sfx_request *request, s32 pitch, s32 volume,
+                           s32 parameter);
+/* Call only after a sample and voice slot have been acquired. Pitch consumes
+ * the first draw, volume the second. Direct starts mutate neither field. */
+void q2_sfx_request_begin(q2_sfx_request *request, bool entity_path,
+                          int (*random_next)(void));
 
 /* The exact default request state written by 0x80071BF8. */
 void q2_sfx_pitch_init(q2_sfx_pitch *pitch);
@@ -280,12 +297,12 @@ typedef struct q2_spu_voice {
 
 /*
  * WHO STOPS A LOOPING VOICE. Nothing in this module does — that is the point
- * of a loop — and the client has no per-entity ownership to hang one off yet.
- * What bounds it today is the zone load: `client_voices_stop` silences every
+ * of a loop. The client retains explicit handles for rotator motor loops.
+ * The zone load also bounds playback: `client_voices_stop` silences every
  * voice before the sound bank is freed, because a playing voice borrows the
  * bank's buffer. So a looping ambience runs for the level and dies with it,
- * which is right for an ambience and is NOT right for a loop a script means to
- * stop early. Recorded rather than papered over with a timeout.
+ * while rotator arrival stops its own handle. Entity voices also stop on owner
+ * removal/reuse or their request deadline; see docs/AUDIO-AUDIT.md.
  */
 
 /* Point a voice at a sample body. `adpcm` must outlive the voice — for a bank

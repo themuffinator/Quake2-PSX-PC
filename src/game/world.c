@@ -80,6 +80,7 @@ static bool sort_screen_emit_restore(psx_ot *ot, u32 console_bucket,
     if (!prim)
         return false;
     prim->kind = PSX_PRIM_DRAW_ENV;
+    prim->tpage = 0x060Au; /* SetDefDrawEnv at 0x80089DE4 */
     prim->xy[0].x = (s16)(old->min_x + old->add_x);
     prim->xy[0].y = (s16)(old->min_y + old->add_y);
     prim->xy[1].x = (s16)(old->max_x - old->min_x);
@@ -493,6 +494,257 @@ void q2_world_render_init(q2_world_render *r)
     q2_tpage_table_init(&r->tpage);
     r->subdiv_threshold = 0;
     r->pressure         = Q2_SURF_POOL_FREE;
+    q2_world_subdiv_reset(r, Q2_WORLD_SUBDIV_DEFAULT);
+    q2_world_packet_reset(r, Q2_WORLD_PACKET_DEFAULT);
+}
+
+void q2_world_packet_reset(q2_world_render *r, int packets)
+{
+    unsigned i;
+    if (!r) return;
+    if (!packets) packets=Q2_WORLD_PACKET_DEFAULT;
+    if (packets<0) packets=0;
+    if (packets>32*Q2_WORLD_PACKET_BLOCKS) packets=32*Q2_WORLD_PACKET_BLOCKS;
+    r->packet_capacity=(u16)((packets+31)/32);
+    r->packet_used=r->packet_pending_count=r->packet_dirs_used=0;
+    r->packet_quota=r->packet_remaining=255;
+    memset(r->packet_slot,0,sizeof(r->packet_slot));
+    for (i=0;i<r->packet_capacity;++i) r->packet_free[i]=(u16)i;
+    for (i=0;i<Q2_WORLD_PACKET_DIRS;++i) r->packet_dir_free[i]=(u8)i;
+}
+
+void q2_world_render_begin_view(q2_world_render *r)
+{
+    if (r) r->packet_remaining=r->packet_quota;
+}
+
+u16 q2_world_packet_request(q2_world_render *r, u32 node, unsigned polygons)
+{
+    unsigned i, blocks;
+    q2_world_packet_slot *slot;
+    if (!r) return 0;
+    for (i=0;i<Q2_WORLD_PACKET_DIRS;++i) {
+        slot=&r->packet_slot[i];
+        if (slot->allocated && slot->node==node && slot->view==r->subdiv_view) {
+            q2_world_subdiv_touch_node(r,node);
+            return (u16)(i+1);
+        }
+    }
+    /* 0x80067804 / 67B9C, then 68044: a failed construction restores its
+     * directory immediately and leaves the per-walk quota unchanged. */
+    if (!r->packet_remaining || r->packet_dirs_used==Q2_WORLD_PACKET_DIRS || polygons>=64)
+        return 0;
+    blocks=(polygons+31)/32;
+    if (blocks>(unsigned)(r->packet_capacity-r->packet_used)) return 0;
+    i=r->packet_dir_free[r->packet_dirs_used++];
+    slot=&r->packet_slot[i];
+    slot->allocated=true;
+    slot->node=node;
+    slot->view=r->subdiv_view;
+    slot->blocks=(u8)blocks;
+    for (i=0;i<blocks;++i) slot->block[i]=r->packet_free[r->packet_used++];
+    --r->packet_remaining;
+    q2_world_subdiv_touch_node(r,node);
+    return (u16)(slot-r->packet_slot+1);
+}
+
+void q2_world_subdiv_reset(q2_world_render *r, int capacity)
+{
+    int i;
+    if (!r) return;
+    if (capacity == 0) capacity=Q2_WORLD_SUBDIV_DEFAULT;
+    if (capacity < 0) capacity=0;
+    if (capacity > Q2_WORLD_SUBDIV_MAX) capacity=Q2_WORLD_SUBDIV_MAX;
+    r->subdiv_capacity=(u16)capacity;
+    r->subdiv_used=r->subdiv_pending_count=0;
+    r->subdiv_view=0;
+    memset(r->subdiv_slot,0,sizeof(r->subdiv_slot));
+    for (i=0;i<capacity;++i) r->subdiv_free[i]=(u16)i;
+    r->pressure=capacity?Q2_SURF_POOL_FREE:Q2_SURF_POOL_FULL;
+}
+
+static bool subdiv_resources(q2_world_render *r, const q2_common_file *common,
+                              const char *zone_name, bool have_heap, u32 largest)
+{
+    q2_zone_resources resources;
+    u32 packets;
+    if (!r) return false;
+    q2_world_subdiv_reset(r,Q2_WORLD_SUBDIV_DEFAULT);
+    q2_world_packet_reset(r,Q2_WORLD_PACKET_DEFAULT);
+    if (!q2_common_resources(common,zone_name,&resources)) return false;
+    /* 0x80070F24 / 0x80071518: a negative RESOURCE value forces its
+     * magnitude; only a negative argument to the lower-level allocator
+     * disables it. QFRONT -3000 and QFMV -1 therefore request 3008 and 32
+     * packets after rounding. Negate unsigned to avoid signed overflow.
+     *
+     * The heap-aware entry ignores positive magnitudes. Its caller must supply
+     * the largest payload after water and particles, before the parent pool.
+     * The legacy entry is the fallback for unknown layouts or failed accounting. */
+    packets=resources.packet_control<0 ? 0u-(u32)resources.packet_control
+                                      : (u32)resources.packet_control;
+    if (resources.packet_control>=0 && have_heap) {
+        u32 blocks=(largest-(1882u*(u32)resources.subdiv_meshes+2u))/3330u;
+        packets=32u*(blocks>256u ? 256u : blocks);
+    }
+    if (resources.subdiv_meshes>Q2_WORLD_SUBDIV_MAX ||
+        packets>32u*Q2_WORLD_PACKET_BLOCKS) return false;
+    q2_world_subdiv_reset(r,resources.subdiv_meshes);
+    q2_world_packet_reset(r,(int)packets);
+    return true;
+}
+
+bool q2_world_subdiv_resources(q2_world_render *r, const q2_common_file *common,
+                              const char *zone_name)
+{
+    return subdiv_resources(r,common,zone_name,false,0);
+}
+
+bool q2_world_subdiv_resources_heap(q2_world_render *r, const q2_common_file *common,
+                                   const char *zone_name, u32 largest_payload)
+{
+    return subdiv_resources(r,common,zone_name,true,largest_payload);
+}
+
+static void subdiv_retire(q2_world_render *r, unsigned i, bool detach)
+{
+    q2_subdiv_slot *slot=&r->subdiv_slot[i];
+    if (!slot->pending) {
+        slot->pending=true;
+        r->subdiv_pending[r->subdiv_pending_count++]=(u16)i;
+    }
+    if (detach) slot->poly=NULL;
+}
+
+void q2_world_subdiv_touch_node(q2_world_render *r, u32 node)
+{
+    unsigned i;
+    if (!r) return;
+    /* node+10 is a FRAME stamp (0x80067A44 / 0x80067D14), shared by all
+     * viewports, unlike the four node+4 packet-directory handles. */
+    for (i=0;i<r->subdiv_capacity;++i)
+        if (r->subdiv_slot[i].allocated && r->subdiv_slot[i].node==node)
+            r->subdiv_slot[i].node_seen=true;
+    for (i=0;i<Q2_WORLD_PACKET_DIRS;++i)
+        if (r->packet_slot[i].allocated && r->packet_slot[i].node==node)
+            r->packet_slot[i].node_seen=true;
+}
+
+void q2_world_render_end_view(q2_world_render *r)
+{
+    unsigned i;
+    if (!r) return;
+    /* 0x80067E8C..68010 releases this view's unseen node packets, calling
+     * 0x80069730 for their meshes. Iterate node then face order, as retail
+     * does, because the free stack is LIFO. Detached retirements have no
+     * parent handle and stay unavailable until the frame boundary. */
+    for (;;) {
+        unsigned next=Q2_WORLD_SUBDIV_MAX;
+        for (i=0;i<r->subdiv_capacity;++i) {
+            const q2_subdiv_slot *s=&r->subdiv_slot[i];
+            if (!s->poly || s->pending || s->node_seen || s->view!=r->subdiv_view)
+                continue;
+            if (next==Q2_WORLD_SUBDIV_MAX || s->node<r->subdiv_slot[next].node ||
+                (s->node==r->subdiv_slot[next].node && s->poly<r->subdiv_slot[next].poly))
+                next=i;
+        }
+        if (next==Q2_WORLD_SUBDIV_MAX) break;
+        memset(&r->subdiv_slot[next],0,sizeof(r->subdiv_slot[next]));
+        r->subdiv_free[--r->subdiv_used]=(u16)next;
+    }
+    for (;;) {
+        unsigned next=Q2_WORLD_PACKET_DIRS, j;
+        q2_world_packet_slot *slot;
+        for (i=0;i<Q2_WORLD_PACKET_DIRS;++i) {
+            const q2_world_packet_slot *s=&r->packet_slot[i];
+            if (!s->allocated || s->node_seen || s->view!=r->subdiv_view) continue;
+            if (next==Q2_WORLD_PACKET_DIRS || s->node<r->packet_slot[next].node)
+                next=i;
+        }
+        if (next==Q2_WORLD_PACKET_DIRS) break;
+        slot=&r->packet_slot[next];
+        /* 0x8006D6F4 queues block returns; the node's directory ID is reusable
+         * immediately, but another viewport cannot take the blocks this frame. */
+        for (j=0;j<slot->blocks;++j)
+            r->packet_pending[r->packet_pending_count++]=slot->block[j];
+        memset(slot,0,sizeof(*slot));
+        r->packet_dir_free[--r->packet_dirs_used]=(u8)next;
+    }
+}
+
+void q2_world_render_end_frame(q2_world_render *r)
+{
+    unsigned i, reserve;
+    if (!r) return;
+    /* 0x80069250: release the retirement list, then clear it. */
+    for (i=0;i<r->subdiv_pending_count;++i) {
+        unsigned index=r->subdiv_pending[i];
+        memset(&r->subdiv_slot[index],0,sizeof(r->subdiv_slot[index]));
+        r->subdiv_free[--r->subdiv_used]=(u16)index;
+    }
+    r->subdiv_pending_count=0;
+    reserve=r->subdiv_capacity<6?r->subdiv_capacity:6;
+    /* 0x800692C8..693BC: farthest LAST requested depth, first slot wins ties.
+     * Retired slots remain unavailable until the next call (GPU still owns
+     * their packets). All viewports share the capacity and free stack, but
+     * own distinct meshes (node+4+viewport at 0x8006780C). */
+    for (i=r->subdiv_capacity-r->subdiv_used;i<reserve;++i) {
+        unsigned j, farthest=Q2_WORLD_SUBDIV_MAX;
+        s32 depth=0;
+        for (j=0;j<r->subdiv_capacity;++j)
+            if (r->subdiv_slot[j].poly && r->subdiv_slot[j].depth>depth) {
+                farthest=j;depth=r->subdiv_slot[j].depth;
+            }
+        if (farthest==Q2_WORLD_SUBDIV_MAX) break;
+        subdiv_retire(r,farthest,true);
+    }
+    for (i=0;i<r->subdiv_capacity;++i) r->subdiv_slot[i].node_seen=false;
+    /* Main calls 0x8006D73C AFTER mesh cleanup, once all views are built. */
+    for (i=0;i<r->packet_pending_count;++i)
+        r->packet_free[--r->packet_used]=r->packet_pending[i];
+    r->packet_pending_count=0;
+    for (i=0;i<Q2_WORLD_PACKET_DIRS;++i) r->packet_slot[i].node_seen=false;
+}
+
+q2_subdiv_result q2_world_subdiv_request(q2_world_render *r,const u8 *poly,
+    u32 node,q2_surf_variant variant,u16 clut,const u16 depth[4])
+{
+    unsigned i, index=Q2_WORLD_SUBDIV_MAX;
+    s32 sum=(s32)depth[1]+depth[3];
+    unsigned free_count=r->subdiv_capacity-r->subdiv_used;
+    bool near_eye=depth[0]==0||depth[1]==0||depth[2]==0||depth[3]==0;
+    for (i=0;i<r->subdiv_capacity;++i)
+        if (r->subdiv_slot[i].poly==poly && r->subdiv_slot[i].node==node &&
+            r->subdiv_slot[i].view==r->subdiv_view) { index=i;break; }
+    q2_world_subdiv_touch_node(r,node);
+    if (r->subdiv_threshold<=0 || !q2_surf_should_subdivide(variant,clut,sum,
+            r->subdiv_threshold,Q2_SURF_POOL_FREE)) {
+        /* Flat-link path 0x800AF9C8 queues a cached handle for release. */
+        if (index!=Q2_WORLD_SUBDIV_MAX) subdiv_retire(r,index,false);
+        return Q2_SUBDIV_FLAT;
+    }
+    if (index==Q2_WORLD_SUBDIV_MAX) {
+        bool accepted;
+        r->pressure=free_count==0?Q2_SURF_POOL_FULL:
+            r->subdiv_capacity<7||free_count>6?Q2_SURF_POOL_FREE:
+            free_count>3?Q2_SURF_POOL_TIGHT:Q2_SURF_POOL_FULL;
+        accepted=q2_surf_should_subdivide(variant,clut,sum,r->subdiv_threshold,r->pressure);
+        /* 0x800698F8: any SZ=0 can consume the final three reserved slots.
+         * If even those are spent, return success WITHOUT linking a flat
+         * near-plane smear (0x80069928..9944). */
+        if (!accepted && near_eye) {
+            if (!free_count) return Q2_SUBDIV_DROP;
+            accepted=true;
+        }
+        if (!accepted) return Q2_SUBDIV_FLAT;
+        index=r->subdiv_free[r->subdiv_used++];
+        r->subdiv_slot[index].poly=poly;
+        r->subdiv_slot[index].node=node;
+        r->subdiv_slot[index].view=r->subdiv_view;
+        r->subdiv_slot[index].allocated=true;
+        r->subdiv_slot[index].node_seen=true;
+    }
+    r->subdiv_slot[index].depth=sum;
+    return Q2_SUBDIV_MESH;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -547,6 +799,7 @@ typedef struct world_quad {
     psx_rgb rgb[4];
     psx_uv  uv[4];
     bool    textured;
+    u16     tpage;
 } world_quad;
 
 static psx_prim *emit_quad(psx_ot *ot,
@@ -572,6 +825,7 @@ static psx_prim *emit_quad(psx_ot *ot,
             stats->depth_max = otz;
     }
 
+    (void)render;
     far  = cam->sort_range > 0 ? cam->sort_range : Q2_CAMERA_SORT_RANGE;
 
     /*
@@ -641,45 +895,61 @@ static psx_prim *emit_quad(psx_ot *ot,
         prim->uv[i]   = q->uv[i];
     }
 
-    /*
-     * Translate the stored fields into what the GPU actually wants. Every rule
-     * here is the world renderer's own, read out of the executable:
-     *
-     *   clut >> 8    indexes the CLUT-id table the engine builds at 0x80076378,
-     *                one entry per 4bpp CLUT the map uploads  (0x80068288)
-     *   clut & 3     non-zero picks primitive code 0x3E over 0x3C, i.e. sets
-     *                ABE                                      (0x800682A8)
-     *   tpage & 0x1F indexes the table of GetTPage words built at 0x80078034 as
-     *                GetTPage(0, 0, 64*(i+1), 256). The literal 0 is the colour
-     *                mode, so 4bpp is the executable's statement, not ours.
-     *
-     * The two paths differ in more than the ABE bit, and that difference is the
-     * whole of world transparency. The opaque path ORs blendTable[2] into the
-     * page's table entry AND WRITES IT BACK (0x80068320), promoting the page
-     * from ABR 0 to ABR 1; the transparent path reads the entry untouched. So a
-     * transparent world surface is B/2+F/2 until an opaque polygon on its page
-     * has been emitted, and B+F for the rest of the level. See surface.h.
-     */
-    {
-        u32 clut_index = q2_mapmod_clut_index(poly->clut);
-        bool semi      = q2_mapmod_clut_semi(poly->clut) != 0;
-        u32 page       = (u32)poly->tpage & 0x1Fu;
-
-        prim->clut = q2_vram_clut_word(clut_index);
-
-        if (semi) {
-            prim->tpage            = q2_tpage_world_semi(&render->tpage, page);
-            prim->semi_transparent = true;
-            if (stats) stats->quads_semi++;
-        } else {
-            prim->tpage            = q2_tpage_world_opaque(&render->tpage, page);
-            prim->semi_transparent = false;
-        }
-    }
+    /* The parent's material was resolved before face culling, at allocation.
+     * Flat and subdivided packets both inherit that stored page. */
+    prim->clut = q2_vram_clut_word(q2_mapmod_clut_index(poly->clut));
+    prim->tpage = q->tpage;
+    prim->semi_transparent = q2_mapmod_clut_semi(poly->clut) != 0;
+    if (stats && prim->semi_transparent) stats->quads_semi++;
     prim->textured_blend = true;
 
     if (stats) stats->quads_emitted++;
     return prim;
+}
+
+/* PAL 0x800AEDD4 constructs XYZ/UV and 0x800B0884 updates RGB with the
+ * same midpoint graph. Each add is followed by an arithmetic shift, including
+ * at the intermediate points. In particular the centre is midpoint(1,3),
+ * not the bilinear average of four corners. Keep the graph shared by all
+ * eight components so geometry, texture and lighting stay on the same mesh. */
+static void subdiv_midpoint(s32 out[8], const s32 a[8], const s32 b[8])
+{
+    int i;
+    for (i = 0; i < 8; i++) out[i] = (a[i] + b[i]) >> 1;
+}
+
+static void subdiv_grid(s32 g[5][5][8], const q2_point pt[4],
+                        const world_quad *q)
+{
+    static const int x[4] = {0,4,4,0}, y[4] = {0,0,4,4};
+    int i;
+    for (i = 0; i < 4; i++) {
+        s32 *v = g[y[i]][x[i]];
+        v[0] = pt[i].x; v[1] = pt[i].y; v[2] = pt[i].z;
+        v[3] = q->uv[i].u; v[4] = q->uv[i].v;
+        v[5] = q->rgb[i].r; v[6] = q->rgb[i].g; v[7] = q->rgb[i].b;
+    }
+    subdiv_midpoint(g[2][4], g[0][4], g[4][4]);
+    subdiv_midpoint(g[2][2], g[0][4], g[4][0]);
+    subdiv_midpoint(g[2][3], g[2][4], g[2][2]);
+    subdiv_midpoint(g[1][4], g[0][4], g[2][4]);
+    subdiv_midpoint(g[3][4], g[4][4], g[2][4]);
+    subdiv_midpoint(g[4][2], g[4][4], g[4][0]);
+    subdiv_midpoint(g[4][3], g[4][4], g[4][2]);
+    subdiv_midpoint(g[3][3], g[4][3], g[2][3]);
+    subdiv_midpoint(g[3][2], g[2][2], g[4][2]);
+    subdiv_midpoint(g[4][1], g[4][0], g[4][2]);
+    subdiv_midpoint(g[1][3], g[0][4], g[2][2]);
+    subdiv_midpoint(g[3][1], g[4][0], g[2][2]);
+    subdiv_midpoint(g[2][0], g[4][0], g[0][0]);
+    subdiv_midpoint(g[3][0], g[4][0], g[2][0]);
+    subdiv_midpoint(g[2][1], g[2][2], g[2][0]);
+    subdiv_midpoint(g[1][0], g[0][0], g[2][0]);
+    subdiv_midpoint(g[0][2], g[0][4], g[0][0]);
+    subdiv_midpoint(g[0][1], g[0][0], g[0][2]);
+    subdiv_midpoint(g[1][2], g[0][2], g[2][2]);
+    subdiv_midpoint(g[1][1], g[1][2], g[1][0]);
+    subdiv_midpoint(g[0][3], g[0][4], g[0][2]);
 }
 
 /*
@@ -687,21 +957,16 @@ static psx_prim *emit_quad(psx_ot *ot,
  *
  * 0x800B007C projects a 5x5 grid of vertices — 21 new ones, the four corners
  * arriving already transformed — and writes them into sixteen POLY_GT4 packets
- * at 52-byte stride. This does the same thing: bilinear interpolation in OBJECT
- * space (which is where the original's grid is built, since 0x800B007C loads
- * plain SVECTORs and runs RTPT over them) followed by one projection per point.
+ * at 52-byte stride. Build the rounded midpoint grid in object space, then
+ * project each point. The original loads plain SVECTORs and runs RTPT.
  *
  * The point of the exercise is the affine texture warp. UVs interpolate linearly
  * in screen space with no perspective divide, so the error over a quad grows
  * with how much perspective it spans; splitting a near quad sixteen ways cuts it
- * by the same factor. Interpolating the UV and Gouraud corners bilinearly is the
- * only thing that keeps the mesh identical to the quad it replaces, and is what
- * the packet writes require, though the interpolation itself was not traced
- * instruction by instruction.
+ * by the same factor. UV and Gouraud values follow that same midpoint graph.
  *
- * Returns the number of primitives emitted, or 0 if any grid point failed to
- * project — in which case the caller falls back to the flat quad rather than
- * dropping the surface.
+ * Cells touching SZ=0 are omitted; other cells still draw. Returns the number
+ * emitted, which can be zero when the entire mesh is behind the eye.
  */
 static u32 emit_subdivided(psx_ot *ot,
                            gte_state *gte,
@@ -718,16 +983,8 @@ static u32 emit_subdivided(psx_ot *ot,
 
     gte_sxy grid_xy[V][V];
     u16     grid_z[V][V];
-    /*
-     * Which grid points PROJECTED. A point whose divide overflowed came back
-     * saturated at 0x1FFFF and is unusable — but only the CELLS that touch it
-     * are, so they are the only thing dropped. Failing the whole surface
-     * instead punches a hole in a wall you can see through, which is what
-     * dropping the quad wholesale did; and using the point anyway smears one
-     * enormous polygon across the screen, which is what the flat fallback did.
-     * Neither is the answer: the mesh exists precisely so that the near part of
-     * a surface can go while the rest of it stays.
-     */
+    s32     grid[V][V][8];
+    /* The alternate retail path rejects SZ=0, not divide overflow. */
     bool    grid_ok[V][V];
     u32     emitted = 0;
     int     gx, gy, i;
@@ -736,19 +993,10 @@ static u32 emit_subdivided(psx_ot *ot,
         for (gx = 0; gx < V; gx++)
             grid_ok[gy][gx] = true;
 
-    /*
-     * The MapMod corners run around the perimeter, so p0-p1 and p3-p2 are the
-     * two opposite edges and the surface parameter is
-     *
-     *     P(s,t) = lerp(lerp(p0,p1,s), lerp(p3,p2,s), t)
-     *
-     * with P(0,0)=p0, P(1,0)=p1, P(1,1)=p2, P(0,1)=p3.
-     */
+    subdiv_grid(grid, pt, flat);
     for (gy = 0; gy < V; gy++) {
         for (gx = 0; gx < V; gx++) {
-            s32 s = gx, t = gy;
-            s32 top[3], bot[3], v[3];
-            int c;
+            const s32 *v = grid[gy][gx];
 
             /* Reuse the corners the caller already projected, exactly as the
              * original does — it is handed pointers to them rather than
@@ -757,13 +1005,6 @@ static u32 emit_subdivided(psx_ot *ot,
                 int corner = (gy == 0) ? (gx == 0 ? 0 : 1)
                                        : (gx == 0 ? 3 : 2);
 
-                /*
-                 * ...but only if that corner PROJECTED. A corner whose divide
-                 * overflowed came back saturated at 0x1FFFF, and reusing it
-                 * would put a garbage vertex into the mesh — which is the whole
-                 * fault subdivision exists to avoid. Decline instead, and let
-                 * the caller drop the quad.
-                 */
                 /*
                  * SZ == 0 — at or behind the eye — is the console's predicate,
                  * not "the divide overflowed". 0x800B00AC..0x800B00C8 tests the
@@ -782,16 +1023,6 @@ static u32 emit_subdivided(psx_ot *ot,
                 grid_z[gy][gx]  = flat->depth[corner];
                 continue;
             }
-
-            top[0] = pt[0].x + ((pt[1].x - pt[0].x) * s) / N;
-            top[1] = pt[0].y + ((pt[1].y - pt[0].y) * s) / N;
-            top[2] = pt[0].z + ((pt[1].z - pt[0].z) * s) / N;
-            bot[0] = pt[3].x + ((pt[2].x - pt[3].x) * s) / N;
-            bot[1] = pt[3].y + ((pt[2].y - pt[3].y) * s) / N;
-            bot[2] = pt[3].z + ((pt[2].z - pt[3].z) * s) / N;
-
-            for (c = 0; c < 3; c++)
-                v[c] = top[c] + ((bot[c] - top[c]) * t) / N;
 
             gte->v[0].x = (s16)v[0];
             gte->v[0].y = (s16)v[1];
@@ -823,33 +1054,13 @@ static u32 emit_subdivided(psx_ot *ot,
             for (i = 0; i < 4; i++) {
                 int cx = gx + dx[i];
                 int cy = gy + dy[i];
-                s32 fs = cx, ft = cy;
+                const s32 *v = grid[cy][cx];
 
                 sub.screen[i] = grid_xy[cy][cx];
                 sub.depth[i]  = grid_z[cy][cx];
 
-                /* The same bilinear weights, applied to the corner attributes. */
-                {
-                    s32 tu = flat->uv[0].u + ((s32)flat->uv[1].u - flat->uv[0].u) * fs / N;
-                    s32 tv = flat->uv[0].v + ((s32)flat->uv[1].v - flat->uv[0].v) * fs / N;
-                    s32 bu = flat->uv[3].u + ((s32)flat->uv[2].u - flat->uv[3].u) * fs / N;
-                    s32 bv = flat->uv[3].v + ((s32)flat->uv[2].v - flat->uv[3].v) * fs / N;
-
-                    sub.uv[i].u = (u8)(tu + (bu - tu) * ft / N);
-                    sub.uv[i].v = (u8)(tv + (bv - tv) * ft / N);
-                }
-                {
-                    s32 tr = flat->rgb[0].r + ((s32)flat->rgb[1].r - flat->rgb[0].r) * fs / N;
-                    s32 tg = flat->rgb[0].g + ((s32)flat->rgb[1].g - flat->rgb[0].g) * fs / N;
-                    s32 tb = flat->rgb[0].b + ((s32)flat->rgb[1].b - flat->rgb[0].b) * fs / N;
-                    s32 br = flat->rgb[3].r + ((s32)flat->rgb[2].r - flat->rgb[3].r) * fs / N;
-                    s32 bg = flat->rgb[3].g + ((s32)flat->rgb[2].g - flat->rgb[3].g) * fs / N;
-                    s32 bb = flat->rgb[3].b + ((s32)flat->rgb[2].b - flat->rgb[3].b) * fs / N;
-
-                    sub.rgb[i].r = (u8)(tr + (br - tr) * ft / N);
-                    sub.rgb[i].g = (u8)(tg + (bg - tg) * ft / N);
-                    sub.rgb[i].b = (u8)(tb + (bb - tb) * ft / N);
-                }
+                sub.uv[i].u = (u8)v[3]; sub.uv[i].v = (u8)v[4];
+                sub.rgb[i].r = (u8)v[5]; sub.rgb[i].g = (u8)v[6]; sub.rgb[i].b = (u8)v[7];
             }
 
             if (emit_quad(ot, cam, render, &sub, poly, forced_bucket,
@@ -894,6 +1105,7 @@ u32 q2_world_build_ot(const q2_world_zone *z,
         q2_world_render_init(&local);
         render = &local;
     }
+    q2_world_render_begin_view(render);
 
     if (stats)
         memset(stats, 0, sizeof(*stats));
@@ -978,6 +1190,7 @@ u32 q2_world_build_ot(const q2_world_zone *z,
         q2_mapmod_rec rec;
         const q2_point_group *grp;
         q2_surf_variant variant;
+        q2_world_packet_slot *parent=NULL;
         s16 spin_angles[3], spin_pivot[3];
         bool spin_active = false;
         s32 forced_bucket = -1;
@@ -1059,6 +1272,36 @@ u32 q2_world_build_ot(const q2_world_zone *z,
         }
 
         variant = q2_scene_flags_variant(node.flags);
+
+        /* Parent packets exist before emitter dispatch (including variant 3
+         * and deferred nodes whose area has no current screen record). */
+        if (!q2_scene_get_mapmod(&z->scene, n, &rec)) {
+            if (stats) stats->quads_rejected_bad++;
+            continue;
+        }
+        if (have_order || !q2_mapmod_rec_is_sealing(&rec)) {
+            u16 handle=q2_world_packet_request(render,n,rec.num_polys);
+            if (!handle) {
+                if (stats) stats->nodes_packet_denied++;
+                continue;
+            }
+            parent=&render->packet_slot[handle-1];
+            if (!parent->prepared) {
+                /* 0x800682C8..68324 runs for EVERY face at construction, before
+                 * culling. Later table promotions cannot rewrite an older
+                 * transparent parent packet, nor its subdivision children. */
+                for (p=0;p<rec.num_polys;++p) {
+                    q2_mapmod_poly material;
+                    if (q2_mapmod_get_poly(&rec,p,&material)) {
+                        u32 page=material.tpage&31u;
+                        parent->tpage[p]=q2_mapmod_clut_semi(material.clut)
+                            ? q2_tpage_world_semi(&render->tpage,page)
+                            : q2_tpage_world_opaque(&render->tpage,page);
+                    }
+                }
+                parent->prepared=true;
+            }
+        }
         if (variant == Q2_SURF_VARIANT_HIDDEN) {
             if (stats) stats->nodes_hidden++;
             continue;
@@ -1087,11 +1330,6 @@ u32 q2_world_build_ot(const q2_world_zone *z,
                 }
                 deferred_area = (s32)(node.area & 0x7Fu);
             }
-        }
-
-        if (!q2_scene_get_mapmod(&z->scene, n, &rec)) {
-            if (stats) stats->quads_rejected_bad++;
-            continue;
         }
 
         /*
@@ -1163,12 +1401,19 @@ u32 q2_world_build_ot(const q2_world_zone *z,
          */
         {
             s32 shift[3] = { 0, 0, 0 };
+            s32 native_shift[3];
+            int axis;
 
             if (z->movers) {
                 q2_movers_node_offset(z->movers, n, mover_shift);
                 shift[0] = mover_shift[0];
                 shift[1] = mover_shift[1];
                 shift[2] = mover_shift[2];
+            }
+            q2_rotators_node_offset(z->rotators, n, native_shift);
+            for (axis = 0; axis < 3; axis++) {
+                mover_shift[axis] += native_shift[axis];
+                shift[axis] += native_shift[axis];
             }
 
             spin_active = z->rotators &&
@@ -1370,6 +1615,7 @@ u32 q2_world_build_ot(const q2_world_zone *z,
                 gte_sxy screen[4];
                 u16 depth[4];
 
+                q.tpage = parent->tpage[p];
                 screen[0] = gte->sxy[0];
                 screen[1] = gte->sxy[1];
                 screen[2] = gte->sxy[2];
@@ -1627,28 +1873,18 @@ u32 q2_world_build_ot(const q2_world_zone *z,
                  * depth the original tests is the sum of two opposite corners
                  * (0x800AF874), not the average of four, so use exactly that.
                  *
-                 * A QUAD THAT ASKED FOR SUBDIVISION AND DID NOT GET IT IS
-                 * DROPPED, not drawn flat.
-                 *
-                 * `emit_subdivided` declines when a grid point — or a reused
-                 * corner — fails to project, and falling back to the flat quad
-                 * there is what put a screenful of enormous skewed polygons over
-                 * the view, HUD included: `gte_divide` clamps to 0x1FFFF on
-                 * overflow, so the flat quad's own corner is saturated and the
-                 * primitive is emitted stretched across the framebuffer.
-                 *
-                 * The original cannot reach that case at all, because it never
-                 * subdivides a quad its near test already rejected — so there is
-                 * no console behaviour to fall back TO. A quad that is near
-                 * enough to need the mesh and cannot be meshed has no drawable
-                 * form, and going is exactly what the near test would have done
-                 * with it.
+                 * The mesh may cross the eye plane. Retail rejects individual
+                 * cells touching SZ=0, retaining the other cells even when the
+                 * original quad has a behind-eye corner. No flat fallback is
+                 * emitted when the mesh contributes no drawable cells.
                  */
-                if (render->subdiv_threshold > 0 &&
-                    q2_surf_should_subdivide(variant, poly.clut,
-                                             (s32)depth[1] + (s32)depth[3],
-                                             render->subdiv_threshold,
-                                             render->pressure)) {
+                q2_subdiv_result decision=q2_world_subdiv_request(render,
+                    rec.polys+(size_t)p*12,n,variant,poly.clut,depth);
+                if (decision==Q2_SUBDIV_DROP) {
+                    if (stats) stats->quads_rejected_near++;
+                    continue;
+                }
+                if (decision==Q2_SUBDIV_MESH) {
                     u32 sub = emit_subdivided(ot, gte, cam, render,
                                               pt, &q, &poly, forced_bucket,
                                               batch, stats);
@@ -1669,6 +1905,7 @@ u32 q2_world_build_ot(const q2_world_zone *z,
         }
     }
 
+    q2_world_render_end_view(render);
     if (have_screen_state) {
         psx_ot_area_screen full = screen_state.record[0];
         s32 centre_x = (cam->ofs_x || cam->ofs_y)

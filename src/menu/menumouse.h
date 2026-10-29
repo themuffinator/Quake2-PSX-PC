@@ -52,7 +52,8 @@ typedef enum q2_menu_hit_part {
     Q2_MENU_HIT_OFF,      /* a toggle's OFF word                            */
     Q2_MENU_HIT_PREV,     /* a choice's left half — the pad's LEFT          */
     Q2_MENU_HIT_NEXT,     /* its right half — the pad's RIGHT               */
-    Q2_MENU_HIT_SLIDER    /* inside a slider's 133x8 track                  */
+    Q2_MENU_HIT_SLIDER,   /* inside a slider's 133x8 track                  */
+    Q2_MENU_HIT_CHAR      /* player-name character; click cycles upward    */
 } q2_menu_hit_part;
 
 typedef struct q2_menu_hit {

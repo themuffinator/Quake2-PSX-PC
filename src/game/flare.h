@@ -60,7 +60,7 @@
  *     4096, which is why a flare blooms as you walk into it and fades as you
  *     walk away.
  *
- * Both element kinds are untextured and additive: the glow is a fan of Gouraud
+ * Both element kinds are untextured and inherit ABR: the glow is a fan of Gouraud
  * quads bright at the centre and black at the rim, and kind 1 adds eight
  * Gouraud lines radiating from the centre. There is no flare texture anywhere
  * on the disc, which is why looking for one never found anything.

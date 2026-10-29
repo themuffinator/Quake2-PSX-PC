@@ -209,7 +209,7 @@ static void dec_track(dec *d, u32 w)
  * this deterministic. Over-walking is harmless because every candidate move is
  * validated structurally before it is accepted.
  */
-static u32 walk_end(const q2_creature *c, u32 entry)
+static u32 walk_end(const q2_creature *c, const dec *d, u32 entry)
 {
     u32 best = entry + WALK_LIMIT * 4;
     u32 i;
@@ -226,6 +226,21 @@ static u32 walk_end(const q2_creature *c, u32 entry)
         if (c->move[i].endfunc_addr > entry && c->move[i].endfunc_addr < best)
             best = c->move[i].endfunc_addr;
 
+    /* A return only ends the function after its forward branch targets.
+     * This preserves multiple-return installers without walking into the
+     * next unregistered function (notably Jorg's embedded Rider spawn). */
+    {
+        u32 addr, frontier = entry;
+        for (addr = entry; addr < best && in_image(d, addr, 4); addr += 4) {
+            u32 w = word_at(d, addr), op = OP(w), target = 0;
+            if (op == 1 || (op >= 4 && op <= 7))
+                target = addr + 4 + (s32)IMM(w) * 4;
+            else if (op == 2)
+                target = ((addr + 4) & 0xF0000000u) | ((w & 0x03FFFFFFu) << 2);
+            if (target >= entry && target < best && target > frontier) frontier = target;
+            if (w == 0x03E00008u && addr >= frontier) return addr + 8;
+        }
+    }
     return best;
 }
 
@@ -239,7 +254,7 @@ static u32 walk_end(const q2_creature *c, u32 entry)
  * `a0` set to a constant under 256 and `a1` set to an in-image address, with a
  * `jalr` before either changes again.
  */
-static void decode_classes(q2_creature *c, dec *d, u32 entry)
+static void decode_classes(q2_creature *c, dec *d, u32 entry, s32 method_class)
 {
     u32 addr;
     u32 pending_class = 0xFFFFFFFFu;
@@ -288,10 +303,13 @@ static void decode_classes(q2_creature *c, dec *d, u32 entry)
                     for (i = 0; i < c->class_count; i++)
                         if (c->class_byte[i] == (u8)pending_class)
                             dup = true;
-                    if (!dup)
+                    if (!dup) {
+                        c->class_method_table[c->class_count] = pending_table;
                         c->class_byte[c->class_count++] = (u8)pending_class;
+                    }
                 }
-                if (!c->method_table_addr)
+                if ((!c->method_table_addr && method_class < 0) ||
+                    pending_class == (u32)method_class)
                     c->method_table_addr = pending_table;
             }
         }
@@ -528,7 +546,7 @@ static void follow_callback(q2_creature *c, dec *d, u32 entry, s32 via,
     if (!entry || !in_image(d, entry, 4) || depth > 4)
         return;
 
-    end = walk_end(c, entry);
+    end = walk_end(c, d, entry);
 
     /*
      * Pass one: does this function install moves at all? A single
@@ -606,19 +624,21 @@ static void follow_callback(q2_creature *c, dec *d, u32 entry, s32 via,
 #define CRE_MOVE_NAME_CHARS  16
 
 /*
- * One record: `{ char name[16]; u16 first_frame; u16 last_frame }`.
+ * The text portion of a native 20-byte frame-name record. The first four
+ * bytes hold the frame range; the following 16 bytes initially hold the name
+ * and zero padding (the engine later caches model positions in that padding).
  *
  * The name is NUL-padded and is NOT terminated when it fills its sixteen
  * bytes, the same rule the level table and the `Strings` dictionary use. The
  * two frames are the move's own range, which is what ties a name to a move
  * without needing the table's order to match the decoder's.
  */
-static bool name_slot_ok(const u8 *p, size_t avail)
+static bool name_text_ok(const u8 *p, size_t avail)
 {
     size_t i;
     bool terminated = false;
 
-    if (avail < CRE_MOVE_NAME_STRIDE)
+    if (avail < CRE_MOVE_NAME_CHARS)
         return false;
     if (p[0] < 0x20 || p[0] > 0x7E)
         return false;
@@ -653,7 +673,7 @@ static bool name_slot_ok(const u8 *p, size_t avail)
         if (p[i] != 0)
             return false;
 
-    return q2_rd_u16(p + 18) >= q2_rd_u16(p + 16);
+    return true;
 }
 
 /* A 12-byte slot holding a NUL-terminated printable name of 3 or more bytes. */
@@ -737,171 +757,6 @@ u32 q2_creature_sound_names(const q2_creature *c, const u8 *image, size_t size,
 /* ------------------------------------------------------------------------- */
 /* A creature's sounds, decoded from the module's own registrations           */
 /* ------------------------------------------------------------------------- */
-#define SND_OP(w)     ((w) >> 26)
-#define SND_RS(w)     (((w) >> 21) & 0x1F)
-#define SND_RT(w)     (((w) >> 16) & 0x1F)
-#define SND_RD(w)     (((w) >> 11) & 0x1F)
-#define SND_FN(w)     ((w) & 0x3F)
-#define SND_IMM(w)    ((s32)(s16)((w) & 0xFFFF))
-
-#define SND_OP_LUI    0x0Fu
-#define SND_OP_LW     0x23u
-#define SND_OP_SW     0x2Bu
-#define SND_OP_ADDIU  0x09u
-#define SND_FN_JALR   0x09u
-
-/* The engine import the modules call to register a sound: block offset 36,
- * which is slot 9. Both modules checked use it and nothing else does. */
-#define SND_IMPORT_SLOT 36
-
-/* How far the scheduler moves things. The widest gap measured between the
- * `addiu` that forms a name pointer and the `jalr` that consumes it is 22
- * instructions, in the Berserk. */
-#define SND_LOOKBACK  64
-#define SND_LOOKAHEAD 12
-
-/* A 12-byte NUL-terminated printable name with its padding checked. */
-static bool snd_name_at(const u8 *image, size_t size, u32 off, char *out)
-{
-    u32 i;
-    bool ended = false;
-    u32 n = 0;
-
-    if ((size_t)off + 12 > size)
-        return false;
-
-    for (i = 0; i < 12; i++) {
-        u8 ch = image[off + i];
-
-        if (ch == 0) {
-            ended = true;
-            continue;
-        }
-        if (ended)
-            return false;
-        if (ch < 0x20 || ch > 0x7E)
-            return false;
-        n++;
-    }
-
-    if (n < 3)
-        return false;
-
-    memcpy(out, image + off, 12);
-    out[12] = '\0';
-    return true;
-}
-
-u32 q2_creature_sound_bindings(const u8 *image, size_t size, u32 load_base,
-                               q2_cre_sound_bind *out, u32 max)
-{
-    size_t i;
-    u32 n = 0;
-
-    if (!image || size < 16)
-        return 0;
-
-    for (i = 0; i + 4 <= size; i += 4) {
-        u32 w = q2_rd_u32(image + i);
-        u32 target, j;
-        u32 hi[32];
-        bool hi_ok[32];
-        char name[13];
-        bool have_name = false;
-        u32 addr = 0;
-        bool have_addr = false;
-        int k;
-
-        /* `lw rT, 36(rB)` — the import fetch. */
-        if (SND_OP(w) != SND_OP_LW || SND_IMM(w) != SND_IMPORT_SLOT)
-            continue;
-        target = SND_RT(w);
-
-        /* ...consumed by a `jalr` a few instructions later. */
-        {
-            bool called = false;
-            size_t at;
-
-            for (j = 4; j <= SND_LOOKAHEAD * 4 && i + j + 4 <= size; j += 4) {
-                u32 v = q2_rd_u32(image + i + j);
-
-                if (SND_OP(v) == 0 && SND_FN(v) == SND_FN_JALR &&
-                    SND_RS(v) == target) {
-                    called = true;
-                    break;
-                }
-            }
-            if (!called)
-                continue;
-            at = i + j;            /* the jalr */
-
-            /*
-             * The NAME. Walk back tracking each register's most recent `lui`,
-             * then take the nearest `addiu rT, rY, imm` whose formed address
-             * lands on a real name. Tracking the `lui` is what makes this
-             * exact rather than a guess about which register holds the base.
-             */
-            for (k = 0; k < 32; k++)
-                hi_ok[k] = false;
-
-            {
-                size_t from = at > SND_LOOKBACK * 4
-                                  ? at - SND_LOOKBACK * 4 : 0;
-                size_t p;
-
-                for (p = from; p < at; p += 4) {
-                    u32 v = q2_rd_u32(image + p);
-
-                    if (SND_OP(v) == SND_OP_LUI) {
-                        hi[SND_RT(v)]    = (u32)(v & 0xFFFF) << 16;
-                        hi_ok[SND_RT(v)] = true;
-                        continue;
-                    }
-                    if (SND_OP(v) == SND_OP_ADDIU && hi_ok[SND_RS(v)]) {
-                        u32 a = hi[SND_RS(v)] + (u32)SND_IMM(v);
-
-                        if (a >= load_base &&
-                            snd_name_at(image, size, a - load_base, name))
-                            have_name = true;
-                        /* keep walking: the NEAREST match wins */
-                    }
-                }
-            }
-
-            if (!have_name)
-                continue;
-
-            /* And the handle's home: the first `sw v0, imm(rX)` after it. */
-            for (j = 4; j <= SND_LOOKAHEAD * 4 && at + j + 4 <= size; j += 4) {
-                u32 v = q2_rd_u32(image + at + j);
-
-                if (SND_OP(v) == SND_OP_LUI) {
-                    hi[SND_RT(v)]    = (u32)(v & 0xFFFF) << 16;
-                    hi_ok[SND_RT(v)] = true;
-                    continue;
-                }
-                if (SND_OP(v) == SND_OP_SW && SND_RT(v) == 2 /* v0 */ &&
-                    hi_ok[SND_RS(v)]) {
-                    addr      = hi[SND_RS(v)] + (u32)SND_IMM(v);
-                    have_addr = true;
-                    break;
-                }
-            }
-
-            if (!have_addr)
-                continue;
-        }
-
-        if (n < max && out) {
-            out[n].addr = addr;
-            memcpy(out[n].name, name, sizeof(out[n].name));
-        }
-        n++;
-    }
-
-    return n;
-}
-
 const char *q2_creature_sound_for_addr(const q2_cre_sound_bind *binds,
                                        u32 count, u32 addr)
 {
@@ -910,6 +765,8 @@ const char *q2_creature_sound_for_addr(const q2_cre_sound_bind *binds,
     if (!binds)
         return NULL;
 
+    /* Later registrations can be conditional fallbacks (Strider). Keep the
+     * primary here; the module-aware resolver handles unconditional stores. */
     for (i = 0; i < count; i++)
         if (binds[i].addr == addr)
             return binds[i].name;
@@ -950,7 +807,44 @@ static const q2_cre_sound_fallback k_sound_fallbacks[] = {
       "sol_deth3", { "sol_deth2", "sol_deth1", "sol_deth3" } },
     /* Tankcomm idle: module+0x808, tnk_idle1 or else tnk_step. */
     { "Tankcomm", 0x2100, { 0x2100, 0x2110, 0 },
-      "tnk_idle1", { "tnk_idle1", "tnk_step", NULL } }
+      "tnk_idle1", { "tnk_idle1", "tnk_step", NULL } },
+    /* Strider +0x928..0xEF8 registers each alternate only if its slot is
+     * empty. Idle and footstep initially share str_step but have distinct
+     * fallback handles, so the client must resolve by address. */
+    { "Strider", 0x2BC0, { 0x2BC0, 0x2BC0, 0 },
+      "str_step", { "str_step", "tnk_idle1", NULL } },
+    { "Strider", 0x2BC4, { 0x2BC4, 0x2BC4, 0 },
+      "str_pain1", { "str_pain1", "tnk_pain", NULL } },
+    { "Strider", 0x2BC8, { 0x2BC8, 0x2BC8, 0 },
+      "str_idle", { "str_idle", "tnk_idle1", NULL } },
+    { "Strider", 0x2BCC, { 0x2BCC, 0x2BCC, 0 },
+      "str_deth", { "str_deth", "tnk_death", NULL } },
+    { "Strider", 0x2BD0, { 0x2BD0, 0x2BD0, 0 },
+      "str_step", { "str_step", "tnk_step", NULL } },
+    { "Strider", 0x2BD4, { 0x2BD4, 0x2BD4, 0 },
+      "str_sght", { "str_sght", "tnk_sight1", NULL } },
+    { "Strider", 0x2BDC, { 0x2BDC, 0x2BDC, 0 },
+      "str_atck2c", { "str_atck2c", "tnk_atck1", NULL } },
+    /* Rider+0xD8C..0xEF8; Jorg's embedded copy uses the same names. */
+    { "Rider", 0x2A10, { 0x2A14, 0, 0 },
+      "mak_pain3", { "mak_pain2", NULL, NULL } },
+    { "Rider", 0x2A18, { 0x2A14, 0, 0 },
+      "mak_pain1", { "mak_pain2", NULL, NULL } },
+    { "Rider", 0x2A3C, { 0x2A38, 0, 0 },
+      "mak_voice3", { "mak_voice4", NULL, NULL } },
+    { "Rider", 0x2A40, { 0x2A38, 0, 0 },
+      "mak_voice", { "mak_voice4", NULL, NULL } },
+    { "Rider", 0x2A28, { 0x2A28, 0, 0 },
+      "mak_bfg_fire", { "wep_bfg__f1y", NULL, NULL } },
+    { "Rider", 0x2A20, { 0x2A24, 0, 0 },
+      "mak_step1", { "mak_step2", NULL, NULL } },
+    { "Rider", 0x2A24, { 0x2A20, 0, 0 },
+      "mak_step2", { "mak_step1", NULL, NULL } },
+    /* Jorg+0xEE4: either missing footstep takes the other handle. */
+    { "Jorg", 0x4A64, { 0x4A68, 0, 0 },
+      "bs3_step1", { "bs3_step2", NULL, NULL } },
+    { "Jorg", 0x4A68, { 0x4A64, 0, 0 },
+      "bs3_step2", { "bs3_step1", NULL, NULL } }
 };
 
 const q2_cre_sound_fallback *q2_creature_sound_fallbacks(u32 *count)
@@ -973,6 +867,21 @@ const char *q2_creature_sound_resolve(const char *module_name,
 
     if (!module_name)
         return own;
+
+    /* Jorg registers its embedded Rider's independent handles at +0x2060
+     * relative to the standalone module. Preserve the actual registration
+     * above, then share only the verified conditional fill rules. */
+    if ((!strcmp(module_name, "Jorg") || !strcmp(module_name, "JorgRider")) &&
+        addr >= load_base + 0x4A70 && addr <= load_base + 0x4AA4) {
+        module_name = "Rider"; addr -= 0x2060;
+    }
+
+    /* Ironmaiden +0xA28 writes a second pain registration to 1B94;
+     * +0xAC0 unconditionally replaces that slot with its sight sound. */
+    if (!strcmp(module_name, "Ironmaiden") && addr == load_base + 0x1B94) {
+        for (i = count; binds && i > 0; i--)
+            if (binds[i - 1].addr == addr) return binds[i - 1].name;
+    }
 
     for (i = 0; i < sizeof(k_sound_fallbacks) / sizeof(k_sound_fallbacks[0]);
          i++) {
@@ -1001,8 +910,7 @@ const char *q2_creature_sound_resolve(const char *module_name,
             if (g->pref_off[j] == 0)
                 break;
 
-            name = q2_creature_sound_for_addr(binds, count,
-                                              load_base + g->pref_off[j]);
+            name = g->pref_name[j];
             if (!name || !name[0])
                 continue;
             if (!bank_has || bank_has(name, user))
@@ -1063,53 +971,36 @@ const char *q2_creature_sound_fallback(const char *module_name,
 /*
  * The whole name table, in order, one entry per record.
  *
- * ANCHORED, not scanned. `q2_creature_move_names` walks the image four bytes at
- * a time looking for anything that validates, which is why six of the Soldier's
- * records came back paired with the wrong name: a 20-byte record read at a
- * 4-byte offset can validate against the tail of its predecessor. The table
- * starts immediately past the module's last instruction — for the Soldier that
- * is 0x80102920, right after the `jr ra` at 0x80102918 and its delay slot — so
- * the first record that validates on a 4-aligned offset AND is followed by
- * another at +20 is the base, and from there the stride is fixed.
+ * Export 3 points directly to this table. 0x8007E7F0/0x8007E95C walks it in
+ * 20-byte steps; 0x8007EA00 stops at a negative first frame. A reversed range
+ * cannot match a frame but does not end the table (Boss2's unused Stand2 is
+ * 21..0). Neither the name nor the range belongs to the following record.
  */
 u32 q2_creature_frame_names(const q2_creature *c, const u8 *image, size_t size,
                             q2_cre_frame_name *out, u32 out_count)
 {
-    size_t off, base = 0;
-    bool   found = false;
+    size_t off;
+    u32 address;
     u32    n = 0;
 
-    if (!c || !image || !out || out_count == 0)
+    if (!c || !image || size < 16 || !out || out_count == 0)
         return 0;
-
-    /*
-     * Find the base: two consecutive valid records at the fixed stride. One
-     * alone can be a coincidence inside code; two in a row at +20 is the table.
-     */
-    for (off = 0; off + 2 * CRE_MOVE_NAME_STRIDE <= size; off += 4) {
-        if (name_slot_ok(image + off + 4, size - off - 4) &&
-            name_slot_ok(image + off + 4 + CRE_MOVE_NAME_STRIDE,
-                         size - off - 4 - CRE_MOVE_NAME_STRIDE)) {
-            base  = off;
-            found = true;
-            break;
-        }
-    }
-    if (!found)
+    address = q2_rd_u32(image + 12);
+    if (!address || address < c->base || (size_t)(address - c->base) >= size)
         return 0;
-
-    for (off = base; off + CRE_MOVE_NAME_STRIDE <= size && n < out_count;
+    for (off = address - c->base; off + CRE_MOVE_NAME_STRIDE <= size && n < out_count;
          off += CRE_MOVE_NAME_STRIDE) {
-        if (!name_slot_ok(image + off + 4, size - off - 4))
-            break;                      /* the table has ended */
-
-        out[n].first = (s32)q2_rd_u16(image + off);
-        out[n].last  = (s32)q2_rd_u16(image + off + 2);
-        out[n].name  = (const char *)(image + off + 4);
-
-        /* A record whose range runs backwards is not one. */
-        if (out[n].last < out[n].first)
+        s32 first = (s16)q2_rd_u16(image + off);
+        s32 last = (s16)q2_rd_u16(image + off + 2);
+        if (first < 0)
             break;
+        if (last < first)
+            continue;
+        if (!name_text_ok(image + off + 4, size - off - 4))
+            break;
+        out[n].first = first;
+        out[n].last = last;
+        out[n].name = (const char *)(image + off + 4);
         n++;
     }
 
@@ -1205,7 +1096,8 @@ bool q2_creature_think_is_empty(const q2_creature *c, const u8 *image,
 u32 q2_creature_unclaimed_names(const q2_creature *c, const u8 *image,
                                 size_t size, const char **out, u32 out_count)
 {
-    size_t off;
+    q2_cre_frame_name names[Q2_CRE_MAX_MOVES];
+    u32 count, index;
     u32 unclaimed = 0;
 
     if (!c || !image)
@@ -1216,27 +1108,14 @@ u32 q2_creature_unclaimed_names(const q2_creature *c, const u8 *image,
      * count means the module names behaviour we never reached -- a gap in the
      * decode, not in the disc.
      */
-    for (off = 0; off + CRE_MOVE_NAME_STRIDE <= size; off += 4) {
+    count = q2_creature_frame_names(c, image, size, names, Q2_CRE_MAX_MOVES);
+    for (index = 0; index < count; index++) {
         s32 first, last;
         u32 i;
         bool claimed = false;
 
-        if (!name_slot_ok(image + off, size - off))
-            continue;
-
-        first = (s32)q2_rd_u16(image + off + 16);
-        last  = (s32)q2_rd_u16(image + off + 18);
-
-        /*
-         * name_slot_ok() alone is far too weak here. Scanning every 4-byte
-         * window finds slices of the module's error strings -- "Invalid
-         * Creature", "Creature Interfa", "d Creature Inter" -- and an earlier
-         * version of this counter reported 241 "unclaimed names" that were
-         * almost all exactly that. A real record's frame pair is ordered and
-         * small; a slice of English text produces a wild one.
-         */
-        if (first > last || last > 1024)
-            continue;
+        first = names[index].first;
+        last = names[index].last;
 
         for (i = 0; i < c->move_count; i++) {
             if (c->move[i].first_frame == first &&
@@ -1248,7 +1127,7 @@ u32 q2_creature_unclaimed_names(const q2_creature *c, const u8 *image,
         if (!claimed) {
             unclaimed++;
             if (out && unclaimed <= out_count)
-                out[unclaimed - 1] = (const char *)image + off;
+                out[unclaimed - 1] = names[index].name;
         }
     }
 
@@ -1277,20 +1156,17 @@ u32 q2_creature_unclaimed_names(const q2_creature *c, const u8 *image,
 static void add_named_but_unreached(q2_creature *c, dec *d, const u8 *image,
                                     size_t size)
 {
-    size_t off;
+    q2_cre_frame_name names[Q2_CRE_MAX_MOVES];
+    u32 count, index;
 
-    for (off = 0; off + CRE_MOVE_NAME_STRIDE <= size; off += 4) {
+    count = q2_creature_frame_names(c, image, size, names, Q2_CRE_MAX_MOVES);
+    for (index = 0; index < count; index++) {
         s32 first, last;
         u32 i, scan;
         bool claimed = false;
 
-        if (!name_slot_ok(image + off, size - off))
-            continue;
-
-        first = (s32)q2_rd_u16(image + off + 16);
-        last  = (s32)q2_rd_u16(image + off + 18);
-        if (first > last || last > 1024)
-            continue;
+        first = names[index].first;
+        last = names[index].last;
 
         for (i = 0; i < c->move_count; i++)
             if (c->move[i].first_frame == first &&
@@ -1325,8 +1201,8 @@ static void add_named_but_unreached(q2_creature *c, dec *d, const u8 *image,
  * -- which is how these surfaced at all, as the only exceptions to the 3:1 rule
  * (openquestions #51h, #58).
  *
- * The boundaries are not inferred: the module ships a {char[16], u16 first,
- * u16 last} record per move, and this splits at exactly those. A move the table
+ * The boundaries are not inferred: the module ships a {s16 first, s16 last,
+ * char[16]} record per move, and this splits at exactly those. A move the table
  * does not subdivide is left alone.
  */
 /*
@@ -1381,27 +1257,23 @@ static void split_overlapping_moves(q2_creature *c)
 
 static void split_merged_moves(q2_creature *c, const u8 *image, size_t size)
 {
-    u32 i;
+    q2_cre_frame_name names[Q2_CRE_MAX_MOVES];
+    u32 i, count;
 
     if (!c || !image)
         return;
 
+    count = q2_creature_frame_names(c, image, size, names, Q2_CRE_MAX_MOVES);
     for (i = 0; i < c->move_count; i++) {
-        size_t off;
+        u32 index;
         u32 pieces = 0;
 
-        for (off = 0; off + CRE_MOVE_NAME_STRIDE <= size; off += 4) {
+        for (index = 0; index < count; index++) {
             s32 first, last;
             u32 fi;
 
-            if (!name_slot_ok(image + off, size - off))
-                continue;
-
-            first = (s32)q2_rd_u16(image + off + 16);
-            last  = (s32)q2_rd_u16(image + off + 18);
-
-            if (first > last || last > 1024)
-                continue;
+            first = names[index].first;
+            last = names[index].last;
 
             /* A STRICT interior piece: inside the move, and not the move. */
             if (first < c->move[i].first_frame || last > c->move[i].last_frame)
@@ -1464,6 +1336,13 @@ static void split_merged_moves(q2_creature *c, const u8 *image, size_t size)
 bool q2_creature_decode(q2_creature *out, const u8 *image, size_t size,
                         u32 base, const char *name)
 {
+    return q2_creature_decode_entry(out, image, size, base, name, 0, -1);
+}
+
+bool q2_creature_decode_entry(q2_creature *out, const u8 *image, size_t size,
+                              u32 base, const char *name, u32 spawn_entry,
+                              s32 method_class)
+{
     dec d;
     u32 export0, export2;
     u32 i, pass;
@@ -1485,11 +1364,11 @@ bool q2_creature_decode(q2_creature *out, const u8 *image, size_t size,
     d.size = size;
     d.base = base;
 
-    export0 = q2_rd_u32(image + 0);
+    export0 = spawn_entry ? spawn_entry : q2_rd_u32(image + 0);
     export2 = q2_rd_u32(image + 8);
 
     if (in_image(&d, export2, 4))
-        decode_classes(out, &d, export2);
+        decode_classes(out, &d, export2, method_class);
     if (in_image(&d, export0, 4))
         decode_spawn(out, &d, export0);
 
@@ -1659,6 +1538,7 @@ typedef struct think_dec {
      */
     s32  mul_back;
     u32  mb_dest;
+    u32  mb_base;               /* quotient register for chained products */
     bool mb_dest_known;
     u32  pend_shift_reg;
     s32  pend_shift_k;
@@ -1769,7 +1649,7 @@ static void decode_body(const q2_creature *c, think_dec *t, u32 entry,
     u32 addr, end;
     int depth = 0;              /* how many branches we are past */
 
-    end = walk_end(c, entry);
+    end = walk_end(c, &t->d, entry);
 
     for (addr = entry; addr < end; addr += 4) {
         u32 w, op, rt, rs;
@@ -1884,8 +1764,17 @@ static void decode_body(const q2_creature *c, think_dec *t, u32 entry,
             t->pend_shift     = k > 0 && k < 12;
         } else if (op == 0 && ((w & 0x3F) == 0x21 || (w & 0x3F) == 0x23)
                    && t->pend_shift) {
+            /* Strider's %50 builds (((q*2)+q)*8+q)*2. Retain the
+             * quotient across the second add instead of restarting at 9q. */
+            if (t->mb_dest_known &&
+                ((rs == t->mb_dest && rt == t->mb_base) ||
+                 ((w & 0x3F) == 0x21 && rt == t->mb_dest && rs == t->mb_base))) {
+                t->mul_back += (w & 0x3F) == 0x21 ? 1 : -1;
+                t->mb_dest = (w >> 11) & 0x1F;
+                t->pend_shift = false;
+            }
             /* addu/subu rd, rs, rt with one operand the shifted value */
-            if (rs == t->pend_shift_reg || rt == t->pend_shift_reg) {
+            if (t->pend_shift && (rs == t->pend_shift_reg || rt == t->pend_shift_reg)) {
                 s32 f = (s32)1 << t->pend_shift_k;
                 s32 got = ((w & 0x3F) == 0x21) ? f + 1 : f - 1;
                 /* A multiply-back of one is not a modulo; it is a shift pair
@@ -1893,6 +1782,7 @@ static void decode_body(const q2_creature *c, think_dec *t, u32 entry,
                 if (got >= 2) {
                     t->mul_back      = got;
                     t->mb_dest       = (w >> 11) & 0x1F;
+                    t->mb_base       = t->pend_shift_reg;
                     t->mb_dest_known = true;
                 }
             }

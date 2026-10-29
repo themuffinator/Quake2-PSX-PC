@@ -297,6 +297,43 @@ def no_errors(report, out, shot):
         raise Failure(f"{report['run.errors']} error lines")
 
 
+def credits_opened(report, out, shot):
+    log = (out / "run.log").read_text(encoding="utf-8")
+    if not re.search(r"credits, [1-9][0-9]* authored rows", log):
+        raise Failure("credits did not load their authored row table")
+
+
+def credits_finished(report, out, shot):
+    credits_opened(report, out, shot)
+    log = (out / "run.log").read_text(encoding="utf-8")
+    if log.count("credits complete") != 1:
+        raise Failure("credits did not finish once and return to Options")
+
+
+def campaign_finished(report, out, shot):
+    credits_opened(report, out, shot)
+    log = (out / "run.log").read_text(encoding="utf-8")
+    if len(re.findall(r"movie: extro over[^\r\n]*campaign credits", log)) != 1:
+        raise Failure("the campaign outro did not enter credits exactly once")
+    if len(re.findall(r"credits complete[^\r\n]*unlock file", log)) != 1:
+        raise Failure("campaign credits did not reach the unlock question")
+    if len(re.findall(r"campaign complete[^\r\n]*SILVER cheats", log)) != 1:
+        raise Failure("default Medium difficulty did not award Silver")
+
+
+def standalone_movie_finished(report, out, shot):
+    """--movie must stop on natural completion, before the diagnostic cap."""
+    log = (out / "run.log").read_text(encoding="utf-8")
+    if not re.search(r"movie: [1-9]\d+ frames shown", log):
+        raise Failure("movie never completed")
+    if not 100 < report.get("run.frames", 0) < 5000:
+        raise Failure("standalone movie ran to the frame cap")
+    if "movie: over with no destination" in log or "movie: intro over" in log:
+        raise Failure("standalone movie returned to the front end")
+    if "campaign complete" in log or "authored rows" in log:
+        raise Failure("standalone movie entered the campaign reward flow")
+
+
 def ticked(report, out, shot):
     if report.get("run.ticks", 0) < 1:
         raise Failure("the world never stepped")
@@ -569,7 +606,11 @@ def build_cases(quick, ntsc):
     cases.append(Case("hud-objectives", ["--map", "BASE1", "--objectives", "20"],
                       frames=120, checks=[no_errors, ticked, rendered]))
     cases.append(Case("credits", ["--credits"], frames=300,
-                      checks=[no_errors], timeout=300))
+                      checks=[no_errors, credits_opened], timeout=300))
+    cases.append(Case("credits-complete", ["--credits"], frames=2000,
+                      checks=[no_errors, credits_finished], timeout=300))
+    cases.append(Case("campaign-unlock", ["--map", "Extro FMV"], frames=5000,
+                      checks=[no_errors, campaign_finished], timeout=300))
 
     # A creature framed, shot at and watched as it dies, with the trace on. The
     # `--trace-cre` path is a different code path through the AI and has never
@@ -628,6 +669,12 @@ def build_cases(quick, ntsc):
     for film in films:
         cases.append(Case(f"movie-{film.split('.')[0]}", ["--movie", film],
                           frames=200, checks=[no_errors], timeout=300))
+    cases.append(Case("movie-natural-exit", ["--movie", films[0]],
+                      frames=5000, checks=[no_errors, standalone_movie_finished],
+                      timeout=300))
+    cases.append(Case("movie-outro-natural-exit", ["--movie", films[1]],
+                      frames=5000, checks=[no_errors, standalone_movie_finished],
+                      timeout=300))
 
     return cases
 

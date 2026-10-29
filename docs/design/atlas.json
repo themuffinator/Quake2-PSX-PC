@@ -1,0 +1,374 @@
+{
+  "version": "1.0",
+  "entries": [
+    {
+      "id": "A01",
+      "title": "PAL front cover",
+      "source": ".branding/originals/packaging/quake-ii-psx-pal-front.jpg",
+      "evidence": "Original",
+      "use": "Primary reference for tank mass, warm industrial metal, white wordmark and the Q emblem.",
+      "limit": "Spanish PAL print code 1000373.202.SP. Use as an archival cover, not a newly assembled UK case.",
+      "credit": "PSX Data Center; scanner not identified",
+      "url": "https://psxdatacenter.com/games/SLES-01534.html"
+    },
+    {
+      "id": "A02",
+      "title": "US front cover",
+      "source": ".branding/originals/packaging/quake-ii-psx-us-front.jpg",
+      "evidence": "Original",
+      "use": "Compare the same central art with a different side rail and publisher band. Preserve the focal face and weapon.",
+      "limit": "NTSC U/C packaging. Scan color and wear differ from the PAL reference.",
+      "credit": "QWERTYUIOP / PSX Data Center",
+      "url": "https://psxdatacenter.com/games/U/Q/SLUS-00757.html"
+    },
+    {
+      "id": "A03",
+      "title": "English PAL back cover",
+      "source": ".branding/originals/packaging/quake-ii-psx-pal-back-with-spines.jpg",
+      "evidence": "Original",
+      "use": "Reference for compact information hierarchy, screenshot grouping, descriptive copy and the physical spine.",
+      "limit": "UK code 1000373.201.UK. The included spines and legal marks belong to historical packaging.",
+      "credit": "VIDEO GAME COLLECTOR / PSX Data Center",
+      "url": "https://psxdatacenter.com/games/SLES-01534.html"
+    },
+    {
+      "id": "A04",
+      "title": "PAL disc label",
+      "source": ".branding/originals/packaging/quake-ii-psx-pal-disc-label.jpg",
+      "evidence": "Original",
+      "use": "A restrained circular composition with a large quiet field and minimal identity elements.",
+      "limit": "Do not use a printed disc ring as a generic UI decoration or infer modern distribution from it.",
+      "credit": "PSX Data Center; scanner not identified",
+      "url": "https://psxdatacenter.com/games/SLES-01534.html"
+    },
+    {
+      "id": "A05",
+      "title": "Manual contents",
+      "source": ".branding/design/evidence/manual-4.png",
+      "evidence": "Original",
+      "use": "Diagrammatic lines, title hierarchy and pale paper establish the manual's technical voice.",
+      "limit": "PDF page 4; printed page 1. Scanned paper tint is variable, not a measured production color.",
+      "credit": "HFS DB / Games Database",
+      "url": "https://db.hfsplay.fr/games/87888-quake-ii?lang=en",
+      "original": ".branding/originals/manuals/quake-ii-psx-1999-activision-manual.pdf",
+      "page": 4
+    },
+    {
+      "id": "A06",
+      "title": "Manual controls",
+      "source": ".branding/design/evidence/manual-6.png",
+      "evidence": "Original",
+      "use": "Use leader lines and direct control labels to make a compact diagram readable.",
+      "limit": "PDF page 6; printed page 3. Historical controller instructions are not a current PC binding map.",
+      "credit": "HFS DB / Games Database",
+      "url": "https://db.hfsplay.fr/games/87888-quake-ii?lang=en",
+      "original": ".branding/originals/manuals/quake-ii-psx-1999-activision-manual.pdf",
+      "page": 6
+    },
+    {
+      "id": "A07",
+      "title": "Manual arsenal",
+      "source": ".branding/design/evidence/manual-21.png",
+      "evidence": "Original",
+      "use": "An excellent reference for a specimen column, light technical grid and adjacent practical description.",
+      "limit": "PDF page 21; printed page 18. The reproduced scan remains historical material, not new game documentation.",
+      "credit": "HFS DB / Games Database",
+      "url": "https://db.hfsplay.fr/games/87888-quake-ii?lang=en",
+      "original": ".branding/originals/manuals/quake-ii-psx-1999-activision-manual.pdf",
+      "page": 21
+    },
+    {
+      "id": "A08",
+      "title": "Manual enemy register",
+      "source": ".branding/design/evidence/manual-28.png",
+      "evidence": "Original",
+      "use": "Compare creature silhouettes at a common visual size with short role and behavior annotations.",
+      "limit": "PDF page 28; printed page 25. Scale is editorial, not a common world-unit measurement.",
+      "credit": "HFS DB / Games Database",
+      "url": "https://db.hfsplay.fr/games/87888-quake-ii?lang=en",
+      "original": ".branding/originals/manuals/quake-ii-psx-1999-activision-manual.pdf",
+      "page": 28
+    },
+    {
+      "id": "A09",
+      "title": "US campaign first page",
+      "source": ".branding/originals/advertisements/quake-ii-psx-us-advert-spread-page-1.jpg",
+      "evidence": "Original",
+      "use": "The orange campaign field, machinery frame and angular technical copy establish the warm secondary direction for new project artwork.",
+      "limit": "Cross-promotes PlayStation and Nintendo 64. Its companion page is retained in the archive, not used as PSX render evidence.",
+      "credit": "JASON / PSX Data Center",
+      "url": "https://psxdatacenter.com/games/U/Q/SLUS-00757.html"
+    },
+    {
+      "id": "A10",
+      "title": "UK campaign advert",
+      "source": ".branding/originals/advertisements/quake-ii-psx-uk-advert.jpg",
+      "evidence": "Original",
+      "use": "One photographic metaphor, a large stamp and an inset screenshot strip create a strong reading order.",
+      "limit": "The violet and meat-red photographic campaign remains a historical reference. Its palette does not prescribe colors for evidence captures.",
+      "credit": "LaunchBox; scanner not identified",
+      "url": "https://gamesdb.launchbox-app.com/games/images/11167-quake-ii"
+    },
+    {
+      "id": "A11",
+      "title": "BASE0 entry passage",
+      "source": ".branding/design/evidence/BASE0-clean.png",
+      "evidence": "Observed",
+      "use": "Rock planes, muted warm material and a narrow route establish a compact directional composition.",
+      "limit": "PAL client display capture, frame 510, 4:3. Stationary view; no movement or hardware-equivalence claim.",
+      "capture": "BASE0-clean"
+    },
+    {
+      "id": "A12",
+      "title": "BASE3 industrial corridor",
+      "source": ".branding/design/evidence/BASE3-clean.png",
+      "evidence": "Observed",
+      "use": "Repetition, rust color and a receding corridor produce the industrial rhythm.",
+      "limit": "PAL client display capture, frame 510. This is the current port, with CRT and bloom disabled.",
+      "capture": "BASE3-clean"
+    },
+    {
+      "id": "A13",
+      "title": "SECURITY blue machinery",
+      "source": ".branding/design/evidence/SECURITY.png",
+      "evidence": "Observed",
+      "use": "Cold blue equipment, symmetrical stairs and a dark middle field separate structure from luminous detail.",
+      "limit": "PAL client display capture, frame 60. Lighting is scene-specific; do not apply the blue tint indiscriminately.",
+      "capture": "SECURITY"
+    },
+    {
+      "id": "A14",
+      "title": "WASTE1 rock and green light",
+      "source": ".branding/design/evidence/WASTE1.png",
+      "evidence": "Observed",
+      "use": "A warm rock envelope meets a localized green source. The opening provides the main focal shape.",
+      "limit": "PAL client display capture, frame 60. The view weapon and HUD belong to the actual capture.",
+      "capture": "WASTE1"
+    },
+    {
+      "id": "A15",
+      "title": "Front-end selection",
+      "source": ".branding/design/evidence/front.png",
+      "evidence": "Observed",
+      "use": "The large emblem, quiet black field and narrow blue band establish an economical hierarchy.",
+      "limit": "PAL client display capture, frame 60. The host input prompt is current project behavior.",
+      "capture": "front"
+    },
+    {
+      "id": "A16",
+      "title": "Mission panel",
+      "source": ".branding/design/evidence/mission.png",
+      "evidence": "Observed",
+      "use": "A luminous metal bracket separates a compact mission message from the scene behind it.",
+      "limit": "PAL client display capture, frame 60, --objectives 1. The panel is intentionally visible.",
+      "capture": "mission"
+    },
+    {
+      "id": "A17",
+      "title": "Frontend bitmap sheet",
+      "source": ".branding/design/evidence/menu.ppm.frontend.png",
+      "evidence": "Observed",
+      "use": "Inspect the menu letterforms, small symbols, prompts and frame components as source pixels.",
+      "limit": "Inspector VRAM view using its text palette. Individual glyph draw palettes can differ; this is not a scalable font.",
+      "capture": "menu-atlas"
+    },
+    {
+      "id": "A18",
+      "title": "HUD text and icon specimen",
+      "source": ".branding/design/evidence/hud.png",
+      "evidence": "Observed",
+      "use": "Inspect runtime font colors, message vocabulary and fixed-pixel spacing in the inspector's overlay specimen.",
+      "limit": "Offline HUD test composition. It is not a captured gameplay event or a new menu layout.",
+      "capture": "hud"
+    },
+    {
+      "id": "A19",
+      "title": "Soldier model study",
+      "source": ".branding/design/evidence/soldier-front.png",
+      "evidence": "Observed",
+      "use": "The front view makes the helmet, armor mass, exposed arms and held weapon legible without a scene behind them.",
+      "limit": "Offline BASE0 model render; clip 0, frame 0, yaw 2048. Inspector view and lighting. Recorded crop; not original hardware evidence.",
+      "capture": "soldier-front",
+      "cropPixels": [
+        141,
+        121,
+        373,
+        350
+      ]
+    },
+    {
+      "id": "A20",
+      "title": "Blaster model study",
+      "source": ".branding/design/evidence/blaster.png",
+      "evidence": "Observed",
+      "use": "Inspect the muzzle, compact receiver and first-person mesh construction. Do not infer a separate world pickup from this view-model asset.",
+      "limit": "Offline BASE0 Blaster G render; clip 0, frame 0, yaw 256. This is a view-model asset. Framed with a recorded crop.",
+      "capture": "blaster",
+      "cropPixels": [
+        161,
+        187,
+        344,
+        290
+      ]
+    },
+    {
+      "id": "A21",
+      "title": "Armor plane",
+      "source": ".branding/originals/packaging/quake-ii-psx-pal-front.jpg",
+      "evidence": "Original",
+      "use": "Broad olive-gray planes, a restrained bevel and a few construction details carry the heavy material.",
+      "limit": "Cover detail crop. Preserve scale and mass; this is not a repeatable texture.",
+      "crop": [
+        0.26,
+        0.14,
+        0.59,
+        0.34
+      ],
+      "credit": "PSX Data Center",
+      "url": "https://psxdatacenter.com/games/SLES-01534.html"
+    },
+    {
+      "id": "A22",
+      "title": "Oxidized panel",
+      "source": ".branding/originals/packaging/quake-ii-psx-pal-front.jpg",
+      "evidence": "Original",
+      "use": "Directional warm corrosion breaks up a large surface while leaving the underlying plane legible.",
+      "limit": "Cover detail crop. Printed halftone and scan variation remain in the image.",
+      "crop": [
+        0.18,
+        0.59,
+        0.37,
+        0.8
+      ],
+      "credit": "PSX Data Center",
+      "url": "https://psxdatacenter.com/games/SLES-01534.html"
+    },
+    {
+      "id": "A23",
+      "title": "Weapon cylinder",
+      "source": ".branding/originals/packaging/quake-ii-psx-pal-front.jpg",
+      "evidence": "Original",
+      "use": "Orange cylindrical machinery, a dark housing and small metallic edges create depth with few shapes.",
+      "limit": "Cover detail crop. Treat the orange as material and light context, not a universal warning color.",
+      "crop": [
+        0.77,
+        0.08,
+        0.94,
+        0.3
+      ],
+      "credit": "PSX Data Center",
+      "url": "https://psxdatacenter.com/games/SLES-01534.html"
+    },
+    {
+      "id": "A24",
+      "title": "Blue equipment",
+      "source": ".branding/design/evidence/SECURITY.png",
+      "evidence": "Observed",
+      "use": "A concentrated blue detail field contrasts with the darker structural surround.",
+      "limit": "Crop of A13. Light and surface are combined in this render; it is not an albedo texture.",
+      "crop": [
+        0.12,
+        0.04,
+        0.4,
+        0.27
+      ],
+      "capture": "SECURITY"
+    },
+    {
+      "id": "A25",
+      "title": "Rock surface",
+      "source": ".branding/design/evidence/WASTE1.png",
+      "evidence": "Observed",
+      "use": "Irregular broad shapes and warm-to-green variation make the organic enclosure distinct from metal.",
+      "limit": "Crop of A14. Perspective and scene lighting are preserved; the crop is not seamless.",
+      "crop": [
+        0.04,
+        0.1,
+        0.34,
+        0.44
+      ],
+      "capture": "WASTE1"
+    },
+    {
+      "id": "A26",
+      "title": "Panel corner",
+      "source": ".branding/design/evidence/menu.ppm.frontend.png",
+      "evidence": "Observed",
+      "use": "A compact bevel and clipped bracket turn a small source tile into a recognizable frame component.",
+      "limit": "46 x 29 source-pixel crop at (32,224). Magnified without smoothing for study.",
+      "cropPixels": [
+        32,
+        224,
+        78,
+        253
+      ],
+      "capture": "menu-atlas"
+    },
+    {
+      "id": "A27",
+      "title": "BOSS1 focal doorway",
+      "source": ".branding/design/evidence/BOSS1.png",
+      "evidence": "Observed",
+      "use": "Dark foreground structure isolates a warm doorway and gives the composition a single deep focal point.",
+      "limit": "PAL client display capture, frame 60. This is an environment and status reference, not a boss model portrait.",
+      "capture": "BOSS1"
+    },
+    {
+      "id": "A28",
+      "title": "HUD status detail",
+      "source": ".branding/design/evidence/SECURITY.png",
+      "evidence": "Observed",
+      "use": "Health, armor and ammunition are grouped with icons. Pale outlined numerals stay readable against the darker scene.",
+      "limit": "Crop of A13. The values are state-dependent and are not prescribed layout constants.",
+      "crop": [
+        0,
+        0.78,
+        0.8,
+        0.98
+      ],
+      "capture": "SECURITY"
+    },
+    {
+      "id": "A29",
+      "title": "THEVAT blue chamber",
+      "source": ".branding/design/evidence/THEVAT-blue.png",
+      "evidence": "Observed",
+      "use": "Cobalt-lit walls and deep blue recesses establish a cool environment across most of the image. Useful for the primary brand atmosphere.",
+      "limit": "PAL client display capture, frame 180, default spawn. No tint or optional bloom applied.",
+      "capture": "THEVAT-blue"
+    },
+    {
+      "id": "A30",
+      "title": "MATRIX5 violet sky",
+      "source": ".branding/design/evidence/MATRIX5-sky.png",
+      "evidence": "Observed",
+      "use": "The violet sky and purple-blue upper light coexist with warm rock and orange illumination. Keep both temperature families legible.",
+      "limit": "PAL client display capture, frame 180, default spawn. A location study, not a claim that every level shares this palette.",
+      "capture": "MATRIX5-sky"
+    },
+    {
+      "id": "A31",
+      "title": "BASE1 source-linked flare",
+      "source": ".branding/design/evidence/BASE1-flare.png",
+      "evidence": "Observed",
+      "use": "A bright lamp anchors the glow and narrow burst. Low-contrast ghost elements extend toward and beyond the frame center.",
+      "limit": "PAL client, frame 60; recorded position and yaw 256. Native flare with CRT and bloom off.",
+      "capture": "BASE1-flare"
+    },
+    {
+      "id": "A32",
+      "title": "Native flare detail",
+      "source": ".branding/design/evidence/BASE1-flare.png",
+      "cropPixels": [
+        180,
+        225,
+        850,
+        475
+      ],
+      "evidence": "Observed",
+      "use": "The bright core, tapered rays and faint polygonal ghosting remain attached to a visible source. Compare the dark space around the effect.",
+      "limit": "Crop of A31, without recoloring or added glow. The exact element behavior is documented in FORMATS section 17.3.",
+      "capture": "BASE1-flare"
+    }
+  ]
+}

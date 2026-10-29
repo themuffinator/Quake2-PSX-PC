@@ -3,6 +3,7 @@
 #include <math.h>
 
 static s16  g_sin_table[Q2_ANGLE_360];
+static s16  g_atan_table[1025];
 static bool g_table_ready;
 
 static void build_table(void)
@@ -27,6 +28,12 @@ static void build_table(void)
         g_sin_table[i] = (s16)value;
     }
 
+    /* A 3/8-bin offset reproduces all 1025 PAL halfwords at 0x800A9430.
+     * This is a numerical reconstruction, verified against the user's disc,
+     * rather than a copy of the executable's lookup data. */
+    for (i = 0; i <= 1024; i++)
+        g_atan_table[i] = (s16)(atan(((double)i + 0.375) / 1024.0) *
+                                2048.0 / 3.14159265358979323846 + 0.5);
     g_table_ready = true;
 }
 
@@ -54,24 +61,78 @@ s32 q2_acos12(s32 cos12)
 {
     double radians, angle;
 
-    if (cos12 >  Q2_ONE_12) cos12 =  Q2_ONE_12;
+    if (cos12 >= Q2_ONE_12) cos12 = Q2_ONE_12 - 2;
     if (cos12 < -Q2_ONE_12) cos12 = -Q2_ONE_12;
+
+    /* 0x80069E64: the table has one entry per TWO cosine units. Its
+     * negative endpoint and zero entry truncate one unit below libm's exact
+     * multiples of pi. These two boundary values plus this quantization
+     * reproduce all 4096 PAL entries without distributing the table. */
+    cos12 = (cos12 >> 1) * 2;
+    if (cos12 == -Q2_ONE_12) return 2047;
+    if (!cos12) return 1023;
 
     radians = acos((double)cos12 / (double)Q2_ONE_12);
     angle   = radians * (double)Q2_ANGLE_360 /
               (2.0 * 3.14159265358979323846);
 
     /* Truncate rather than round: the original's table does, visibly so at the
-     * ends — its entry for cos = 4095/4096 is 20 where rounding gives 21. */
+     * ends — its entry for cos = 4094/4096 is 20 where rounding gives 21. */
     return (s32)angle;
+}
+
+void q2_quat_slerp(const s16 a[4], const s16 b[4], s32 t, s16 out[4])
+{
+    s32 bq[4], dot, wa = 4096 - t, wb = t;
+    u32 sum = 0;
+    bool same = true;
+    int i;
+    for (i = 0; i < 4; i++) {
+        sum += (u32)((s32)a[i] * b[i]);
+        same = same && a[i] == b[i];
+    }
+    dot = (s32)sum;
+    for (i = 0; i < 4; i++) bq[i] = dot < 0 ? -(s32)b[i] : b[i];
+    if (dot < 0) dot = (s32)(0u - (u32)dot);
+
+    /* 0x80069D34..0x80069E04 copies the ORIGINAL b at the endpoint,
+     * even when the interior takes the short arc through -b. Equal inputs
+     * also copy directly, avoiding two independently rounded products. */
+    if (!t || t == 4096 || same) {
+        for (i = 0; i < 4; i++) out[i] = t ? b[i] : a[i];
+        return;
+    }
+    if (4096 - (dot >> 12) > 128) {
+        s32 ang = q2_acos12(dot >> 12), sn = q2_sin12(ang);
+        if (sn) {
+            wa = q2_sin12((s32)((u32)wa * (u32)ang) >> 12) * 4096 / sn;
+            wb = q2_sin12((s32)((u32)wb * (u32)ang) >> 12) * 4096 / sn;
+        }
+    }
+    for (i = 0; i < 4; i++)
+        out[i] = (s16)(((s32)((u32)wa * (u32)(s32)a[i]) >> 12) +
+                       ((s32)((u32)wb * (u32)bq[i]) >> 12));
 }
 
 s32 q2_ratan2(s32 y, s32 x)
 {
+    u32 ax = x < 0 ? 0u - (u32)x : (u32)x;
+    u32 ay = y < 0 ? 0u - (u32)y : (u32)y;
+    u32 lo = ax < ay ? ax : ay, hi = ax < ay ? ay : ax, index;
+    s32 angle;
     if (x == 0 && y == 0)
         return 0;
-    return (s32)lround(atan2((double)y, (double)x) * 2048.0 /
-                       3.14159265358979323846);
+    build_table();
+    /* 0x8008A398/420 avoids overflowing the numerator by shifting the
+     * denominator instead. Keep the resulting ratio truncation in both paths.
+     * Unsigned magnitudes also define INT_MIN, outside native valid input. */
+    index = lo >= 0x200000u ? lo / (hi >> 10) : (lo << 10) / hi;
+    if (index > 1024) index = 1024;
+    angle = g_atan_table[index];
+    if (ay >= ax) angle = 1024 - angle;
+    if (x < 0) angle = 2048 - angle;
+    if (y < 0) angle = -angle;
+    return angle;
 }
 
 void q2_rotation_yaw_pitch(s16 m[3][3], s32 yaw, s32 pitch)
@@ -181,29 +242,17 @@ void q2_rotation_euler(s16 m[3][3], s32 rx, s32 ry, s32 rz)
 
 void q2_quat_to_matrix(s16 m[3][3], const s16 q[4])
 {
-    /* Each product of two 1.3.12 values is brought back to 1.3.12 by >> 12
-     * before the quaternion form's doubling, so no term can overflow s16 for a
-     * unit quaternion. */
-    s32 x = q[0], y = q[1], z = q[2], w = q[3];
-
-    s32 xx = (x * x) >> Q2_FRAC_12, yy = (y * y) >> Q2_FRAC_12;
-    s32 zz = (z * z) >> Q2_FRAC_12;
-    s32 xy = (x * y) >> Q2_FRAC_12, xz = (x * z) >> Q2_FRAC_12;
-    s32 yz = (y * z) >> Q2_FRAC_12;
-    s32 wx = (w * x) >> Q2_FRAC_12, wy = (w * y) >> Q2_FRAC_12;
-    s32 wz = (w * z) >> Q2_FRAC_12;
-
-    m[0][0] = (s16)(Q2_ONE_12 - 2 * (yy + zz));
-    m[0][1] = (s16)(2 * (xy - wz));
-    m[0][2] = (s16)(2 * (xz + wy));
-
-    m[1][0] = (s16)(2 * (xy + wz));
-    m[1][1] = (s16)(Q2_ONE_12 - 2 * (xx + zz));
-    m[1][2] = (s16)(2 * (yz - wx));
-
-    m[2][0] = (s16)(2 * (xz - wy));
-    m[2][1] = (s16)(2 * (yz + wx));
-    m[2][2] = (s16)(Q2_ONE_12 - 2 * (xx + yy));
+    s32 x=q[0], y=q[1], z=q[2], w=q[3];
+    /* 0x80069B54 doubles each operand BEFORE multiplying and shifting.
+     * Doubling an already shifted product loses the odd matrix coefficients. */
+    s32 xx=(s32)((u32)x*(u32)(2*x))>>12, yy=(s32)((u32)y*(u32)(2*y))>>12;
+    s32 zz=(s32)((u32)z*(u32)(2*z))>>12, xy=(s32)((u32)x*(u32)(2*y))>>12;
+    s32 xz=(s32)((u32)x*(u32)(2*z))>>12, yz=(s32)((u32)y*(u32)(2*z))>>12;
+    s32 wx=(s32)((u32)w*(u32)(2*x))>>12, wy=(s32)((u32)w*(u32)(2*y))>>12;
+    s32 wz=(s32)((u32)w*(u32)(2*z))>>12;
+    m[0][0]=(s16)(4096-yy-zz); m[0][1]=(s16)(xy-wz); m[0][2]=(s16)(xz+wy);
+    m[1][0]=(s16)(xy+wz); m[1][1]=(s16)(4096-xx-zz); m[1][2]=(s16)(yz-wx);
+    m[2][0]=(s16)(xz-wy); m[2][1]=(s16)(yz+wx); m[2][2]=(s16)(4096-xx-yy);
 }
 
 void q2_rotation_view_anamorphic(s16 m[3][3], s32 yaw, s32 pitch, s32 roll)

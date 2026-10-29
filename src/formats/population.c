@@ -108,6 +108,17 @@ int q2_pop_group_zone(const q2_pop_group *g)
     return digits ? zone : -1;
 }
 
+bool q2_pop_group_is_zone(const q2_pop_group *g)
+{
+    u32 i;
+
+    if (q2_pop_group_zone(g) < 0)
+        return false;
+    for (i = 4; i < 12 && g->name[i] >= '0' && g->name[i] <= '9'; i++)
+        ;
+    return g->name[i] == '\0';
+}
+
 /* Common bounds check for a record inside a list. */
 static const u8 *list_record(const q2_population *p, u32 list_offset,
                              u32 slot, u32 stride)

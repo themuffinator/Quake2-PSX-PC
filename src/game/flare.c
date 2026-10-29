@@ -13,40 +13,26 @@
  *   0x80074C4C   the hexagon the DISC is made of — a separate, unrolled routine
  *   0x80074FF4   the eight lines the starburst is made of
  *
- * Everything is untextured and additive. There is no flare bitmap on the disc.
+ * Everything is untextured and additive. There is no
+ * flare bitmap on the disc.
  */
 #include "flare.h"
+#include "surface.h"
 
-#include "surface.h"   /* blendTable — see flare_blend */
 #include "trig.h"
 
 #include <string.h>
 
-/* ------------------------------------------------------------------------- */
-/* What "additive" actually rests on                                          */
-/*                                                                            */
-/* Not one of the three flare packets carries a texture page. They are         */
-/* untextured POLY_G4, POLY_F4 and LINE_G2 with the ABE bit set, and an        */
-/* untextured semi-transparent primitive takes its blend from the GPU's        */
-/* CURRENT draw mode — whatever the last packet to name a texture page left    */
-/* there. So the flares inherit, and what they inherit from is the world.      */
-/*                                                                            */
-/* That chain terminates: the world's opaque path at 0x80068300 ORs            */
-/* blendTable[2] into the page's entry and WRITES IT BACK (surface.h), so      */
-/* every page the world has drawn on is permanently at blendTable[2] == 32,    */
-/* which is ABR 1, which is B + F. The flares land in the viewport slice's     */
-/* last bucket, after all of it, and come out additive.                        */
-/*                                                                            */
-/* It is inheritance and not a declaration, so it is worth saying where it is  */
-/* thin: a viewport that drew no textured world polygon at all would hand the  */
-/* flares whatever mode the previous viewport finished in. Nothing on this     */
-/* disc reaches that state — the flare pass only runs on a viewport with a     */
-/* world in it — and naming the selector here rather than a bare 0x20 keeps    */
-/* the derivation visible instead of leaving a constant nobody can source.     */
-/* ------------------------------------------------------------------------- */
-static u16 flare_blend(void)
+/* Host display-state setup, not a field in the retail flare packets. The
+ * explicit GPU-state walk exposed a regression: BASE1 reaches the flare pass
+ * with mode 0x061f (ABR 0), after intervening model/portal packets. Half blending
+ * makes the black rim darken the wall. Preserve the port's intended additive
+ * flare pass independently of that incidental predecessor. set_tpage models
+ * a preceding draw-mode command, including the usual dither/draw enables. */
+static void flare_additive(psx_prim *p)
 {
-    return q2_surf_blend_table[Q2_SURF_WORLD_BLEND_SELECTOR];
+    p->set_tpage = true;
+    p->tpage = (u16)(0x0600u | q2_surf_blend_table[Q2_SURF_WORLD_BLEND_SELECTOR]);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -310,7 +296,7 @@ static u32 flare_burst(psx_xy centre, s32 radius, const u8 rgb[3],
 
             p->semi_transparent = true;
             p->textured_blend   = false;
-            p->tpage            = flare_blend();
+            flare_additive(p);
             emitted++;
         }
     }
@@ -437,13 +423,13 @@ static u32 flare_emit(const q2_flare_style *style, psx_xy at, s32 scale,
 
                 p->semi_transparent = true;
                 p->textured_blend   = false;
+                flare_additive(p);
                 /* These four corners really are in libgpu's Z order — see the
                  * fan note above — so the backend must split them on the other
                  * diagonal. Without this the second triangle of every sector
                  * came out as a black sliver and the 12-gon glow drew as a
                  * six-spoke pinwheel. */
                 p->quad_zorder      = true;
-                p->tpage            = flare_blend();
                 emitted++;
             }
         } else if (stats) {

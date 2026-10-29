@@ -3,7 +3,10 @@
 #include "trig.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
+
+static void screen_adapt_views(q2_screen *s);
 
 /* ------------------------------------------------------------------------- */
 /* Small helpers                                                              */
@@ -380,6 +383,148 @@ void q2_screen_set_layout(q2_screen *s, q2_screen_layout layout, int players)
         s->view_count = 3;
 
     s->layout = layout;
+    memcpy(s->native_view, s->view, sizeof(s->view));
+    screen_adapt_views(s);
+}
+
+static void screen_adapt_views(q2_screen *s)
+{
+    int i, width = s->buf[0].width, height = s->buf[0].height;
+    if (!width || !height) return;
+    for (i = 0; i < s->view_count; i++) {
+        q2_screen_view *v = &s->view[i];
+        const q2_screen_view *n = &s->native_view[i];
+        double scale;
+        v->x = n->x; v->y = n->y; v->w = n->w; v->h = n->h;
+        v->vw = n->vw; v->vh = n->vh;
+        v->ofs_x = n->ofs_x; v->ofs_y = n->ofs_y; v->proj = n->proj;
+        if (!s->adaptive) continue;
+        v->x = v->y = 0;
+        v->w = (s16)width; v->h = (s16)height;
+        if (s->layout == Q2_SCREEN_LAYOUT_TWO_V ||
+            s->layout == Q2_SCREEN_LAYOUT_QUAD) {
+            int col = i & 1;
+            v->x = (s16)(col * (width / 2 + 1));
+            v->w = (s16)(col ? width - v->x : width / 2);
+        }
+        if (s->layout == Q2_SCREEN_LAYOUT_TWO_H ||
+            s->layout == Q2_SCREEN_LAYOUT_QUAD) {
+            int row = s->layout == Q2_SCREEN_LAYOUT_QUAD ? i / 2 : i;
+            v->y = (s16)(row * (height / 2 + 1));
+            v->h = (s16)(row ? height - v->y : height / 2);
+        }
+        if (v->w < 1) v->w = 1;
+        if (v->h < 1) v->h = 1;
+        /* Hor+ projection: preserve vertical FOV at every aspect. Tall views
+         * narrow horizontally instead of pushing the vertical frustum toward
+         * 180 degrees, which the authored sky and near-plane paths cannot use. */
+        scale = (double)v->h / n->h;
+        v->proj = (s16)fmax(1.0, floor(n->proj * scale + 0.5));
+        v->ofs_x = v->w / 2; v->ofs_y = v->h / 2;
+        v->vw = v->w; v->vh = v->h;
+    }
+}
+
+q2_result q2_screen_resize(q2_screen *s, bool adaptive, int width, int height)
+{
+    psx_framebuffer buffers[2] = {{0}};
+    double w, h, scale;
+    int iw, ih;
+    q2_result rc;
+    if (!s) return Q2_ERR_INVALID_ARG;
+    if (width <= 0 || height <= 0) return Q2_OK;
+    w = s->disp.width; h = s->disp.height;
+    if (adaptive) {
+        /* Native pixels occupy a 4:3 picture. Adapt its horizontal frustum.
+         * Cap resolution within the GTE/GPU coordinate and polygon-span limits;
+         * this changes pixel density, not the requested display shape. */
+        double ratio = (double)width / height;
+        if (ratio >= 4.0 / 3.0) w *= ratio * 0.75;
+        else h *= (4.0 / 3.0) / ratio;
+        scale = fmin(1.0, fmin(960.0 / w, 480.0 / h));
+        w *= scale; h *= scale;
+    }
+    iw = (int)fmax(4.0, floor(w + 0.5));
+    ih = (int)fmax(4.0, floor(h + 0.5));
+    if (iw == s->buf[0].width && ih == s->buf[0].height && s->adaptive == adaptive)
+        return Q2_OK;
+    if (iw != s->buf[0].width || ih != s->buf[0].height) {
+        rc = psx_fb_init(&buffers[0], iw, ih);
+        if (rc != Q2_OK) return rc;
+        rc = psx_fb_init(&buffers[1], iw, ih);
+        if (rc != Q2_OK) { psx_fb_free(&buffers[0]); return rc; }
+        psx_fb_free(&s->buf[0]); psx_fb_free(&s->buf[1]);
+        s->buf[0] = buffers[0]; s->buf[1] = buffers[1];
+    }
+    s->adaptive = adaptive;
+    screen_adapt_views(s);
+    return Q2_OK;
+}
+
+void q2_screen_ui_rect(const q2_screen *s, int view,
+                       int *x, int *y, int *w, int *h)
+{
+    int nw = s->disp.width, nh = s->disp.height;
+    int dw = s->buf[0].width, dh = s->buf[0].height;
+    int rw, rh;
+    double scale;
+    if (view >= 0 && view < s->view_count) {
+        nw = s->native_view[view].w; nh = s->native_view[view].h;
+        dw = s->view[view].w; dh = s->view[view].h;
+    }
+    scale = fmin((double)dw / nw, (double)dh / nh);
+    rw = (int)floor(nw * scale + 0.5);
+    rh = (int)floor(nh * scale + 0.5);
+    if (x) *x = (dw - rw) / 2;
+    if (y) *y = (dh - rh) / 2;
+    if (w) *w = rw;
+    if (h) *h = rh;
+}
+
+static void screen_ui_prim(const q2_screen *s, int view,
+                           psx_prim *prim, bool edges)
+{
+    int x, y, w, h, i, count = 4;
+    int nw = s->disp.width, nh = s->disp.height;
+    int dh = s->buf[0].height;
+    if (!s->adaptive || prim->kind == PSX_PRIM_TPAGE ||
+        prim->kind == PSX_PRIM_TWINDOW || prim->kind == PSX_PRIM_MASK ||
+        prim->kind == PSX_PRIM_CACHE_CLEAR ||
+        prim->kind == PSX_PRIM_DRAW_ENV || prim->kind == PSX_PRIM_MOVE) return;
+    if (view >= 0) {
+        nw = s->native_view[view].w; nh = s->native_view[view].h;
+        dh = s->view[view].h;
+    }
+    q2_screen_ui_rect(s, view, &x, &y, &w, &h);
+    if (prim->kind == PSX_PRIM_SPRT) {
+        prim->sprite_w = (u16)abs(prim->xy[2].x - prim->xy[0].x);
+        prim->sprite_h = (u16)abs(prim->xy[2].y - prim->xy[0].y);
+    }
+    /* Full-screen fades/dimmers cover the whole target, including its wings. */
+    if (view < 0 && prim->kind == PSX_PRIM_TILE &&
+        prim->xy[0].x <= 0 && prim->xy[0].y <= 0 &&
+        prim->xy[2].x >= nw && prim->xy[2].y >= nh) {
+        prim->xy[2].x = (s16)s->buf[0].width;
+        prim->xy[2].y = (s16)s->buf[0].height;
+        return;
+    }
+    if (edges) y = prim->xy[0].y < nh / 2 ? 0 : dh - h;
+    if (prim->kind == PSX_PRIM_LINE_F2 || prim->kind == PSX_PRIM_LINE_G2)
+        count = 2;
+    for (i = 0; i < count; i++) {
+        prim->xy[i].x = (s16)(x + (int)floor((double)prim->xy[i].x * w / nw + 0.5));
+        prim->xy[i].y = (s16)(y + (int)floor((double)prim->xy[i].y * h / nh + 0.5));
+    }
+}
+
+void q2_screen_ui_range(const q2_screen *s, int view, psx_ot *ot,
+                        u32 first, bool edges)
+{
+    u32 i;
+    for (i = first; i < ot->prim_count; i++) {
+        ot->prims[i].ui = true;
+        screen_ui_prim(s, view, &ot->prims[i], edges);
+    }
 }
 
 q2_screen_layout q2_screen_layout_for(int players, bool horizontal_split)
@@ -478,6 +623,7 @@ void q2_screen_free(q2_screen *s)
         return;
     psx_fb_free(&s->buf[0]);
     psx_fb_free(&s->buf[1]);
+    q2_screen_capture_scene(s, false);
 }
 
 void q2_screen_buffer_origin(const q2_screen *s, int index, int *x, int *y)
@@ -515,13 +661,9 @@ void q2_screen_pixel_aspect(const q2_screen *s, int *num, int *den)
         return;
     }
 
-    /*
-     * An NTSC request gets PAL's geometry with `height_is_inferred` set, and the
-     * same caveat applies here: nothing has been read out of an NTSC build, so
-     * the 240 is the standard's, not this game's. It is used anyway because the
-     * alternative — pretending a PAL pixel shape is right for NTSC — is worse,
-     * and the flag is what tells a caller not to trust it.
-     */
+    /* Television pixel aspect uses the standard's picture height. The game's
+     * framebuffer heights are independently recorded in screen.h: PAL's 248
+     * lines leave a border within its 256-line picture, while NTSC uses 240. */
     lines = (s->disp.video_mode == 1) ? Q2_SCREEN_LINES_4_3_PAL
                                       : Q2_SCREEN_LINES_4_3_NTSC;
 
@@ -540,6 +682,7 @@ const char *q2_screen_fit_name(q2_screen_fit fit)
     case Q2_SCREEN_FIT_SQUARE:     return "square";
     case Q2_SCREEN_FIT_FULL_4_3:   return "4:3";
     case Q2_SCREEN_FIT_STRETCH:    return "stretch";
+    case Q2_SCREEN_FIT_AUTO:       return "auto";
     default:                       return "?";
     }
 }
@@ -554,6 +697,13 @@ static void picture_aspect(const q2_screen *s, q2_screen_fit fit,
     int pn = 1, pd = 1;
 
     switch (fit) {
+    case Q2_SCREEN_FIT_AUTO:
+        /* Use the target's actual pixel ratio, including rounding at bounded
+         * resolutions. At extreme window shapes this safely adds borders
+         * instead of stretching a one-pixel-wide/tall picture. */
+        *wn = s->buf[0].width * 4 * (int)s->disp.height;
+        *wd = s->buf[0].height * 3 * (int)s->disp.width;
+        return;
     case Q2_SCREEN_FIT_SQUARE:
         break;                    /* pixels stay 1:1 */
     case Q2_SCREEN_FIT_TELEVISION:
@@ -768,31 +918,11 @@ void q2_screen_background(q2_screen *s)
  * set, so the value is not statically determined and cannot simply be read out
  * of the executable.
  *
- * It can still be settled, by two arguments that agree:
- *
- *   - BOTH TILES FADE TO ZERO, and a fade has to be continuous at its ends. The
- *     flash's mode 2 scales its colour by `strength/initial`, so it finishes at
- *     (0,0,0) the frame before it stops being drawn; the water's tint starts at
- *     (0,0,0) the frame the amplitude leaves zero. Under `B/2 + F/2` a zero
- *     colour still halves the screen, so both effects would snap — a damage
- *     flash would end by dimming the picture and then popping back. Under
- *     `B + F` a zero colour is a no-op, and both ramps are smooth. The same
- *     holds for `B - F` and `B + F/4`, which is what makes this an argument
- *     against HALF rather than an argument for ADD on its own.
- *
- *   - WHAT IS ACTUALLY IN THE REGISTER at that point in the table is the last
- *     world polygon's blend, and the world's selector table makes an unset
- *     selector ADD rather than the half blend an unset field would suggest —
- *     see q2_screen_blend_word. So the ordinary case really is `B + F`.
- *
- * Between the three, only ADD gives the water a blue cast; `B - F` would take
- * blue *out* and leave the screen yellow, and `B + F/4` at (15,0,55) is too
- * faint to be worth ramping to over fourteen frames.
- *
- * This is a REASONED choice and not a transcribed one, which is why it is
- * written down here rather than left as a constant in two places.
+ * Composition carries that register through the actual OT order. Textured
+ * polygon packets update bits 0..8 and 11 even when clipped or opaque; E1 and
+ * draw environments replace the mode, while tiles/sprites/lines inherit it.
+ * See https://psx-spx.consoledev.net/graphicsprocessingunitgpu/ .
  */
-#define SCREEN_TILE_BLEND PSX_BLEND_ADD
 
 /* ------------------------------------------------------------------------- */
 /* The damage flash — 0x80076764                                              */
@@ -857,7 +987,6 @@ static void flash_emit(q2_screen_view *v, int p, psx_ot *ot)
         prim->rgb[0].g = f->out[1];
         prim->rgb[0].b = f->out[2];
         prim->semi_transparent = true;   /* `ori 2` into the code at 0x800767A8 */
-        prim->tpage = psx_make_tpage(0, 0, SCREEN_TILE_BLEND, PSX_TEX_4BIT);
     }
 
     f->strength--;
@@ -966,6 +1095,7 @@ static bool water_move(q2_screen *s, psx_ot *ot, u32 bucket,
         return false;
 
     prim->kind = PSX_PRIM_MOVE;
+    prim->clear_cache = true; /* GP0(01) in the retail five-word DR_MOVE */
     prim->xy[PSX_MOVE_SRC].x  = sx;
     prim->xy[PSX_MOVE_SRC].y  = sy;
     prim->xy[PSX_MOVE_DST].x  = dx;
@@ -1081,7 +1211,6 @@ static void water_tint(const q2_screen_view *v, psx_ot *ot, u32 bucket, s16 amp)
     prim->rgb[0].b = (u8)water_div_trunc(a * Q2_SCREEN_WATER_TINT_B, 12);
 
     prim->semi_transparent = true;      /* `ori 2` into the code at 0x80063280 */
-    prim->tpage = psx_make_tpage(0, 0, SCREEN_TILE_BLEND, PSX_TEX_4BIT);
 }
 
 static void water_update(q2_screen *s, q2_screen_view *v, int p, psx_ot *ot)
@@ -1512,6 +1641,34 @@ static void env_from_overlay(const q2_screen *s, screen_env *e)
 
     env_from_view(&s->overlay, e);
     e->x = (s16)(e->x + (assumed - actual));
+    if (s->adaptive) {
+        e->x = e->y = 0;
+        e->w = (s16)s->buf[0].width;
+        e->h = (s16)s->buf[0].height;
+    }
+}
+
+q2_result q2_screen_capture_scene(q2_screen *s, bool enabled)
+{
+    int i;
+    if (!s) return Q2_ERR_INVALID_ARG;
+    for (i = 0; i < 2; i++) {
+        psx_framebuffer *fb = &s->buf[i], *scene = &s->scene[i];
+        if (!enabled || scene->width != fb->width || scene->height != fb->height) {
+            psx_fb_free(scene);
+            free(s->ui_mask[i]); s->ui_mask[i] = NULL;
+        }
+        if (enabled && !scene->px) {
+            size_t n = (size_t)fb->width * fb->height;
+            if (psx_fb_init(scene, fb->width, fb->height) != Q2_OK ||
+                !(s->ui_mask[i] = calloc(n, 1))) {
+                q2_screen_capture_scene(s, false);
+                return Q2_ERR_NO_MEMORY;
+            }
+            memcpy(scene->px, fb->px, n * sizeof(u16));
+        }
+    }
+    return Q2_OK;
 }
 
 static void env_apply(psx_framebuffer *fb, const screen_env *e,
@@ -1534,18 +1691,24 @@ static void env_apply(psx_framebuffer *fb, const screen_env *e,
         if (y1 > fb->height) y1 = fb->height;
 
         for (py = e->y < 0 ? 0 : e->y; py < y1; py++)
-            for (px = e->x < 0 ? 0 : e->x; px < x1; px++)
-                fb->px[py * fb->width + px] = c;
+            for (px = e->x < 0 ? 0 : e->x; px < x1; px++) {
+                psx_fb_store(fb, px, py, c);
+                if (opts->scene) {
+                    opts->scene[py * fb->width + px] = c;
+                    opts->ui_mask[py * fb->width + px] = 0;
+                }
+            }
     }
 }
 
 void q2_screen_compose(q2_screen *s, psx_ot *ot,
-                       const psx_vram *vram, const psx_raster_opts *opts)
+                       psx_vram *vram, const psx_raster_opts *opts)
 {
     psx_framebuffer *fb;
     psx_raster_opts  local;
     u32 buckets, b;
     int p;
+    bool native_target;
 
     if (!s || !ot || !opts)
         return;
@@ -1558,7 +1721,32 @@ void q2_screen_compose(q2_screen *s, psx_ot *ot,
     if (!fb->px)
         return;
 
+    native_target=!s->adaptive && vram && fb->width<=PSX_VRAM_WIDTH &&
+                  fb->height<=PSX_VRAM_HEIGHT;
+    for (p=0;native_target && p<2;++p)
+        native_target=s->disp.buf[p].x>=0 && s->disp.buf[p].y>=0 &&
+            s->disp.buf[p].x+fb->width<=PSX_VRAM_WIDTH &&
+            s->disp.buf[p].y+fb->height<=PSX_VRAM_HEIGHT;
+    if (native_target) {
+        int row, ox=s->disp.buf[s->disp.draw_buffer].x;
+        int oy=s->disp.buf[s->disp.draw_buffer].y;
+        /* Host loading/menu paths can clear or draw into the presentation
+         * buffer before composition. Publish those writes before binding. */
+        for (row=0;row<fb->height;++row)
+            memcpy(&vram->px[oy+row][ox],fb->px+row*fb->width,
+                   (size_t)fb->width*sizeof(u16));
+        psx_fb_bind_vram(fb,vram,s->disp.buf[s->disp.draw_buffer].x,
+                        s->disp.buf[s->disp.draw_buffer].y);
+    }
+
     local = *opts;
+    local.native_coords = !s->adaptive;
+    local.scene = s->scene[s->disp.draw_buffer].px;
+    local.ui_mask = s->ui_mask[s->disp.draw_buffer];
+    /* A caller may have resized without requesting another scene capture. */
+    if (s->scene[s->disp.draw_buffer].width != fb->width ||
+        s->scene[s->disp.draw_buffer].height != fb->height)
+        local.scene = NULL;
     local.clip_x = local.clip_y = local.clip_w = local.clip_h = 0;
     local.ofs_x  = local.ofs_y  = 0;
 
@@ -1587,13 +1775,15 @@ void q2_screen_compose(q2_screen *s, psx_ot *ot,
             screen_env e;
             e.x = 0;
             e.y = 0;
-            e.w = (s16)s->disp.width;
-            e.h = (s16)s->disp.height;
+            e.w = (s16)fb->width;
+            e.h = (s16)fb->height;
             e.clear  = true;                  /* isbg = 1 at 0x800769F4 */
             e.rgb[0] = s->disp.bg_rgb[0];
             e.rgb[1] = s->disp.bg_rgb[1];
             e.rgb[2] = s->disp.bg_rgb[2];
             env_apply(fb, &e, &local);
+            psx_draw_state_mode(&s->gpu,0x060Au); /* SetDefDrawEnv: tpage 10, dtd/dfe on */
+            s->gpu.texture_window = 0;
         }
 
         for (p = 0; p < s->view_count; p++) {
@@ -1604,6 +1794,8 @@ void q2_screen_compose(q2_screen *s, psx_ot *ot,
                 screen_env e;
                 env_from_view(&s->view[p], &e);
                 env_apply(fb, &e, &local);
+                psx_draw_state_mode(&s->gpu,0x060Au);
+                s->gpu.texture_window = 0;
             }
         }
 
@@ -1612,13 +1804,52 @@ void q2_screen_compose(q2_screen *s, psx_ot *ot,
             screen_env e;
             env_from_overlay(s, &e);
             env_apply(fb, &e, &local);
+            psx_draw_state_mode(&s->gpu,0x060Au);
+            s->gpu.texture_window = 0;
         }
 
         for (idx = ot->bucket_head[b]; idx >= 0; idx = ot->next[idx]) {
             const psx_prim *prim = &ot->prims[idx];
+            local.ui = b >= (u32)Q2_SCREEN_OT_OVERLAY * PSX_OT_SUBDIV;
 
             if (prim->kind == PSX_PRIM_DRAW_ENV) {
                 int ep;
+
+                if (b >= (u32)Q2_SCREEN_OT_OVERLAY * PSX_OT_SUBDIV) {
+                    screen_env e;
+                    int ox = prim->xy[2].x;
+                    int oy = prim->xy[2].y;
+                    env_from_overlay(s, &e);
+                    if (s->adaptive) {
+                        int ux, uy, uw, uh;
+                        double sx, sy;
+                        q2_screen_ui_rect(s, -1, &ux, &uy, &uw, &uh);
+                        sx = (double)uw / s->disp.width;
+                        sy = (double)uh / s->disp.height;
+                        /* Full-canvas restore also restores the wings of an
+                         * adaptive display. Partial clips follow the UI. */
+                        if (prim->xy[0].x || prim->xy[0].y ||
+                            prim->xy[1].x != s->disp.width ||
+                            prim->xy[1].y != s->disp.height) {
+                            e.x = (s16)(ux + (int)floor(prim->xy[0].x * sx + 0.5));
+                            e.y = (s16)(uy + (int)floor(prim->xy[0].y * sy + 0.5));
+                            e.w = (s16)((int)floor((prim->xy[0].x + prim->xy[1].x) * sx + 0.5) + ux - e.x);
+                            e.h = (s16)((int)floor((prim->xy[0].y + prim->xy[1].y) * sy + 0.5) + uy - e.y);
+                        }
+                        ox = (int)floor(ox * sx + 0.5);
+                        oy = (int)floor(oy * sy + 0.5);
+                    } else {
+                        ox += e.x; oy += e.y;
+                        e.x += prim->xy[0].x; e.y += prim->xy[0].y;
+                        e.w = prim->xy[1].x; e.h = prim->xy[1].y;
+                    }
+                    e.clear = false;
+                    env_apply(fb, &e, &local);
+                    local.ofs_x = (s16)ox; local.ofs_y = (s16)oy;
+                    psx_draw_state_mode(&s->gpu, prim->tpage);
+                    s->gpu.texture_window = prim->texture_window;
+                    continue;
+                }
 
                 /* The packet is inside one viewport slice. Its coordinates
                  * are relative to the unshaken viewport origin. */
@@ -1637,13 +1868,27 @@ void q2_screen_compose(q2_screen *s, psx_ot *ot,
                         e.clear = false; /* packet+24 is explicitly zero */
                         e.rgb[0] = e.rgb[1] = e.rgb[2] = 0;
                         env_apply(fb, &e, &local);
+                        psx_draw_state_mode(&s->gpu,prim->tpage);
+                        s->gpu.texture_window = prim->texture_window;
                         break;
                     }
                 }
                 continue;
             }
-            psx_raster_prim(fb, prim, vram, &local);
+            if (s->adaptive && b >= (u32)Q2_SCREEN_OT_OVERLAY * PSX_OT_SUBDIV) {
+                psx_prim ui = *prim;
+                screen_ui_prim(s, -1, &ui, false);
+                psx_raster_command(fb, &ui, vram, &local, &s->gpu);
+            } else {
+                psx_raster_command(fb, prim, vram, &local, &s->gpu);
+            }
         }
+    }
+    /* Refresh both presentation copies after native transfers (which can
+     * reach the other buffer), then release the borrowed VRAM lifetime. */
+    if (native_target) for (p=0;p<2;++p) {
+        psx_fb_bind_vram(&s->buf[p],vram,s->disp.buf[p].x,s->disp.buf[p].y);
+        psx_fb_bind_vram(&s->buf[p],NULL,0,0);
     }
 }
 

@@ -211,6 +211,7 @@ static void usage(void)
     puts("  syms    <disc> [list|name]  the linker's own symbol table: 1,037 named");
     puts("                             functions, by source file (NTSC disc only)");
     puts("  moddisasm <disc> <map> [addr] [n] [creature]  disassemble one CreAIBin module");
+    puts("             <map> also accepts MAP/ZONE0.DAT for zone-local modules");
     puts("  levdisasm <disc> <map> [addr] [n]  disassemble a relocated LevelBin module");
     puts("  modstrings <disc> <map> [crea]  the text a relocated module carries");
     puts("  modxrefs <disc> <map> <addr> [crea]  references to an address in one");
@@ -824,7 +825,7 @@ static int cmd_verify(disc *d)
                             q2_monster_set_register(&ms, k);
 
                         /* A census with no hull: no drop, which is what a count wants. */
-                        if (q2_spawn_from_population(&ms, &pop3, NULL, &st) == Q2_OK) {
+                        if (q2_spawn_from_population(&ms, &pop3, NULL, NULL, &st) == Q2_OK) {
                             spawn_records += st.records;
                             spawn_placed  += st.placed;
                             spawn_oob     += st.out_of_range;
@@ -4702,6 +4703,30 @@ static void ev_rot_call(void *user, const q2_event_item *item, u8 call_index)
     ctx->steps += q2_rotators_call(ctx->set, ctx->uf, item, call_index);
 }
 
+static u32 ev_census(const q2_events *ev, const char *path,
+                      u32 op_hist[64], u32 *negative_fx)
+{
+    q2_event_record rec;
+    u32 count = 0;
+    if (!q2_events_first_record(ev, &rec)) return 0;
+    do {
+        u32 k;
+        for (k = 0; k < rec.n_items; k++) {
+            q2_event_item item;
+            s16 mod, damage;
+            if (!q2_events_get_item(ev, &rec, k, &item)) break;
+            op_hist[item.opcode & 0x3F]++;
+            count++;
+            if (q2_events_get_fx_damage(&item, &mod, &damage)) {
+                printf("  FX %s record +0x%X: mod %d, damage %d\n",
+                       path, rec.offset, (int)mod, (int)damage);
+                if (damage < 0) (*negative_fx)++;
+            }
+        }
+    } while (q2_events_next_record(ev, &rec, &rec));
+    return count;
+}
+
 static int cmd_events(disc *d)
 {
     int i, n = disc_file_count(d);
@@ -4711,6 +4736,7 @@ static int cmd_events(disc *d)
     u32 movers_built = 0, movers_moved = 0, movers_open = 0, movers_empty = 0;
     u32 rot_built = 0, rot_calls = 0, rot_steps = 0, rot_moved = 0, rot_turned = 0;
     u32 trig_with_event = 0, trig_in_common = 0;
+    u32 negative_fx = 0;
 
     memset(op_hist, 0, sizeof(op_hist));
     printf("Running every event script on the disc...\n\n");
@@ -4738,9 +4764,9 @@ static int cmd_events(disc *d)
 
             files++;
             records += ev.record_count;
+            items += ev_census(&ev, f->path, op_hist, &negative_fx);
 
             if (q2_event_rt_init(&rt, &ev) == Q2_OK) {
-                q2_event_record rec;
                 u32 k;
 
                 /*
@@ -4753,19 +4779,6 @@ static int cmd_events(disc *d)
                  * q2_event_rt_init resets it to -1, so this follows the init.
                  */
                 rt.current_zone = atoi(base + 4);
-
-                /* Census every item before running anything. */
-                if (q2_events_first_record(&ev, &rec)) {
-                    do {
-                        for (k = 0; k < rec.n_items; k++) {
-                            q2_event_item it;
-                            if (!q2_events_get_item(&ev, &rec, k, &it))
-                                break;
-                            op_hist[it.opcode & 0x3F]++;
-                            items++;
-                        }
-                    } while (q2_events_next_record(&ev, &rec, &rec));
-                }
 
                 /*
                  * The zone's rotating brushes, wired to the scripts that turn
@@ -4879,6 +4892,7 @@ static int cmd_events(disc *d)
             if (q2_events_parse_common(&ev, &cf) == Q2_OK) {
                 files++;
                 records += ev.record_count;
+                items += ev_census(&ev, f->path, op_hist, &negative_fx);
 
                 /*
                  * Which script do the trigger volumes fire?
@@ -4928,7 +4942,8 @@ static int cmd_events(disc *d)
 
     printf("  files with events : %u\n", files);
     printf("  records           : %u\n", records);
-    printf("  items             : %u\n", items);
+    printf("  items             : %u  (COMMON and ZONE)\n", items);
+    printf("  negative FX hits  : %u\n", negative_fx);
     printf("  named entries     : %u\n", named);
     printf("  records executed  : %u\n", ran);
     printf("  movers skipped    : %u  (link not decoded)\n", movers);

@@ -290,9 +290,8 @@ typedef struct q2_mp_session {
     s16 team_frags[Q2_MP_MAX_TEAMS];     /* 0x800B34A0, round wins in VERSUS */
     s16 kills[Q2_MP_MAX_PLAYERS][Q2_MP_MAX_PLAYERS];  /* 0x800B34A8          */
 
-    /* Per-player team colour, the halfword at config+2 (0x800B32B8 + p*34).
-     * In the shipped build every player's is its own, because the team UI is
-     * behind the same disabled flag the flag modes are. */
+    /* Per-player team colour, config+2 (0x800B32B8 + p*34).
+     * FrontEndResetMultiplayerDefaults seeds this with p & 1. */
     s16 team[Q2_MP_MAX_PLAYERS];
 
     /* QMULTI.C's own state, at the module offsets named. */
@@ -399,9 +398,9 @@ q2_mp_request q2_mp_take_request(q2_mp_session *s);
  *
  * WHERE IT GOES, because a caller has to put it somewhere: each of the four
  * one-item tables is { text, x = 256, y = 124 }, and the winner line beside it
- * is a SEPARATE row at { "", x = 256, y = 20 } — module+0x14E8, loaded into
- * item slot 16 at 0x80100FF4 and filled by 0x8010098C, while the banner goes
- * into slot 32 at 0x801010BC. So the winner line sits at the TOP of the screen
+ * is a SEPARATE row at { "", x = 256, y = 20 } — module+0x14E8, loaded with
+ * font size 16 at 0x80100FF4 and filled by 0x8010098C, while the banner uses
+ * size 32 at 0x801010BC. So the winner line sits at the TOP of the screen
  * and the banner across the middle; they are not stacked.
  *
  * 0x80101008 skips the winner row entirely when the end state is 5,
@@ -526,8 +525,10 @@ const char *q2_mp_hud_image(bool multiplayer, int players);
  * In TEAM DEATHMATCH the original builds its candidate list in a way worth
  * naming rather than quietly fixing: it marks which team colours are in use, and
  * then pairs the mark for colour `i` with the score of PLAYER `i`. With one
- * player per colour — which is every shipped configuration, the team UI being
- * disabled — the two agree. This function reproduces it.
+ * player per colour the two agree, but retail defaults to alternating teams:
+ * this is an original winner-banner bug, not a reason to change the teams.
+ * QMRESULT separately sorts the actual team totals. This function preserves
+ * the banner's behaviour.
  */
 #define Q2_MP_WINNER_DRAW 8
 
@@ -558,20 +559,31 @@ const char *q2_mp_winner_text(const q2_mp_session *s, int winner,
  * six titles in mode order (`DM SCORES`, `TEAM DM SCORES`, `CTF SCORES`,
  * `TAG SCORES`, `TEAM TAG SCORES`, `VERSUS SCORES`), the four colour names, the
  * team line `"%s TEAM SCORED %d"`, and the two-line prompt `ALL PLAYERS PRESS`
- * / `FIRE TO CONTINUE`. Nothing here is invented; the layout is, and is marked
- * as such below.
+ * / `FIRE TO CONTINUE`.
  *
  * Writes up to `max` lines of Q2_MP_SCORE_LINE bytes and returns how many. In a
- * team mode the per-team lines follow the per-player ones, which is the order
- * the module's own strings sit in. `names` supplies the four player names as
+ * Team Deathmatch groups players under their team totals. Both teams and
+ * players sort descending, preserving slot order on ties. `names` supplies the four player names as
  * `q2_mp_winner_text` takes them; NULL gives "PLAYER 1".."PLAYER 4".
  *
- * What is NOT reconstructed is where on the screen each line goes: the module
- * positions them through the engine's text calls and those offsets have not
- * been read. A caller laying them out in order, centred, is showing the right
- * words in the right sequence and not claiming the original's pixels.
+ * q2_mp_score_rows also supplies the runtime layout recovered from QMRESULT
+ * +0x0E1C..+0x1550: 15-pixel row steps, a gap after each team, and a starting
+ * y of (252 - 11 * layout_rows) / 2. READY belongs to the player, not their
+ * sorted row. Title and the fixed prompts are separate page furniture.
  */
 #define Q2_MP_SCORE_LINE 40
+#define Q2_MP_SCORE_ROWS (Q2_MP_MAX_PLAYERS + Q2_MP_MAX_TEAMS)
+
+typedef struct q2_mp_score_row {
+    char text[Q2_MP_SCORE_LINE];
+    s16 y;
+    s8 player;       /* -1 for a team heading */
+    s8 colour;
+    bool highlight;  /* team headings, or every row outside Team Deathmatch */
+} q2_mp_score_row;
+
+u32 q2_mp_score_rows(const q2_mp_session *s, const char *const *names,
+                      u32 ready, q2_mp_score_row *rows, u32 max);
 
 u32 q2_mp_scoreboard(const q2_mp_session *s, const char *const *names,
                      char lines[][Q2_MP_SCORE_LINE], u32 max);

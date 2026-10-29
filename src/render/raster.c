@@ -14,6 +14,16 @@ void psx_raster_opts_default(psx_raster_opts *opts)
     opts->textures          = true;
     opts->clip_x = opts->clip_y = opts->clip_w = opts->clip_h = 0;
     opts->ofs_x  = opts->ofs_y  = 0;
+    opts->texture_window = 0;
+    opts->mask_mode = 0;
+    opts->native_coords = false;
+    opts->skip_field = false;
+    opts->field = 0;
+    opts->missing_texture_bank = false;
+    opts->cache = NULL;
+    opts->scene = NULL;
+    opts->ui_mask = NULL;
+    opts->ui = false;
 }
 
 /*
@@ -54,6 +64,8 @@ q2_result psx_fb_init(psx_framebuffer *fb, int width, int height)
 
     fb->width  = width;
     fb->height = height;
+    fb->vram = NULL;
+    fb->vram_x = fb->vram_y = 0;
     return Q2_OK;
 }
 
@@ -64,6 +76,27 @@ void psx_fb_free(psx_framebuffer *fb)
     free(fb->px);
     fb->px = NULL;
     fb->width = fb->height = 0;
+    fb->vram = NULL;
+}
+
+q2_result psx_fb_bind_vram(psx_framebuffer *fb, psx_vram *vram, int x, int y)
+{
+    int row;
+    if (!fb || !fb->px) return Q2_ERR_INVALID_ARG;
+    if (vram && (x < 0 || y < 0 || x + fb->width > PSX_VRAM_WIDTH ||
+                 y + fb->height > PSX_VRAM_HEIGHT)) return Q2_ERR_INVALID_ARG;
+    fb->vram = vram;
+    fb->vram_x = x; fb->vram_y = y;
+    if (vram) for (row = 0; row < fb->height; ++row)
+        memcpy(fb->px + row * fb->width, &vram->px[y+row][x],
+               (size_t)fb->width * sizeof(u16));
+    return Q2_OK;
+}
+
+void psx_fb_store(psx_framebuffer *fb, int x, int y, u16 colour)
+{
+    fb->px[y * fb->width + x] = colour;
+    if (fb->vram) fb->vram->px[fb->vram_y+y][fb->vram_x+x] = colour;
 }
 
 void psx_fb_clear(psx_framebuffer *fb, u16 colour)
@@ -76,6 +109,11 @@ void psx_fb_clear(psx_framebuffer *fb, u16 colour)
     n = fb->width * fb->height;
     for (i = 0; i < n; i++)
         fb->px[i] = colour;
+    if (fb->vram) {
+        int x, y;
+        for (y=0;y<fb->height;++y) for (x=0;x<fb->width;++x)
+            fb->vram->px[fb->vram_y+y][fb->vram_x+x] = colour;
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -92,7 +130,11 @@ static u16 blend_pixel(u16 back, int r, int g, int b, psx_blend mode)
 {
     int br, bg, bb;
 
-    unpack555(back, &br, &bg, &bb);
+    /* Blending consumes RGB555, after modulation/dither/reduction. Keeping
+     * fractional foreground bits until afterwards makes subtraction too dark
+     * (B=8, F=7 must leave channel 1, not turn it into channel 0). */
+    br = back & 31; bg = (back >> 5) & 31; bb = (back >> 10) & 31;
+    r >>= 3; g >>= 3; b >>= 3;
 
     switch (mode) {
     case PSX_BLEND_HALF:
@@ -109,11 +151,11 @@ static u16 blend_pixel(u16 back, int r, int g, int b, psx_blend mode)
         break;
     }
 
-    if (r < 0) r = 0; else if (r > 255) r = 255;
-    if (g < 0) g = 0; else if (g > 255) g = 255;
-    if (b < 0) b = 0; else if (b > 255) b = 255;
+    if (r < 0) r = 0; else if (r > 31) r = 31;
+    if (g < 0) g = 0; else if (g > 31) g = 31;
+    if (b < 0) b = 0; else if (b > 31) b = 31;
 
-    return psx_rgb555((u8)r, (u8)g, (u8)b);
+    return (u16)(r | (g << 5) | (b << 10));
 }
 
 /* ------------------------------------------------------------------------- */
@@ -123,8 +165,66 @@ static u16 blend_pixel(u16 back, int r, int g, int b, psx_blend mode)
 /* 8-bit modes a texel is an index into a CLUT that also lives in VRAM. UVs    */
 /* are u8 and therefore wrap within the page — a UV of 260 is 4, not clamped.  */
 /* ------------------------------------------------------------------------- */
-static bool sample_texture(const psx_vram *vram, u16 tpage, u16 clut,
-                           u8 u, u8 v, int *r, int *g, int *b)
+/* Keep the ordinary RGB555 result untouched. The optional scene copy blends
+ * against its own background, so UI never leaks into bloom even when a later
+ * damage flash or water move follows the HUD in the ordering table. */
+static void write_pixel(psx_framebuffer *fb, const psx_raster_opts *opts,
+                        const psx_prim *prim, int at, int r, int g, int b,
+                        bool semi, bool tex_stp)
+{
+    psx_blend mode = (psx_blend)((prim->tpage >> 5) & 3);
+    u16 colour = psx_rgb555((u8)r, (u8)g, (u8)b);
+    u16 mask = ((opts->mask_mode & 1) || tex_stp) ? 0x8000u : 0;
+    if (opts->skip_field && (((at / fb->width + fb->vram_y) & 1) == opts->field)) return;
+    if ((opts->mask_mode & 2) && (fb->px[at] & 0x8000u)) return;
+    fb->px[at] = (u16)((semi ? blend_pixel(fb->px[at], r, g, b, mode) : colour) | mask);
+    if (fb->vram)
+        fb->vram->px[fb->vram_y+at/fb->width][fb->vram_x+at%fb->width] = fb->px[at];
+    if (opts->scene) {
+        if (opts->ui || prim->ui) {
+            opts->ui_mask[at] = 255;
+        } else {
+            opts->scene[at] = (u16)((semi ? blend_pixel(opts->scene[at], r, g, b, mode) : colour) | mask);
+            if (!semi) opts->ui_mask[at] = 0;
+        }
+    }
+}
+
+/* Cache indexing/invalidation follows Mednafen's GPL-2.0-or-later PS1 GPU
+ * (gpu_common.inc / gpu.cpp). See README credits and the fixture provenance.
+ * In particular 8-bit mode caches 64x32 texels, not the old 32x64 description. */
+static u16 texture_word(const psx_vram *vram, psx_texture_cache *cache,
+                        unsigned x, unsigned y, unsigned bpp)
+{
+    unsigned address=y*1024+x, line, base=address&~3u;
+    if (!cache) return vram->px[y][x];
+    line=bpp==0 ? ((address>>2)&3)|((address>>8)&252)
+                : ((address>>2)&7)|((address>>7)&248);
+    if (cache->tag[line]!=base+1) {
+        memcpy(cache->word[line],&vram->px[y][x&~3u],8);
+        cache->tag[line]=base+1;
+    }
+    return cache->word[line][address&3];
+}
+
+static void cache_palette(psx_texture_cache *cache, const psx_vram *vram,
+                           u16 clut, u16 mode)
+{
+    unsigned bpp=(mode>>7)&3, i, tag;
+    if (!vram || bpp>=2) return;
+    tag=((clut&0x7FFFu)|(bpp<<16))+1;
+    /* A full 256-entry load satisfies a later 4-bit request for the same
+     * palette. This is visible in ps1-tests/clut-cache row 152; comparing the
+     * depth bits for equality (as Mednafen does) reloads that row incorrectly. */
+    if (cache->clut_tag==tag || (!bpp && cache->clut_tag==(tag|0x10000u))) return;
+    for (i=0;i<(bpp?256u:16u);++i)
+        cache->clut[i]=vram->px[(clut>>6)&511][((clut&63)*16+i)&1023];
+    cache->clut_tag=tag;
+}
+
+static bool sample_texture(const psx_vram *vram, psx_texture_cache *cache, u16 tpage, u16 clut,
+                           u32 window, u8 u, u8 v,
+                           int *r, int *g, int *b, bool *stp)
 {
     int page_x = (tpage & 0x0F) * 64;      /* in 16-bit words */
     int page_y = ((tpage >> 4) & 1) * 256;
@@ -136,45 +236,42 @@ static bool sample_texture(const psx_vram *vram, u16 tpage, u16 clut,
     if (!vram)
         return false;
 
+    /* E2 replaces selected UV bits before addressing either packed texels or
+     * direct colour. Non-contiguous masks are legal; this is not a rectangle
+     * clamp. Texture and CLUT fetches wrap on the same VRAM row. */
+    {
+        u32 mx = (window & 31u) << 3, my = ((window >> 5) & 31u) << 3;
+        u = (u8)((u & ~mx) | (((window >> 10) << 3) & mx));
+        v = (u8)((v & ~my) | (((window >> 15) << 3) & my));
+    }
+
     if (bpp == 0) {              /* 4 bits per texel: 4 texels per word */
-        int vx = page_x + (u >> 2);
+        int vx = (page_x + (u >> 2)) & 1023;
         int vy = page_y + v;
         u16 word;
         int index;
 
-        if (vx < 0 || vx >= PSX_VRAM_WIDTH || vy < 0 || vy >= PSX_VRAM_HEIGHT)
-            return false;
-
-        word  = vram->px[vy][vx];
+        word  = texture_word(vram,cache,(unsigned)vx,(unsigned)vy,0);
         index = (word >> ((u & 3) * 4)) & 0x0F;
 
-        if (clut_y >= PSX_VRAM_HEIGHT || clut_x + index >= PSX_VRAM_WIDTH)
-            return false;
-        texel = vram->px[clut_y][clut_x + index];
+        texel = cache ? cache->clut[index] : vram->px[clut_y][(clut_x + index) & 1023];
 
     } else if (bpp == 1) {       /* 8 bits per texel: 2 texels per word */
-        int vx = page_x + (u >> 1);
+        int vx = (page_x + (u >> 1)) & 1023;
         int vy = page_y + v;
         u16 word;
         int index;
 
-        if (vx < 0 || vx >= PSX_VRAM_WIDTH || vy < 0 || vy >= PSX_VRAM_HEIGHT)
-            return false;
-
-        word  = vram->px[vy][vx];
+        word  = texture_word(vram,cache,(unsigned)vx,(unsigned)vy,1);
         index = (word >> ((u & 1) * 8)) & 0xFF;
 
-        if (clut_y >= PSX_VRAM_HEIGHT || clut_x + index >= PSX_VRAM_WIDTH)
-            return false;
-        texel = vram->px[clut_y][clut_x + index];
+        texel = cache ? cache->clut[index] : vram->px[clut_y][(clut_x + index) & 1023];
 
     } else {                     /* 16 bits per texel, direct colour */
-        int vx = page_x + u;
+        int vx = (page_x + u) & 1023;
         int vy = page_y + v;
 
-        if (vx < 0 || vx >= PSX_VRAM_WIDTH || vy < 0 || vy >= PSX_VRAM_HEIGHT)
-            return false;
-        texel = vram->px[vy][vx];
+        texel = texture_word(vram,cache,(unsigned)vx,(unsigned)vy,2);
     }
 
     /* An all-zero texel is fully transparent on this hardware — it is not
@@ -183,14 +280,14 @@ static bool sample_texture(const psx_vram *vram, u16 tpage, u16 clut,
         return false;
 
     unpack555(texel, r, g, b);
+    *stp = (texel & 0x8000u) != 0;
     return true;
 }
 
 /* ------------------------------------------------------------------------- */
 /* Triangle rasterisation                                                     */
 /*                                                                            */
-/* Edge functions in integer arithmetic, matching the integer vertex positions */
-/* the GTE produced. Barycentric weights drive Gouraud colour and affine UVs.  */
+/* Fixed-point edges and UV/RGB accumulators; see raster_scan.inc.           */
 /* ------------------------------------------------------------------------- */
 typedef struct raster_vertex {
     int x, y;
@@ -198,225 +295,12 @@ typedef struct raster_vertex {
     int u, v;
 } raster_vertex;
 
-static int edge(const raster_vertex *a, const raster_vertex *b, int px, int py)
+static int signed11(int value)
 {
-    return (b->x - a->x) * (py - a->y) - (b->y - a->y) * (px - a->x);
+    return (value & 1023) - (value & 1024);
 }
 
-/*
- * Is a->b a TOP or LEFT edge of the (already winding-normalised) triangle?
- *
- * With screen y increasing downwards and the weights normalised positive, an
- * edge that travels UP the screen is a left edge, and a horizontal edge that
- * travels RIGHT is a top edge. Those two are the ones the GPU fills; the right
- * and bottom edges are excluded, so a pixel on the seam between two triangles
- * belongs to exactly one of them. See the note in raster_triangle.
- */
-static bool edge_is_top_left(const raster_vertex *a, const raster_vertex *b)
-{
-    if (b->y == a->y)
-        return b->x > a->x;     /* horizontal: top when it runs right */
-    return b->y < a->y;         /* travels up the screen: a left edge  */
-}
-
-static void raster_triangle(psx_framebuffer *fb,
-                            const raster_vertex *v0,
-                            const raster_vertex *v1,
-                            const raster_vertex *v2,
-                            const psx_prim *prim,
-                            const psx_vram *vram,
-                            const psx_raster_opts *opts)
-{
-    int min_x, max_x, min_y, max_y;
-    int area;
-    int px, py;
-    const raster_vertex *a = v0, *b = v1, *c = v2;
-
-    area = edge(a, b, c->x, c->y);
-    if (area == 0)
-        return;                     /* degenerate */
-
-    /* The GPU draws both windings. Rather than cull, normalise so the
-     * barycentric weights stay positive. Backface rejection is the game's job,
-     * via NCLIP, not the rasteriser's. */
-    if (area < 0) {
-        const raster_vertex *t = b;
-        b = c;
-        c = t;
-        area = -area;
-    }
-
-    min_x = a->x < b->x ? (a->x < c->x ? a->x : c->x) : (b->x < c->x ? b->x : c->x);
-    max_x = a->x > b->x ? (a->x > c->x ? a->x : c->x) : (b->x > c->x ? b->x : c->x);
-    min_y = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
-    max_y = a->y > b->y ? (a->y > c->y ? a->y : c->y) : (b->y > c->y ? b->y : c->y);
-
-    {
-        int cx0, cy0, cx1, cy1;
-        raster_clip(fb, opts, &cx0, &cy0, &cx1, &cy1);
-        if (min_x < cx0) min_x = cx0;
-        if (min_y < cy0) min_y = cy0;
-        if (max_x >= cx1) max_x = cx1 - 1;
-        if (max_y >= cy1) max_y = cy1 - 1;
-    }
-
-    /*
-     * THE FILL RULE, and why a transparent surface used to have its own mesh
-     * printed on it.
-     *
-     * The edge test was inclusive on all three edges (`w >= 0`), so a pixel
-     * lying exactly on an edge SHARED by two triangles was rasterised twice.
-     * For opaque geometry the second write lays down the same colour and
-     * nothing shows, which is why this survived; for a semi-transparent one the
-     * blend runs twice and the pixel comes out at B + 2F. Every quad is split
-     * into two triangles, so its own diagonal is a shared edge; neighbouring
-     * quads share their borders; and a subdivided near quad has 24 of them. The
-     * result was the tessellation drawn onto every transparent surface as a
-     * bright grid with a diagonal through each cell.
-     *
-     * The hardware's rule — stated three times in this tree already
-     * (raster.h, menufont.c, panel.c) and never implemented here — is that the
-     * right and bottom edges of a primitive do not draw. Expressed on the edge
-     * function, an edge is "top or left" when it goes up the screen, or is
-     * horizontal and runs to the right; those keep `>= 0` and every other edge
-     * takes `> 0`. Applied AFTER the winding normalisation above, because the
-     * swap changes which edge is which.
-     */
-    /*
-     * THE UV RANGE THIS PRIMITIVE IS ALLOWED TO SAMPLE, and why it has to be
-     * bounded rather than cast.
-     *
-     * The interpolation below is `(w0*u0 + w1*u1 + w2*u2) / area` in integers.
-     * The barycentric weights are exact only on the vertices; everywhere else
-     * the truncating divide lands the result up to a texel outside the range the
-     * three corners span, and the result was then cast straight to `u8`.
-     *
-     * Both halves of that are visible. One texel over an edge samples whatever
-     * is packed NEXT TO this face's texture in the same 256x256 page, which is
-     * the stitching along every seam. And the cast WRAPS: a `tu` of 256 becomes
-     * 0 and a -1 becomes 255, so a face whose UVs sit against a page boundary
-     * jumps to the far side of the page and picks up an unrelated texture
-     * entirely. On the blaster that is the emitter's orange arriving as speckles
-     * across the body, which is how this was spotted.
-     *
-     * The hardware does neither. Its texture coordinate unit walks a fixed-point
-     * accumulator between the primitive's own endpoints — the artefacts it has
-     * are sub-texel swim and the affine warp above, not a jump into a different
-     * texture — so clamping to the corners' own range is the faithful bound as
-     * well as the correct one. Hoisted out of the pixel loop: it is a property
-     * of the triangle.
-     *
-     * WHAT THIS BOUND CANNOT DO, and what had to be fixed instead: it clamps u
-     * and v SEPARATELY, so it is an axis-aligned box round the corners. A UV
-     * quad that is not axis-aligned has a footprint smaller than its own box,
-     * and a sample can walk off a DIAGONAL edge while staying inside the box —
-     * which is precisely what the truncating divide did.
-     *
-     * Measured on `Blaster G` part 7 face 56, the strip along the top of the
-     * gun in BASE0:
-     *
-     *     screen (370,157) (348,151) (326,151) (341,158)
-     *     uv     (161,128) (119,128) (108,139) (148,139)
-     *
-     * Its top edge runs (119,128) to (108,139), so that edge lies on the
-     * anti-diagonal u + v == 247 and the whole quad sits at u + v >= 247. The
-     * truncating divide walked the top row of pixels along u + v == 246 — one
-     * texel outside the primitive, for all eleven of them — and that row of the
-     * real texture is the emitter's orange grille. The gun grew a dashed orange
-     * line along its top edge; the console's own frame has no such line, and
-     * `test_raster` pins that with the same numbers.
-     *
-     * Rounding the interpolant to nearest rather than toward zero is what
-     * removes it. The truncation is a systematic bias of up to a whole texel in
-     * one direction; rounding halves the worst case and centres it, so a sample
-     * on an edge stays on the edge instead of stepping off it. This is the one
-     * place the backend departs from "reproduce the integer arithmetic" on a
-     * judgement rather than a read instruction: no capture settles what the
-     * GPU's texture unit rounds. What settles it here is that the old behaviour
-     * demonstrably left the primitive and the console demonstrably does not
-     * draw the result.
-     */
-    {
-        int umin = a->u < b->u ? (a->u < c->u ? a->u : c->u)
-                               : (b->u < c->u ? b->u : c->u);
-        int umax = a->u > b->u ? (a->u > c->u ? a->u : c->u)
-                               : (b->u > c->u ? b->u : c->u);
-        int vmin = a->v < b->v ? (a->v < c->v ? a->v : c->v)
-                               : (b->v < c->v ? b->v : c->v);
-        int vmax = a->v > b->v ? (a->v > c->v ? a->v : c->v)
-                               : (b->v > c->v ? b->v : c->v);
-
-        int bias0 = edge_is_top_left(b, c) ? 0 : -1;
-        int bias1 = edge_is_top_left(c, a) ? 0 : -1;
-        int bias2 = edge_is_top_left(a, b) ? 0 : -1;
-
-    for (py = min_y; py <= max_y; py++) {
-        for (px = min_x; px <= max_x; px++) {
-            int w0 = edge(b, c, px, py);
-            int w1 = edge(c, a, px, py);
-            int w2 = edge(a, b, px, py);
-            int r, g, bl;
-            u16 *dst;
-
-            if (w0 + bias0 < 0 || w1 + bias1 < 0 || w2 + bias2 < 0)
-                continue;
-
-            /* Gouraud: barycentric interpolation of the per-vertex colours. */
-            r  = (w0 * a->r + w1 * b->r + w2 * c->r) / area;
-            g  = (w0 * a->g + w1 * b->g + w2 * c->g) / area;
-            bl = (w0 * a->b + w1 * b->b + w2 * c->b) / area;
-
-            if (opts->textures && vram &&
-                (prim->kind == PSX_PRIM_FT3 || prim->kind == PSX_PRIM_GT3 ||
-                 prim->kind == PSX_PRIM_FT4 || prim->kind == PSX_PRIM_GT4)) {
-                int tu, tv, tr, tg, tb;
-
-                /* Affine: the UVs interpolate in screen space with no 1/w term.
-                 * This is the warp, and it is intentional. */
-                tu = (w0 * a->u + w1 * b->u + w2 * c->u + area / 2) / area;
-                tv = (w0 * a->v + w1 * b->v + w2 * c->v + area / 2) / area;
-
-                /* Bounded by this primitive's own corners — see above. */
-                if (tu < umin) tu = umin; else if (tu > umax) tu = umax;
-                if (tv < vmin) tv = vmin; else if (tv > vmax) tv = vmax;
-
-                if (!sample_texture(vram, prim->tpage, prim->clut,
-                                    (u8)tu, (u8)tv, &tr, &tg, &tb))
-                    continue;       /* transparent texel */
-
-                if (prim->textured_blend) {
-                    /* Texture modulated by the vertex colour. 0x80 is unity, so
-                     * a mid-grey vertex colour leaves the texture unchanged. */
-                    r  = (tr * r)  >> 7;
-                    g  = (tg * g)  >> 7;
-                    bl = (tb * bl) >> 7;
-                } else {
-                    r = tr; g = tg; bl = tb;
-                }
-            }
-
-            if (opts->dither) {
-                r  = psx_dither_channel((u8)(r  < 0 ? 0 : (r  > 255 ? 255 : r)),  px, py);
-                g  = psx_dither_channel((u8)(g  < 0 ? 0 : (g  > 255 ? 255 : g)),  px, py);
-                bl = psx_dither_channel((u8)(bl < 0 ? 0 : (bl > 255 ? 255 : bl)), px, py);
-            }
-
-            if (r < 0) r = 0; else if (r > 255) r = 255;
-            if (g < 0) g = 0; else if (g > 255) g = 255;
-            if (bl < 0) bl = 0; else if (bl > 255) bl = 255;
-
-            dst = &fb->px[py * fb->width + px];
-
-            if (opts->semi_transparency && prim->semi_transparent) {
-                *dst = blend_pixel(*dst, r, g, bl,
-                                   (psx_blend)((prim->tpage >> 5) & 3));
-            } else {
-                *dst = psx_rgb555((u8)r, (u8)g, (u8)bl);
-            }
-        }
-    }
-    }
-}
+#include "raster_scan.inc"
 
 /* ------------------------------------------------------------------------- */
 /* Rectangles: sprites and tiles                                              */
@@ -442,10 +326,16 @@ static void raster_rect(psx_framebuffer *fb,
     int y0 = prim->xy[0].y + opts->ofs_y;
     int x1 = prim->xy[2].x + opts->ofs_x;
     int y1 = prim->xy[2].y + opts->ofs_y;
-    bool textured = (prim->kind == PSX_PRIM_SPRT);
+    bool textured = prim->kind == PSX_PRIM_SPRT && opts->textures && vram;
     int px, py;
     int cx0, cy0, cx1, cy1;
 
+    if (textured && opts->missing_texture_bank) return;
+    if (opts->native_coords) {
+        int nx=signed11(x0+fb->vram_x)-fb->vram_x;
+        int ny=signed11(y0+fb->vram_y)-fb->vram_y;
+        x1+=nx-x0; y1+=ny-y0; x0=nx; y0=ny;
+    }
     if (x1 < x0) { int t = x0; x0 = x1; x1 = t; }
     if (y1 < y0) { int t = y0; y0 = y1; y1 = t; }
 
@@ -458,18 +348,24 @@ static void raster_rect(psx_framebuffer *fb,
             int r = prim->rgb[0].r;
             int g = prim->rgb[0].g;
             int b = prim->rgb[0].b;
-            u16 *dst;
+            bool stp = false;
 
             if (px < cx0 || px >= cx1)
                 continue;
 
-            if (textured && opts->textures && vram) {
+            if (textured) {
                 int tr, tg, tb;
-                u8 u = (u8)(prim->uv[0].u + (px - x0));
-                u8 v = (u8)(prim->uv[0].v + (py - y0));
+                int du = (prim->sprite_w
+                            ? (px - x0) * prim->sprite_w / (x1 - x0)
+                            : (px - x0));
+                int dv = (prim->sprite_h
+                            ? (py - y0) * prim->sprite_h / (y1 - y0)
+                            : (py - y0));
+                u8 u = (u8)(prim->uv[0].u + ((prim->tpage & 0x1000u) ? -du : du));
+                u8 v = (u8)(prim->uv[0].v + ((prim->tpage & 0x2000u) ? -dv : dv));
 
-                if (!sample_texture(vram, prim->tpage, prim->clut, u, v,
-                                    &tr, &tg, &tb))
+                if (!sample_texture(vram, opts->cache, prim->tpage, prim->clut, opts->texture_window, u, v,
+                                    &tr, &tg, &tb, &stp))
                     continue;      /* index 0 is transparent, not black */
 
                 if (prim->textured_blend) {
@@ -485,153 +381,81 @@ static void raster_rect(psx_framebuffer *fb,
             if (g < 0) g = 0; else if (g > 255) g = 255;
             if (b < 0) b = 0; else if (b > 255) b = 255;
 
-            dst = &fb->px[py * fb->width + px];
+            write_pixel(fb, opts, prim, py * fb->width + px, r, g, b,
+                        opts->semi_transparency && prim->semi_transparent && (!textured || stp), stp);
+        }
+    }
+}
 
-            if (opts->semi_transparency && prim->semi_transparent) {
-                *dst = blend_pixel(*dst, r, g, b,
-                                   (psx_blend)((prim->tpage >> 5) & 3));
-            } else {
-                *dst = psx_rgb555((u8)r, (u8)g, (u8)b);
+/* ------------------------------------------------------------------------- */
+/* VRAM copies buffer 128 words at a time, left-to-right and top-to-bottom.
+ * Vertical overlap intentionally feeds earlier destination rows back into
+ * later source rows. Mednafen gpu.cpp (GPL-2.0-or-later, Mednafen Team
+ * 2011-2017) documents the chunk size; ps1-tests supplies overlap captures.
+ * A bound native target wraps independently at 1024/512. Standalone/adaptive
+ * targets retain host clipping, with the same transfer order. */
+static void raster_move(psx_framebuffer *fb, const psx_prim *prim,
+                        const psx_raster_opts *opts)
+{
+    int sx=prim->xy[0].x, sy=prim->xy[0].y;
+    int dx=prim->xy[1].x, dy=prim->xy[1].y;
+    int w=prim->xy[2].x, h=prim->xy[2].y;
+    int y, x, j;
+    if (fb->vram) {
+        w=((w-1)&1023)+1; h=((h-1)&511)+1;
+        /* Logical screen packets are relative to this buffer's origin. */
+        sx+=fb->vram_x; dx+=fb->vram_x;
+        sy+=fb->vram_y; dy+=fb->vram_y;
+    } else {
+        if (w<=0 || h<=0) return;
+        if (sx<0) { w+=sx; dx-=sx; sx=0; }
+        if (dx<0) { w+=dx; sx-=dx; dx=0; }
+        if (sy<0) { h+=sy; dy-=sy; sy=0; }
+        if (dy<0) { h+=dy; sy-=dy; dy=0; }
+        if (sx+w>fb->width) w=fb->width-sx;
+        if (dx+w>fb->width) w=fb->width-dx;
+        if (sy+h>fb->height) h=fb->height-sy;
+        if (dy+h>fb->height) h=fb->height-dy;
+    }
+    for (y=0;y<h;++y) for (x=0;x<w;x+=128) {
+        u16 pixels[128], scene[128];
+        u8 ui[128];
+        int n=w-x<128?w-x:128;
+        for (j=0;j<n;++j) {
+            int rx=sx+x+j, ry=sy+y, local_x=rx, local_y=ry;
+            if (fb->vram) {
+                rx&=1023; ry&=511;
+                pixels[j]=fb->vram->px[ry][rx];
+                local_x=rx-fb->vram_x; local_y=ry-fb->vram_y;
+            } else pixels[j]=fb->px[ry*fb->width+rx];
+            scene[j]=pixels[j]; ui[j]=0;
+            if (opts->scene && local_x>=0 && local_x<fb->width &&
+                local_y>=0 && local_y<fb->height) {
+                int at=local_y*fb->width+local_x;
+                scene[j]=opts->scene[at]; ui[j]=opts->ui_mask[at];
+            }
+        }
+        for (j=0;j<n;++j) {
+            int wx=dx+x+j, wy=dy+y, local_x=wx, local_y=wy;
+            u16 *dst, mask=(opts->mask_mode&1)?0x8000:0;
+            if (fb->vram) {
+                wx&=1023; wy&=511;
+                dst=&fb->vram->px[wy][wx];
+                local_x=wx-fb->vram_x; local_y=wy-fb->vram_y;
+            } else dst=&fb->px[wy*fb->width+wx];
+            if ((opts->mask_mode&2) && (*dst&0x8000)) continue;
+            *dst=pixels[j]|mask;
+            if (local_x>=0 && local_x<fb->width && local_y>=0 && local_y<fb->height) {
+                int at=local_y*fb->width+local_x;
+                fb->px[at]=pixels[j]|mask;
+                if (opts->scene) {
+                    opts->scene[at]=scene[j]|mask; opts->ui_mask[at]=ui[j];
+                }
             }
         }
     }
 }
 
-/* ------------------------------------------------------------------------- */
-/* VRAM -> VRAM copy — GP0(0x80), libgpu's DR_MOVE                            */
-/*                                                                            */
-/* The only primitive that reads pixels back out of the framebuffer. It is a  */
-/* blit and not a draw, so three of the rasteriser's rules do not apply to it: */
-/* the drawing offset is not added, the drawing area does not clip it, and    */
-/* neither the blend modes nor the dither are involved — the halfwords are     */
-/* copied verbatim, mask bit included.                                        */
-/*                                                                            */
-/* Only the framebuffer bounds constrain it, and the ORIGINAL DOES NOT CHECK   */
-/* THEM either: on hardware a copy that runs off the edge wraps within VRAM.   */
-/* This port's framebuffer is not the whole of VRAM (see src/screen), so a     */
-/* rectangle that leaves it is clipped rather than wrapped. That is a          */
-/* divergence, and it is the safe direction: the water warp is the only        */
-/* emitter and it keeps its rectangles inside the viewport by construction —   */
-/* which is exactly what the screen shake's inset is for.                      */
-/*                                                                            */
-/* Source and destination overlap on every single use, so the row copy runs    */
-/* in whichever direction keeps it non-destructive.                            */
-/* ------------------------------------------------------------------------- */
-static void raster_move(psx_framebuffer *fb, const psx_prim *prim)
-{
-    int sx = prim->xy[PSX_MOVE_SRC].x;
-    int sy = prim->xy[PSX_MOVE_SRC].y;
-    int dx = prim->xy[PSX_MOVE_DST].x;
-    int dy = prim->xy[PSX_MOVE_DST].y;
-    int w  = prim->xy[PSX_MOVE_SIZE].x;
-    int h  = prim->xy[PSX_MOVE_SIZE].y;
-    int step, y;
-
-    if (w <= 0 || h <= 0)
-        return;
-
-    /* Clip both rectangles together, so a copy never shears. */
-    if (sx < 0) { w += sx; dx -= sx; sx = 0; }
-    if (dx < 0) { w += dx; sx -= dx; dx = 0; }
-    if (sy < 0) { h += sy; dy -= sy; sy = 0; }
-    if (dy < 0) { h += dy; sy -= dy; dy = 0; }
-
-    if (sx + w > fb->width)  w = fb->width  - sx;
-    if (dx + w > fb->width)  w = fb->width  - dx;
-    if (sy + h > fb->height) h = fb->height - sy;
-    if (dy + h > fb->height) h = fb->height - dy;
-
-    if (w <= 0 || h <= 0)
-        return;
-
-    /* Rows overlap only when the two rectangles share columns; copying away
-     * from the direction of travel is what makes an overlapping move behave as
-     * though the source had been read whole. */
-    if (dy > sy) {
-        y    = h - 1;
-        step = -1;
-    } else {
-        y    = 0;
-        step = 1;
-    }
-
-    for (; y >= 0 && y < h; y += step)
-        memmove(&fb->px[(dy + y) * fb->width + dx],
-                &fb->px[(sy + y) * fb->width + sx],
-                (size_t)w * sizeof(u16));
-}
-
-/* ------------------------------------------------------------------------- */
-/* Lines                                                                      */
-/*                                                                            */
-/* LINE_F2 (code 0x40) and LINE_G2 (0x50). The GPU walks a line with a         */
-/* Bresenham-style DDA on the major axis and writes one pixel per step, so a   */
-/* line is exactly one pixel thick and its endpoints are BOTH drawn — unlike a */
-/* polygon, whose right and bottom edges are dropped. Gouraud lines            */
-/* interpolate the two endpoint colours along the same parameter.              */
-/*                                                                            */
-/* Nothing in the world renderer emits one. The menu does: a slider's frame is */
-/* four of them around a 133 x 8 box (0x8001BBAC), so before this existed a    */
-/* slider drew as a bare fill with no outline.                                 */
-/* ------------------------------------------------------------------------- */
-static void raster_line(psx_framebuffer *fb,
-                        const psx_prim *prim,
-                        const psx_raster_opts *opts)
-{
-    int x0 = prim->xy[0].x + opts->ofs_x;
-    int y0 = prim->xy[0].y + opts->ofs_y;
-    int x1 = prim->xy[1].x + opts->ofs_x;
-    int y1 = prim->xy[1].y + opts->ofs_y;
-    bool gouraud = (prim->kind == PSX_PRIM_LINE_G2);
-    int dx = x1 - x0, dy = y1 - y0;
-    int adx = dx < 0 ? -dx : dx;
-    int ady = dy < 0 ? -dy : dy;
-    int steps = adx > ady ? adx : ady;
-    int cx0, cy0, cx1, cy1;
-    int i;
-
-    raster_clip(fb, opts, &cx0, &cy0, &cx1, &cy1);
-
-    for (i = 0; i <= steps; i++) {
-        /* Rounded so the two ends land exactly on the given endpoints. */
-        int px = steps ? x0 + (dx * i + (dx < 0 ? -steps : steps) / 2) / steps : x0;
-        int py = steps ? y0 + (dy * i + (dy < 0 ? -steps : steps) / 2) / steps : y0;
-        int r, g, b;
-        u16 *dst;
-
-        if (px < cx0 || px >= cx1 || py < cy0 || py >= cy1)
-            continue;
-
-        if (gouraud && steps) {
-            r = prim->rgb[0].r + (prim->rgb[1].r - prim->rgb[0].r) * i / steps;
-            g = prim->rgb[0].g + (prim->rgb[1].g - prim->rgb[0].g) * i / steps;
-            b = prim->rgb[0].b + (prim->rgb[1].b - prim->rgb[0].b) * i / steps;
-        } else {
-            r = prim->rgb[0].r;
-            g = prim->rgb[0].g;
-            b = prim->rgb[0].b;
-        }
-
-        if (opts->dither) {
-            r = psx_dither_channel((u8)(r < 0 ? 0 : (r > 255 ? 255 : r)), px, py);
-            g = psx_dither_channel((u8)(g < 0 ? 0 : (g > 255 ? 255 : g)), px, py);
-            b = psx_dither_channel((u8)(b < 0 ? 0 : (b > 255 ? 255 : b)), px, py);
-        }
-        if (r < 0) r = 0; else if (r > 255) r = 255;
-        if (g < 0) g = 0; else if (g > 255) g = 255;
-        if (b < 0) b = 0; else if (b > 255) b = 255;
-
-        dst = &fb->px[py * fb->width + px];
-
-        if (opts->semi_transparency && prim->semi_transparent)
-            *dst = blend_pixel(*dst, r, g, b,
-                               (psx_blend)((prim->tpage >> 5) & 3));
-        else
-            *dst = psx_rgb555((u8)r, (u8)g, (u8)b);
-    }
-}
-
-/* ------------------------------------------------------------------------- */
 static void fill_vertex(raster_vertex *rv, const psx_prim *prim, int i, int colour_index)
 {
     rv->x = prim->xy[i].x;
@@ -649,11 +473,30 @@ void psx_raster_prim(psx_framebuffer *fb,
                      const psx_raster_opts *opts)
 {
     raster_vertex v[4];
+    psx_prim decoded;
     bool gouraud;
     int i;
 
     if (!fb || !fb->px || !prim || !opts)
         return;
+
+    if (opts->native_coords && prim->kind <= PSX_PRIM_TILE) {
+        decoded = *prim;
+        if (prim->kind == PSX_PRIM_SPRT || prim->kind == PSX_PRIM_TILE) {
+            /* These are host endpoint extents, not encoded GP0 size words.
+             * Keep extended UI/diagnostic rectangles; decode positions only. */
+            int w=prim->xy[2].x-prim->xy[0].x;
+            int h=prim->xy[2].y-prim->xy[0].y;
+            decoded.xy[0].x=(s16)signed11(prim->xy[0].x);
+            decoded.xy[0].y=(s16)signed11(prim->xy[0].y);
+            decoded.xy[2].x=(s16)(decoded.xy[0].x+w);
+            decoded.xy[2].y=(s16)(decoded.xy[0].y+h);
+        } else for (i=0;i<4;++i) {
+            decoded.xy[i].x=(s16)signed11(prim->xy[i].x);
+            decoded.xy[i].y=(s16)signed11(prim->xy[i].y);
+        }
+        prim=&decoded;
+    }
 
     gouraud = (prim->kind == PSX_PRIM_G3  || prim->kind == PSX_PRIM_GT3 ||
                prim->kind == PSX_PRIM_G4  || prim->kind == PSX_PRIM_GT4);
@@ -665,56 +508,6 @@ void psx_raster_prim(psx_framebuffer *fb,
          * where it belongs in the buffer. */
         v[i].x += opts->ofs_x;
         v[i].y += opts->ofs_y;
-    }
-
-    /*
-     * THE GPU'S OWN SIZE LIMIT, and it is what keeps a near-plane smear off the
-     * screen without anything having to test for one.
-     *
-     * The hardware does not draw a polygon whose vertices are more than 1023
-     * apart horizontally or 511 apart vertically — it drops the primitive
-     * silently. That is not an optimisation to skip: it is the rule that makes
-     * the console's picture clean while its GTE is clamping near vertices to the
-     * screen coordinate limits.
-     *
-     * `gte_divide` raises its overflow when the projection distance reaches twice
-     * the depth, returns the clamped 0x1FFFF, and `gte_push_sxy` saturates the
-     * result to +/-1024. A face with one vertex out there and the rest in frame
-     * spans the whole buffer, and drawing it paints a bright sliver with the
-     * texture smeared along it. On the view weapon — whose grip sits 44 units
-     * from the eye — that was a dashed orange bar above the blaster and orange
-     * streaks down its edges, the emitter's texels stretched across faces that
-     * should never have been rasterised.
-     *
-     * The port already got the first half of this right for the right reason:
-     * the executable contains no `cfc2 rX, $31`, so the game never tests the
-     * overflow and cannot be discarding these faces itself. It does not need to.
-     * The GPU discards them.
-     */
-    /*
-     * POLYGONS ONLY. A rectangle's extent is a width/height field in its packet,
-     * not a pair of independent vertices, so it cannot express a span past the
-     * limit and the rule has nothing to say about it — the drawing area clips it
-     * instead. Applying the span test to tiles as well drops a legitimately
-     * oversized one, which is exactly what test_screen builds to check that the
-     * viewport's clip rectangle holds.
-     */
-    if (prim->kind == PSX_PRIM_F3  || prim->kind == PSX_PRIM_FT3 ||
-        prim->kind == PSX_PRIM_G3  || prim->kind == PSX_PRIM_GT3 ||
-        prim->kind == PSX_PRIM_F4  || prim->kind == PSX_PRIM_FT4 ||
-        prim->kind == PSX_PRIM_G4  || prim->kind == PSX_PRIM_GT4) {
-        int lox = v[0].x, hix = v[0].x, loy = v[0].y, hiy = v[0].y;
-        int n = (prim->kind == PSX_PRIM_F3  || prim->kind == PSX_PRIM_FT3 ||
-                 prim->kind == PSX_PRIM_G3  || prim->kind == PSX_PRIM_GT3) ? 3 : 4;
-
-        for (i = 1; i < n; i++) {
-            if (v[i].x < lox) lox = v[i].x;
-            if (v[i].x > hix) hix = v[i].x;
-            if (v[i].y < loy) loy = v[i].y;
-            if (v[i].y > hiy) hiy = v[i].y;
-        }
-        if (hix - lox > PSX_PRIM_MAX_SPAN_X || hiy - loy > PSX_PRIM_MAX_SPAN_Y)
-            return;
     }
 
     switch (prim->kind) {
@@ -729,55 +522,18 @@ void psx_raster_prim(psx_framebuffer *fb,
     case PSX_PRIM_FT4:
     case PSX_PRIM_G4:
     case PSX_PRIM_GT4:
-        /*
-         * WHICH DIAGONAL A QUAD IS SPLIT ALONG, and why the fan is not it.
-         *
-         * The GPU draws a four-point polygon as two triangles sharing the edge
-         * between its SECOND and THIRD corners: (0,1,2) and (1,3,2). That much
-         * was already right here. What was missing is that the corners reaching
-         * this backend are NOT in the order the hardware would have seen them.
-         *
-         * Both linkers convert the file's perimeter order into the hardware's Z
-         * order on the way into the packet, and they do it by exchanging corners
-         * 2 and 3 — vertices and UVs together, so the pairing survives:
-         *
-         *   model linker  0x800B2410  SXY0,SXY1,SXY2 <= file v0,v1,v3, then
-         *                             SXY0 <= file v2 for the second NCLIP;
-         *                             stored at packet +8,+20,+32,+44, so
-         *                             x2y2 <= v3 and x3y3 <= v2. The four shift
-         *                             counts on the packed index word are
-         *                             3, 5, 21, 13 — 0, 1, 3, 2.
-         *   world linker  0x800AF844  the identical four shifts, same order.
-         *   model emitter 0x8006A3CC..0x8006A3F8
-         *                             POLY uv0,uv1,uv2,uv3 <= file uv0,uv1,uv3,
-         *                             uv2 (stores to +12,+24,+36,+48).
-         *
-         * So the hardware's shared edge, expressed in the PERIMETER indices this
-         * backend actually holds, is 1—3 — and its two triangles are (0,1,3) and
-         * (1,2,3). Fanning (0,1,2)+(0,2,3) covers the same quad but creases it
-         * along the OTHER diagonal, 0—2.
-         *
-         * That is not cosmetic. UVs interpolate affinely per triangle, so the
-         * diagonal is what decides which way the texture warps: the same quad
-         * split the two ways bends in visibly different directions. A port whose
-         * whole point is reproducing the console's affine warp cannot have that
-         * backwards.
-         *
-         * `quad_zorder` says this particular packet is ALREADY in the hardware's
-         * order — the flares are built as console packets — so it takes the
-         * literal (0,1,2)+(1,3,2) instead.
-         *
-         * Reading perimeter data as Z-ordered produces a bowtie per quad
-         * instead: walls come out as a regular lattice of diamond holes that
-         * reads like a clipping bug rather than an index-order one. See the
-         * correction in scene.h.
-         */
+        /* GPU packet order is (0,1,2), then (1,2,3). The game linkers
+         * exchange perimeter vertices/UVs 2 and 3 (model 0x800B2410 and
+         * 0x8006A3E4; world 0x800AF844), so perimeter triangles are (0,1,3)
+         * and (1,3,2). Preserve their vertex order as well as the diagonal:
+         * the leftmost-vertex tie selects the fixed-point attribute origin.
+         * Flares and other already-encoded packets set quad_zorder. */
         if (prim->quad_zorder) {
             raster_triangle(fb, &v[0], &v[1], &v[2], prim, vram, opts);
-            raster_triangle(fb, &v[1], &v[3], &v[2], prim, vram, opts);
+            raster_triangle(fb, &v[1], &v[2], &v[3], prim, vram, opts);
         } else {
             raster_triangle(fb, &v[0], &v[1], &v[3], prim, vram, opts);
-            raster_triangle(fb, &v[1], &v[2], &v[3], prim, vram, opts);
+            raster_triangle(fb, &v[1], &v[3], &v[2], prim, vram, opts);
         }
         break;
 
@@ -794,7 +550,7 @@ void psx_raster_prim(psx_framebuffer *fb,
     /* Deliberately outside the offset the loop above applied to `v`: a copy
      * takes absolute coordinates. */
     case PSX_PRIM_MOVE:
-        raster_move(fb, prim);
+        raster_move(fb, prim, opts);
         break;
 
     /* Consumed by q2_screen_compose while walking the ordering table. */
@@ -806,16 +562,118 @@ void psx_raster_prim(psx_framebuffer *fb,
     }
 }
 
+void psx_draw_state_gp1(psx_draw_state *state, u32 command)
+{
+    if (!state) return;
+    switch (command >> 24) {
+    case 0: {
+        /* GP1(09)'s permission latch survives a GPU soft reset. */
+        bool allow=state->allow_texture_bank;
+        memset(state,0,sizeof(*state));
+        state->allow_texture_bank=allow;
+        break;
+    }
+    case 1: state->cache.clut_tag=0; break; /* reset command buffer */
+    case 5: state->display_y=(u16)((command>>10)&511); break;
+    case 8: state->display_mode=(u8)command; break;
+    case 9: state->allow_texture_bank=(command&1)!=0; break;
+    default: break;
+    }
+}
+
+static void draw_mode(psx_draw_state *state, u16 value, u16 mask)
+{
+    u16 previous=state->mode;
+    if (!state->allow_texture_bank) mask &= ~0x0800u;
+    state->mode=(u16)((state->mode & ~mask) | (value & mask));
+    if (((previous^state->mode)&0x081Fu) ||
+        (!(previous&0x0180u)!=!(state->mode&0x0180u)))
+        memset(state->cache.tag,0,sizeof(state->cache.tag));
+}
+
+void psx_draw_state_mode(psx_draw_state *state, u16 mode)
+{
+    if (state) draw_mode(state,mode,0x3FFFu);
+}
+
+void psx_draw_state_clear_cache(psx_draw_state *state)
+{
+    if (!state) return;
+    memset(state->cache.tag,0,sizeof(state->cache.tag));
+    state->cache.clut_tag=0;
+}
+
+void psx_raster_command(psx_framebuffer *fb, const psx_prim *prim,
+                        const psx_vram *vram, const psx_raster_opts *opts,
+                        psx_draw_state *state)
+{
+    psx_prim resolved;
+    psx_raster_opts local;
+    bool polygon_page;
+    if (!prim || !opts || !state) return;
+    if (vram && state->cache.owner!=vram) {
+        psx_draw_state_clear_cache(state);
+        state->cache.owner=vram;
+        state->cache.transfer_serial=vram->transfer_serial;
+    }
+    if (vram && state->cache.transfer_serial!=vram->transfer_serial) {
+        memset(state->cache.tag,0,sizeof(state->cache.tag));
+        state->cache.transfer_serial=vram->transfer_serial;
+    }
+    if (prim->clear_cache || prim->kind==PSX_PRIM_CACHE_CLEAR)
+        psx_draw_state_clear_cache(state);
+    if (prim->kind==PSX_PRIM_CACHE_CLEAR) return;
+    if (prim->kind==PSX_PRIM_MOVE)
+        memset(state->cache.tag,0,sizeof(state->cache.tag));
+    if (prim->kind == PSX_PRIM_TPAGE) {
+        draw_mode(state,prim->tpage,0x3FFFu);
+        return;
+    }
+    if (prim->kind == PSX_PRIM_TWINDOW) {
+        state->texture_window = prim->texture_window & 0xFFFFFu;
+        return;
+    }
+    if (prim->kind == PSX_PRIM_MASK) {
+        state->mask_mode = prim->mask_mode & 3u;
+        return;
+    }
+    polygon_page = prim->kind == PSX_PRIM_FT3 || prim->kind == PSX_PRIM_FT4 ||
+                   prim->kind == PSX_PRIM_GT3 || prim->kind == PSX_PRIM_GT4;
+    /* This happens even for an opaque, fully clipped or oversized polygon:
+     * packet decoding changes the register before rasterization can reject it. */
+    if (prim->set_tpage)
+        draw_mode(state,prim->tpage,0x3FFFu);
+    else if (polygon_page)
+        draw_mode(state,prim->tpage,0x09FFu);
+    /* CLUT fetch is part of packet dispatch, even if clipping later rejects
+     * every pixel. It must finish before a primitive draws over its palette. */
+    if (polygon_page || prim->kind==PSX_PRIM_SPRT)
+        cache_palette(&state->cache,vram,prim->clut,state->mode);
+    resolved = *prim;
+    resolved.tpage = state->mode;
+    local = *opts;
+    local.cache=&state->cache;
+    local.dither = opts->dither && (state->mode & 0x0200u) != 0;
+    local.texture_window = state->texture_window;
+    local.mask_mode = state->mask_mode;
+    local.missing_texture_bank = (state->mode & 0x0800u) != 0;
+    local.skip_field = (state->display_mode & 0x24u) == 0x24u &&
+                      !(state->mode & 0x0400u);
+    local.field = (u8)((state->display_y + state->field) & 1);
+    psx_raster_prim(fb, &resolved, vram, &local);
+}
+
 typedef struct walk_ctx {
     psx_framebuffer       *fb;
     const psx_vram        *vram;
     const psx_raster_opts *opts;
+    psx_draw_state        state;
 } walk_ctx;
 
 static void walk_visit(const psx_prim *prim, void *user)
 {
     walk_ctx *ctx = (walk_ctx *)user;
-    psx_raster_prim(ctx->fb, prim, ctx->vram, ctx->opts);
+    psx_raster_command(ctx->fb, prim, ctx->vram, ctx->opts, &ctx->state);
 }
 
 void psx_raster_ot(psx_framebuffer *fb,
@@ -823,11 +681,14 @@ void psx_raster_ot(psx_framebuffer *fb,
                    const psx_vram *vram,
                    const psx_raster_opts *opts)
 {
-    walk_ctx ctx;
+    walk_ctx ctx = {0};
 
     ctx.fb   = fb;
     ctx.vram = vram;
     ctx.opts = opts;
+    ctx.state.mode = opts->dither ? 0x0200u : 0;
+    ctx.state.texture_window = opts->texture_window;
+    ctx.state.mask_mode = opts->mask_mode;
 
     psx_ot_walk(ot, walk_visit, &ctx);
 }

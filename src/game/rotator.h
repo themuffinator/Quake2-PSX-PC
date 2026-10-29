@@ -168,6 +168,7 @@ typedef struct q2_rotator {
     s32  accum;         /* obj+0x20, the 32-bit accumulator (ACCUM only)      */
     s16  angle;         /* obj+0x0C + 2*axis, a 4096-step angle               */
     s16  pivot[3];      /* obj+0x18, RELATIVE to the node's origin            */
+    s16  offset[3];     /* obj+0x12, independent translation (SECURITY Orb)  */
 
     /*
      * obj+0x50 bit 24. A PER-FRAME FLAG, NOT A LATCH: both handlers read it
@@ -418,5 +419,8 @@ u32 q2_rotators_tick(q2_rotator_set *set, s32 dt);
  */
 bool q2_rotators_node_transform(const q2_rotator_set *set, u32 node,
                                 s16 angles[3], s16 pivot[3]);
+
+/* The same object can turn and translate; the native orb driver writes +0x14. */
+void q2_rotators_node_offset(const q2_rotator_set *set, u32 node, s32 out[3]);
 
 #endif /* Q2PSX_ROTATOR_H */

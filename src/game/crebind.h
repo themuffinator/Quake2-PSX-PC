@@ -48,12 +48,12 @@
  * skips a NULL method and the AI skips a NULL callback.
  */
 /*
- * FOUR OF THE THIRTEEN SLOTS DO NOT HAVE THIS SIGNATURE, and the table stores
- * them anyway.
+ * Six of the thirteen slots have additional arguments or a return value:
  *
  *     5  dodge        void (*)(q2_monster *, q2_monster *other, s32 eta)
  *     8  sight        void (*)(q2_monster *, q2_monster *other)
  *     9  checkattack  bool (*)(q2_monster *)
+ *    10  bigturn      void (*)(q2_monster *, s32 clamped_turn)
  *    11  pain         void (*)(q2_monster *, s16 damage)
  *    12  die          void (*)(q2_monster *, s16 damage)
  *
@@ -61,7 +61,7 @@
  * than through the flat table, so the entry here must be written with an
  * explicit cast — `(q2_class_method)(void *)soldier_pain`. Writing the bare
  * function name is a compile error, which is the right outcome: the alternative
- * is five separate tables for thirteen slots.
+ * is six separate tables for thirteen slots.
  */
 typedef struct q2_cre_impl {
     const char *name;                       /* the module name it matches */
@@ -72,6 +72,7 @@ typedef struct q2_cre_impl {
      * spawn function does beyond the callbacks — a Soldier picks its weapon
      * variant here. `variant` is the entity's skinnum. */
     void (*spawn)(q2_monster *m);
+    bool scripted; /* No monster_start: direct think/use, no kill denominator. */
 } q2_cre_impl;
 
 /* A decoded creature joined to an implementation and ready to spawn. */
@@ -95,7 +96,21 @@ typedef struct q2_cre_bind {
      */
     const q2_cre_think *think;
     u32                 think_count;
+    /* Flyer module+0x1760: shared transition selector, reset with the bind. */
+    s32                 flyer_transition;
+    u8                  strider_turn;
+    u8                  strider_explosion_phase;
+    u8                  boss1_explosion_phase;
+    u8                  jorg_explosion_phase;
 } q2_cre_bind;
+
+typedef struct q2_cre_shared_state {
+    bool present;
+    s32 flyer_transition;
+    u8 strider_turn, strider_explosion_phase, boss1_explosion_phase, jorg_explosion_phase;
+} q2_cre_shared_state;
+void q2_cre_shared_capture(q2_cre_shared_state *state, const q2_cre_bind *bind);
+void q2_cre_shared_restore(q2_cre_bind *bind, const q2_cre_shared_state *state);
 
 /* Attach a decoded action set. Call before spawning from this bind. */
 /*
@@ -125,6 +140,8 @@ bool q2_creature_bind(q2_cre_bind *b, const q2_creature *c,
 
 /* Set up `m` as one of this creature: class byte, scale, mass, callbacks. */
 void q2_creature_spawn(q2_cre_bind *b, q2_monster *m, u32 class_index);
+/* Bind a dormant population record without executing export 0 or using RNG. */
+void q2_creature_prepare(q2_cre_bind *b, q2_monster *m, u32 class_index);
 
 /*
  * The move whose animation starts at `first_frame`, or NULL.
@@ -161,6 +178,33 @@ bool q2_cre_set_move_at(q2_monster *m, u32 module_addr);
 q2_cre_bind *q2_cre_bind_for(const q2_monster *m);
 void         q2_cre_bind_reset(void);
 
+/* Stable saved callback ids: 0 none, 1 M_MoveFrame, 2..7 scripted thinks,
+ * 8 deferred Rider launch, 9 Medic revival on the next actor frame.
+ * Unknown functions encode as 255 and are rejected by save capture. */
+u8 q2_cre_think_id(const q2_monster *m);
+bool q2_cre_think_valid(const q2_monster *m, u8 id);
+void q2_cre_restore_think(q2_monster *m, u8 id);
+void q2_cre_script_callbacks(q2_monster *m);
+#define Q2_CRE_THINK_LAST 9
+void q2_cre_rider_launch(q2_monster *m);
+void q2_cre_medic_revive(q2_monster *m);
+bool q2_cre_boss_checkattack(q2_monster *m, s32 cooldown);
+q2_class_method q2_cre_method_for(const q2_monster *m, u32 index);
+void q2_cre_set_named_sound_hook(void (*fn)(q2_monster *, const char *, void *),
+                                 void *user);
+void q2_cre_play_named_sound(q2_monster *m, const char *name);
+void q2_cre_set_lifecycle_hooks(q2_monster *monsters, u32 count,
+    q2_monster *(*spawn)(q2_monster *, u8, void *),
+    bool (*revive)(q2_monster *, q2_monster *, void *), void *user);
+q2_monster *q2_cre_roster(u32 *count);
+q2_monster *q2_cre_spawn_child(q2_monster *m, u8 pop_class);
+bool q2_cre_revive(q2_monster *medic, q2_monster *corpse);
+/* Direct actor writes made by modules must reach combat/presentation before
+ * another creature can damage or inspect that actor in the same AI tick. */
+void q2_cre_set_actor_hooks(void (*effect)(q2_monster *, u32, u8, void *),
+                            void (*spawn)(q2_monster *, void *), void *user);
+void q2_cre_actor_effect(q2_monster *m, u32 index, u8 ticks);
+
 /* The built-in implementations, NULL-terminated. */
 const q2_cre_impl *const *q2_cre_impls(void);
 
@@ -175,6 +219,33 @@ const q2_cre_impl *const *q2_cre_impls(void);
  */
 void q2_cre_set_sound_hook(void (*fn)(q2_monster *m, int which, void *user),
                            void *user);
+/* A cloned request can change pitch without changing its registered sample.
+ * The ordinary hook is the fallback for hosts without a pitched sound path.
+ * Setting the ordinary hook clears this optional hook. */
+void q2_cre_set_pitched_sound_hook(void (*fn)(q2_monster *, int, u8, void *),
+                                   void *user);
+void q2_cre_play_pitched_sound(q2_monster *m, u32 handle, u8 pitch);
+/* The request belongs to m's module; the emitting entity may be another
+ * actor (RiderStand uses the player). Preserve both identities. */
+void q2_cre_set_sound_owner_hook(void (*fn)(q2_monster *, u32, const q2_monster *, void *),
+                                 void *user);
+void q2_cre_play_sound_owner(q2_monster *m, u32 handle, const q2_monster *owner);
+/* fire_hit (0x80061118): the contact point and the separate kick after damage.
+ * Impulse components are the signed halfwords added at entity+0x2F8. */
+bool q2_cre_melee_contact(const q2_monster *m, const s32 aim[3], s32 point[3]);
+void q2_cre_melee_impulse(q2_monster *victim, const s32 point[3], s32 kick,
+                          s16 impulse[3]);
+/* Direct damage (+0xF0) and posed beam attachment (+0x7C). These imports
+ * are used by the Parasite and Medic independently of projectile firing. */
+void q2_cre_set_contact_hooks(
+    void (*hurt)(q2_monster *, q2_monster *, s16, int, const s32 *, void *),
+    void (*beam)(q2_monster *, q2_monster *, s16, void *), void *user);
+void q2_cre_hurt(q2_monster *self, q2_monster *target, s16 damage,
+                  int mod, const s32 point[3]);
+void q2_cre_beam(q2_monster *self, q2_monster *target, s16 vertex);
+void q2_cre_set_explosion_hook(void (*fn)(q2_monster *, const s32 *, s32, void *),
+                                 void *user);
+void q2_cre_explosion(q2_monster *self, const s32 point[3], s32 scale);
 void q2_cre_set_fire_hook(void (*fn)(q2_monster *m, int flash, void *user),
                           void *user);
 
@@ -239,8 +310,8 @@ const char *q2_cre_sound_resolve(const q2_monster *m, const char *registered,
  * a1 and a2 are the muzzle and a 1.12 unit aim, and the engine traces the
  * shot from the one along the other (0x80061E2C scales the aim `<< 2`, so a
  * round reaches 16384 units). `aimed` says the creature filled `start` and
- * `dir` with what its module computes; a shot without it is resolved the old
- * way, at whoever the creature is hunting, because nothing more is known.
+ * `dir` with what its module computes; the client rejects a shot without it
+ * and counts it in the unsupported-fire diagnostic.
  * Without the direction a Soldier killed mid-stride shot the player through
  * the back of its own head: `soldier_fire` aims flashes 5 and 6 — the two
  * Death1 frames — straight along its own forward vector, not at anyone, and
@@ -257,7 +328,8 @@ typedef struct q2_cre_shot {
     s32 count;          /* pellets; 1 for anything that is not a shotgun   */
     bool aimed;         /* start and dir below are the module's own        */
     s32 start[3];       /* a1: the posed muzzle, world units               */
-    s32 dir[3];         /* a2: the aim, a 1.12 unit vector                 */
+    s32 dir[3];         /* a2: module aim; Flyer passes an unnormalized delta */
+    u32 effects;        /* blaster wrapper: bit 0x40 selects hyper bolts  */
 } q2_cre_shot;
 
 /*

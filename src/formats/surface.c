@@ -70,7 +70,7 @@ u16 q2_tpage_world_opaque(q2_tpage_table *t, u32 page)
 
     /*
      * 0x80068314-0x80068324. The OR is blendTable[2]; the store back into the
-     * table is what makes every later transparent polygon on this page
+     * table is what makes later transparent packet constructions on this page
      * additive, and is the only reason "world transparency is ADD" is true.
      */
     w = (u16)(t->word[page] | q2_surf_blend_table[Q2_SURF_WORLD_BLEND_SELECTOR]);

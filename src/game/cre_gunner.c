@@ -141,10 +141,9 @@
  * the damage, speed, kick and spread read out of the two fire thinks are
  * delivered instead of recorded. What remains:
  *
- *   * The muzzle point is not computed. Both fire thinks build a world start
- *     position from the model's own attachment tags; this port has no such
- *     plumbing at the creature layer, and `soldier_fire` already leaves the
- *     same arithmetic to the host.
+ *   * Muzzle posing now uses the host attachment hook: vertices 227/231 for
+ *     the chain gun and vertex 273 for the grenade. The shot carries the
+ *     module's aim, including the chain gun's negative velocity lead.
  *   * Nothing calls `dodge`. Slot 5 is installed — `crebind.c` wires it — and
  *     the executable has no reader for entity+0xF4 at all, which crebind.c
  *     records at length. The handler is here because the module writes it.
@@ -318,14 +317,18 @@ static const q2_cre_shot gun_shot_bullet = {
  * it is CONSTANT across all four frames where id varies the flash number —
  * which is a real departure and the console's own.
  *
- * The damage and the speed reach the host now, in `gun_shot_grenade` above.
- * The muzzle arithmetic is still left to the host, for the same reason
- * `soldier_fire` leaves it. `q2_cre_fire_shot` no longer refuses a shot on
- * the enemy's account, so all four frames reach the hook — see the header.
+ * Resolve vertex 273 alone, then pass the body's forward vector to the
+ * engine wrapper, which supplies the toss and spread. Neither this muzzle
+ * nor this direction depends on the enemy surviving the volley.
  */
 static void gunner_grenade(q2_monster *self)
 {
-    q2_cre_fire_shot(self, &gun_shot_grenade);
+    q2_cre_shot shot = gun_shot_grenade;
+
+    shot.aimed = true;
+    q2_cre_muzzle(self, 273, 273, shot.start);
+    q2_angle_vectors(self->angles, shot.dir, NULL, NULL);
+    q2_cre_fire_shot(self, &shot);
 }
 
 /*
@@ -350,14 +353,27 @@ static void gunner_grenade(q2_monster *self)
  * and DEFAULT_BULLET_VSPREAD unchanged. Index 1 is the vertical axis here and
  * the view height is ADDED, which is the same sign `visible()` uses.
  *
- * Four of those figures are handed over now — damage, kick and the two spreads,
- * in `gun_shot_bullet` above. The two vector steps are not: the lead and the
- * start position are geometry this port has no creature-layer plumbing for, so
- * they stay described here and the host aims the shot.
+ * The muzzle hook supplies the posed 227/231 attachment; the module's own
+ * velocity correction and eye height determine the trace direction.
  */
 static void gunner_fire(q2_monster *self)
 {
-    q2_cre_fire_shot(self, &gun_shot_bullet);
+    q2_cre_shot shot = gun_shot_bullet;
+    s32 target[3];
+    int k;
+
+    shot.aimed = true;
+    q2_cre_muzzle(self, 227, 231, shot.start);
+    if (self->enemy) {
+        q2_vector_ma(self->enemy->pos, -819, self->enemy->velocity, target);
+        target[1] += self->enemy->view_height;
+        for (k = 0; k < 3; k++)
+            shot.dir[k] = target[k] - shot.start[k];
+        q2_vector_normalize(shot.dir);
+    } else {
+        q2_angle_vectors(self->angles, shot.dir, NULL, NULL);
+    }
+    q2_cre_fire_shot(self, &shot);
 }
 
 /*

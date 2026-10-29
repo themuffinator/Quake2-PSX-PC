@@ -9,6 +9,7 @@
 #include "item.h"          /* q2_item_shrink_think — 0x8005B358 */
 #include "monster.h"       /* the corpse site's record */
 #include "playerdeath.h"   /* the player site's record */
+#include "sdkmath.h"       /* SquareRoot0 / VectorNormal — the toss mover's */
 #include "shock.h"         /* q2_shock_explosion — 0x8005AA7C */
 #include "trace.h"         /* q2_move_push_vector — 0x8005625C */
 #include "trig.h"
@@ -131,11 +132,11 @@ void q2_model_ent_sounds_clear(q2_model_ent_sounds *q)
     q->dropped = 0;
 }
 
-static void model_ent_sound_push(q2_model_ent_sounds *q, const s32 at[3])
+void q2_model_ent_sound_push(q2_model_ent_sounds *q, const s32 at[3])
 {
     int k;
 
-    if (!q)
+    if (!q || !at)
         return;
     if (q->count >= Q2_MODEL_ENT_SOUNDS_MAX) {
         q->dropped++;
@@ -256,7 +257,7 @@ q2_entity *q2_model_ent_spawn(q2_entity_set *set, const q2_model_bank *bank,
      * entity's own +0x54, which is `at`. Before the rumble, as on the console;
      * the owner plays it (modelent.h).
      */
-    model_ent_sound_push(sounds, at);
+    q2_model_ent_sound_push(sounds, at);
 
     /*
      * AND EVERY PAD NEAR IT SHAKES — the function's last call, 0x8005AA7C,
@@ -482,6 +483,16 @@ q2_gib_body *q2_gib_body_of(const q2_entity *e)
     return NULL;
 }
 
+bool q2_gib_body_restore(const q2_entity_set *set, u32 slot, const q2_gib_body *body)
+{
+    gib_rec *r;
+    if (!set || slot >= set->count || !body) return false;
+    r = rec_claim(set, slot);
+    if (!r) return false;
+    r->set = set; r->slot = slot; r->used = true; r->body = *body;
+    return true;
+}
+
 void q2_gib_parent_init(q2_gib_parent *p)
 {
     if (!p)
@@ -557,24 +568,6 @@ static s32 gib_clip(const q2_gib_world *w, const q2_gib_parent *p, s32 pt[3])
     for (k = 0; k < 3; k++)
         pt[k] = end[k];
     return node;
-}
-
-static u32 isqrt_u64(u64 n)
-{
-    u64 x = 0, bit = (u64)1 << 62;
-
-    while (bit > n)
-        bit >>= 2;
-    while (bit) {
-        if (n >= x + bit) {
-            n -= x + bit;
-            x = (x >> 1) + bit;
-        } else {
-            x >>= 1;
-        }
-        bit >>= 2;
-    }
-    return (u32)x;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1097,22 +1090,25 @@ static bool gib_move(const q2_gib_world *g, q2_entity *e, q2_gib_body *b,
          *   vel   = VectorNormal(refl - hit) * speed >> 12 0x80046A14..0x80046A5C
          *
          * The squares are `mult`/`mflo` summed in 32 bits, as item.c's rest
-         * test sums them. VectorNormal (0x8008A588) is libgte's table-driven
-         * normalise; `dir * 4096 / |dir|` is its exact counterpart and may
-         * differ from it by a unit — INFERRED, not measured. A stop the port
-         * cannot read a plane for (a start outside every cell) has a zero
-         * normal: no push and no mirror, so the gib keeps its heading at
-         * 2304/4096 of its speed, stays where it was, and so runs down to rest
-         * in place over a few ticks rather than escaping the hull.
+         * test sums them. The root is the SDK's SquareRoot0 (0x8008A7E8,
+         * `jal` at 0x800466F4) and the direction its table-driven VectorNormal
+         * (0x8008A588, `jal` at 0x80046A14) — the same mover the launcher and
+         * hand grenades take, whose 2,592 native toss cases pass through these
+         * two routines. An exact root and `dir * 4096 / |dir|` used to stand
+         * in for them; the quantized root of 3200^2 is 3197, so a rebound kept
+         * 1800 where the console keeps 1798, and the gib's rest tick and trail
+         * draws drifted from there. A stop the port cannot read a plane for (a
+         * start outside every cell) has a zero normal: no push and no mirror,
+         * so the gib keeps its heading at 2304/4096 of its speed, stays where
+         * it was, and so runs down to rest in place over a few ticks rather
+         * than escaping the hull. That guard is the port's.
          */
         u32 v2 = (u32)((s32)b->vel[0] * b->vel[0]) +
                  (u32)((s32)b->vel[1] * b->vel[1]) +
                  (u32)((s32)b->vel[2] * b->vel[2]);
-        s32 speed = (s32)(((s64)isqrt_u64(v2) * Q2_GIB_RESTITUTION) >> 12);
+        s32 speed = (s32)(q2_sdk_sqrt0(v2) * Q2_GIB_RESTITUTION) >> 12;
         s16 push[3] = { 0, 0, 0 };
-        s32 hit[3], rem[3], dot2;
-        s64 dir[3], len2 = 0;
-        u32 len;
+        s32 hit[3], rem[3], dot2, dir[3], unit[3];
 
         q2_move_push_vector(normal, push);
         if (!normal[0] && !normal[1] && !normal[2])
@@ -1134,16 +1130,12 @@ static bool gib_move(const q2_gib_world *g, q2_entity *e, q2_gib_body *b,
                        (s32)(((s64)normal[k] * dot2 + 0x800000) >> 24);
 
             e->pos[k] = hit[k];
-            dir[k]    = (s64)refl - hit[k];
-            len2     += dir[k] * dir[k];
+            dir[k]    = refl - hit[k];
         }
 
-        len = isqrt_u64((u64)len2);
-        for (k = 0; k < 3; k++) {
-            s32 unit = len ? (s32)((dir[k] * 4096) / (s64)len) : 0;
-
-            b->vel[k] = (s16)((unit * speed) >> 12);   /* `sra 12`, a floor */
-        }
+        q2_sdk_vector_normal(dir, unit);
+        for (k = 0; k < 3; k++)    /* `mult`/`mflo`, then `sra 12`, a floor */
+            b->vel[k] = (s16)((s32)((u32)unit[k] * (u32)speed) >> 12);
     }
 
     return true;
@@ -1282,23 +1274,21 @@ u32 q2_gib_monster_corpse(const struct q2_monster *m)
      * The corpse handler hands 0x8007CEB4 the ACTOR. What the port's creature
      * record can say about it:
      *
-     *   +0x54 / +0xA4   `pos` — it is the actor's origin (combat.c's
-     *                   q2_actor_from_monster copies it straight across), and
-     *                   the port keeps no separate draw origin for a creature;
+     *   +0x54 / +0xA4   the physical actor's origin, independently of the
+     *                   AI edict's linked destination;
      *   +0xD2 / +0xDA   47 once detached, with the CLASS-TABLE row kept as
      *                   what it was. `pop_class_id` is that row; `class_id` is
      *                   the module's class byte (64..94) and would index the
      *                   dispatcher's table wrongly for every creature;
-     *   +0xE0, +0x2F8   not here: the record's `velocity` is the AI's, in the
-     *                   AI's frame, and the knockback lives on the q2_actor.
-     *                   The owner's `describe` supplies both when it has them;
-     *                   left alone they are zero, a body that falls apart where
-     *                   it lies.
+     *   +0xE0, +0x2F8   physical velocity and unconsumed impulse. The owner's
+     *                   `describe` may supply a combat update from this frame.
      */
     p.placed = true;
     for (k = 0; k < 3; k++) {
-        p.pos[k]    = m->pos[k];
-        p.origin[k] = m->pos[k];
+        p.pos[k]    = q2_cre_origin(m)[k];
+        p.origin[k] = q2_cre_origin(m)[k];
+        p.velocity[k] = m->motion.velocity[k];
+        p.knockback[k] = m->motion.impulse[k];
     }
     p.cls       = m->corpse ? Q2_GIB_CORPSE_CLASS : m->pop_class_id;
     p.was_class = m->pop_class_id;

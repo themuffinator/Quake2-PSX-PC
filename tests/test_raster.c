@@ -16,7 +16,7 @@
  *
  * The GPU then splits a four-point polygon on the edge between its SECOND and
  * THIRD corners. Undo the conversion and that edge, in perimeter indices, is
- * 1—3: the two triangles are (0,1,3) and (1,2,3), NOT the fan (0,1,2)+(0,2,3).
+ * 1—3: the two triangles are (0,1,3) and (1,3,2), NOT the fan (0,1,2)+(0,2,3).
  *
  * Both cover a convex quad, so nothing about a wall's silhouette catches this.
  * What it changes is everything that interpolates: UVs are affine per triangle,
@@ -155,7 +155,7 @@ static void test_uv_diagonal(void)
  * A dart: the perimeter walks (0,0) -> (64,24) -> (128,0) -> (64,96), so corner
  * 1 is REFLEX and the polygon has a notch bitten out of its top edge.
  *
- * The hardware's triangles (0,1,3) and (1,2,3) meet along the vertical segment
+ * The hardware's triangles (0,1,3) and (1,3,2) meet along the vertical segment
  * from (64,24) to (64,96) — inside the shape — and cover the dart and nothing
  * else. The fan's diagonal 0—2 runs along y = 0, which lies OUTSIDE the
  * polygon, so its two triangles overlap and between them fill the whole
@@ -218,7 +218,7 @@ static void test_folded_quad_coverage(void)
 /*
  * `quad_zorder` marks a packet that is ALREADY in hardware order because it was
  * built as a console packet (flare.c). Those must keep the literal
- * (0,1,2)+(1,3,2), and the fix to the perimeter rule must not have quietly
+ * (0,1,2)+(1,2,3), and the fix to the perimeter rule must not have quietly
  * become one rule for both.
  *
  * The same dart in Z order is corners 0,1,3,2 — so feeding the perimeter dart's
@@ -384,6 +384,342 @@ static void test_sample_stays_inside_uv(void)
     free(vram);
 }
 
+static void test_draw_mode_inheritance(void)
+{
+    static const u16 result[4] = {0x318C, 0x6318, 0x2108, 0x4A52};
+    psx_framebuffer fb;
+    psx_raster_opts opts;
+    psx_draw_state state = {0};
+    psx_prim p = {0};
+    psx_vram *vram = calloc(1, sizeof(*vram));
+    int mode;
+    if (!vram || psx_fb_init(&fb, 8, 8) != Q2_OK) exit(2);
+    psx_raster_opts_default(&opts);
+    opts.dither = false;
+    for (mode = 0; mode < 4; mode++) {
+        psx_fb_clear(&fb, 0x4210);
+        memset(&p, 0, sizeof(p));
+        /* Opaque, completely offscreen: its TPage still changes the GPU. */
+        p.kind = PSX_PRIM_FT4;
+        p.tpage = (u16)(mode << 5);
+        p.xy[0].x = p.xy[1].x = p.xy[2].x = p.xy[3].x = -900;
+        state.mode = 0x3600;
+        psx_raster_command(&fb, &p, vram, &opts, &state);
+        check(state.mode == (u16)(0x3600 | mode << 5),
+              "polygon page preserves draw-mode high bits despite clipping");
+        p.kind = PSX_PRIM_TILE;
+        p.tpage = 0x60; /* not a field of a hardware TILE; must be ignored */
+        p.xy[0].x = p.xy[0].y = 0;
+        p.xy[2].x = p.xy[2].y = 8;
+        p.rgb[0].r = p.rgb[0].g = p.rgb[0].b = 64;
+        p.semi_transparent = true;
+        psx_raster_command(&fb, &p, vram, &opts, &state);
+        check(pixel_at(&fb, 2, 2) == result[mode],
+              "tile pixels inherit each of the four hardware ABR modes");
+        check((state.mode & 0x60) == (u16)(mode << 5),
+              "untextured packets cannot overwrite the mode");
+    }
+    p.kind = PSX_PRIM_TPAGE;
+    p.tpage = 0x0101; /* 16-bit texture, X=64, no dither */
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(state.mode == 0x0101, "E1 replaces the complete mode");
+    vram->px[0][64] = 0x03E0;
+    p.kind = PSX_PRIM_SPRT;
+    p.tpage = 0;
+    p.semi_transparent = p.textured_blend = false;
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(pixel_at(&fb, 0, 0) == 0x03E0, "sprite inherits texture page from E1");
+    p.kind = PSX_PRIM_TILE;
+    p.set_tpage = true;
+    p.tpage = 0x0600;
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(state.mode == 0x0600, "folded panel DR_TPAGE replaces the full mode");
+    memset(&p, 0, sizeof(p));
+    p.kind = PSX_PRIM_FT4;
+    p.tpage = 0x083D; /* BIGGUN's GetTPage(0,1,832,832) */
+    p.xy[1].x = p.xy[2].x = 8;
+    p.xy[2].y = p.xy[3].y = 8;
+    p.uv[0].v = p.uv[1].v = p.uv[2].v = p.uv[3].v = 159;
+    vram->px[415][832] = 0x1111;
+    vram->px[0][1] = 0x7FFF;
+    /* New fixture palette replaces the one loaded by the clipped polygons. */
+    psx_draw_state_clear_cache(&state);
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(state.mode == 0x063D, "GP1 defaults to ignoring the second-VRAM-bank bit");
+    check(pixel_at(&fb, 2, 2) == 0x7FFF,
+          "retail ignores high texture Y without GP1 enabling the second bank");
+    psx_draw_state_gp1(&state, 0x09000001u);
+    psx_fb_clear(&fb, 0x001f);
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(state.mode == 0x0E3D, "GP1 enables polygon writes to the second-VRAM-bank bit");
+    check(pixel_at(&fb, 2, 2) == 0x001f,
+          "enabled second bank samples absent VRAM and leaves the target alone");
+    p.tpage = 0x003D;
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(state.mode == 0x063D, "the next textured polygon can clear bit 11");
+    psx_fb_free(&fb);
+    free(vram);
+}
+
+static void test_texture_transparency_bit(void)
+{
+    psx_framebuffer fb;
+    psx_raster_opts opts;
+    psx_prim p = {0};
+    psx_vram *vram = calloc(1, sizeof(*vram));
+    int bpp, sprite, stp, x, y;
+    if (!vram || psx_fb_init(&fb, 8, 8) != Q2_OK) exit(2);
+    psx_raster_opts_default(&opts);
+    opts.dither = false;
+    for (bpp = 0; bpp < 3; bpp++) {
+        for (sprite = 0; sprite < 2; sprite++) {
+            memset(&p, 0, sizeof(p));
+            p.kind = sprite ? PSX_PRIM_SPRT : PSX_PRIM_FT4;
+            p.tpage = (u16)((bpp << 7) | 0x20);
+            p.clut = 16 << 6;
+            p.xy[1].x = p.xy[2].x = 8;
+            p.xy[2].y = p.xy[3].y = 8;
+            p.semi_transparent = true;
+            for (stp = 0; stp < 2; stp++) {
+                u16 texel = (u16)(0x001F | (stp << 15));
+                for (y = 0; y < 8; y++)
+                    for (x = 0; x < 8; x++)
+                        vram->px[y][x] = bpp == 0 ? 0x1111 : bpp == 1 ? 0x0101 : texel;
+                vram->px[16][1] = texel;
+                psx_fb_clear(&fb, 0x4210);
+                psx_raster_prim(&fb, &p, vram, &opts);
+                check(pixel_at(&fb, 1, 1) == (stp ? 0xC21F : 0x001F),
+                      "textured ABE blends only texels with STP, in every colour depth");
+                p.semi_transparent = false;
+                psx_raster_prim(&fb, &p, vram, &opts);
+                check(pixel_at(&fb, 1, 1) == (stp ? 0x801F : 0x001F),
+                      "opaque packets preserve STP in framebuffer bit 15 without blending");
+                p.semi_transparent = true;
+            }
+        }
+    }
+    psx_fb_free(&fb);
+    free(vram);
+}
+
+static void test_scaled_ui_sprite(void)
+{
+    psx_framebuffer fb = {0};
+    psx_vram *vram = calloc(1, sizeof(*vram));
+    psx_raster_opts opts;
+    psx_prim p = {0};
+    int x, y;
+    psx_fb_init(&fb, 16, 16);
+    opts_exact(&opts);
+    p.kind = PSX_PRIM_SPRT;
+    p.tpage = 2u << 7; /* 15-bit texels */
+    p.xy[0].x = p.xy[0].y = 2;
+    p.xy[2].x = 10; p.xy[2].y = 6;
+    p.sprite_w = 4; p.sprite_h = 2;
+    for (y = 0; y < 2; y++) for (x = 0; x < 4; x++)
+        vram->px[y][x] = (u16)(1+x+4*y);
+    psx_raster_prim(&fb, &p, vram, &opts);
+    for (y = 2; y < 6; y++) for (x = 2; x < 10; x++)
+        check(pixel_at(&fb, x, y) == 1+(x-2)/2+4*((y-2)/2),
+              "scaled sprites sample their original texels, not adjacent atlas cells");
+    check(pixel_at(&fb, 10, 5) == 0, "scaled sprite stays within destination");
+    /* Clip after scaling: clipping must not restart the sprite's UV origin. */
+    opts.clip_x = 5; opts.clip_y = 3; opts.clip_w = 4; opts.clip_h = 3;
+    psx_fb_clear(&fb, 0);
+    psx_raster_prim(&fb, &p, vram, &opts);
+    check(pixel_at(&fb, 5, 3) == 2 && pixel_at(&fb, 4, 3) == 0,
+          "viewport clipping retains scaled sprite sampling");
+    p.xy[2].x = 4; p.xy[2].y = 3;
+    opts.clip_w = opts.clip_h = 0;
+    psx_fb_clear(&fb, 0);
+    psx_raster_prim(&fb, &p, vram, &opts);
+    check(pixel_at(&fb, 2, 2) == 1 && pixel_at(&fb, 3, 2) == 3,
+          "small viewports downsample within the source sprite");
+    psx_fb_free(&fb);
+    free(vram);
+}
+
+static void test_texture_window_and_addressing(void)
+{
+    psx_framebuffer fb;
+    psx_raster_opts opts;
+    psx_draw_state state = {0};
+    psx_prim p = {0}, command = {0};
+    psx_vram *vram = calloc(1, sizeof(*vram));
+    int bpp, sprite, x, y;
+    if (!vram || psx_fb_init(&fb, 8, 8) != Q2_OK) exit(2);
+    opts_exact(&opts);
+    p.xy[1].x = p.xy[2].x = 8; p.xy[2].y = p.xy[3].y = 8;
+    p.clut = psx_make_clut(0, 64);
+    for (bpp = 0; bpp < 3; bpp++) for (sprite = 0; sprite < 2; sprite++) {
+        memset(vram, 0, sizeof(*vram));
+        psx_draw_state_clear_cache(&state); /* independent addressing fixture */
+        for (y = 24; y < 32; y++) for (x = 0; x < 8; x++)
+            vram->px[y][(16 >> (2-bpp))+x] = bpp == 0 ? 0x1111 : bpp == 1 ? 0x0101 : 0x03E0;
+        vram->px[64][1] = 0x03E0;
+        command.kind = PSX_PRIM_TWINDOW;
+        command.texture_window = 31u | (31u << 5) | (2u << 10) | (3u << 15);
+        psx_raster_command(&fb, &command, vram, &opts, &state);
+        command.kind = PSX_PRIM_TPAGE; command.tpage = (u16)(bpp << 7);
+        psx_raster_command(&fb, &command, vram, &opts, &state);
+        p.kind = sprite ? PSX_PRIM_SPRT : PSX_PRIM_FT4; p.tpage = command.tpage;
+        psx_fb_clear(&fb, 0);
+        psx_raster_command(&fb, &p, vram, &opts, &state);
+        check(pixel_at(&fb, 2, 2) == 0x03E0,
+              "E2 window persists across E1 and applies to all texture depths and primitive paths");
+    }
+    command.kind = PSX_PRIM_TWINDOW; command.texture_window = 0;
+    psx_raster_command(&fb, &command, vram, &opts, &state);
+    p.kind = PSX_PRIM_FT4;
+    p.tpage = (2 << 7) | 15;
+    for (x = 0; x < 4; x++) { p.uv[x].u = 64; p.uv[x].v = 20; }
+    vram->px[20][0] = 0x001F;
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(pixel_at(&fb, 2, 2) == 0x001F, "direct texture X wraps within the VRAM row");
+    p.tpage = (1 << 7) | 15; p.clut = psx_make_clut(1008,64);
+    for (x = 0; x < 4; x++) p.uv[x].u = 128;
+    vram->px[20][0] = 0xC8C8;
+    vram->px[64][184] = 0x7C00;
+    psx_vram_transfer(vram); /* CPU upload; 16->8 bit E1 alone does not flush */
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(pixel_at(&fb, 2, 2) == 0x7C00, "8-bit texel fetch and CLUT index both wrap without carrying to Y");
+
+    p.kind = PSX_PRIM_SPRT; p.tpage = 0x3100; p.set_tpage = true;
+    p.uv[0].u = 3; p.uv[0].v = 2;
+    p.xy[2].x = 4; p.xy[2].y = 3;
+    for (y = 0; y < 3; y++) for (x = 0; x < 4; x++) vram->px[y][x] = (u16)(1+x+8*y);
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(pixel_at(&fb, 0, 0) == 20 && pixel_at(&fb, 3, 2) == 1,
+          "E1 rectangle flip bits decrement U and V from the sprite origin");
+    psx_fb_free(&fb);
+    free(vram);
+}
+
+static void test_framebuffer_masks(void)
+{
+    psx_framebuffer fb;
+    psx_raster_opts opts;
+    psx_draw_state state = {0};
+    psx_prim p = {0}, command = {0};
+    u16 scene[16] = {0}; u8 ui[16] = {0};
+    psx_vram *vram = calloc(1, sizeof(*vram));
+    if (!vram || psx_fb_init(&fb, 4, 4) != Q2_OK) exit(2);
+    opts_exact(&opts); opts.scene = scene; opts.ui_mask = ui;
+    p.kind = PSX_PRIM_TILE; p.xy[2].x = p.xy[2].y = 4; p.rgb[0].r = 248;
+    command.kind = PSX_PRIM_MASK; command.mask_mode = 1;
+    psx_raster_command(&fb, &command, vram, &opts, &state);
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(fb.px[0] == 0x801F && scene[0] == 0x801F, "E6 force mask covers untextured and scene output");
+    command.mask_mode = 2;
+    psx_raster_command(&fb, &command, vram, &opts, &state);
+    p.rgb[0].r = 0; p.rgb[0].g = 248; p.ui = true;
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(fb.px[0] == 0x801F && scene[0] == 0x801F && ui[0] == 0,
+          "mask-protected UI writes change neither pixels nor bloom coverage");
+    command.mask_mode = 0;
+    psx_raster_command(&fb, &command, vram, &opts, &state);
+    p.ui = false; p.kind = PSX_PRIM_SPRT; p.set_tpage = true; p.tpage = 2 << 7;
+    vram->px[0][0] = 0x8000;
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(fb.px[0] == 0x8000, "STP-only black texel is opaque black with mask, not transparent");
+    vram->px[0][0] = 0;
+    psx_vram_transfer(vram);
+    command.mask_mode = 1;
+    psx_raster_command(&fb, &command, vram, &opts, &state);
+    fb.px[0] = 0x03E0;
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(fb.px[0] == 0x03E0, "zero texels skip writes even with force-mask enabled");
+
+    memset(&p, 0, sizeof(p));
+    p.kind = PSX_PRIM_MOVE;
+    p.xy[PSX_MOVE_DST].x = 1; p.xy[PSX_MOVE_SIZE].x = 3; p.xy[PSX_MOVE_SIZE].y = 1;
+    fb.px[0] = 0x001F; fb.px[1] = 0x03E0; fb.px[2] = 0x8001; fb.px[3] = 0;
+    command.mask_mode = 3;
+    psx_raster_command(&fb, &command, vram, &opts, &state);
+    psx_raster_command(&fb, &p, vram, &opts, &state);
+    check(fb.px[1] == 0x801F && fb.px[2] == 0x8001 && fb.px[3] == 0x8001,
+          "overlapping MOVE honours force/check masks without corrupting source pixels");
+    psx_fb_free(&fb);
+    free(vram);
+}
+
+static void test_rgb555_blending(void)
+{
+    psx_framebuffer fb;
+    psx_raster_opts opts;
+    psx_prim p = {0};
+    int mode, back, front;
+    if (psx_fb_init(&fb, 1, 1) != Q2_OK) exit(2);
+    psx_raster_opts_default(&opts);
+    opts.dither = false;
+    p.kind = PSX_PRIM_TILE;
+    p.xy[2].x = p.xy[2].y = 1;
+    p.semi_transparent = true;
+    for (mode = 0; mode < 4; mode++) {
+        int mismatches = 0;
+        p.tpage = (u16)(mode << 5);
+        for (back = 0; back < 32; back++) for (front = 0; front < 256; front++) {
+            int f = front >> 3, result;
+            switch (mode) {
+            case 0: result = (back + f) / 2; break;
+            case 1: result = back + f; break;
+            case 2: result = back - f; break;
+            default: result = back + f / 4; break;
+            }
+            if (result < 0) result = 0;
+            if (result > 31) result = 31;
+            fb.px[0] = (u16)(back | back << 5 | back << 10);
+            p.rgb[0].r = p.rgb[0].g = p.rgb[0].b = (u8)front;
+            psx_raster_prim(&fb, &p, NULL, &opts);
+            if ((fb.px[0] & 0x7FFF) != (u16)(result | result << 5 | result << 10)) mismatches++;
+        }
+        check(mismatches == 0, "all 32x256 channel pairs blend after RGB555 reduction");
+    }
+    psx_fb_free(&fb);
+}
+
+static void test_dither_eligibility(void)
+{
+    psx_framebuffer fb;
+    psx_raster_opts opts;
+    psx_prim p = {0};
+    psx_vram *vram = calloc(1, sizeof(*vram));
+    int i;
+    if (!vram || psx_fb_init(&fb, 8, 8) != Q2_OK) exit(2);
+    psx_raster_opts_default(&opts);
+    p.xy[1].x = p.xy[2].x = 8;
+    p.xy[2].y = p.xy[3].y = 8;
+    p.tpage = 2 << 7;
+    for (i = 0; i < 4; i++) p.rgb[i].r = p.rgb[i].g = p.rgb[i].b = 128;
+    vram->px[0][0] = psx_rgb555(128,128,128);
+    p.kind = PSX_PRIM_F4;
+    psx_raster_prim(&fb, &p, vram, &opts);
+    check(fb.px[0] == 0x4210, "flat untextured polygons bypass dithering");
+    p.kind = PSX_PRIM_FT4;
+    psx_raster_prim(&fb, &p, vram, &opts);
+    check(fb.px[0] == 0x4210, "raw texture polygons preserve texels without dithering");
+    p.textured_blend = true;
+    psx_raster_prim(&fb, &p, vram, &opts);
+    check(fb.px[0] == 0x3DEF, "modulated flat polygons use the dither matrix");
+    p.kind = PSX_PRIM_G4;
+    psx_raster_prim(&fb, &p, vram, &opts);
+    check(fb.px[0] == 0x3DEF, "Gouraud polygons use the dither matrix");
+    p.kind = PSX_PRIM_TILE;
+    psx_raster_prim(&fb, &p, vram, &opts);
+    check(fb.px[0] == 0x4210, "tiles never dither");
+    p.kind = PSX_PRIM_LINE_F2;
+    p.xy[1].x = 7;
+    psx_raster_prim(&fb, &p, vram, &opts);
+    check(fb.px[0] == 0x3DEF, "flat lines still dither");
+    psx_fb_clear(&fb, 0);
+    p.xy[0].y = -300; p.xy[1].y = 300;
+    psx_raster_prim(&fb, &p, vram, &opts);
+    for (i = 0; i < 64; i++) if (fb.px[i]) break;
+    check(i == 64, "GPU rejects lines spanning more than 511 rows before clipping");
+    psx_fb_free(&fb);
+    free(vram);
+}
+
 int main(void)
 {
     puts("quad split");
@@ -393,6 +729,13 @@ int main(void)
     test_folded_quad_coverage();
     test_zorder_unchanged();
     test_sample_stays_inside_uv();
+    test_draw_mode_inheritance();
+    test_texture_transparency_bit();
+    test_scaled_ui_sprite();
+    test_rgb555_blending();
+    test_dither_eligibility();
+    test_texture_window_and_addressing();
+    test_framebuffer_masks();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

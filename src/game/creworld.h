@@ -47,9 +47,8 @@
  * as "could not start", so every creature was told it was buried in the floor it
  * stood on and none of them moved. See openquestions #48.
  *
- * The seven shipped modules use their transcribed callbacks and decoded
- * per-frame actions through crebind and cre_actions. Unsupported actions are
- * counted in the action diagnostics rather than silently treated as attacks.
+ * Implemented modules use transcribed callbacks and frame methods through
+ * crebind. Unsupported modules remain outside the gameplay registry.
  */
 #ifndef Q2PSX_CREWORLD_H
 #define Q2PSX_CREWORLD_H
@@ -66,8 +65,8 @@
 #include "q2psx.h"
 #include "spawn.h"
 
-/* The disc has seven distinct modules; a map carries at most a few of them. */
-#define Q2_CREWORLD_MAX_MODULES 16
+/* The disc contains 22 distinct module names, including zone-local AI. */
+#define Q2_CREWORLD_MAX_MODULES 32
 
 /*
  * Model-clip ticks per AI animation frame.
@@ -122,7 +121,22 @@ typedef struct q2_creature_module {
     u32               frame_name_count;
 
     bool         ready;
+    bool         sounds_ready;
+    u32          sound_count;
+    q2_cre_sound_bind sound_bind[128];
+    q2_sfx_request sound_request[128];
 } q2_creature_module;
+
+/* Resolve the actual initializer once per loaded world. Ordinary requests
+ * alias the bank; explicit clones retain their module's separate identity. */
+struct q2_creature_world;
+void q2_creature_world_init_sound_requests(struct q2_creature_world *w,
+    bool (*bank_has)(const char *, void *), void *user,
+    q2_sfx_request *(*lookup)(const char *, void *));
+q2_sfx_request *q2_creature_world_sound_request(struct q2_creature_world *w,
+    const q2_monster *m, u32 addr, const char *registered,
+    bool (*bank_has)(const char *, void *), void *user,
+    q2_sfx_request *(*lookup)(const char *, void *), const char **name);
 
 typedef struct q2_creature_world {
     q2_creature_module mod[Q2_CREWORLD_MAX_MODULES];
@@ -137,6 +151,11 @@ typedef struct q2_creature_world {
 
     q2_monster_set     set;
     q2_spawn_stats     stats;
+
+    /* Borrow the live world objects, not their replaceable target arrays.
+     * Scripted batches settle against their state when summoned. */
+    q2_collision          *placement_coll;
+    const q2_move_world    *placement_world;
 
     /* Kept rather than dropped, because CREBATCH names a GROUP and the names
      * live here. Borrows COMMON.DAT, which outlives the zone. */
@@ -217,22 +236,27 @@ bool q2_creature_corner_overlaps(const q2_monster *m, const q2_monster *corner);
  * Decode every creature module this map ships, and place every spawn record
  * whose class resolves to one of them.
  *
- * `common` must outlive the call but not the result — the modules are copied
+ * `common` and optional `zone` need only outlive the call — modules are copied
  * and relocated into storage this owns. Returns Q2_OK even when a map places no
  * creatures; `w->stats` says what happened.
  *
  * `coll` is the zone's SecondaryCol and is what DROPS each creature onto its
  * floor — the console's shared placement sweep. Passing NULL leaves every
  * creature at the authored height, which is a hint rather than a position.
+ * `world` supplies resident solid platforms for the same placement sweep.
+ * These two world objects must outlive this creature world; delayed batches
+ * borrow them to place fresh creatures after platforms/scene solids change.
  */
 q2_result q2_creature_world_load(q2_creature_world *w, const disc *d,
                                  const q2_build_id *id,
                                  const q2_common_file *common,
-                                 q2_collision *coll);
+                                 const q2_zone_file *zone,
+                                 q2_collision *coll, const q2_move_world *world);
 
 /*
- * Wake every creature and point the AI at the player. Call once the player is
- * standing where the level starts them.
+ * Initialize and wake active creatures and point the AI at the player. Dormant
+ * batches wait for summon; saved runtime resumes without repeating export 0.
+ * Call once the player is standing where the level starts them.
  */
 /*
  * `player_origin` is the player's ENTITY ORIGIN — feet - Q2_EYE_BASE, which is
@@ -244,13 +268,16 @@ void q2_creature_world_wake(q2_creature_world *w, const s32 player_origin[3],
                             s16 player_health);
 
 /*
- * One AI tick. `player_eye` moves the sight client first, so a creature that
+ * One AI tick. `player_origin` moves the sight client first, so a creature that
  * looks this tick looks at where the player is now.
  *
  * Returns how many creatures thought, which is zero on a level with none.
  */
 u32 q2_creature_world_tick(q2_creature_world *w, const s32 player_origin[3],
                            s16 player_health);
+/* Actor handlers installed by a module run on the next engine frame, outside
+ * the ten-Hz animation/AI clock (Medic's deferred replacement). */
+void q2_creature_world_actor_tick(q2_creature_world *w);
 
 /*
  * The player made a noise, and creatures may look for it.
@@ -309,6 +336,16 @@ const char *q2_creature_world_sound_name(const q2_creature_world *w,
  */
 const char *q2_creature_world_sound_for_addr(const q2_creature_world *w,
                                              const q2_monster *m, u32 addr);
+const char *q2_creature_world_sound_resolve(const q2_creature_world *w,
+                                            const q2_monster *m, u32 addr,
+                                            bool (*bank_has)(const char *, void *),
+                                            void *user);
+/* Compatibility for transcriptions whose play sites still pass a sound index.
+ * Resolve that registration's slot, then execute the same bank-dependent init. */
+const char *q2_creature_world_sound_resolve_name(const q2_creature_world *w,
+        const q2_monster *m, const char *registered,
+        bool (*bank_has)(const char *, void *), void *user);
+
 
 /*
  * SUMMON a Population group — what `CREBATCH` means.
@@ -320,12 +357,14 @@ const char *q2_creature_world_sound_for_addr(const q2_creature_world *w,
  * maps, so at load nothing is selected.
  *
  * This port spawns every record up front and holds the ones a script owns
- * DORMANT — `in_use` clear — because the alternative is re-running the spawn
+ * DORMANT — `in_use` clear and `spawn_pending` set — because the alternative is re-running the spawn
  * pass mid-level against a set other systems already hold pointers into. The
  * effect is the console's: an ambush is not standing there until it is called
  * for. Waking also runs `q2_monster_start_go`, since dormant records were
  * deliberately skipped by the initial world wake. Returns how many creatures
  * this call woke, which is 0 for a group already summoned — the bit-1 latch.
+ * Geometrically excluded and freed records never acquire the pending latch.
+ * An explicit selection has no zone-name test, matching retail CREBATCH.
  */
 u32 q2_creature_world_summon(q2_creature_world *w, const char *group);
 
@@ -343,13 +382,20 @@ u32 q2_creature_world_summon(q2_creature_world *w, const char *group);
  * selector calls, 71 resolve to a real group, and **69 of those 71 claim a
  * zone**. The two that do not are JAIL3's `Jail4Return` and `Jail5Return` —
  * populations for coming BACK to a level, which the module selects
- * conditionally and a static scan cannot gate.
+ * conditionally and a static scan cannot gate. The client uses hold_selected
+ * with the same mission/key decisions it used for item startup.
  *
  * Call after the world has loaded and before it wakes. Returns how many were
  * held.
  */
 u32 q2_creature_world_hold_batches(q2_creature_world *w, int resident_zone,
                                    const u8 *levelbin, u32 levelbin_size);
+
+/* Use the owner's resolved startup selection (one byte per Population group).
+ * Items and creatures then share conditional LevelBin decisions. Call after
+ * geometric zone filtering and before wake; excluded records stay excluded. */
+u32 q2_creature_world_hold_selected(q2_creature_world *w, int resident_zone,
+                                     const u8 *selected, u32 count);
 
 void q2_creature_world_free(q2_creature_world *w);
 

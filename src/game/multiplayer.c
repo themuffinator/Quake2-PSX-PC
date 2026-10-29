@@ -220,10 +220,10 @@ void q2_mp_session_init(q2_mp_session *s, q2_mp_mode mode, int players)
     s->frag_limit  = q2_mp_frag_options[Q2_MP_FRAG_OPTION_DEFAULT];
     s->round_limit = q2_mp_round_options[Q2_MP_ROUND_OPTION_DEFAULT];
 
-    /* One colour per player. The team UI is behind the same disabled flag the
-     * flag modes are, so this is every shipped configuration. */
+    /* FrontEndResetMultiplayerDefaults, 0x8001BED4 / 0x8001BF04. The
+     * individual colour is p; the separate team halfword is p & 1. */
     for (i = 0; i < Q2_MP_MAX_PLAYERS; i++)
-        s->team[i] = (s16)i;
+        s->team[i] = (s16)(i & 1);
 
     s->end          = Q2_MP_RUNNING;
     s->last_alive   = 0;
@@ -520,8 +520,9 @@ int q2_mp_find_winner(const q2_mp_session *s)
             if (t >= 0 && t < Q2_MP_MAX_TEAMS)
                 used[t] = 1;
             /* `sum[i] += frags[i]` — indexed by PLAYER, paired below with the
-             * mark for the TEAM of the same index. With one player per colour
-             * the two agree, which is every shipped configuration. */
+             * mark for the TEAM of the same index. This retail banner bug
+             * remains observable with the alternating default teams. The
+             * results page independently uses the real team totals. */
             total[i] = (s16)(total[i] + s->frags[i]);
         }
 
@@ -568,59 +569,99 @@ static const char *const k_team_name[Q2_MP_MAX_TEAMS] = {
     "BLUE", "RED", "PURPLE", "GREEN"
 };
 
-u32 q2_mp_scoreboard(const q2_mp_session *s, const char *const *names,
-                     char lines[][Q2_MP_SCORE_LINE], u32 max)
+static void score_order(const s16 *scores, int *ids, int count)
+{
+    int i, j;
+    for (i = 1; i < count; i++) {
+        int id = ids[i];
+        for (j = i; j > 0 && scores[ids[j - 1]] < scores[id]; j--)
+            ids[j] = ids[j - 1];
+        ids[j] = id;
+    }
+}
+
+u32 q2_mp_score_rows(const q2_mp_session *s, const char *const *names,
+                      u32 ready, q2_mp_score_row *rows, u32 max)
 {
     static const char *const k_default_name[Q2_MP_MAX_PLAYERS] = {
         "PLAYER 1", "PLAYER 2", "PLAYER 3", "PLAYER 4"
     };
     u32 n = 0;
-    int i, players;
+    int i, t, players, teams = 0, y;
+    int order[Q2_MP_MAX_PLAYERS], team_order[Q2_MP_MAX_TEAMS];
+    bool used[Q2_MP_MAX_TEAMS] = {false};
+    const s16 *scores;
     bool team_mode;
 
-    if (!s || !lines || max == 0)
+    if (!s || !rows || max == 0)
         return 0;
 
     players = s->player_count;
     if (players < 1)
-        players = 1;
+        return 0;
     if (players > Q2_MP_MAX_PLAYERS)
         players = Q2_MP_MAX_PLAYERS;
 
-    /* Modes 1 and 4 are the team ones; VERSUS scores per player and keeps its
-     * round wins in the team array, which the caller reads separately. */
-    team_mode = (s->mode == Q2_MP_TEAM_DEATHMATCH || s->mode == Q2_MP_TEAM_TAG);
-
-    if (n < max)
-        snprintf(lines[n++], Q2_MP_SCORE_LINE, "%s", q2_mp_score_title(s->mode));
-
-    for (i = 0; i < players && n < max; i++) {
-        const char *who = (names && names[i] && names[i][0])
-                              ? names[i] : k_default_name[i];
-
-        /* In VERSUS the number that matters is rounds won, which the session
-         * keeps in team_frags — the module's own use of that array. */
-        snprintf(lines[n++], Q2_MP_SCORE_LINE, "%-12s %4d", who,
-                 s->mode == Q2_MP_VERSUS ? s->team_frags[i] : s->frags[i]);
+    /* QMRESULT +0x0F3C / +0x1064 only group mode 1. */
+    team_mode = s->mode == Q2_MP_TEAM_DEATHMATCH;
+    scores = s->mode == Q2_MP_VERSUS ? s->team_frags : s->frags;
+    for (i = 0; i < players; i++) {
+        order[i] = i;
+        if (s->team[i] >= 0 && s->team[i] < Q2_MP_MAX_TEAMS)
+            used[s->team[i]] = true;
     }
+    score_order(scores, order, players);
+    for (t = 0; t < Q2_MP_MAX_TEAMS; t++)
+        if (used[t]) team_order[teams++] = t;
+    score_order(s->team_frags, team_order, teams);
+    y = (252 - 11 * (players + (team_mode ? 1 + 2 * teams : 0))) / 2;
 
-    if (team_mode) {
-        for (i = 0; i < Q2_MP_MAX_TEAMS && n < max; i++) {
-            if (s->team_frags[i] == 0)
-                continue;
-            snprintf(lines[n++], Q2_MP_SCORE_LINE, "%s TEAM SCORED %d",
-                     q2_mp_team_name(i), s->team_frags[i]);
+    for (t = 0; t < (team_mode ? teams : 1); t++) {
+        int team = team_mode ? team_order[t] : -1;
+        if (team_mode && n < max) {
+            q2_mp_score_row *row = &rows[n++];
+            memset(row, 0, sizeof(*row));
+            snprintf(row->text, sizeof(row->text), "%s TEAM SCORED %d",
+                     q2_mp_team_name(team), s->team_frags[team]);
+            row->y = (s16)y;
+            row->player = -1;
+            row->colour = (s8)team;
+            row->highlight = true;
+            y += 15;
         }
+        for (i = 0; i < players && n < max; i++) {
+            int p = order[i];
+            const char *who = names && names[p] && names[p][0]
+                                  ? names[p] : k_default_name[p];
+            q2_mp_score_row *row;
+            if (team_mode && s->team[p] != team) continue;
+            row = &rows[n++];
+            memset(row, 0, sizeof(*row));
+            /* QMRESULT +0x1214 / +0x141C: 31 columns, with READY at 2,
+             * the name at 12, and the score at 26. Bound host-supplied names. */
+            snprintf(row->text, sizeof(row->text), "  %-5s     %-12.12s  %-5d",
+                     ready & (1u << p) ? "READY" : "", who, scores[p]);
+            row->y = (s16)y;
+            row->player = (s8)p;
+            row->colour = (s8)(team_mode ? team : p);
+            row->highlight = !team_mode;
+            y += 15;
+        }
+        y += 15;
     }
+    return n;
+}
 
-    /*
-     * `ALL PLAYERS PRESS` / `FIRE TO CONTINUE` used to be appended here and are
-     * not part of the score list. QMRESULT's module holds them as a static
-     * two-row page at 256,180 and 256,200 (#101) — fixed furniture the score
-     * rows grow above, not two more scores. Appending them made their position
-     * depend on the player count.
-     */
-
+u32 q2_mp_scoreboard(const q2_mp_session *s, const char *const *names,
+                     char lines[][Q2_MP_SCORE_LINE], u32 max)
+{
+    q2_mp_score_row rows[Q2_MP_SCORE_ROWS];
+    u32 i, count, n = 0;
+    if (!s || !lines || !max) return 0;
+    snprintf(lines[n++], Q2_MP_SCORE_LINE, "%s", q2_mp_score_title(s->mode));
+    count = q2_mp_score_rows(s, names, 0, rows, Q2_MP_SCORE_ROWS);
+    for (i = 0; i < count && n < max; i++)
+        snprintf(lines[n++], Q2_MP_SCORE_LINE, "%s", rows[i].text);
     return n;
 }
 

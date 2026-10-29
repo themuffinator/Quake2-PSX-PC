@@ -22,7 +22,7 @@
  * ---------------------------------------------------------------------------
  * Two TILE primitives, both exactly (x, y, w, h), both **rgb (0, 0, 0)** with
  * the semi-transparency bit set (`code |= 2` at `0x8003F1C8`), bracketed by two
- * draw-mode packets carrying `0xE1000600` — texture page 0, abr **1**, which on
+ * draw-mode packets carrying `0xE1000600` — texture page 0, abr **0**, which on
  * this hardware is B/2 + F/2.
  *
  * Black at half strength darkens; drawing it **twice** darkens to a quarter.

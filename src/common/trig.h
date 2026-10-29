@@ -44,24 +44,23 @@ s32 q2_sin12(s32 angle);
 s32 q2_cos12(s32 angle);
 
 /*
- * Inverse cosine: takes a 1.3.12 cosine and returns the angle, 0 for +1.0 and
- * Q2_ANGLE_180 for -1.0. Inputs outside ±4096 are clamped.
- *
- * The original has this as a 4096-entry table at 0x8009FC44 indexed by
- * cos/2 + 2048, used only by the quaternion interpolator. This computes the
- * same function rather than shipping the table; `q2psx-inspect anims` measures
- * the two against each other over all 4096 entries so the difference is a
- * number rather than an assumption.
+ * Native inverse cosine (PAL 0x8009FC44): quantize cos12 down to an even
+ * value and clamp to [-4096,4094]. The endpoint results are 2047 and 20;
+ * zero maps to 1023. Computed rather than shipping the executable's table,
+ * with every entry checked against the disc by test_cremotion --disc.
  */
 s32 q2_acos12(s32 cos12);
+
+/* PAL 0x80069C64, including its equal-input/endpoint copies and separate
+ * signed product shifts. t is a 12-bit interpolation fraction, 0..4096. */
+void q2_quat_slerp(const s16 a[4], const s16 b[4], s32 t, s16 out[4]);
 
 /*
  * ratan2 (0x8008A358): the Psy-Q library's table-driven atan2, an angle on the
  * 4096-step circle in -2048..2048, and 0 for (0, 0) (0x8008A384). The console
  * looks the ratio up in a 1025-entry table at 0x800A9430 after folding the
- * octant; this computes the same function in floating point and rounds to the
- * unit, the way the sine table is built. The two can differ by one step where
- * the table's own rounding does.
+ * octant. The reconstructed table matches all 1025 PAL entries; ratio
+ * quantization and the large-magnitude division follow the native instructions.
  */
 s32 q2_ratan2(s32 y, s32 x);
 

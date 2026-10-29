@@ -282,26 +282,46 @@ Array of 32-byte records terminated by 12 NUL bytes. `len % 32 == 12` on 49/49.
 ```c
 typedef struct {           /* 32 bytes */
     char    name[12];      /* CONFIRMED: zone name, e.g. "Zone0" -> ZONE0.DAT      */
-    int32_t unk0;          /* UNKNOWN: 49 distinct values, -3000..6600, incl. the
-                            * sentinels -1 and -3000. Mostly round numbers. Does
-                            * not track zone file size. Draw distance is a guess.  */
+    int32_t packet_control;/* CONFIRMED: negative forces its magnitude in packets;
+                            * nonnegative asks the loader to size from free RAM.   */
     int32_t always0;       /* CONFIRMED: 0 in every record of every map            */
     int32_t alwaysM1;      /* CONFIRMED: -1 in every record; none/invalid sentinel */
-    int32_t unk3;          /* INFERRED: 64 in 47/49 maps; two records hold 80.
-                            * NOT a constant.                                      */
-    int32_t unk4;          /* UNKNOWN: 17 distinct values in 40..180. Per-zone
-                            * budget or limit. Varies between zones of one map.    */
+    int32_t particle_groups;/* CONFIRMED: 149 records hold 64; JAIL4/ZONE0 and
+                             * JAIL5/ZONE2 hold 80. Zero -> 32; negative -> 0.      */
+    int32_t subdiv_meshes; /* CONFIRMED: cached 4x4 mesh count, 40..180 on disc;
+                            * zero -> 112, negative -> 0.                           */
 } q2p_resource;
 ```
 
 | Offset | Type | Name | Meaning | Confidence |
 | --- | --- | --- | --- | --- |
 | `0x00` | `char[12]` | `name` | Zone name → `ZONE<n>.DAT` | CONFIRMED |
-| `0x0C` | `int32_t` | `unk0` | Scalar, −3000…6600 | UNKNOWN |
+| `0x0C` | `int32_t` | `packet_control` | Negative forces its magnitude; nonnegative selects automatic heap-based packet capacity | CONFIRMED |
 | `0x10` | `int32_t` | `always0` | 0 everywhere | CONFIRMED |
 | `0x14` | `int32_t` | `alwaysM1` | −1 everywhere | CONFIRMED |
-| `0x18` | `int32_t` | `unk3` | 64, occasionally 80 | INFERRED |
-| `0x1C` | `int32_t` | `unk4` | Per-zone budget, 40…180 | UNKNOWN |
+| `0x18` | `int32_t` | `particle_groups` | Particle group capacity: 64, or 80 in JAIL4/ZONE0 and JAIL5/ZONE2 | CONFIRMED |
+| `0x1C` | `int32_t` | `subdiv_meshes` | Cached subdivision meshes, 40…180; 0 → 112, negative → 0 | CONFIRMED |
+
+PAL first passes `+0x18` to the particle allocator `0x80030C70` at
+`0x80070E98..70E9C` and `0x8007148C..71490`. That allocator defaults zero to
+32, disables negative counts, and allocates 288-byte group records plus two
+40-byte packet arrays. Its total packet count is `groups*15` for one viewport,
+or `(groups/2)*viewports*15` otherwise. `0x800304A8..30AEC` spends one shared
+packet allowance across all views, not one allowance per view.
+
+The loader then reads `+0x0C` / `+0x1C` at `0x800714A4..714A8` (also
+`0x80070EB0..70EB4`). **Correction, 28 October:** it does not pass the raw
+flat-packet setting straight to `0x80070AA8`. After the particle allocation,
+`0x8006EACC` supplies the largest contiguous allocatable heap payload; the automatic count is
+`32 * min(256, (largest_payload - (1882*subdiv_meshes + 2)) / 3330)`, using unsigned
+32-bit subtraction/division. A negative `packet_control` overrides that count
+with its magnitude. The low-level allocator then applies its own zero/default,
+negative/disable and round-to-32 rules. QFRONT's `-3000` therefore requests
+3,008 packets and QFMV's `-1` requests 32. Those signed overrides are now fixed
+in the port; automatic sizing still needs native allocation-history accounting.
+See the renderer audit. Mesh initialization at
+`0x80069408` uses nonzero 212-byte-offset handles and free/tight/full allocation
+boundaries.
 
 > **CORRECTION.** The record count is the map's **declared** zone count and is *not* the number of
 > `ZONE<n>.DAT` files present. Twelve maps declare 5 zones but ship only 2 zone files. **Never size the zone
@@ -511,6 +531,14 @@ against +0.2450 / 65.51 % for whole-model absolute.
 > | C (`+0x34`) | the **animation bank** — see §2.2.1 | each clip's duration **×10** |
 > | D (`+0x38`) | 20-byte records, terminated by a zero word at `+0` | three `u16` at `+12`, `+14`, `+16` **×5** |
 >
+> The block D conversion is now confirmed by executing `0x8006C214` on both
+> supported PAL/US executables, including the stores at `0x8006C294`,
+> `0x8006C2A4` and `0x8006C2B0` (PAL addresses). The third field is a reset
+> position after passing the end, not a live cursor. Player binding then sets
+> Stand/Run's reset positions to their starts (`0x8003CBF4` / `0x8003CC04`).
+> Live position is entity `+0x100`. The parser retains disc units; runtime
+> consumers apply the conversion. Historical note 51f's denial is withdrawn.
+>
 > Block B being an 8-entry head table is what the earlier measurement saw as "exactly 16 zero bytes in
 > 821/965 models": eight empty chains. Block C's ×10 is **time, not distance** — it is what makes the
 > runtime clock tick ten times per animation frame. (An earlier draft of this table guessed it was spatial
@@ -576,25 +604,36 @@ frame. Each names a stream of 4-bit durations in frames, eight to a word and rea
 that part's own key list. A part holds a key for as many frames as its nibble says; poses between keys are
 interpolated, translations linearly and rotations by the spherical interpolator at `0x80069C64`.
 
-**Retail supplies a continuous sub-frame clock to that interpolator for both creatures and players.** In the
-world-entity frame, `0x8007ED9C…0x8007F000` consumes elapsed time in 30-unit AI intervals and leaves `s3` as
-the 0…29 remainder; the only call to `0x8007EB10`, at `0x8007F158`, passes it as `a2`, and
-`0x8007ECAC…0x8007ECBC` writes `runtimeMove.base + a2` to `entity+0x100`. The pose walk at `0x8006B5D8`
-divides that position by ten and deliberately keeps the remainder for lerp/slerp. Player bodies have a
+**Retail supplies a continuous sub-frame clock to that interpolator for both creatures and players.** The
+PAL live-actor handler at `0x8007EBC4` consumes elapsed time in 30-unit AI intervals.
+`0x8007E9DC` retains the previous AI base in edict+46, installs the new named
+frame position in actor+176 bits 17..31, and samples `previous + phase` into
+actor+256 unless the hold bit is set. A change of animation range or backward
+frame jump sets the transition bit; phase 20..29 enables blending to the new
+clip. `0x8006B4DC` blends the outgoing final key into the incoming first key
+over ten position units. At position zero it decodes the first key directly,
+including when the first duration nibble is zero. The pose walk
+divides the position by ten and retains the remainder for lerp/slerp. Player bodies have a
 separate, even plainer driver: `0x8003DF58…0x8003DF68` adds the frame delta to the same `entity+0x100`
 halfword, while `0x8003DF70…0x8003DFC0` compares the named move bounds and wraps or marks its end.
 
-The port mirrors both paths. Creature cursors expose `BASE + PHASE` (resetting phase when AI chooses a new
-base), and multiplayer Male2 bodies advance the disc's named Stand/Run/Attak/Jump/death moves on the render
-clock. Neither path rounds to an animation key before calling `q2_model_pose_at`, so translation lerp and
-quaternion slerp receive the same tenths-of-a-frame remainder retail did.
+The port's creature cursor lives in `q2_cre_motion`, independent of display-frame
+sampling, and reaches `q2_model_pose_transition` with both clips when blending.
+Multiplayer Male2 bodies advance the disc's named Stand/Run/Attak/Jump/death moves
+on the render clock. Neither path discards the tenths-of-a-frame remainder.
+CAIS/ZPOP v5 preserve the creature's physical and animation state; see the
+[creature audit](CREATURE-AUDIT.md#physical-actor-reconstruction) for the motion
+and impulse contracts and native instruction comparisons.
 
 That interpolator is worth following exactly rather than substituting a textbook slerp, because two of its
 details are observable: it negates the second quaternion when the dot product is negative, so it always takes
 the short way round, and once `1 − cos θ` falls below `0x80` it drops to a straight lerp — which is most
 frames of most animations. Its inverse cosine is a 4096-entry table at `0x8009FC44` indexed by `cos/2 + 2048`;
-this port computes the function instead, and `q2psx-inspect anims` measures the substitution against the
-original: **4,094 of 4,096 entries identical, the other two off by one unit (0.088°)**.
+the computed reconstruction now matches **all 4,096 entries**, including the negative endpoint
+(`2047`) and zero-cosine entry (`1023`). Equal quaternions are copied directly; an interpolation
+fraction of 4096 copies the original incoming quaternion even when the interior flips its sign.
+Separate product shifts preserve the native rounding. Quaternion-to-matrix doubles operands
+**before** multiplying and shifting; doubling already-rounded products loses odd coefficients.
 
 Three details of the walk are load-bearing, and each was found by the disc disagreeing with a first attempt:
 
@@ -603,11 +642,13 @@ Three details of the walk are load-bearing, and each was found by the disc disag
 * **The tick clamp is to the START of the last frame**, `duration - 10`, not to the clip end. Ticks in the
   final ten subticks are inside the clip but past the last key, and a looser clamp walks the duration stream
   into the zeros that follow it, where the zero-nibble rule above then runs the key index away. 428 frames.
-* **The last key of a model's last clip has no successor inside block C.** The original reads one anyway,
-  eight bytes into block D; the port holds the final key instead. 429 frames, always the same position.
+* **The last key of a model's last clip can have its successor outside block C.** The original reads
+  the following eight bytes even across the block-D boundary. The port now preserves that read,
+  bounded by the whole model allocation, instead of substituting the final key.
 
-Census with the path implemented: **2,036,080 keys** decoded across all 4,535 clips, **zero** escaping their
-block.
+The initial census decoded **2,036,080 keys** across all 4,535 clips. The later native-instruction
+comparison samples all 3,241 variable-rate clips at eight positions, including final keys and clip
+transitions: **25,928 complete poses / 426,080 part poses**, with no translation or quaternion differences.
 
 **How a pose reaches the vertices** — from the hand-written GTE routine at `0x800B1F90`, which is worth
 following because a port has to reproduce the order and not merely the arithmetic:
@@ -1374,9 +1415,9 @@ not touch the tpage word.
 
 > **The opaque path WRITES THE TABLE BACK** (`sh` at `0x80068320`). `tpageTable` is built by
 > `GetTPage(0, 0, ...)` with an ABR argument of **0**, so a page starts at B/2+F/2 and is permanently promoted
-> to B+F the first time any opaque polygon on it is drawn; transparent polygons then inherit the promotion.
-> "World transparency is additive" is therefore true in the steady state and false on the first frame a page
-> is touched. A port that bakes in the constant loses the mechanism — model that table as mutable state.
+> to B+F when an opaque parent packet is constructed, before face culling. Later transparent packet
+> constructions inherit that promotion; previously cached packets retain their original page until rebuilt.
+> World transparency therefore depends on both the mutable table and parent-packet lifetime.
 
 ### 3.2 `Points` — per-node vertex lists
 
@@ -2779,12 +2820,20 @@ through to the exhausted data track.
 A placeholder `.WAV` file sits in the ISO at exactly track 2's INDEX 01; its declared size is a count of
 2048-byte logical sectors (a disc-space reservation), not playable audio.
 
-> **CORRECTION — the engine really does drive CD-DA.** An earlier pass concluded the track was a decoy that
-> a port could ignore entirely. In fact two entries in the music table carry `xai_file_index == -1` and are
-> routed to a code path that issues `CdControl(CdlSetmode, 0x05)` then `CdControl(CdlPlay, &cdda_loc[id])`
-> against a TOC table built at boot from `CdlGetTN` / `CdlGetTD` (with a +38-frame BCD offset and full carry
-> fixup). Because the track is silence, a port may implement those two music ids as "no music" — but it must
-> model the dispatch, not pretend it does not exist.
+The US backing has 13,875 sectors including its pregap (183 seconds playable).
+Its only nonzero PCM samples are 15,245 values of -1 and 15,294 values of +1,
+confined to file-relative sectors 151..255. PAL's digital silence must not be
+generalized to every byte of the US image.
+
+The native CD-DA branch exists, but neither supported build's named playlists
+selects it. Reserved music ids 0/1 have `xai_file_index == -1` and zero duration.
+Forcing those ids issues `CdControlB(CdlSetmode, 0x05)` and
+`CdControlB(CdlPlay, &cdda_loc[id])`, with TOC entries 0/1 naming lead-out and
+the first data track. Track 2 occupies entry 2, whose music id instead selects
+XA. `GetToc` does not change the music table, and `PlayThisXA` is a no-op.
+The port's silent fallback for these ids remains a limitation for modified
+tables, not an identified missing retail soundtrack. See the
+[native selector audit](AUDIO-AUDIT.md#cd-da-and-playlist-scope).
 
 ---
 
@@ -2824,14 +2873,18 @@ Memory map (all CONFIRMED by disassembling `crt0` at `0x80085F50` instruction by
 | rodata begins | ≈ `0x8009B520` | |
 | PSY-Q library code | `0x800AED30` … `0x800B26D0` | ends where BSS clearing starts |
 | BSS | `0x800B26D0` … `0x800EE718` | 245,832 bytes, zeroed by `crt0` |
-| Heap | `0x800EE718` … `0x801FF600` | **1,118,952 bytes usable** |
+| Heap | `0x800EE718` … `0x801FF600` | **1,117,928-byte extent**; maximum initial payload 1,117,872 |
 | Stack top | `0x801FFFF8` | `(gp[0]-8) \| 0x80000000` |
 | Stack reserve | `0x500` | |
 
 > **CORRECTION — the heap ceiling.** Heap init stores `0x801FFB00` (RAM size minus the `0x500` stack
 > reserve), but `_malloc` then recomputes its top as `that - 0x500 == 0x801FF600`, i.e. **the stack reserve
-> is charged twice**. The real allocatable ceiling is `0x801FF600` (`0x1112E8` = 1,118,952 bytes), not the
+> is charged twice**. The real allocatable ceiling is `0x801FF600` (`0x110EE8` = 1,117,928 bytes), not the
 > `0x1113E0` value `crt0` records in a global.
+> Executing native heap initialization and its largest-block probe confirms a
+> maximum initial payload of **1,117,872 bytes**: the extent loses the 28-byte
+> head sentinel and 28 bytes for the prospective allocation header. The older
+> extent calculation overstated the space by 1,024 bytes.
 
 ### 9.2 `SYSTEM.CNF`
 
@@ -2895,8 +2948,9 @@ typedef struct {                /* 56 bytes */
     char      dirname[10];      /* INFERRED: uppercase on-disc directory name. Width
                                  * 10 is deduced from the s16 at +0x16, not from a
                                  * located reader.                                   */
-    int16_t   unit;             /* CONFIRMED: campaign unit; 0 == not in the campaign.
-                                 * 16-bit width proved by two `lh` sites.            */
+    int16_t   unit;             /* CONFIRMED: 0 no mission record, 1..5 campaign,
+                                 * 6 Tribute (unshipped Quake3/HalfLife). Native
+                                 * direct-level selection reads this with `lh`.     */
     void     *runtime_ptr;      /* CONFIRMED: a RUNTIME POINTER, not an ignorable
                                  * NULL callback — the resource loader writes here.
                                  * A port MUST model it as writable per-level state. */
@@ -2907,18 +2961,23 @@ typedef struct {                /* 56 bytes */
                                  * 0 (front-end/stub), 1, 2, 4. Nothing in the code
                                  * distinguishes 1 from 2 from 4.                    */
     uint8_t   pad0;             /* CONFIRMED: 0 on all 52 records                    */
-    int8_t    music[14];        /* INFERRED: a byte list whose terminator equals
-                                 * -(number of preceding entries) — that arithmetic
-                                 * property is CONFIRMED on all 52 records. That the
-                                 * entries are track selectors is NOT: no instruction
-                                 * anywhere in the image loads offset 0x22 from a
-                                 * level record.                                     */
+    int8_t    music[10];        /* CONFIRMED: track ids, negative relative jumps,
+                                 * and zero termination; cursor walk at 0x80071A68. */
+    uint8_t   reserved[4];      /* +0x2C..0x2F, zero in both supported executables   */
     uint8_t   runtime[8];       /* CONFIRMED: cleared per-level at new-game start by
                                  * a stride-56 walk that stores zero to +0x30..+0x37 */
 } Q2Level;
 ```
 
 Six records name directories that do not exist on the disc; four directories exist that no record names.
+
+The direct-level path at `0x8003E39C` looks up the display name, reads the
+mission id at `+0x16`, and passes it to `GameNewMission` (`0x8003F37C`). Native
+execution confirms all 51 named entries on both PAL and US. Multiplayer
+restart (`0x80041958`) selects id 7, the null initializer: it allocates no
+mission record. Id 6 instead runs `InitMissionTribute` and allocates four
+bytes. These must not be conflated. The reader stops at the empty-name
+sentinel; the following `Base3`/`Jail2` bytes are not another level record.
 
 ### 9.5 Item table — **SOLVED, and with it every item on the disc**
 
@@ -2967,6 +3026,33 @@ The resulting packet is one modulated, semi-transparent `POLY_FT4`: RGB `(128,12
 CLUT `(0,248)`, and UVs `(224,224)`…`(239,239)`. Those UVs select the lower-right 16 × 16 shadow tile already
 present in `chars.lbm`; no new texture asset is involved. Its footprint shrinks by `(600-height)/600` and is
 suppressed at a height of 600 or more.
+
+**Moving-body blobs (`0x80078978`).** Creature spawn sets render bit 0 at `0x8007E5D8`;
+the footprint radius is the live hit-cylinder radius at `+0x94`, including the widened
+corpse radius. Multiplayer bodies use their 286-unit hit radius. Both client draw paths
+now submit the same shadow packet as items, ahead of the model within its ordering-table
+chain, with the viewport's own area projection and clipping.
+
+The floor linker copies the collision centre from `+0x54`, then, when not grounded,
+queries downward by three times the separation radius at `+0x90` (128). SecondaryColl
+is already eroded for the body's 286-unit half extent, so the hit gains 286 to reach
+the visible floor; a PrimaryColl fallback needs no correction. Height shrink measures
+the distance from the body's feet to that floor, independently of its animation's
+model-origin offset. Grounded players use their contact height, including lifts.
+Creatures query each draw because their AI `on_ground` latch is not reliably cleared
+by all movement paths. Collision queries use copies of the trace context, preserving
+simulation scratch state across multiple viewports.
+Solid moving-platform tops are tested from the feet as well, taking the nearest
+surface above the map floor and excluding trigger/liquid volumes.
+
+One deliberate difference from retail: an unplaced body or a downward query without
+a floor emits no shadow; the console retains the query endpoint. This avoids a floating
+quad where no supporting surface was found. Lists stop at the first `0xFFFF` even if
+their supplied capacity includes further entries. Headless `--report` exposes cumulative
+`items.shadows`, `creatures.shadows`, and `players.shadows`; compare these only with
+fixed-step `--headless` runs. `shadow_blobs` tests floor placement/fallback, moving and
+grounded bodies, height shrink, live radius, packet exhaustion, and actual subtractive
+pixels including transparent texels. The item tests also cover posed lists and termination.
 
 **The flag bits, all nine of them.**
 
@@ -3056,7 +3142,7 @@ typedef struct {                /* 6 bytes */
                                  * 19 of 20 XA entries match to the decisecond; one
                                  * is 1.0 s short. The consumer multiplies by 5
                                  * (deciseconds -> 50 Hz PAL ticks) with a 30.0 s
-                                 * fallback when the CD call fails.                  */
+                                 * fallback when file/TOC selection is unavailable.  */
 } Q2MusicEntry;
 
 #define Q2_MUSIC_ENTRY_COUNT 22
@@ -3066,6 +3152,13 @@ typedef struct {                /* 6 bytes */
 
 Records 2…21 are exactly `(file 0..4) × (channel 0..3)` in ascending order, which is what makes the flat-id
 mapping above exact.
+
+The level record's signed bytes at `+0x22` select these ids. A negative byte
+branches relative to the cursor; zero stops playback rather than implicitly
+restarting the list. Executed PAL/US fixtures cover all 51 named records per
+revision: 37 seven-track loops, QFRONT's one-track loop, MAGDEMO's four-track
+loop, and 12 immediately stopped lists. All twenty XA ids occur; QUAKE_E's
+four channels appear as opening tracks. Neither reserved CD-DA id occurs.
 
 **XA playback sequence (CONFIRMED, all three calls verified at their call sites):**
 
@@ -3764,8 +3857,9 @@ Since +Y is down, a *larger* offset raises the camera.
 
 #### 9.12.11a The view angles are not the aim — `0x80038260`
 
-`entity+0xE6`/`+0xE8`/`+0xEA` are what the player is **aiming**. What the camera uses is those plus three
-independent decaying kicks, composed here and applied at `0x8004F40C`:
+`entity+0xE6`/`+0xE8`/`+0xEA` are what the player is **aiming**, and the world camera uses that plain aim.
+The **weapon** receives three independent decaying offsets, composed here and applied by its sole caller
+at `0x8004F40C`:
 
 | amplitude | deadline | period | axes |
 |---|---|---|---|
@@ -3783,11 +3877,15 @@ The shift comes **first**. Forming the fixed-point numerator and then dividing i
 identify the periods are `0x88888889 >> 4` (30), `0x1B4E81B5 >> 4` (150) and `0xB60B60B7 >> 6` (90); the last
 is `Q2_FALL_KICK_TIME`, which is how the fall kick was identified.
 
-The camera **negates** the composed pitch (`0x8004F41C`) and adds the yaw and roll as they stand.
+The weapon placement **negates** the composed pitch (`0x8004F41C`) and adds the yaw and roll as they stand.
 
-One quirk is real rather than a transcription slip: `client+0xD0` is *also* the pain-sound throttle, set to
-`now + 210` at `0x8003AF50` while the kick it gates decays over 150. So for the first 60 ticks after taking
-damage the hurt kick is scaled by **more than one**. One field, two jobs.
+`client+0xD0` is also the pain-sound throttle, set to `now + 210` at `0x8003AF50`, while the offset it gates
+decays over 150. A nonzero stored amplitude consequently scales by more than one for the first 60 ticks.
+However, executing the native damage routine and PlayerThink feedback block shows that they **preserve**
+`client+0x9C/+0x9E`; they do not assign an amplitude from damage or impact direction. Spawn's 224-byte
+client clear (`0x8003B2BC`) initializes both to zero. The port's guessed damage-times-eight assignment was
+removed. The reader remains for explicit/saved values, verified against 132 native instruction cases.
+The MOD-dependent impact shock at `0x8005859C` is a separate GameWindow effect.
 
 #### 9.12.11b `entity+0x10C` bit 12 is the fly cheat — `0x8003A41C`
 
@@ -4776,7 +4874,7 @@ one horizontal edge and one vertical edge, and the builder makes a whole border 
 
 **The body** is two `TILE` primitives, both exactly `(x, y, w, h)`, both **rgb (0,0,0)** with the
 semi-transparency bit set (`0x8003F1C8`), bracketed by two draw-mode packets carrying `0xE1000600` - abr
-**1**, which is `B/2 + F/2`. Black at half strength darkens; laying it down **twice** darkens to a quarter,
+**0**, which is `B/2 + F/2`. Black at half strength darkens; laying it down **twice** darkens to a quarter,
 which is why the panel reads as smoked glass rather than as a fill.
 
 **The frame** is eight `POLY_FT4`, code **0x2D** - the *raw* bit set so the texture is not modulated, the
@@ -5594,11 +5692,9 @@ subtract; arm the mod's effect timer.
 
 Two things it does **not** do, and both matter:
 
-* **It never kills.** There is no die or pain callback; health goes negative and the entity's own think
-  notices later.
-* **For a creature with an AI brain it does not even subtract health.** `0x800584B4` posts the amount to the
-  module through `0x800627F8` and jumps past the health store. The module owns the creature's health, which
-  is why the per-creature figures are behind open question #6.
+* The **player** arm stores health and leaves death handling to the player's think.
+* The **creature** arm calls `0x800627F8` (T_Damage) at `0x800584B4`. That callee subtracts health and
+  dispatches pain, death and enemy reactions; stopping the trace at this call formerly hid those effects.
 
 ### 13.4 Armour — `0x80057BE4`, table at `0x8009C5EC`
 
@@ -5621,6 +5717,13 @@ slightly stronger against small hits, which is not the sort of thing that would 
 absorbs `damage*2/3`, capped at twice the cells, and spends one cell per two points absorbed.
 
 **Mod 8 skips both stages** — the only damage class in the game that ignores armour outright.
+
+Both helpers test damage and held inventory for **zero**, not positivity. Their damage argument is a full
+signed word, including the remainder passed between stages. The power cap is the signed halfword of twice
+the cell count; ordinary armour sign-extends the low halfword of its shifted result before comparing with
+held armour. Negative absorption restores inventory through the native halfword stores. A bounded execution
+of the actual PAL routines supplies 130 numeric regression vectors in `tests/fixtures/combat_armour_reference.h`.
+This defines edge behaviour; the complete COMMON/ZONE script census finds nine FX damage copies, all positive.
 
 ### 13.5 Means of death — 1…21
 
@@ -6815,6 +6918,24 @@ the layout above from a consumer QMULTI.C never talks to: `+882` (player count),
 the kill matrix is write-only. Its own strings are the six scoreboard titles, the four team colours,
 `"%s TEAM SCORED %d"`, and `"ALL PLAYERS PRESS"` / `"FIRE TO CONTINUE"`.
 
+The runtime layout is reconstructed in `q2_mp_score_rows`: `+0x0E1C` gathers
+scores and `+0x0D64` stably sorts them descending. VERSUS sorts round wins;
+only mode 1 groups players by team. `+0x0F60` counts represented teams even
+when their total is zero, then sorts their `team_frags` totals. A team heading
+precedes its members, who retain their personal score order. The starting y is
+`(252 - 11 * rows) / 2`, where `rows` is the player count plus `1 + 2 * teams`
+in team mode. Rows advance by 15 pixels, with another 15 between teams.
+Player lines have 31 columns: READY starts at 2, the name at 12 and score at 26.
+Readiness pointers belong to player IDs rather than sorted positions.
+
+`+0x1714` places the title at (256,32) with size 32, red highlight, and the
+two size-16 prompts at (256,180) and (256,200). `+0x1890` draws `wipteam1.lbm`
+behind the menu: two 256x240 8bpp sprites from slots 4 and 6, palette `0x3FC0`,
+RGB modulation 64 and additive blending. Its non-black palette entries receive
+STP at `+0x3E9C`. The client now loads QMRESULT into one viewport, restores the
+shared `frontend.lbm` atlas from QDUMMY after clearing VRAM, and draws that art
+and those rows. It no longer keeps the split arena beneath the scoreboard.
+
 The readiness loop is `0x80101580`. It reads the player count from engine `+882`, calls the
 per-player fire-edge predicate through engine `+344` (`0x801015E0..0x801015EC`), and latches one byte
 per player at module `+0x5250`. A ready row gains the literal `READY` (`0x80101608..0x80101648`).
@@ -6822,7 +6943,8 @@ While any player is unready, module `+0x5254` is reset to **150** (`0x801016E8`)
 the frame's dt at engine `+0xD4` is subtracted; `bgez` at `0x801016CC` waits at zero too, and only a
 negative result writes request **18** through engine `+0x3AC` (`0x801016D8..0x801016E0`).
 `q2_mp_results_tick` carries this latch and strict deadline. The engine handles 18 at `0x800187D0`
-by calling `0x8007CCE0(2)`; the port's return to multiplayer setup is an explicit flow adapter.
+by calling `0x8007CCE0(2)`. QFRONT `+0x3214..+0x325C` reads this selector and
+calls `+0xCF68`, the MULTIPLAYER mode-menu builder; the client returns there too.
 
 Request **19** reloads the arena, so module-owned round state is fresh while engine-owned scores,
 limits and the kill matrix survive. `q2_mp_round_start` resets that transient state, and the client
@@ -6945,6 +7067,13 @@ at `0x800AEABC`, `0x30/0x30/0x30`; explosion model-entity spawn explicitly copie
 `0x800AEAC8`, `0x40/0x40/0x40`, to `+0x2AC`. This distinction is visible: using the item's 0x30 or leaving
 the field zero turns the otherwise correct explosion texture into a dark brown/black ball.
 
+Gameplay player spawning is a separate case: `0x8003B444..0x8003B470` copies
+`0x20/0x20/0x20` from `0x800AE88C` into both `+0x2B0` and `+0x2AC`. Creature
+spawning retains the allocator's `0x40` pair. Executed PAL/US spawn prefixes
+and all distinct creature-module initialization paths confirm these values
+under the recorded fixture conditions; see `actor_light_reference.h` and the
+functional audit. The item's `0x30` is not the creature/player lighting floor.
+
 **Retail explosions do cast a dynamic light.** The model entity's think calls the runtime-light appender
 with colour `0xC0/0x40/0x31`. Its outer radius is
 `clamp(51 * (320 - t), 0, 4096) * 1300 / 4096`, with inner radius three quarters of outer. This light is
@@ -7001,7 +7130,7 @@ typedef struct {            /* 8 bytes */
 the screen centre, and a negative value on the far side of it. Three of style 1's five ghosts are past the
 centre. The four styles are nested, so the only authored choice is how much of the flare a light shows.
 
-**Both element kinds are untextured and additive.** A disc is a fan of quads around a centre point —
+**Both element kinds are untextured and semi-transparent.** A disc is a fan of quads around a centre point —
 `POLY_G4` code `0x3A` for kind 1, bright at the centre corner and black at the three rim corners, and
 `POLY_F4` code `0x2A` for kind 2 — over a 12-gon and a 6-gon respectively (`0x80074E6C`, `0x80074C4C`). Kind
 1 then adds **eight `LINE_G2` spikes** (`0x80074FF4`), coloured at the centre and black at the tip, at 0°,
@@ -7038,10 +7167,12 @@ these numbers directly; C's `/` on `int32_t` truncates toward zero, which is pre
 trailing `- (n >> 31)` produces.
 
 **Nothing declares the blend; it is inherited.** None of the three packets carries a texture page, and an
-untextured semi-transparent primitive takes its mode from the GPU's *current* draw mode. The chain
-terminates in the world: the opaque path at `0x80068300` ORs `blendTable[2]` into the page's entry and
-writes it back (§4.6), `blendTable[2]` is 32, and 32 is ABR 1 — `B + F`. The flares link into the viewport
-slice's last bucket, after all of it, and come out additive.
+untextured semi-transparent primitive takes its mode from the GPU's *current* draw mode. The opaque world
+path commonly leaves ABR 1 (`B + F`), but intervening model packets and draw environments can change it.
+The compositor executes that state in final ordering-table order. The host explicitly establishes
+ABR 1 for its flare pass: otherwise BASE1 reaches it with `0x061f` (ABR 0), and the black rims
+half-blend the background into dark discs. This setup is a host correction, not an extra field
+claimed to exist in the original untextured packets.
 
 **Which lights can carry one, and the one that tries.** `AddDynamicLight` (`0x80075C34`, §17.5) takes the
 style and the size shift packed into its fourth argument and ORs them into `light+16` at bits 11–13 and
@@ -7085,7 +7216,7 @@ and it compares all 4096 entries of the executable's `{sin, cos}` table against 
 `tests/test_light.c` checks the arithmetic those claims feed: the attenuation curve and its two boundary
 cases, the 16-bit wrapping delta, the ranking, the colour matrix's transposition, `VectorNormal`, and `NCS`
 producing the colour that arithmetic implies. It also reads a drawn flare back out of the ordering table and
-measures its geometry — twelve *distinct* rim vertices, roundness at 320×240, every primitive additive, the
+measures its geometry — twelve *distinct* rim vertices, roundness at 320×240, inherited semitransparency, the
 arms at 4096/2500 and 4096/3500 of the rim, and each ghost's width following its own `size`. The vertex
 count is there for a reason: the n-gon generator's two cursors walk from opposite ends and write at +4 from
 each, so iteration *k* fills `out[k+1]` and `out[n+1-k]`. This port had `out[n-k]`, which silently drops a
@@ -7437,7 +7568,7 @@ the chunk pointer to `0x800651BC`, which splits it at a literal 864 bytes — no
 the halves at `gp+0x4614` and `gp+0x4610`:
 
 ```
-[0, 864)      216 faces, four u8 indices each, in the GPU's Z order
+[0, 864)      216 faces, four u8 indices each, in perimeter order
 [864, end)    (size - 864) / 8 vertices: s16 x, y, z, band
 ```
 
@@ -7484,17 +7615,10 @@ decoded mesh was actually drawn: BIGGUN's 216 quads over 218 vertices are a **sp
 the band sweeps its surface. It is a shimmer on a body — a glint, which is what the chunk has been called
 all along.
 
-Which means **nothing in this engine draws a weapon trail.** The blaster bolt's visible body is its own
-oriented hull — the 20 x 20 x 100 box at `0x8009DB1C` (§9.6) — and it leaves nothing behind it; a rocket is
-a model; the laser is a beam that exists only while it fires. A port that added trails would be adding
-something the console does not have.
-
-> **CORRECTION, for two weapons.** The glint is not a trail, but the blaster bolt's particles (`0x80048588`)
-> and the railgun's are: `AnyoneFireInstantRail` (`0x8004917C`) ends in three calls to the offsets spawner
-> `0x8003004C` (`0x800497B8`, `0x800497F8`, `0x80049964`) that lay a corkscrew of ramp-0 particles along
-> the shot, a ring 64 units out per 1024-unit segment turned by the shooter's matrix. `q2_fx_rail_trail`
-> in `src/game/effect.h` carries the whole construction, including the spawn loop that covers about half
-> of a long beam.
+Weapon trails are separate effects: the blaster's particles (`0x80048588`), the railgun's corkscrew
+(`0x8004917C`, ending in three calls to `0x8003004C`), and the BFG's timed beams (`0x80049CF0`).
+`q2_fx_rail_trail` carries the rail construction, including the spawn loop that covers about half of a
+long beam. The glint mesh is not used by any of them.
 
 ### 18.8.1 What turns a glint on — and it is not the engine
 
@@ -7548,18 +7672,73 @@ On this disc that recovers **6 bands, phase 4** from BIGGUN, and nothing from th
 The `and` form of the third instruction is the *test* site and must not read as a raise: the two differ by
 one function field, and taking either would light a glint on a map that only ever asks whether one is lit.
 
-The port therefore turns the glint on automatically wherever a script turns it on, with the script's own
-numbers rather than hardcoded ones — no interpreter, and no special case for BIGGUN.
+The scanner also recognizes the generator's table-address instruction sequences and bounds-checks the
+six angle triples, six lightning targets, eight UV pairs and spark origin. This is a reconstruction of
+BIGGUN's known script, not an interpreter for arbitrary `LevelBin` code. An unrecognized angle table
+leaves the automatic driver off. `q2psx-inspect effects` checks and prints the decoded bindings.
 
-**What still needs the script to run** is only *which entity* wears it. The search loop at chunk `+0x1868`
-walks 48 records of 768 bytes and takes the one whose `+0xD2` is 46 and whose `+0xDA` is 20 — a kind tag and
-a sub-id, both written by the spawner (`0x8007D700` stores 47 into `+0xD2` for a different kind). The rule
-is recorded so the lookup becomes exact the moment the port's entity records carry those two fields; until
-then the caller supplies the position and the effect system does not guess one.
+**The owner is item 20, `Blackhole P`, in zone 1.** The search at chunk `+0x1868` walks 48 records of
+768 bytes and takes kind `+0xD2 == 46`, sub-id `+0xDA == 20`. Those fields are now represented by
+`q2_entity.kind` and `place_id`. Its model is in the zone's `CastList`, so item lookup and drawing try
+that bank after COMMON. A missing owner does not substitute the camera.
 
-`q2psx-inspect effects` scans BIGGUN's `LevelBin` for both instruction pairs, prints what the port reads
-back out of it, and fails if either the sites or the immediates go missing — so every claim here is about
-this disc rather than about a memory of it.
+`q2_sim_glint_tick` reconstructs the owner's bob, alternating turns and pauses, and band refresh from
+`+0x131C..+0x1F80`. The module's private RNG starts at zero; turn draws precede the per-band angle jitter
+and RGB draws. Each refresh restores phase 4. The owner's `Activate` animation and full Euler transform
+feed the normal model draw, and each glint is composed with that same matrix at scale **768/256 = 3**.
+The helper at `0x80055AF8` divides the matrix products by 256 toward zero; its scale arguments are
+8-bit fixed point, unlike the 12-bit rotation matrix. Treating the scale as 768/4096 shrank the arcs and
+their lightning attachment radius by sixteen. The attachment helper at `0x800650D0` calls the same
+scaler, so the local `(0,0,512)` tip lies 1536 world units from an unrotated owner.
+
+The phase is consumed after drawing, as at `0x80064D38` / `0x80064DEC`, including wholly black bands.
+The port advances it once after all viewports have drawn the same phase. Logic ticks only refresh the
+bands; advancing before that refresh had kept every rendered band at phase 4.
+
+The renderer projects the first 96 mesh vertices and visits at most 79 faces per band, including faces
+skipped for being black. It converts perimeter indices to GPU Z order only at emission. NCLIP on indices
+0, 1 and 3 determines whether a face is prepended or appended to the **owner's existing model batch**;
+putting every face in a separate area bucket loses the console's body/glint ordering.
+
+### 18.8.3 Generator lightning and shutdown
+
+BIGGUN's renderer at `LevelBin+0x38C..+0x11F0` draws six textured lightning ribbons. Their starts are the
+transformed `(0,0,512)` of each scaled band matrix; their endpoints come from the table at `+0x35C4`.
+Each ribbon is split into segments of at most 256 world units, sharing a 32-quad pool. The eight wrapping
+noise accumulators move interior joints while both endpoints stay fixed. They advance once per rendered
+frame, shared by all viewports. Quads use RGB 128, additive semitransparency, CLUT 77 and texture page slot
+12. The literal page word is `0x083D`: `+0x44C` passes X=832 as both coordinates to `GetTPage(0,1,832,832)`.
+Bit 11 survives in GPU state while retail 1 MiB VRAM wraps the texture address to Y=256.
+
+Projected half-width is `(256 << 6) / SZ`, perpendicular to the screen-space segment. Its normalization
+uses `0x80055CBC` (the SDK square-root seed followed by two integer Newton corrections), which can round
+up; substituting a floor square root changes short segments.
+
+The texture is **`Squiggle.lbm`, 4-bit, at slot 12 / V 159**. It is a standalone image and must be
+uploaded after the zone VRAM image; otherwise valid lightning polygons sample empty VRAM. The eight
+UV pairs at `+0x358C` advance once per two rendered frames. The last segment shortens U proportionally.
+
+The real, key-gated `Destroy Grav` mission callback (`+0x12B0`) starts the 3600-tick power countdown and
+posts the evacuation objective. When the owner's next turn expires at zero power, its `Death` move
+starts. The 1600-tick break-up clock reveals `Crack1` through `Crack22` at the authored thresholds.
+The last 200 ticks of the 1390-tick death fade stop the glint and lightning, trigger `DestroyGlass`, emit
+one white strength-10/mode-2 screen flash, and enable `GravTeleport`. The owner is then removed.
+Power-source sparks use the decoded origin at `+0x360C` and stop when their scene node is destroyed.
+
+The sequence state survives same-map zone changes. Re-entering before the burst keeps the teleporter
+disabled; returning after completion does not respawn the generator or repeat the flash. After removal,
+the module's 300-tick countdown attempts 5 points of acid damage against living entity kinds below 38
+and kind 47. It pauses outside BIGGUN zone 1 and while player zero has flag `0x4000`. Each expiry adds
+300 once, preserving overshoot. The normal damage path handles armour, protection and the player's
+400-tick acid throttle, including burn sound and HUD feedback.
+
+**The broad generator arcs are the glint mesh.** The supplied
+[original-game recording at 1:49:33–1:49:43](https://www.youtube.com/watch?v=K1DMSXbWRiQ&t=6573s)
+shows broad white/purple arcs as well as lightning. Correcting the 16-fold scale error above restores
+those arcs around the core, with narrow cyan ribbons joining their tips to the room. Their changing
+colours come from the module's randomized band RGB, not the lightning's CLUT. PAL and NTSC use the same
+module and assets. Engine captures verify the restored geometry and animation; their camera and RNG
+phase are not synchronized to the recording, so this is not a pixel-for-pixel comparison.
 
 ### 18.9 What is checked
 
@@ -7573,6 +7752,27 @@ and eight bursts, the hull closes and does not drift along the beam, and every d
 
 `tests/test_effect` covers the same ground without a disc, using a synthetic ramp whose entries are their own
 index so the *lookup* is visible in the assertion rather than hidden behind a gradient.
+
+It also checks glint scale, camera transforms, face limits and owner-batch ordering, lightning UV timing and width,
+fixed endpoints, pool limits, clipping, and the laser cell-to-area mapping. `tests/test_client_effects`
+exercises the real client callers for damage, armour absorption and all four power-up tints, including
+split-screen isolation and damage precedence. Its optional disc run is:
+
+```text
+test_client_effects --headless DISC OUTPUT_DIR
+```
+
+That run uses fixed 1/30-second steps and writes engine framebuffer captures. It drives BIGGUN's real
+key-gated shutdown, checks crack visibility, the single white flash, evacuation damage and zone re-entry,
+verifies rendered phase consumption including black bands and split viewports, and captures damage,
+quad and underwater effects. The underwater fixture publishes the player flag written by the volume
+dispatcher, then verifies distortion ramps to 4096 and back to zero. `q2psx-inspect screen DISC` separately
+checks the disc's screen layouts, flash modes, distortion phases, strip pools and camera shake constants.
+`tests/test_raster` verifies all four inherited ABR modes, mode changes from clipped opaque polygons,
+sprite page inheritance, E1 replacement, high page bits, and per-texel STP for 4/8/16-bit textures.
+The screen compositor keeps one GPU mode across viewports and buffers. Default draw environments write
+`0x060A`; textured polygons update bits 0–8 and 11; untextured flash, water, flare and glint packets inherit
+the current ABR. HUD sprites and panels retain their preceding explicit DR_TPAGE setup.
 
 ---
 
@@ -7831,12 +8031,13 @@ numbers so that nothing downstream needs renumbering.
 
 ### Behavioural / audio-visual polish
 
-13. **Which in-game situation selects which music id.** The id lives in a `$gp` global; the writer was not
-    traced. The per-map id is probably in the level `.DAT` chunks. Without it, music is silent or arbitrary.
-14. **Whether the engine loops XA tracks.** The duration field is converted to 50 Hz ticks and stored to two
-    globals with a 30.0 s fallback — that looks exactly like a countdown to a restart or fade — but the code
-    consuming those globals was not disassembled. The one entry that is 1.0 s *short* of its measured length
-    hints the value is a deliberate restart point, not a pure length.
+13. **RESOLVED — music-id selection.** The level table's playlist at `+0x22` supplies the id;
+    `CdCheckMusic` writes it at `0x80071AB8`. Native PAL/US execution covers every named
+    playlist. See §9.8 and the audio audit.
+14. **RESOLVED — XA countdown and looping.** Authored tenths become 50 Hz PAL or 60 Hz US
+    fields, with 64-field fades and a 30-second missing-file fallback. Expiration advances
+    the playlist; negative bytes loop explicitly and zero stops. QUAKE_C channel 3's
+    extra second is cut off by its authored timer.
 15. **MDEC output depth (24-bit vs 15-bit) for the movies.** Now harder to settle from the EXE, because the
     movie player is **not in the main executable** at all (see #16).
 16. **Locate the movie player overlay.** The executable contains no `.STX` / `MOVIES` / `STX` string
@@ -7869,7 +8070,10 @@ numbers so that nothing downstream needs renumbering.
 23. ~~`CollNode` fields `c` and `d`.~~ **RESOLVED:** `d`'s low byte is contents;
     `c` is two hull-specific halfwords — PrimaryColl `+28` is the SortData byte offset and SecondaryCol
     `+30` is the first SpaceLights index (§3.4, §3.11).
-24. `Resources` `unk0` (−3000…6600) and `unk4` (40…180); `unk3` (64, occasionally 80).
+24. `Resources` field meanings are now decoded in §2.1: packet allocation control,
+    subdivision mesh count and particle group count. The native heap-dependent
+    flat-packet allocation policy remains an implementation gap, not an unknown
+    field meaning.
 25. `TrigBounds` trigger `id` (9…75 plus 255) and `flags` (14 distinct values) value semantics.
 26. The five `Lights` style values (`(n<<3)|7`, n = 0…4) — what each style *does*.
 27. Pickup `flags` bits beyond 0, 1 and 8; and the meaning of the pickup `extra` list (a consumer exists — a

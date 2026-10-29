@@ -119,6 +119,85 @@ static void test_divide(void)
 /* ------------------------------------------------------------------------- */
 /* Saturation                                                                 */
 /* ------------------------------------------------------------------------- */
+static void test_accumulator_boundaries(void)
+{
+    gte_state g;
+    gte_init(&g);
+    g.v[0].z = -10;
+    gte_rtps(&g, false);
+    check_eq_i(g.ir[2], -10, "RTPS lm=0 retains negative IR3");
+    check_eq_i(g.sz[3], 0, "negative IR3 still clamps SZ3 to zero");
+
+    gte_init(&g);
+    g.tr.x = 0x7FFFFFFF;
+    g.v[0].x = 1; g.v[0].y = 1; g.v[0].z = 1000;
+    g.rot.m[0][1] = -4096;
+    gte_rtps(&g, false);
+    check_eq_i(g.mac[0], 0x7FFFFFFF, "cancelled 44-bit overflows preserve final MAC");
+    check((g.flag & (GTE_FLAG_MAC1_POS | GTE_FLAG_MAC1_NEG)) ==
+                    (GTE_FLAG_MAC1_POS | GTE_FLAG_MAC1_NEG),
+          "RTPS flags intermediate positive and negative 44-bit wraps before shifting");
+    gte_mvmva(&g, 1, 0, 0, 0, 0);
+    check((g.flag & (GTE_FLAG_MAC1_POS | GTE_FLAG_MAC1_NEG)) ==
+                    (GTE_FLAG_MAC1_POS | GTE_FLAG_MAC1_NEG),
+          "MVMVA observes the same intermediate accumulator wraps");
+
+    gte_init(&g);
+    g.v[0].z = 1; g.dqa = 32767; g.dqb = 0x7FFFFFFF;
+    gte_rtps(&g, true);
+    check((g.flag & GTE_FLAG_MAC0_POS) != 0, "depth cue multiply-add flags MAC0 overflow");
+    check_eq_i(g.ir0, 4096, "depth cue clamps from the wide intermediate");
+
+    gte_init(&g);
+    check_eq_i(gte_divide(&g, 58243, 29122), 0x1FFFF,
+               "UNR can round a valid quotient up to its saturation limit");
+    check(!(g.flag & GTE_FLAG_DIV_OVERFLOW),
+          "UNR rounding saturation is not a divide overflow");
+}
+
+static void test_depth_cue_precision(void)
+{
+    gte_state g;
+    gte_init(&g);
+    g.bk.x = g.bk.y = g.bk.z = 8193;
+    g.rgbc.r = g.rgbc.g = g.rgbc.b = 1;
+    g.rgbc.c = 0x3C;
+    g.ir0 = 2048;
+    gte_ncds(&g);
+    check_eq_i(g.mac[0], 15, "NCDS retains modulation fractions until depth cue completes");
+    check_eq_i(g.rgb_fifo[2].r, 0, "depth cue precision reaches the colour FIFO");
+    check_eq_i(g.rgb_fifo[2].c, 0x3C, "depth cue preserves the packet code");
+    gte_cdp(&g);
+    check_eq_i(g.mac[1], 15, "CDP shares the full precision modulation/depth cue path");
+    gte_ncdt(&g);
+    check_eq_i(g.rgb_fifo[0].b + g.rgb_fifo[1].b + g.rgb_fifo[2].b, 0,
+               "NCDT applies that arithmetic independently to all three vertices");
+}
+
+static void test_mvmva_selectors(void)
+{
+    gte_state g;
+    gte_init(&g);
+    g.rgbc.r = 2; g.ir0 = 5;
+    g.rot.m[0][2] = 7; g.rot.m[1][1] = -11;
+    g.v[0].x = 3; g.v[0].y = 4; g.v[0].z = 5;
+    gte_mvmva(&g, 0, 3, 0, 3, 0);
+    check_eq_i(g.mac[0], 57, "reserved matrix row 1 uses RGBC red and IR0");
+    check_eq_i(g.mac[1], 84, "reserved matrix row 2 repeats RT13");
+    check_eq_i(g.mac[2], -132, "reserved matrix row 3 repeats RT22");
+
+    gte_init(&g);
+    g.rot.m[0][1] = 2048; g.rot.m[0][2] = -1024;
+    g.v[0].x = 7; g.v[0].y = 8; g.v[0].z = 12;
+    g.fc.x = 40000;
+    gte_mvmva(&g, 1, 0, 0, 2, 0);
+    check_eq_i(g.mac[0], 1, "FC MVMVA discards FC and the first column");
+    check_eq_i(g.ir[0], 1, "FC MVMVA retains only columns two and three");
+    check_eq_i(g.mac[1], 8, "FC MVMVA second row");
+    check_eq_i(g.mac[2], 12, "FC MVMVA third row");
+    check(g.flag & GTE_FLAG_IR1_SAT, "discarded FC term still raises saturation");
+}
+
 static void test_saturation(void)
 {
     gte_state g;
@@ -664,29 +743,18 @@ static void test_ordering_table(void)
     psx_ot_free(&ot);
 }
 
-/* ------------------------------------------------------------------------- */
-/* Placeholder for hardware-captured vectors                                  */
-/* ------------------------------------------------------------------------- */
-static void test_known_vectors(void)
-{
-    printf("hardware-captured vectors\n");
-    printf("  SKIPPED - no capture available.\n");
-    printf("  This is the only test that can prove bit-exactness. Until it\n");
-    printf("  exists, treat the fidelity claim as 'built to be exact', not\n");
-    printf("  'measured to be exact'.\n");
-}
-
-/* ------------------------------------------------------------------------- */
 int main(void)
 {
     printf("Q2PSX-PC fidelity conformance tests\n\n");
 
     test_divide();
     test_saturation();
+    test_accumulator_boundaries();
+    test_depth_cue_precision();
+    test_mvmva_selectors();
     test_vertex_snapping();
     test_trig();
     test_ordering_table();
-    test_known_vectors();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     printf("%s\n", g_failures == 0 ? "PASS" : "FAIL");

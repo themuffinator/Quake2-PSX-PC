@@ -41,7 +41,9 @@
 #define TAG_EVNT TAG('E', 'V', 'N', 'T')   /* script flags                    */
 #define TAG_EVIT TAG('E', 'V', 'I', 'T')   /* script item latches (v6)        */
 #define TAG_EOBJ TAG('E', 'O', 'B', 'J')   /* permanent object changes        */
+#define TAG_NMIS TAG('N', 'M', 'I', 'S')   /* native unit mission callbacks   */
 #define TAG_EVHS TAG('E', 'V', 'H', 'S')   /* previously visited maps        */
+#define TAG_ZPOP TAG('Z', 'P', 'O', 'P')   /* visited-zone population state  */
 #define TAG_TRIG TAG('T', 'R', 'I', 'G')   /* trigger residency               */
 #define TAG_ENTS TAG('E', 'N', 'T', 'S')   /* per-entity mutable state        */
 #define TAG_ITEM TAG('I', 'T', 'E', 'M')   /* group order and stable item keys */
@@ -55,6 +57,7 @@
 #define TAG_ROTR TAG('R', 'O', 'T', 'R')   /* rotating brush motion */
 #define TAG_CAIS TAG('C', 'A', 'I', 'S')   /* creature behavior */
 #define TAG_SKIL TAG('S', 'K', 'I', 'L')   /* difficulty before roster build */
+#define TAG_UNLK TAG('U', 'N', 'L', 'K')   /* unlocked game-variable tier */
 #define TAG_RAND TAG('R', 'A', 'N', 'D')   /* shared gameplay random state */
 #define TAG_VWPN TAG('V', 'W', 'P', 'N')   /* live weapon animation */
 #define TAG_ERTS TAG('E', 'R', 'T', 'S')   /* resident script scheduler */
@@ -63,7 +66,7 @@
 
 #define SAVE_FILE_HEADER 16                /* magic, version, size, crc       */
 #define SETTINGS_MAGIC "Q2CF"
-#define SETTINGS_VERSION 1u
+#define SETTINGS_VERSION 2u
 
 /* A corrupt count must not become a gigabyte allocation. These are far above
  * anything a real map produces and far below anything that hurts. */
@@ -82,6 +85,7 @@ typedef struct save_ai_monster {
     char move_module[13];
     u32 move_offset;
     u8 has_move, thinking;
+    q2_cre_shared_state shared;
 } save_ai_monster;
 
 struct q2_save_ai {
@@ -91,6 +95,10 @@ struct q2_save_ai {
     q2_level level;
     s32 level_refs[4];
     q2_trail_state trail;
+    bool spawn_pending_present;
+    bool script_state_present;
+    bool shared_state_present;
+    bool motion_present;
 };
 
 /* One field list keeps capture, portable encoding and apply in agreement. */
@@ -364,6 +372,7 @@ void q2_save_free(q2_save *s)
     free(s->event_item_flags);
     free(s->event_object_flags);
     q2_event_store_free(&s->event_history);
+    q2_zone_history_free(&s->zone_history);
     free(s->trigger_inside);
     free(s->entities);
     free(s->item_group_order);
@@ -750,10 +759,9 @@ q2_result q2_save_capture(q2_save *out, const q2_sim *sim,
             d->pos[1]     = e->pos[1];
             d->pos[2]     = e->pos[2];
 
-            /* These are transient presentation, as the save contract states.
-             * Their callbacks/models are not Population places and cannot be
-             * rebuilt by index. Keeping them live made a mid-explosion save
-             * fail to load. Keep the slot empty so later item keys still map. */
+            /* Legacy ENTS has no transient model/physics payload. Keep its
+             * slot empty so old readers and standalone snapshots stay safe.
+             * The client's ZPOP v2 restores the full object into this slot. */
             if (e->kind == Q2_ENT_KIND_MODEL || e->think == q2_gib_think)
                 d->in_use = 0;
         }
@@ -976,15 +984,18 @@ static q2_result rebuild_saved_item_roster(const q2_save *s, q2_sim *sim)
             if (j == stage.entities.count)
                 goto rebuilt_done;
         } else if (s->entities[i].in_use) {
-            /* Non-Population entities retain the legacy by-index rule. They
-             * are not part of CREBATCH reconstruction, but rejecting a changed
-             * slot is safer than attaching their state to an item. */
-            if (i >= stage.entities.count || used[i] ||
+            const q2_zone_object *o = q2_zone_saved_entity(&s->zone_history, s->map, s->zone, i);
+            if (o && o->kind == Q2_ZONE_DYNAMIC) {
+                rebuilt.ent[i] = o->runtime->entity.state;
+            } else {
+                /* Older files can only restore a matching load-time object. */
+                if (i >= stage.entities.count || used[i] ||
                 !stage.entities.ent[i].in_use ||
                 stage.entities.ent[i].population_group >= 0)
-                goto rebuilt_done;
-            rebuilt.ent[i] = stage.entities.ent[i];
-            used[i] = 1;
+                    goto rebuilt_done;
+                rebuilt.ent[i] = stage.entities.ent[i];
+                used[i] = 1;
+            }
         }
 
         if (s->entities[i].in_use &&
@@ -1315,6 +1326,11 @@ q2_result q2_save_apply(const q2_save *s, q2_sim *sim, q2_inventory *inv,
             e->origin[1] = e->pos[1] + Q2_EYE_BASE - e->model_offset;
             e->origin[2] = e->pos[2];
             q2_entity_set_bounds(e, Q2_ITEM_TOUCH_HALF);
+            {
+                const q2_zone_object *o = q2_zone_saved_entity(&s->zone_history, s->map, s->zone, i);
+                /* The client supplies the zone bank in its final apply pass. */
+                if (o) q2_zone_apply_entity(o, sim, i, NULL);
+            }
         }
     }
 
@@ -1575,6 +1591,13 @@ static void write_player(wbuf *w, const q2_save *s)
 
     write_move_ent(w, &p->ent);
 
+    /* Optional player tail: old saves end after the mover. */
+    w_u32(w, 1);
+    w_s16v(w, p->aim_direction, 3);
+    w_s16(w, p->aim_pitch); w_s16(w, p->aim_assist);
+    w_s32v(w, p->aim_eye, 3); w_s32(w, p->aim_node);
+    w_bool(w, p->aim_ready); w_bool(w, p->aim_view_valid);
+
     w_chunk_end(w, at);
 }
 
@@ -1621,6 +1644,13 @@ static void read_player(rbuf *r, q2_save *s)
     p->water_voice = r_bool(r);
 
     read_move_ent(r, &p->ent);
+    if (r->at < r->len) {
+        if (r->len - r->at != 32 || r_u32(r) != 1) { r->bad = true; return; }
+        r_s16v(r, p->aim_direction, 3);
+        p->aim_pitch = r_s16(r); p->aim_assist = r_s16(r);
+        r_s32v(r, p->aim_eye, 3); p->aim_node = r_s32(r);
+        p->aim_ready = r_bool(r); p->aim_view_valid = r_bool(r);
+    }
 }
 
 static void write_sim(wbuf *w, const q2_save *s)
@@ -2371,6 +2401,11 @@ static bool read_rotators(rbuf *r, q2_save *s)
 
 static void copy_ai_state(q2_monster *d, const q2_monster *m)
 {
+    d->motion = m->motion;
+    d->spawn_pending = m->spawn_pending;
+    d->render_scale = m->render_scale;
+    d->script_pain_used = m->script_pain_used;
+    d->spawn_initialized = m->spawn_initialized;
 #define COPY_SCALAR(t, f) d->f = m->f;
 #define COPY_ARRAY(t, f, n) memcpy(d->f, m->f, sizeof(d->f));
     AI_SCALARS(COPY_SCALAR)
@@ -2393,6 +2428,8 @@ static void write_ai_state(wbuf *w, const q2_monster *m)
 static void read_ai_state(rbuf *r, q2_monster *m)
 {
     u32 k;
+    m->render_scale = Q2_ONE_12; /* pre-script-state saves */
+    m->spawn_initialized = true; /* older loads eagerly ran export 0 */
 #define READ_SCALAR(t, f) m->f = r_##t(r);
 #define READ_ARRAY(t, f, n) for (k = 0; k < n; k++) m->f[k] = r_##t(r);
     AI_SCALARS(READ_SCALAR)
@@ -2420,11 +2457,11 @@ static bool valid_ai_ref(s32 ref, u32 count, u32 corners)
     return ref >= 0 ? (u32)ref < count : -(s64)ref - 3 < (s64)corners;
 }
 
-static q2_monster *resolve_ai_ref(q2_creature_world *w, s32 ref)
+static q2_monster *resolve_ai_ref(q2_creature_world *w, const u32 *map, s32 ref)
 {
     if (ref == -1) return NULL;
     if (ref == -2) return &w->sight;
-    if (ref >= 0) return &w->set.monsters[ref];
+    if (ref >= 0) return &w->set.monsters[map[ref]];
     return &w->corner[-(s64)ref - 3];
 }
 
@@ -2466,6 +2503,10 @@ q2_result q2_save_capture_ai(q2_save *s, const q2_creature_world *w, u32 phase_u
     a = calloc(1, sizeof(*a));
     if (!a) return Q2_ERR_NO_MEMORY;
     a->count = w->set.count; a->corner_count = w->corner_count;
+    a->spawn_pending_present = true;
+    a->script_state_present = true;
+    a->shared_state_present = true;
+    a->motion_present = true;
     a->phase_us = phase_us;
     a->monsters = a->count ? calloc(a->count, sizeof(*a->monsters)) : NULL;
     if (a->count && !a->monsters) { free_ai(a); return Q2_ERR_NO_MEMORY; }
@@ -2482,13 +2523,14 @@ q2_result q2_save_capture_ai(q2_save *s, const q2_creature_world *w, u32 phase_u
         const q2_monster *m = &w->set.monsters[i];
         save_ai_monster *d = &a->monsters[i];
         copy_ai_state(&d->state, m);
+        q2_cre_shared_capture(&d->shared, m->cre_bind);
         if (!ai_ref(w, m->enemy, &d->refs[0]) ||
             !ai_ref(w, m->oldenemy, &d->refs[1]) ||
             !ai_ref(w, m->goalentity, &d->refs[2]) ||
             !ai_ref(w, m->movetarget, &d->refs[3]) ||
             !ai_ref(w, m->owner, &d->refs[4])) goto bad;
-        if (m->think && m->think != q2_M_MoveFrame) goto bad;
-        d->thinking = m->think != NULL;
+        d->thinking = q2_cre_think_id(m);
+        if (!q2_cre_think_valid(m, d->thinking)) goto bad;
         if (!m->currentmove) continue;
         for (j = 0; j < w->mod_count && !d->has_move; j++) {
             const q2_creature_module *mod = &w->mod[j];
@@ -2513,37 +2555,67 @@ bad:
 q2_result q2_save_apply_ai(const q2_save *s, q2_creature_world *w, u32 *phase_us)
 {
     const struct q2_save_ai *a;
-    u32 i, j;
+    u32 i, j, k, added = 0, *map;
     if (!s || !w) return Q2_ERR_INVALID_ARG;
     if (!s->ai) return Q2_OK;
     a = s->ai;
-    if (a->count != w->set.count || a->corner_count != w->corner_count ||
-        (a->count && (!w->set.monsters || !a->monsters)) ||
+    if (a->count > w->set.count ||
+        (a->shared_state_present && a->count != w->set.count) ||
+        a->corner_count != w->corner_count ||
+        (w->set.count && !w->set.monsters) || (a->count && !a->monsters) ||
         (a->corner_count && !w->corner) || a->trail.head >= Q2_TRAIL_LENGTH)
         return Q2_ERR_BAD_FORMAT;
+    map = a->count ? malloc(a->count * sizeof(*map)) : NULL;
+    if (a->count && !map) return Q2_ERR_NO_MEMORY;
+    /* CAIS 1..3 predate Jorg/Rider/Medic support. Their roster omits those
+     * actors and the reserved Rider child, so all later indices can shift.
+     * Match the preserved authored order and remap EVERY saved reference.
+     * No other roster change is accepted, and v4 keeps exact validation. */
+    for (i = k = 0; k < w->set.count; k++) {
+        const q2_monster *m = &w->set.monsters[k];
+        if (i < a->count && m->group == a->monsters[i].state.group &&
+            m->pop_class_id == a->monsters[i].state.pop_class_id) {
+            map[i++] = k;
+        } else if (!a->shared_state_present && a->count < w->set.count &&
+                   m->pop_class_id >= 13 && m->pop_class_id <= 15) {
+            if (m->spawn_initialized && !(m->aiflags & Q2_AI_GOOD_GUY)) added++;
+        } else goto bad;
+    }
+    if (i != a->count) goto bad;
     for (i = 0; i < 4; i++)
         if (!valid_ai_ref(a->level_refs[i], a->count, a->corner_count))
-            return Q2_ERR_BAD_FORMAT;
+            goto bad;
     for (i = 0; i < a->count; i++) {
         const save_ai_monster *d = &a->monsters[i];
-        const q2_monster *m = &w->set.monsters[i];
+        const q2_monster *m = &w->set.monsters[map[i]];
         if (m->pop_class_id != d->state.pop_class_id || m->group != d->state.group ||
-            (d->has_move && !resolve_ai_move(w, d))) return Q2_ERR_BAD_FORMAT;
+            (d->has_move && !resolve_ai_move(w, d)) ||
+            !q2_cre_think_valid(m, d->thinking)) goto bad;
         for (j = 0; j < 5; j++)
             if (!valid_ai_ref(d->refs[j], a->count, a->corner_count))
-                return Q2_ERR_BAD_FORMAT;
+                goto bad;
     }
     for (i = 0; i < a->count; i++) {
         const save_ai_monster *d = &a->monsters[i];
-        q2_monster *m = &w->set.monsters[i];
+        q2_monster *m = &w->set.monsters[map[i]];
+        bool was_pending = m->spawn_pending;
+        if (m->cre_bind) q2_creature_prepare(m->cre_bind, m, w->class_variant[m->pop_class_id]);
         copy_ai_state(m, &d->state);
+        m->resume_pending = false;
+        q2_cre_shared_restore(m->cre_bind, &d->shared);
+        /* Version 1 has no explicit dormant-state bit. Keep only resident
+         * records which the fresh load held and the save never started. */
+        if (!a->spawn_pending_present)
+            m->spawn_pending = was_pending && !m->in_use && !m->dead &&
+                               !d->thinking;
+        m->population_active = !m->spawn_pending && (m->in_use || m->dead);
         m->currentmove = d->has_move ? resolve_ai_move(w, d) : NULL;
-        m->think = d->thinking ? q2_M_MoveFrame : NULL;
-        m->enemy = resolve_ai_ref(w, d->refs[0]);
-        m->oldenemy = resolve_ai_ref(w, d->refs[1]);
-        m->goalentity = resolve_ai_ref(w, d->refs[2]);
-        m->movetarget = resolve_ai_ref(w, d->refs[3]);
-        m->owner = resolve_ai_ref(w, d->refs[4]);
+        q2_cre_restore_think(m, d->thinking);
+        m->enemy = resolve_ai_ref(w, map, d->refs[0]);
+        m->oldenemy = resolve_ai_ref(w, map, d->refs[1]);
+        m->goalentity = resolve_ai_ref(w, map, d->refs[2]);
+        m->movetarget = resolve_ai_ref(w, map, d->refs[3]);
+        m->owner = resolve_ai_ref(w, map, d->refs[4]);
         if (m->corpse) {
             m->stand = m->idle = m->search = m->walk = m->run = NULL;
             m->attack = m->melee = NULL;
@@ -2553,13 +2625,205 @@ q2_result q2_save_apply_ai(const q2_save *s, q2_creature_world *w, u32 *phase_us
     }
     copy_ai_state(&w->sight, &a->sight);
     q2_level_state = a->level;
-    q2_level_state.sight_client = resolve_ai_ref(w, a->level_refs[0]);
-    q2_level_state.sight_entity = resolve_ai_ref(w, a->level_refs[1]);
-    q2_level_state.sound_entity = resolve_ai_ref(w, a->level_refs[2]);
-    q2_level_state.sound2_entity = resolve_ai_ref(w, a->level_refs[3]);
+    if (!a->motion_present) {
+        for (i = 0; i < a->count; i++) {
+            q2_monster *m = &w->set.monsters[map[i]];
+            if (!m->in_use) continue;
+            q2_cre_motion_init(m);
+            m->motion.phase = (u8)(((a->phase_us * 300u + 500000u) / 1000000u) % 30u);
+        }
+    }
+    q2_level_state.total_monsters += (s32)added;
+    q2_level_state.sight_client = resolve_ai_ref(w, map, a->level_refs[0]);
+    q2_level_state.sight_entity = resolve_ai_ref(w, map, a->level_refs[1]);
+    q2_level_state.sound_entity = resolve_ai_ref(w, map, a->level_refs[2]);
+    q2_level_state.sound2_entity = resolve_ai_ref(w, map, a->level_refs[3]);
     q2_trail_restore(&a->trail);
     if (phase_us) *phase_us = a->phase_us;
+    free(map);
     return Q2_OK;
+bad:
+    free(map);
+    return Q2_ERR_BAD_FORMAT;
+}
+
+q2_zone_ref q2_zone_ref_capture(const q2_creature_world *w, const q2_monster *m)
+{
+    q2_zone_ref r = {0};
+    u32 i;
+    if (!m || !w) return r;
+    if (m == &w->sight) { r.kind = Q2_ZREF_PLAYER; return r; }
+    for (i = 0; i < w->set.count; i++) if (m == &w->set.monsters[i]) {
+        r.kind = Q2_ZREF_CREATURE; r.group = m->group;
+        r.slot = m->population_slot; r.id = m->pop_class_id;
+        return r;
+    }
+    for (i = 0; i < w->corner_count; i++) if (m == &w->corner[i]) {
+        r.kind = Q2_ZREF_CORNER; r.slot = i; r.id = (u16)m->targetname;
+        return r;
+    }
+    r.kind = UINT32_MAX; /* Refuse an unowned pointer rather than save it. */
+    return r;
+}
+
+q2_monster *q2_zone_ref_resolve(q2_creature_world *w, q2_zone_ref r)
+{
+    u32 i;
+    if (!w) return NULL;
+    if (r.kind == Q2_ZREF_PLAYER) return &w->sight;
+    if (r.kind == Q2_ZREF_CORNER) {
+        if (r.slot < w->corner_count && (u16)w->corner[r.slot].targetname == r.id)
+            return &w->corner[r.slot];
+        for (i = 0; i < w->corner_count; i++)
+            if ((u16)w->corner[i].targetname == r.id) return &w->corner[i];
+        return NULL;
+    }
+    if (r.kind == Q2_ZREF_CREATURE)
+        for (i = 0; i < w->set.count; i++) {
+            q2_monster *m = &w->set.monsters[i];
+            if (m->group == r.group && m->population_slot == r.slot &&
+                m->pop_class_id == r.id) return m;
+        }
+    return NULL;
+}
+
+bool q2_zone_capture_monster(q2_zone_runtime *r, const q2_creature_world *w,
+                              const q2_monster *m)
+{
+    u32 j, k;
+    memset(&r->creature, 0, sizeof(r->creature));
+    copy_ai_state(&r->creature.state, m);
+    q2_cre_shared_capture(&r->creature.shared, m->cre_bind);
+    r->creature.refs[0] = q2_zone_ref_capture(w, m->enemy);
+    r->creature.refs[1] = q2_zone_ref_capture(w, m->oldenemy);
+    r->creature.refs[2] = q2_zone_ref_capture(w, m->goalentity);
+    r->creature.refs[3] = q2_zone_ref_capture(w, m->movetarget);
+    r->creature.refs[4] = q2_zone_ref_capture(w, m->owner);
+    for (j = 0; j < 5; j++) if (r->creature.refs[j].kind > Q2_ZREF_CORNER) return false;
+    r->creature.thinking = q2_cre_think_id(m);
+    if (!q2_cre_think_valid(m, r->creature.thinking)) return false;
+    if (!m->currentmove) return true;
+    for (j = 0; j < w->mod_count; j++) {
+        const q2_creature_module *mod = &w->mod[j];
+        for (k = 0; k < mod->bind.move_count && k < mod->cre.move_count; k++) {
+            if (m->currentmove != &mod->bind.move[k]) continue;
+            snprintf(r->creature.move_module, sizeof(r->creature.move_module), "%s", mod->name);
+            r->creature.move_offset = mod->cre.move[k].addr - mod->cre.base;
+            r->creature.has_move = 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+static s32 zone_rebase_time(s32 value, s32 from, s32 to)
+{
+    s64 rebased;
+    if (!value) return 0;
+    rebased = (s64)value - from + to;
+    if (rebased > INT32_MAX) return INT32_MAX;
+    if (rebased < INT32_MIN) return INT32_MIN;
+    /* Zero disables next_think. An already due think must still run. */
+    return rebased == 0 ? -1 : (s32)rebased;
+}
+
+bool q2_zone_apply_monster(const q2_zone_runtime *r, q2_creature_world *w,
+                            q2_monster *m)
+{
+    save_ai_monster key = {0};
+    const q2_mmove *move = NULL;
+    if (!q2_cre_think_valid(m, r->creature.thinking)) return false;
+    if (r->creature.has_move) {
+        memcpy(key.move_module, r->creature.move_module, sizeof(key.move_module));
+        key.move_offset = r->creature.move_offset;
+        move = resolve_ai_move(w, &key);
+        if (!move) return false;
+    }
+    if (m->cre_bind) q2_creature_prepare(m->cre_bind, m, w->class_variant[m->pop_class_id]);
+    copy_ai_state(m, &r->creature.state);
+    m->resume_pending = false;
+    q2_cre_shared_restore(m->cre_bind, &r->creature.shared);
+#define REBASE_AI(f) m->f = zone_rebase_time(m->f, r->ai_time, q2_level_state.time);
+    REBASE_AI(next_think) REBASE_AI(pain_debounce) REBASE_AI(show_hostile)
+    REBASE_AI(teleport_time) REBASE_AI(pausetime) REBASE_AI(attack_finished)
+    REBASE_AI(search_time) REBASE_AI(trail_time) REBASE_AI(idle_time)
+#undef REBASE_AI
+    if (m->next_think < 0) m->next_think = 1;
+    if (m->motion.ready) {
+        m->motion.clock += q2_level_state.time - r->ai_time;
+        m->motion.ent.node = -1; /* collision cells belong to the rebuilt zone */
+    }
+    m->population_active = true;
+    m->currentmove = move;
+    q2_cre_restore_think(m, r->creature.thinking);
+    m->enemy = q2_zone_ref_resolve(w, r->creature.refs[0]);
+    m->oldenemy = q2_zone_ref_resolve(w, r->creature.refs[1]);
+    m->goalentity = q2_zone_ref_resolve(w, r->creature.refs[2]);
+    m->movetarget = q2_zone_ref_resolve(w, r->creature.refs[3]);
+    m->owner = q2_zone_ref_resolve(w, r->creature.refs[4]);
+    if (m->corpse) {
+        m->stand = m->idle = m->search = m->walk = m->run = NULL;
+        m->attack = m->melee = NULL;
+        m->dodge = NULL; m->sight = NULL; m->checkattack = NULL; m->bigturn = NULL;
+    }
+    return true;
+}
+
+static void write_cre_shared(wbuf *w, const q2_cre_shared_state *s, const q2_monster *m)
+{
+    w_bool(w, m->spawn_initialized); w_bool(w, s->present);
+    w_s32(w, s->flyer_transition); w_u8(w, s->strider_turn);
+    w_u8(w, s->strider_explosion_phase); w_u8(w, s->boss1_explosion_phase);
+    w_u8(w, s->jorg_explosion_phase);
+}
+
+static bool read_cre_shared(rbuf *r, q2_cre_shared_state *s, q2_monster *m)
+{
+    u8 initialized = r_u8(r), present = r_u8(r);
+    m->spawn_initialized = initialized != 0; s->present = present != 0;
+    s->flyer_transition = r_s32(r); s->strider_turn = r_u8(r);
+    s->strider_explosion_phase = r_u8(r); s->boss1_explosion_phase = r_u8(r);
+    s->jorg_explosion_phase = r_u8(r);
+    return !r->bad && initialized <= 1 && present <= 1;
+}
+
+/* CAIS/ZPOP v5: no pointers, host padding or collision-cache assumptions. */
+static void write_cre_motion(wbuf *w, const q2_cre_motion *p)
+{
+    w_bool(w, p->ready);
+    w_s32v(w, p->ent.pos, 3); w_s32v(w, p->target, 3);
+    w_s16v(w, p->ent.ground_normal, 3); w_s16v(w, p->ent.last_normal, 3);
+    w_u32(w, p->ent.flags); w_s16(w, p->ent.max_slope_ny);
+    w_s32(w, p->ent.node);
+    w_s16v(w, p->velocity, 3); w_s16v(w, p->delta, 3); w_s16v(w, p->impulse, 3);
+    w_s16(w, p->yaw); w_s16(w, p->target_yaw);
+    w_u32(w, p->flags); w_s32(w, p->clock);
+    w_u8(w, p->phase_base); w_u8(w, p->phase);
+    w_u16(w, p->anim_base); w_s16(w, p->anim_previous); w_s16(w, p->anim_position);
+    w_u8(w, p->anim_flags); w_s32(w, p->queued_yaw); w_bool(w, p->animation_ready);
+    w_s16(w, p->seed_frame); w_bool(w, p->seed_pending);
+}
+
+static bool read_cre_motion(rbuf *r, q2_cre_motion *p)
+{
+    u8 ready = r_u8(r);
+    if (ready > 1) return false;
+    p->ready = ready != 0;
+    r_s32v(r, p->ent.pos, 3); r_s32v(r, p->target, 3);
+    r_s16v(r, p->ent.ground_normal, 3); r_s16v(r, p->ent.last_normal, 3);
+    p->ent.flags = r_u32(r); p->ent.max_slope_ny = r_s16(r);
+    p->ent.node = r_s32(r);
+    r_s16v(r, p->velocity, 3); r_s16v(r, p->delta, 3); r_s16v(r, p->impulse, 3);
+    p->yaw = r_s16(r); p->target_yaw = r_s16(r);
+    p->flags = r_u32(r); p->clock = r_s32(r);
+    p->phase_base = r_u8(r); p->phase = r_u8(r);
+    p->anim_base = r_u16(r); p->anim_previous = r_s16(r); p->anim_position = r_s16(r);
+    p->anim_flags = r_u8(r); p->queued_yaw = r_s32(r);
+    ready = r_u8(r); p->animation_ready = ready != 0;
+    if (ready > 1) return false;
+    p->seed_frame = r_s16(r); ready = r_u8(r); p->seed_pending = ready != 0;
+    return !r->bad && p->phase_base < 30 && p->phase < 30 && ready <= 1 &&
+           p->anim_base < 32768 && p->anim_flags < 4;
 }
 
 static void write_ai(wbuf *w, const q2_save *s)
@@ -2569,7 +2833,8 @@ static void write_ai(wbuf *w, const q2_save *s)
     u32 i;
     if (!a) return;
     at = w_chunk_begin(w, TAG_CAIS);
-    w_u32(w, 1); w_u32(w, a->count); w_u32(w, a->corner_count);
+    w_u32(w, a->motion_present ? 5 : a->shared_state_present ? 4 : a->script_state_present ? 3 : a->spawn_pending_present ? 2 : 1);
+    w_u32(w, a->count); w_u32(w, a->corner_count);
     w_u32(w, a->phase_us);
     w_s32(w, a->level.framenum); w_s32(w, a->level.time);
     w_s32(w, a->level.total_monsters); w_s32(w, a->level.killed_monsters);
@@ -2588,6 +2853,14 @@ static void write_ai(wbuf *w, const q2_save *s)
         write_ai_state(w, &d->state);
         w_s32v(w, d->refs, 5); w_str(w, d->move_module, sizeof(d->move_module));
         w_u32(w, d->move_offset); w_u8(w, d->has_move); w_u8(w, d->thinking);
+        if (a->spawn_pending_present)
+            w_u8(w, d->state.spawn_pending);
+        if (a->script_state_present) {
+            w_s16(w, d->state.render_scale);
+            w_bool(w, d->state.script_pain_used);
+        }
+        if (a->shared_state_present) write_cre_shared(w, &d->shared, &d->state);
+        if (a->motion_present) write_cre_motion(w, &d->state.motion);
     }
     w_chunk_end(w, at);
 }
@@ -2596,11 +2869,15 @@ static bool read_ai(rbuf *r, q2_save *s)
 {
     struct q2_save_ai *a;
     u32 version = r_u32(r), n = r_u32(r), i, j;
-    if (r->bad || version != 1 || s->ai || n > SAVE_MAX_ENTITIES ||
+    if (r->bad || version < 1 || version > 5 || s->ai || n > SAVE_MAX_ENTITIES ||
         n > (r->len - r->at) / 128) return false;
     a = calloc(1, sizeof(*a));
     if (!a) return false;
     s->ai = a;
+    a->spawn_pending_present = version >= 2;
+    a->script_state_present = version >= 3;
+    a->shared_state_present = version >= 4;
+    a->motion_present = version >= 5;
     a->count = n; a->corner_count = r_u32(r); a->phase_us = r_u32(r);
     if (a->corner_count > SAVE_MAX_ENTITIES || a->phase_us > 500000) return false;
     a->monsters = n ? calloc(n, sizeof(*a->monsters)) : NULL;
@@ -2627,7 +2904,21 @@ static bool read_ai(rbuf *r, q2_save *s)
         for (j = 0; j < sizeof(d->move_module); j++)
             d->move_module[j] = (char)r_u8(r);
         d->move_offset = r_u32(r); d->has_move = r_u8(r); d->thinking = r_u8(r);
-        if (r->bad || d->has_move > 1 || d->thinking > 1 ||
+        if (version >= 2) {
+            u8 pending = r_u8(r);
+            if (pending > 1 || (pending && (d->state.in_use || d->state.dead)))
+                return false;
+            d->state.spawn_pending = pending != 0;
+        }
+        if (version >= 3) {
+            u8 pain_used;
+            d->state.render_scale = r_s16(r); pain_used = r_u8(r);
+            if (pain_used > 1) return false;
+            d->state.script_pain_used = pain_used != 0;
+        }
+        if (version >= 4 && !read_cre_shared(r, &d->shared, &d->state)) return false;
+        if (version >= 5 && !read_cre_motion(r, &d->state.motion)) return false;
+        if (r->bad || d->has_move > 1 || d->thinking > (version >= 3 ? Q2_CRE_THINK_LAST : 1) ||
             !memchr(d->move_module, 0, sizeof(d->move_module))) return false;
         for (j = 0; j < 5; j++)
             if (!valid_ai_ref(d->refs[j], n, a->corner_count)) return false;
@@ -2712,8 +3003,9 @@ void q2_save_capture_creatures(q2_save *s, const q2_monster_set *set)
         d->frame  = m->frame;
         for (k = 0; k < 3; k++) {
             d->angles[k] = m->angles[k];
-            d->pos[k]    = m->pos[k];
+            d->pos[k]    = q2_cre_origin(m)[k];
         }
+        d->angles[2] = q2_cre_yaw(m);
     }
 }
 
@@ -2746,6 +3038,9 @@ void q2_save_apply_creatures(const q2_save *s, q2_monster_set *set)
             m->angles[k] = d->angles[k];
             m->pos[k]    = d->pos[k];
         }
+        /* CRES predates the separate actor state. CAIS v5, when present,
+         * subsequently restores the distinct physical and AI coordinates. */
+        q2_cre_motion_init(m);
     }
 }
 
@@ -3039,10 +3334,236 @@ static bool read_event_history(rbuf *r, q2_save *s)
     return r->at == r->len;
 }
 
+/* ZPOP v2 retains live zone objects without serialising process addresses.
+ * The original 58-byte authored record remains the prefix of every object. */
+#define ZENT_SCALARS(X) \
+    X(bool, in_use) X(u16, kind) X(u32, flags) X(u32, render_flags) \
+    X(u32, effect) X(u16, place_id) X(s16, scale) X(s16, fade) \
+    X(s16, model_offset) X(s32, frame) X(s16, health) X(u8, surface) \
+    X(s16, field90) X(s32, flash) X(s32, remove_in) X(s32, respawn_at) \
+    X(bool, hidden) X(u8, shadow_vertex_count) X(s32, clip_length) \
+    X(s32, population_group) X(u32, population_slot) X(u32, zone_serial)
+#define ZENT_ARRAYS(X) \
+    X(s32, pos, 3) X(s32, origin, 3) X(s32, spawn_origin, 3) \
+    X(s32, angles, 3) X(s32, bounds_min, 3) X(s32, bounds_max, 3) \
+    X(bool, taken, Q2_MAX_PLAYERS) X(u8, glow, 3) \
+    X(u16, shadow_vertex, Q2_ITEM_SHADOW_VERTEX_MAX)
+#define ZPROJ_SCALARS(X) \
+    X(bool, in_use) X(u32, kind) X(u16, flags) X(s16, damage) X(s16, mod) \
+    X(s16, splash_radius) X(s32, expires) X(s32, owner) X(bool, bounced) \
+    X(u16, phase) X(s16, anim) X(s16, anim_end) X(s32, node) \
+    X(u16, beam_time) X(u32, zone_serial)
+#define ZPROJ_ARRAYS(X) X(s32, pos, 3) X(s32, vel, 3) X(s16, angles, 3) X(s16, base, 2)
+
+static bool read_zone_bool(rbuf *r)
+{
+    u8 b = r_u8(r);
+    if (b > 1) r->bad = true;
+    return b != 0;
+}
+
+static void write_zone_ref(wbuf *w, q2_zone_ref ref)
+{
+    w_u32(w, ref.kind); w_u32(w, ref.group); w_u32(w, ref.slot); w_u32(w, ref.id);
+}
+
+static q2_zone_ref read_zone_ref(rbuf *r)
+{
+    q2_zone_ref ref;
+    ref.kind = r_u32(r); ref.group = r_u32(r); ref.slot = r_u32(r); ref.id = r_u32(r);
+    return ref;
+}
+
+static void write_zone_runtime(wbuf *w, const q2_zone_object *o)
+{
+    const q2_zone_runtime *r = o->runtime;
+    u32 i, k;
+    w_u8(w, r != NULL);
+    if (!r) return;
+    w_s32(w, r->sim_time); w_s32(w, r->ai_time); w_s32(w, r->ai_frame);
+    if (o->kind == Q2_ZONE_CREATURE) {
+        write_ai_state(w, &r->creature.state);
+        w_bool(w, r->creature.state.spawn_pending);
+        w_s16(w, r->creature.state.render_scale);
+        w_bool(w, r->creature.state.script_pain_used);
+        for (i = 0; i < 5; i++) write_zone_ref(w, r->creature.refs[i]);
+        w_str(w, r->creature.move_module, sizeof(r->creature.move_module));
+        w_u32(w, r->creature.move_offset);
+        w_u8(w, r->creature.has_move); w_u8(w, r->creature.thinking);
+        w_s32(w, r->creature.animation.cursor.position);
+        w_s32(w, r->creature.animation.cursor.target);
+        w_bool(w, r->creature.animation.cursor.ready); w_u8(w, r->creature.animation.source);
+        write_cre_shared(w, &r->creature.shared, &r->creature.state);
+        write_cre_motion(w, &r->creature.state.motion);
+    } else if (o->kind == Q2_ZONE_PROJECTILE) {
+        const q2_projectile *m = &r->projectile.state;
+#define WRITE_ZONE_SCALAR(t, f) w_##t(w, (t)m->f);
+#define WRITE_ZONE_ARRAY(t, f, n) for (k = 0; k < n; k++) w_##t(w, m->f[k]);
+        ZPROJ_SCALARS(WRITE_ZONE_SCALAR)
+        ZPROJ_ARRAYS(WRITE_ZONE_ARRAY)
+        write_zone_ref(w, r->projectile.shooter);
+        w_u32(w, r->projectile.source_slot);
+    } else {
+        const q2_entity *m = &r->entity.state;
+        ZENT_SCALARS(WRITE_ZONE_SCALAR)
+        ZENT_ARRAYS(WRITE_ZONE_ARRAY)
+        w_str(w, m->model, sizeof(m->model));
+        w_u32(w, r->entity.source_slot); w_u8(w, r->entity.think);
+        w_bool(w, r->entity.model_bound);
+        w_s16v(w, r->entity.velocity, 3);
+        w_s16v(w, r->entity.gib.vel, 3); w_u32(w, r->entity.gib.move_flags);
+        w_s32(w, r->entity.gib.spin);
+    }
+#undef WRITE_ZONE_SCALAR
+#undef WRITE_ZONE_ARRAY
+}
+
+static bool read_zone_runtime(rbuf *b, q2_zone_object *o, u32 version)
+{
+    q2_zone_runtime *r;
+    u32 i, k;
+    bool present = read_zone_bool(b);
+    if (b->bad) return false;
+    if (!present) return true;
+    if (o->kind < Q2_ZONE_ITEM || o->kind > Q2_ZONE_PROJECTILE || !r_need(b, 12)) return false;
+    r = o->runtime = calloc(1, sizeof(*r));
+    if (!r) return false;
+    r->sim_time = r_s32(b); r->ai_time = r_s32(b); r->ai_frame = r_s32(b);
+    if (o->kind == Q2_ZONE_CREATURE) {
+        read_ai_state(b, &r->creature.state);
+        r->creature.state.spawn_pending = read_zone_bool(b);
+        if (version >= 3) {
+            r->creature.state.render_scale = r_s16(b);
+            r->creature.state.script_pain_used = read_zone_bool(b);
+        }
+        for (i = 0; i < 5; i++) r->creature.refs[i] = read_zone_ref(b);
+        for (i = 0; i < sizeof(r->creature.move_module); i++) r->creature.move_module[i] = (char)r_u8(b);
+        r->creature.move_offset = r_u32(b);
+        r->creature.has_move = r_u8(b); r->creature.thinking = r_u8(b);
+        if (version < 3 && r->creature.thinking > 1) return false;
+        r->creature.animation.cursor.position = r_s32(b);
+        r->creature.animation.cursor.target = r_s32(b);
+        r->creature.animation.cursor.ready = read_zone_bool(b);
+        r->creature.animation.source = r_u8(b);
+        if (version >= 4 && !read_cre_shared(b, &r->creature.shared, &r->creature.state)) return false;
+        if (version >= 5 && !read_cre_motion(b, &r->creature.state.motion)) return false;
+    } else if (o->kind == Q2_ZONE_PROJECTILE) {
+        q2_projectile *m = &r->projectile.state;
+#define READ_ZONE_SCALAR(t, f) m->f = r_##t(b);
+#define READ_ZONE_ARRAY(t, f, n) for (k = 0; k < n; k++) m->f[k] = r_##t(b);
+        ZPROJ_SCALARS(READ_ZONE_SCALAR)
+        ZPROJ_ARRAYS(READ_ZONE_ARRAY)
+        r->projectile.shooter = read_zone_ref(b);
+        r->projectile.source_slot = r_u32(b);
+    } else {
+        q2_entity *m = &r->entity.state;
+        ZENT_SCALARS(READ_ZONE_SCALAR)
+        ZENT_ARRAYS(READ_ZONE_ARRAY)
+        for (i = 0; i < sizeof(m->model); i++) m->model[i] = (char)r_u8(b);
+        m->node = m->model_index = -1;
+        r->entity.source_slot = r_u32(b); r->entity.think = r_u8(b);
+        r->entity.model_bound = read_zone_bool(b);
+        r_s16v(b, r->entity.velocity, 3);
+        r_s16v(b, r->entity.gib.vel, 3); r->entity.gib.move_flags = r_u32(b);
+        r->entity.gib.spin = r_s32(b); r->entity.gib.cell = -1;
+    }
+#undef READ_ZONE_SCALAR
+#undef READ_ZONE_ARRAY
+    return !b->bad && q2_zone_runtime_valid(o->kind, r);
+}
+
+static void write_zone_history(wbuf *w, const q2_save *s)
+{
+    u32 i, j;
+    size_t at;
+    if (!s->zone_history_present) return;
+    at = w_chunk_begin(w, TAG_ZPOP);
+    w_u32(w, 5);
+    w_u32(w, s->zone_history.count);
+    for (i = 0; i < s->zone_history.count; i++) {
+        const q2_zone_population *p = &s->zone_history.map[i];
+        w_str(w, p->map, Q2_ZONE_MAP_NAME);
+        w_u32(w, p->identity); w_u32(w, p->count);
+        w_u32(w, p->next_serial); w_bool(w, p->runtime_present);
+        w_s32(w, p->ai_time); w_s32(w, p->ai_frame); w_u32(w, p->ai_phase_us);
+        for (j = 0; j < 3; j++) write_zone_ref(w, p->alerts[j]);
+        w_s32v(w, p->alert_frame, 3);
+        w_u32(w, p->trail.head); w_bool(w, p->trail.active);
+        for (j = 0; j < Q2_TRAIL_LENGTH; j++) {
+            w_s32v(w, p->trail.spot[j].origin, 3);
+            w_s32(w, p->trail.spot[j].timestamp); w_s16(w, p->trail.spot[j].yaw);
+        }
+        for (j = 0; j < p->count; j++) {
+            const q2_zone_object *o = &p->object[j];
+            w_u32(w, o->group); w_u32(w, o->slot); w_s32(w, o->zone);
+            w_u16(w, o->id); w_u8(w, o->kind); w_u8(w, o->removed);
+            w_u8(w, o->dead); w_u8(w, o->hidden); w_u8(w, o->taken); w_u8(w, o->shrink);
+            w_s16(w, o->health); w_s16(w, o->scale); w_s16(w, o->target);
+            w_s32v(w, o->pos, 3); w_s32(w, o->yaw); w_s32(w, o->frame);
+            w_s32(w, o->remove_in); w_s32(w, o->respawn_at); w_u32(w, o->spawnflags);
+            write_zone_runtime(w, o);
+        }
+    }
+    w_chunk_end(w, at);
+}
+
+static bool read_zone_history(rbuf *r, q2_save *s)
+{
+    u32 i, j, count, version = r_u32(r);
+    if (s->zone_history_present || version < 1 || version > 5) return false;
+    count = r_u32(r);
+    if (r->bad || count > Q2_ZONE_HISTORY_MAPS ||
+        !r_need(r, (size_t)count * (Q2_ZONE_MAP_NAME + 8))) return false;
+    s->zone_history_present = true;
+    if (count) {
+        s->zone_history.map = calloc(count, sizeof(*s->zone_history.map));
+        if (!s->zone_history.map) return false;
+    }
+    s->zone_history.count = count;
+    for (i = 0; i < count; i++) {
+        q2_zone_population *p = &s->zone_history.map[i];
+        if (!r_need(r, Q2_ZONE_MAP_NAME) || r->p[r->at + Q2_ZONE_MAP_NAME - 1]) return false;
+        r_str(r, p->map, Q2_ZONE_MAP_NAME);
+        p->identity = r_u32(r); p->count = p->capacity = r_u32(r);
+        if (version >= 2) {
+            p->next_serial = r_u32(r); p->runtime_present = read_zone_bool(r);
+            p->ai_time = r_s32(r); p->ai_frame = r_s32(r); p->ai_phase_us = r_u32(r);
+            for (j = 0; j < 3; j++) p->alerts[j] = read_zone_ref(r);
+            r_s32v(r, p->alert_frame, 3);
+            p->trail.head = r_u32(r); p->trail.active = read_zone_bool(r);
+            for (j = 0; j < Q2_TRAIL_LENGTH; j++) {
+                r_s32v(r, p->trail.spot[j].origin, 3);
+                p->trail.spot[j].timestamp = r_s32(r); p->trail.spot[j].yaw = r_s16(r);
+            }
+        }
+        if (r->bad || p->count > Q2_ZONE_HISTORY_OBJECTS || !r_need(r, (size_t)p->count * 58)) return false;
+        if (p->count) {
+            p->object = calloc(p->count, sizeof(*p->object));
+            if (!p->object) return false;
+        }
+        for (j = 0; j < p->count; j++) {
+            q2_zone_object *o = &p->object[j];
+            o->group = r_u32(r); o->slot = r_u32(r); o->zone = r_s32(r);
+            o->id = r_u16(r); o->kind = r_u8(r); o->removed = r_u8(r);
+            o->dead = r_u8(r); o->hidden = r_u8(r); o->taken = r_u8(r); o->shrink = r_u8(r);
+            o->health = r_s16(r); o->scale = r_s16(r); o->target = r_s16(r);
+            r_s32v(r, o->pos, 3); o->yaw = r_s32(r); o->frame = r_s32(r);
+            o->remove_in = r_s32(r); o->respawn_at = r_s32(r); o->spawnflags = r_u32(r);
+            if (version >= 2 && !read_zone_runtime(r, o, version)) return false;
+        }
+    }
+    return !r->bad && r->at == r->len && q2_zone_history_valid(&s->zone_history);
+}
+
 static q2_result build_body(const q2_save *s, wbuf *w)
 {
     u32 i;
-    if ((s->skill_present && (s->skill < 0 || s->skill > 3)) ||
+    if (s->native_mission_present && !q2_native_mission_valid(&s->native_mission))
+        return Q2_ERR_BAD_FORMAT;
+    if (s->zone_history_present && !q2_zone_history_valid(&s->zone_history))
+        return Q2_ERR_BAD_FORMAT;
+    if ((s->cheat_level_present && s->cheat_level > 3) ||
+        (s->skill_present && (s->skill < 0 || s->skill > 3)) ||
         (s->viewweapon_present && !valid_viewweapon(s)) ||
         (s->event_runtime_present && !valid_event_runtime(&s->event_runtime)) ||
         s->rotator_count > SAVE_MAX_ENTITIES ||
@@ -3060,6 +3581,36 @@ static q2_result build_body(const q2_save *s, wbuf *w)
                 return Q2_ERR_BAD_FORMAT;
     }
     write_head(w, s);
+    if (s->native_mission_present) {
+        size_t at = w_chunk_begin(w, TAG_NMIS);
+        w_u32(w, 7);
+        w_u32(w, s->native_mission.flags);
+        w_s32v(w, s->native_mission.lab_phase, 2);
+        w_s32v(w, s->native_mission.boss_phase, 2);
+        for (i = 0; i < 5; i++) {
+            for (u32 k = 0; k < 3; k++) w_u16(w, (u16)s->native_mission.orb_arc[i].velocity[k]);
+            w_u16(w, (u16)s->native_mission.orb_arc[i].life);
+            w_s32v(w, s->native_mission.orb_arc[i].to, 3);
+        }
+        w_s32v(w, s->native_mission.security_wall, 4);
+        w_u32(w, s->native_mission.reactor_start);
+        w_u32(w, (u32)s->native_mission.reactor_alarm);
+        w_u32(w, s->native_mission.reactor_glass);
+        w_u32(w, s->native_mission.power1_next_blast);
+        w_u32(w, s->native_mission.power1_blast_phase);
+        for (i = 0; i < Q2_NATIVE_LIFT_COUNT; i++) {
+            const q2_native_lift *lift = &s->native_mission.lift[i];
+            w_u8(w, lift->valid); w_u8(w, lift->state); w_u16(w, lift->wait);
+            w_u32(w, (u32)lift->offset);
+            w_s32v(w, lift->min, 3); w_s32v(w, lift->max, 3);
+            w_s32v(w, lift->env_min, 3); w_s32v(w, lift->env_max, 3);
+            w_u32(w, (u32)lift->dy);
+        }
+        w_u32(w, (u32)s->native_mission.security_quake_phase);
+        w_u32(w, (u32)s->native_mission.boss2_quake_time);
+        w_u32(w, (u32)s->native_mission.boss2_quake_phase);
+        w_chunk_end(w, at);
+    }
     write_player(w, s);
     write_sim(w, s);
 
@@ -3083,6 +3634,7 @@ static q2_result build_body(const q2_save *s, wbuf *w)
     if (s->event_object_flags)
         write_bytes_chunk(w, TAG_EOBJ, s->event_object_flags, s->event_object_count);
     write_event_history(w, s);
+    write_zone_history(w, s);
     write_bytes_chunk(w, TAG_TRIG, s->trigger_inside, s->trigger_count);
     write_entities(w, s);
     write_item_state(w, s);
@@ -3101,6 +3653,11 @@ static q2_result build_body(const q2_save *s, wbuf *w)
     write_level_counters(w, s);
     write_help_keys(w, s);
     write_settings(w, s);
+    if (s->cheat_level_present) {
+        size_t at = w_chunk_begin(w, TAG_UNLK);
+        w_u32(w, s->cheat_level);
+        w_chunk_end(w, at);
+    }
 
     return w->bad ? Q2_ERR_NO_MEMORY : Q2_OK;
 }
@@ -3263,6 +3820,54 @@ static q2_result read_body(q2_save *out, const u8 *body, size_t body_size)
 
         switch (tag) {
         case TAG_HEAD: read_head(&c, out);    break;
+        case TAG_NMIS: {
+            u32 version = r_u32(&c);
+            if (out->native_mission_present ||
+                !((version == 1 && c.len == 124) || (version == 2 && c.len == 140) ||
+                  (version == 3 && c.len == 152) || (version == 4 && c.len == 160) ||
+                  (version == 5 && c.len == 280) || (version == 6 && c.len == 580) ||
+                  (version == 7 && c.len == 592)))
+                return Q2_ERR_BAD_FORMAT;
+            out->native_mission.flags = r_u32(&c);
+            r_s32v(&c, out->native_mission.lab_phase, 2);
+            r_s32v(&c, out->native_mission.boss_phase, 2);
+            for (u32 i = 0; i < 5; i++) {
+                for (u32 k = 0; k < 3; k++)
+                    out->native_mission.orb_arc[i].velocity[k] = (s16)r_u16(&c);
+                out->native_mission.orb_arc[i].life = (s16)r_u16(&c);
+                r_s32v(&c, out->native_mission.orb_arc[i].to, 3);
+            }
+            if (version >= 2) r_s32v(&c, out->native_mission.security_wall, 4);
+            if (version >= 3) {
+                out->native_mission.reactor_start = r_u32(&c);
+                out->native_mission.reactor_alarm = (s32)r_u32(&c);
+                out->native_mission.reactor_glass = r_u32(&c);
+            }
+            if (version >= 4) {
+                out->native_mission.power1_next_blast = r_u32(&c);
+                out->native_mission.power1_blast_phase = r_u32(&c);
+            }
+            if (version >= 5) for (u32 i = 0; i < (version == 5 ? 2u : Q2_NATIVE_LIFT_COUNT); i++) {
+                q2_native_lift *lift = &out->native_mission.lift[i];
+                lift->valid = r_u8(&c); lift->state = r_u8(&c); lift->wait = r_u16(&c);
+                lift->offset = (s32)r_u32(&c);
+                r_s32v(&c, lift->min, 3); r_s32v(&c, lift->max, 3);
+                r_s32v(&c, lift->env_min, 3); r_s32v(&c, lift->env_max, 3);
+                lift->dy = (s32)r_u32(&c);
+            }
+            /* Old saves recorded no BOSS2 quake clock. Do not invent a new
+             * post-boss sequence merely because the train is already open. */
+            out->native_mission.boss2_quake_time = Q2_NATIVE_QUAKE_INACTIVE;
+            if (version >= 7) {
+                out->native_mission.security_quake_phase = (s32)r_u32(&c);
+                out->native_mission.boss2_quake_time = (s32)r_u32(&c);
+                out->native_mission.boss2_quake_phase = (s32)r_u32(&c);
+            }
+            if (c.bad || !q2_native_mission_valid(&out->native_mission))
+                return Q2_ERR_BAD_FORMAT;
+            out->native_mission_present = true;
+            break;
+        }
         case TAG_PLYR: read_player(&c, out);  break;
         case TAG_SIMS: read_sim(&c, out);     break;
         case TAG_INVN: read_inventory(&c, &out->inventory); break;
@@ -3288,6 +3893,10 @@ static q2_result read_body(q2_save *out, const u8 *body, size_t body_size)
         case TAG_EVHS:
             if (!read_event_history(&c, out))
                 return Q2_ERR_BAD_FORMAT;
+            break;
+
+        case TAG_ZPOP:
+            if (!read_zone_history(&c, out)) return Q2_ERR_BAD_FORMAT;
             break;
 
         case TAG_EOBJ:
@@ -3347,6 +3956,16 @@ static q2_result read_body(q2_save *out, const u8 *body, size_t body_size)
             if (out->skill < 0 || out->skill > 3) return Q2_ERR_BAD_FORMAT;
             out->skill_present = true;
             break;
+
+        case TAG_UNLK: {
+            u32 tier;
+            if (out->cheat_level_present || c.len != 4) return Q2_ERR_BAD_FORMAT;
+            tier = r_u32(&c);
+            if (tier > 3) return Q2_ERR_BAD_FORMAT;
+            out->cheat_level = (u8)tier;
+            out->cheat_level_present = true;
+            break;
+        }
 
         case TAG_RAND:
             if (out->game_rng_present || c.len != 4) return Q2_ERR_BAD_FORMAT;
@@ -3715,7 +4334,7 @@ q2_result q2_settings_slot_path(int slot, char *out, u32 out_size)
 
 q2_result q2_settings_slot_write(const q2_settings_blob *settings, int slot)
 {
-    u8 file[SAVE_FILE_HEADER + 4 + Q2_SETTINGS_VALUE_MAX * 2];
+    u8 file[SAVE_FILE_HEADER + 8 + Q2_SETTINGS_VALUE_MAX * 2];
     u8 *body = file + SAVE_FILE_HEADER;
     u32 body_size, crc, i;
     char path[512];
@@ -3724,16 +4343,19 @@ q2_result q2_settings_slot_write(const q2_settings_blob *settings, int slot)
 
     if (!settings)
         return Q2_ERR_INVALID_ARG;
-    if (settings->count > Q2_SETTINGS_VALUE_MAX)
+    if (settings->count > Q2_SETTINGS_VALUE_MAX || settings->cheat_level > 3 ||
+        (settings->unlock_file && !settings->cheat_level))
         return Q2_ERR_RANGE;
     rc = q2_settings_slot_path(slot, path, (u32)sizeof(path));
     if (rc != Q2_OK)
         return rc;
 
-    body_size = 4 + settings->count * 2;
+    body_size = 8 + settings->count * 2;
     q2_wr_u32(body, settings->count);
     for (i = 0; i < settings->count; i++)
         q2_wr_u16(body + 4 + i * 2, (u16)settings->value[i]);
+    q2_wr_u16(body + 4 + settings->count * 2, settings->cheat_level);
+    q2_wr_u16(body + 6 + settings->count * 2, settings->unlock_file ? 1 : 0);
     crc = crc32_of(body, body_size);
 
     memcpy(file, SETTINGS_MAGIC, 4);
@@ -3750,8 +4372,7 @@ q2_result q2_settings_slot_write(const q2_settings_blob *settings, int slot)
         fclose(f);
         return Q2_ERR_IO;
     }
-    fclose(f);
-    return Q2_OK;
+    return fclose(f) == 0 ? Q2_OK : Q2_ERR_IO;
 }
 
 q2_result q2_settings_slot_read(q2_settings_blob *out, int slot)
@@ -3779,7 +4400,7 @@ q2_result q2_settings_slot_read(q2_settings_blob *out, int slot)
     version   = q2_rd_u32(data + 4);
     body_size = q2_rd_u32(data + 8);
     crc       = q2_rd_u32(data + 12);
-    if (version != SETTINGS_VERSION) {
+    if (version != 1 && version != SETTINGS_VERSION) {
         rc = Q2_ERR_UNSUPPORTED;
         goto done;
     }
@@ -3790,13 +4411,24 @@ q2_result q2_settings_slot_read(q2_settings_blob *out, int slot)
     }
 
     count = q2_rd_u32(data + SAVE_FILE_HEADER);
-    if (count > Q2_SETTINGS_VALUE_MAX || body_size != 4 + count * 2) {
+    if (count > Q2_SETTINGS_VALUE_MAX ||
+        body_size != (version == 1 ? 4u : 8u) + count * 2) {
         rc = Q2_ERR_BAD_FORMAT;
         goto done;
     }
     out->count = count;
     for (i = 0; i < count; i++)
         out->value[i] = (s16)q2_rd_u16(data + SAVE_FILE_HEADER + 4 + i * 2);
+    if (version >= 2) {
+        u32 at = SAVE_FILE_HEADER + 4 + count * 2;
+        u16 tier = q2_rd_u16(data + at), unlock = q2_rd_u16(data + at + 2);
+        if (tier > 3 || unlock > 1 || (unlock && !tier)) {
+            rc = Q2_ERR_BAD_FORMAT;
+            goto done;
+        }
+        out->cheat_level = (u8)tier;
+        out->unlock_file = unlock != 0;
+    }
     rc = Q2_OK;
 
 done:

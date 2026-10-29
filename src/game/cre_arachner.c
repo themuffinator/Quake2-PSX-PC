@@ -159,22 +159,16 @@
  * the shared copy skips clip pieces for the same reason the private one did.
  *
  * ---------------------------------------------------------------------------
- * What is still owed
+ * Host integration
  * ---------------------------------------------------------------------------
- *   - The muzzle. Both fire thinks build a world point from the pose record,
- *     the object's rotation matrix at object+0x2C0 and its origin at +0xA4.
- *     This port has no object and no matrix, so the shot has no start point
- *     and no direction. Its FIGURES are no longer owed — `q2_cre_shot` carries
- *     damage, kick and flash, so the 50 / 100 / 0 the module hands
- *     monster_fire_railgun now reaches the host, which resolves the rail along
- *     the line of sight instead of from the barrel.
- *   - The PITCHED-UP pain cry, which is the one thing here that is read and
- *     still undeliverable. module+0x19A4 is not a second sample: the module's
+ *   - Muzzles now use the host's posed attachment hook and both rails aim at
+ *     blind_target. The host traces a penetrating rail from that barrel;
+ *     it no longer converts line of sight into guaranteed player damage.
+ *   - The pitched pain cry uses its native cloned request. module+0x19A4 is
+ *     not a second sample: the module's
  *     init CLONES module+0x19A0 through import +0x3C and sets the clone's
  *     PITCH modifier to 50 through import +0x44 — byte +1 of the sound request
- *     record, over 32, against the default 35 (src/audio/vag.h). The sound hook
- *     carries a handle and no pitch, so both of the Arachner's pain cries come
- *     out at the default pitch. See ARA_SND_PAIN2_QUIET and `ara_play`.
+ *     record, over 32, against the default 35 (src/audio/vag.h).
  *   - `export 1` at module+0xAAC, which is a render-time hook rather than an
  *     AI one: while the object's animation position lies inside the model's
  *     "Melee" clip it starts two blur trails through import +0x78, over
@@ -277,15 +271,10 @@ extern void  *q2_cre_melee_user;
 static void ara_play(q2_monster *m, u32 handle_addr)
 {
     /*
-     * The cloned pain handle is asked for by the address of the sample it was
-     * cloned from, because that is the one the module registered a NAME for
-     * (`q2_creature_world_sound_for_addr` resolves an address against the
-     * registrations, creworld.c) and because the port's sound hook carries no
-     * pitch argument. The consequence is audible and is stated rather than
-     * hidden: half the Arachner's pain cries should be pitched up and all of
-     * them come out at the default pitch.
-     *
-     * What the clone changes IS established. The module passes (clone, 50,
+     * Keep the cloned handle's identity. Export 2 now executes its clone and
+     * parameter imports, so substituting the original handle and a pitch
+     * override would mutate the normal pain request for subsequent cries.
+     * The module passes (clone, 50,
      * 128, -1) to import +0x44 at module+0x87C..+0x890, and import +0x44 is
      * 0x80073A34 (the loader stores it at 0x8007DAAC): three guarded byte
      * stores into the 12-byte request record — byte +1 unless the argument is
@@ -293,9 +282,6 @@ static void ara_play(q2_monster *m, u32 handle_addr)
      * leave the volume and priority alone and only byte +1 changes, which is
      * the pitch modifier: 50/32 of the sample's rate against the default 35/32.
      */
-    if (handle_addr == ARA_SND_PAIN2_QUIET)
-        handle_addr = ARA_SND_PAIN2;
-
     if (q2_cre_sound_fn)
         q2_cre_sound_fn(m, (int)handle_addr, q2_cre_sound_user);
 }
@@ -469,17 +455,10 @@ static void arachner_bite2(q2_monster *self) { ara_bite(self); }  /* [8] */
  *   4. play module+0x19AC, `wep_railgf1a`.
  *   5. import +0x8C: monster_fire_railgun(self, start, dir, 50, 100, 0).
  *
- * STEPS 1 THROUGH 3 CANNOT BE RUN. Every one of them reads the link object —
- * the model, the animation position, the rotation matrix, the world origin —
- * and this port keeps none of it on `q2_monster`. So the shot has no muzzle
- * and no direction.
- *
- * STEP 5 NOW DOES. `q2_cre_shot` carries what the module passes, so the slot,
- * the flash, the damage and the kick all go through together and the host
- * resolves the rail along the line of sight instead of from the muzzle. The
- * four fields a railgun has no argument for — speed, hspread, vspread, count —
- * stay zero because the module passes nothing for them; the rail is one trace
- * and not a spread of pellets, and main.c reads a zero count as one shot.
+ * The host's muzzle hook supplies the posed attachment. Aim at the saved
+ * `blind_target`, not the enemy's current position: the two barrels sample
+ * the target at different times. The client traces the rail and draws its
+ * spiral using that same start and direction.
  *
  * NO ENEMY GUARD, because neither module site has one. Both fire at
  * `blind_target`, which is a SNAPSHOT and outlives the enemy that made it, so
@@ -489,9 +468,16 @@ static void arachner_bite2(q2_monster *self) { ara_bite(self); }  /* [8] */
  * too. The sound is played first exactly as the module plays it first
  * (module+0xCC4 before module+0xCF8).
  */
-static void ara_rail_fire(q2_monster *self)
+static void ara_rail_fire(q2_monster *self, s16 vert_a, s16 vert_b)
 {
-    q2_cre_shot shot;
+    q2_cre_shot shot = { 0 };
+    int k;
+
+    shot.aimed = true;
+    q2_cre_muzzle(self, vert_a, vert_b, shot.start);
+    for (k = 0; k < 3; k++)
+        shot.dir[k] = self->blind_target[k] - shot.start[k];
+    q2_vector_normalize(shot.dir);
 
     ara_play(self, ARA_SND_RAIL);
 
@@ -520,7 +506,7 @@ static void ara_rail_fire(q2_monster *self)
  */
 static void arachner_rail_right(q2_monster *self)
 {
-    ara_rail_fire(self);
+    ara_rail_fire(self, 290, 307);
     ara_track_enemy(self);
 }
 
@@ -533,7 +519,7 @@ static void arachner_rail_right(q2_monster *self)
  */
 static void arachner_rail_left(q2_monster *self)
 {
-    ara_rail_fire(self);
+    ara_rail_fire(self, 239, 253);
 }
 
 /*

@@ -50,15 +50,14 @@
  * pad stops being read and the gun stops being driven — without either being
  * tested for anywhere. There is no `if (dead)` in front of the movement code
  * because there does not need to be one. What still moves the body is
- * `corpse_think`'s own physics: gravity, the ground plane, and the dt * 5
+ * `corpse_think`'s own physics: gravity, the ground plane, and the dt * 40
  * friction below.
  *
  * A port with one tick function and no think pointer has to say it out loud.
- * `sim.c` does, at the top of `q2_sim_tick`: a dead player is ticked with a
- * neutral pad AND with the input-derived accumulators cleared, because a
- * neutral pad alone only stops `yaw_rate` and `wish` from growing — a body
- * that died mid-turn would keep turning. `vel` is left alone; that is momentum
- * and the corpse is supposed to keep it.
+ * `sim.c` selects the corpse or down-body physics separately from the live
+ * player's controls, view and volume contacts. The client supplies the death
+ * stage: corpse_think brakes all axes, respawn_think moves without braking,
+ * and fade/dissolve/gib handlers stop moving altogether.
  *
  * ---------------------------------------------------------------------------
  * player_die, 0x800396AC, in order
@@ -133,7 +132,7 @@
  * ---------------------------------------------------------------------------
  *     if (health <= gib_health) { gib(self); return; }        0x8003956C
  *     list_append(self);                                      0x800552B4
- *     approach(&vel[i], 0, dt * 5)  for i in 0..2             0x8006FE3C
+ *     approach(&vel[i], 0, dt * 40) for i in 0..2             0x8006FE3C
  *     clip_velocity(self);                                    0x80039AA4
  *     if (!deathmatch)   { ent2 |= DEAD; return; }            0x80039610
  *     if (animflags == 0){ player_anim(self, DEATH); return; }
@@ -270,8 +269,8 @@
 #define Q2_PDEATH_SCALE_ONE       4096
 #define Q2_PDEATH_FADE_RATE       16
 
-/* corpse_think's velocity friction: `approach(v, 0, dt * 5)` (0x800395A0). */
-#define Q2_PDEATH_FRICTION        5
+/* 0x800395A0 builds dt * 5, then sll 19 / sra 16 multiplies it by 8. */
+#define Q2_PDEATH_FRICTION        40
 
 /* What 0x8003DDF8 writes into entity+222 when it places a player (0x8003DE34).
  * Not -1: 4 is the engine's "not a player" sentinel, which the frag hook's own
@@ -327,8 +326,9 @@ typedef enum q2_player_anim {
 } q2_player_anim;
 
 /*
- * 0x8003CE14, as a pure choice: what move should be playing, given what is
- * playing now and what the tick wants.
+ * Limited legacy chooser used by the standalone death-chain API. This has no
+ * position or dt and cannot implement the full 0x8003CE14 transition rules.
+ * Live body animation uses q2_player_anim_step below.
  *
  * `roll` is the engine's `rand() % 3` — the caller supplies it so the choice is
  * reproducible in a test. `animflags` is entity+0x102.
@@ -339,6 +339,24 @@ typedef enum q2_player_anim {
  */
 q2_player_move q2_player_anim_pick(q2_player_anim want, q2_player_move cur,
                                    u16 animflags, u32 roll);
+
+/* Complete 0x8003CE14 state, including advance-before-install and jump holds.
+ * Ranges are the loaded move records in native 300 Hz position units. Call
+ * once per positive game tick, independently of rendering. The only random
+ * draws are native PAIN and the first DEATH request, from the shared BIOS RNG. */
+typedef struct q2_player_anim_range {
+    u16 start, end, rest;
+} q2_player_anim_range;
+
+typedef struct q2_player_anim_state {
+    q2_player_move move;
+    s16 position;
+    u16 flags;
+} q2_player_anim_state;
+
+void q2_player_anim_step(q2_player_anim_state *state,
+                        const q2_player_anim_range moves[Q2_PMOVE_COUNT],
+                        q2_player_anim want, u32 entity_flags, s32 dt);
 
 /* ------------------------------------------------------------------------- */
 /* The state a dying player is in                                             */

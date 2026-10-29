@@ -136,6 +136,13 @@ void q2_sim_scene_solids_update(q2_sim *sim, const q2_rotator_set *rotators)
     for (i = 0; i < sim->scene_solid_count; i++) {
         const q2_scene_solid *s = &sim->scene_solids[i];
         q2_move_target *t = &sim->volumes[first + i];
+        s32 offset[3];
+        int axis;
+        q2_rotators_node_offset(rotators, (u32)s->node, offset);
+        for (axis = 0; axis < 3; axis++) {
+            t->min[axis] = t->env_min[axis] + offset[axis];
+            t->max[axis] = t->env_max[axis] + offset[axis];
+        }
         t->active = !s->freed;
         if (s->explosive >= 0 && sim->explosives &&
             (u32)s->explosive < sim->explosives->count)
@@ -147,8 +154,8 @@ void q2_sim_scene_solids_update(q2_sim *sim, const q2_rotator_set *rotators)
             /* 0x8002B3B4 / 0x8002B5F8 move only the LIVE box's Y bounds.
              * The original envelope and motion vector remain untouched; this
              * is a relocated slab, not a rotated box or a lift carrying riders. */
-            t->min[1] = t->env_min[1] + lift;
-            t->max[1] = t->env_max[1] + lift;
+            t->min[1] += lift;
+            t->max[1] += lift;
         }
     }
 }
@@ -160,4 +167,46 @@ void q2_sim_scene_solids_hide(q2_sim *sim, s32 node)
     for (i = 0; i < sim->scene_solid_count; i++)
         if (sim->scene_solids[i].node == node) sim->scene_solids[i].freed = true;
     q2_sim_scene_solids_update(sim, NULL);
+}
+
+bool q2_sim_scene_solid_set(q2_sim *sim, s32 node,
+                             const s32 min[3], const s32 max[3])
+{
+    u32 i, first;
+    q2_move_target *t;
+    int axis;
+    if (!sim || node < 0 || !min || !max) return false;
+    for (axis = 0; axis < 3; axis++) if (min[axis] > max[axis]) return false;
+    first = sim->mover_count + sim->breakable_solid_count;
+    if (first + sim->scene_solid_count > sim->volume_count) return false;
+    for (i = 0; i < sim->scene_solid_count; i++)
+        if (sim->scene_solids[i].node == node &&
+            sim->scene_solids[i].rotator < 0 && sim->scene_solids[i].explosive < 0)
+            break;
+    if (i == sim->scene_solid_count) {
+        q2_scene_solid *list = realloc(sim->scene_solids, (i + 1u) * sizeof(*list));
+        q2_move_target *volumes;
+        if (!list) return false;
+        sim->scene_solids = list;
+        volumes = realloc(sim->volumes, (sim->volume_count + 1u) * sizeof(*volumes));
+        if (!volumes) return false;
+        sim->volumes = volumes;
+        memmove(volumes + first + i + 1u, volumes + first + i,
+                (sim->volume_count - first - i) * sizeof(*volumes));
+        sim->volume_count++;
+        sim->scene_solid_count++;
+    }
+    sim->scene_solids[i] = (q2_scene_solid){ node, -1, -1, false };
+    t = &sim->volumes[first + i];
+    memset(t, 0, sizeof(*t));
+    for (axis = 0; axis < 3; axis++) {
+        t->min[axis] = t->env_min[axis] = min[axis];
+        t->max[axis] = t->env_max[axis] = max[axis];
+    }
+    t->id = (s32)(first + i);
+    t->kind = Q2_MOVE_KIND_ENTITY;
+    t->active = true;
+    sim->move_world.targets = sim->volumes;
+    sim->move_world.count = sim->volume_count;
+    return true;
 }

@@ -19,11 +19,9 @@
  * the entity's own +0xE8 on the 4096-step circle; the origin is +0xA4, which
  * the spawner already biased by 286 and the model's own offset.
  *
- * NOT YET: the sparkle particles the materialise ramp emits. The translucent
- * floor shadow is reconstructed from the item table's posed-vertex list and
- * the real 16x16 tile/palette in `chars.lbm` / the executable palette bank.
- * An item that has not finished materialising therefore brightens through the
- * decoded lighting ramp and casts its retail shadow, but has no sparkles yet.
+ * Materialise sparkles are emitted by the client's entity-event consumer,
+ * using the posed model through q2_model_world_vertex. This draw also handles
+ * the translucent floor shadow and the Blackhole P's attached glint chain.
  */
 #ifndef Q2PSX_ENTITYDRAW_H
 #define Q2PSX_ENTITYDRAW_H
@@ -45,11 +43,15 @@ typedef struct q2_entity_draw_stats {
     u32 outside_zone;  /* no cell of the loaded zone's hulls holds it        */
     u32 faces_emitted;
     u32 shadows_emitted;
+    u32 glint_emitted;
+    u32 glint_draws;
     u32 ot_overflow;
 } q2_entity_draw_stats;
 
 typedef struct q2_entity_draw_ctx {
+    const struct q2_fx_glint *glint;
     const q2_model_bank *bank;      /* the map's CastList                    */
+    const q2_model_bank *zone_bank; /* resident zone's CastList fallback     */
     u32                  clut4_count_a;  /* model palettes start after these */
 
     /*

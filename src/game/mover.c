@@ -735,7 +735,7 @@ q2_result q2_movers_build_calls(q2_mover_set *out, const q2_events *events,
                 u32 part;
 
                 memcpy(nodes, m->node, parts * sizeof(nodes[0]));
-                prototype.external   = 1;
+                prototype.external   = Q2_MV_EXTERNAL_CRATES;
                 prototype.part_count = 1;
                 prototype.sealed     = 0;
 
@@ -1596,7 +1596,7 @@ u32 q2_movers_step_crates(q2_mover_set *set, const q2_events *events,
         s32 factor, product, step, centre;
         s32 before;
 
-        if (!m->external || m->item_offset != item_offset ||
+        if (m->external != Q2_MV_EXTERNAL_CRATES || m->item_offset != item_offset ||
             m->part_count != 1 ||
             !q2_scene_get_node(scene, (u32)m->node[0], &node))
             continue;

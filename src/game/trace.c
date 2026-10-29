@@ -5,6 +5,74 @@
 #include "weapon.h"      /* q2_rng_next — the separation pass's coincident draw */
 #include "worldscale.h"
 
+bool q2_move_step(q2_collision *coll, q2_move_ent *ent, const s16 delta[3],
+                  const q2_move_world *world, const q2_move_bodies *bodies,
+                  s32 self_id, const s16 mins[3], const s16 maxs[3], q2_rng *rng)
+{
+    return q2_move_actor(coll, ent, delta, world, bodies, self_id, mins, maxs,
+                          rng, false);
+}
+
+void q2_move_ground_project(q2_move_ent *ent, s16 velocity[3])
+{
+    s32 ny = ent->ground_normal[1];
+    if (ny <= ent->max_slope_ny || !ny || !(ent->flags & 0x2060u) ||
+        (ent->flags & 0x980u)) return;
+    /* addu/subu wrap before the signed division. */
+    velocity[1] = (s16)((s32)(0u -
+        ((u32)((s32)velocity[0] * ent->ground_normal[0]) +
+         (u32)((s32)velocity[2] * ent->ground_normal[2]))) / ny);
+}
+
+static s16 move_ease(s16 value, s32 target, s32 step)
+{
+    s32 v = value;
+    if (v < target) { v += step; if (v > target) v = target; }
+    else { v -= step; if (v < target) v = target; }
+    return (s16)v;
+}
+
+void q2_move_integrate(q2_move_ent *ent, s16 v[3], s16 impulse[3],
+                       u32 *flags, s32 gravity, s32 dt, bool multiplayer,
+                       s16 delta[3])
+{
+    s32 dv, dvdt, half;
+    int k;
+    delta[0] = (s16)((s32)((u32)(s32)v[0] * (u32)dt) / Q2_VEL_DIV);
+    delta[2] = (s16)((s32)((u32)(s32)v[2] * (u32)dt) / Q2_VEL_DIV);
+    if ((*flags & 0x1000u) || (ent->flags & 0x180u) ||
+        ((ent->flags & 0x800u) && !(*flags & 0x4000u))) {
+        delta[1] = (s16)((s32)((u32)(s32)v[1] * (u32)dt) / Q2_VEL_DIV);
+        ent->flags &= ~Q2_ENT_GROUNDED_MASK;
+        for (k = 0; k < 3; k++) { v[k] = (s16)(v[k] + impulse[k]); impulse[k] = 0; }
+        return; /* 0x80045F44 clears the halfwords, but leaves 0x4000 armed. */
+    }
+    dv = (s32)((u32)gravity * (u32)dt);
+    dvdt = (s32)((u32)dv * (u32)dt);
+    half = dvdt / 2;
+    delta[1] = (s16)((s32)((u32)(s32)v[1] * (u32)dt + (u32)half) / Q2_VEL_DIV);
+    v[1] = (s16)((u32)(s32)v[1] + (u32)dv);
+    if (ent->flags & Q2_ENT_LIQUID_FLOAT)
+        v[1] = move_ease(v[1], Q2_LIQUID_FLOAT_VY, dt * Q2_LIQUID_EASE_RATE);
+    else if (ent->flags & Q2_ENT_LIQUID_SINK) {
+        if (v[1] < Q2_LIQUID_SINK_VY) v[1] = (s16)(v[1] - dt * Q2_LIQUID_SINK_PUSH);
+        else v[1] = move_ease(v[1], Q2_LIQUID_SINK_VY, dt * Q2_LIQUID_EASE_RATE);
+    } else if (v[1] > Q2_TERMINAL_VY) v[1] = Q2_TERMINAL_VY;
+    if (!(*flags & 0x4000u)) return;
+    ent->flags &= ~0x2860u;
+    memset(ent->ground_normal, 0, sizeof(ent->ground_normal));
+    ent->last_normal[0] = ent->last_normal[2] = 0;
+    ent->last_normal[1] = 4096;
+    *flags &= ~0x4000u;
+    for (k = 0; k < 3; k++) {
+        v[k] = (s16)(v[k] + impulse[k]);
+        if (k == 1 && !multiplayer && v[k] < Q2_IMPULSE_CEILING)
+            v[k] = Q2_IMPULSE_CEILING;
+        delta[k] = (s16)((s32)((u32)(s32)v[k] * (u32)dt) / Q2_VEL_DIV);
+        impulse[k] = 0;
+    }
+}
+
 /* ------------------------------------------------------------------------- */
 /* Helpers in the original's arithmetic                                       */
 /* ------------------------------------------------------------------------- */
@@ -1047,10 +1115,11 @@ static void move_step_gate(q2_collision *coll, q2_move_ent *ent,
 /* ------------------------------------------------------------------------- */
 /* 0x8004583C — the stepped frame move                                        */
 /* ------------------------------------------------------------------------- */
-bool q2_move_step(q2_collision *coll, q2_move_ent *ent, const s16 delta_in[3],
+bool q2_move_actor(q2_collision *coll, q2_move_ent *ent, const s16 delta_in[3],
                   const q2_move_world *world,
                   const q2_move_bodies *bodies, s32 self_id,
-                  const s16 mins[3], const s16 maxs[3], struct q2_rng *rng)
+                  const s16 mins[3], const s16 maxs[3], struct q2_rng *rng,
+                  bool force_step)
 {
     /*
      * THE FRAME'S DELTA IS A LOCAL, because the separation pass writes to it.
@@ -1115,7 +1184,7 @@ bool q2_move_step(q2_collision *coll, q2_move_ent *ent, const s16 delta_in[3],
      * it while airborne cancels the jump completely and the player never leaves
      * the floor. The flags are read here, before they are cleared.
      */
-    grounded = (ent->flags & Q2_ENT_GROUNDED_MASK) != 0 &&
+    grounded = ((ent->flags & Q2_ENT_GROUNDED_MASK) != 0 || force_step) &&
                !(ent->flags & Q2_ENT_UNDERWATER);
 
     if (!grounded) {

@@ -52,8 +52,9 @@
  *     BFG       radius 1300   mod  1   0x8004BBBC, 0x8004BC74
  *
  * The rocket's direct hit is applied separately and first, at full damage with
- * mod 15 (0x8004AE14), and only then does the blast go off — so a direct hit is
- * damage plus splash, exactly as in the lineage.
+ * mod 15 (0x8004AE14), and only then does the blast go off. That victim is
+ * excluded from the splash; a grenade touching its owner skips direct damage
+ * and passes no excluded victim instead.
  *
  * Three different call sites carry the grenade's numbers because a grenade can
  * end three ways: its fuse expiring, touching a target, and being destroyed.
@@ -126,12 +127,21 @@ typedef enum q2_proj_kind {
     Q2_PROJ_BFG            /* "BFGBlast", 0x8004BE04                        */
 } q2_proj_kind;
 
-/* The flags halfword at record+0x22, bit for bit. */
+/* The bolt's flags halfword at record+0x22, bit for bit. */
 #define Q2_PROJ_FLAG_TRAIL      0x0001u  /* 0x800482B0 */
 #define Q2_PROJ_FLAG_LIGHT      0x0002u  /* 0x800481C0 */
 #define Q2_PROJ_FLAG_BODY       0x0004u  /* 0x80047F44 */
 #define Q2_PROJ_FLAG_IMPACT     0x0008u  /* 0x80048660 */
 #define Q2_PROJ_FLAG_LIGHT_BIG  0x0010u  /* 0x80048238; no caller sets it */
+
+/* Grenade movement flags from entity+0x98 share the host flags field. */
+#define Q2_PROJ_TOSS_REST       0x0020u
+#define Q2_PROJ_TOSS_HELD       0x0040u
+#define Q2_PROJ_TOSS_STOPPED    (Q2_PROJ_TOSS_REST | Q2_PROJ_TOSS_HELD)
+
+/* Native Grenade2/3 entity+0x50 becomes zero permanently after leaving the
+ * owner's expanded X/Z bounds. Kept in the existing saved flags payload. */
+#define Q2_PROJ_OWNER_CLEAR     0x0080u
 
 /* The two values any caller of 0x8004D70C passes. */
 #define Q2_PROJ_FLAGS_BLASTER      11u   /* 0x8004C11C, 0x800620D4 */
@@ -152,10 +162,9 @@ u16 q2_projectile_flags_for_mod(s16 mod);
 #define Q2_LIFETIME_BOLT     2560
 
 /*
- * Gravity on a thrown grenade. MODELLED: the grenade is handed to the shared
- * entity physics, so it falls at the world's gravity rather than at a constant
- * of its own, and the port therefore takes the simulation's value rather than
- * inventing one. Passed in by the caller.
+ * Gravity on a thrown grenade comes from the shared entity mover's global
+ * at 0x800AE924. Passed in by the simulation; the signed halfword store and
+ * one-sided terminal clamp are covered by native toss fixtures.
  */
 
 /*
@@ -237,9 +246,11 @@ typedef struct q2_projectile {
 
     /*
      * The console's record+0x22, and what every per-tick arm of the sweep is
-     * gated on — see the header note. Only a bolt has one; the four class
-     * spawners take no such argument, so it is zero for them and no arm runs.
+     * gated on — see the header note. Only a bolt has those render bits;
+     * the four class spawners take no such argument, so no bolt arm runs.
      *
+     * Grenades use bits 5/6 for their separate native toss movement flags.
+     * These do not overlap any bolt render flag and persist in PRST/ZPOP.
      * Saved in PRST. Legacy files reconstruct the two authored values from
      * the means of death: 11 pairs with mod 6 and 14 with mod 5 at the three
      * callers of 0x8004D70C. q2_projectile_flags_for_mod owns that fallback.
@@ -259,19 +270,21 @@ typedef struct q2_projectile {
     /*
      * A CREATURE that fired it (q2_sim_creature_launch), or NULL for a
      * player's. `owner` is -1 then, since a creature is not a player index.
-     * It names who is credited and who the shot cannot hit, and it makes the
-     * player a target of it. Not saved: a creature's bolt or rocket in flight
-     * across a save comes back as the world's.
+     * It names who is credited and initially ignored by collision; grenades
+     * release that exclusion through Q2_PROJ_OWNER_CLEAR. ZPOP v2 retains the
+     * creature's authored identity
+     * and rebinds this pointer after a zone change or native save restore.
+     * Legacy PROJ-only saves have no shooter identity.
      */
     q2_actor *shooter;
 
     /*
      * THE ATTITUDE ITS MODEL IS DRAWN WITH — entity+0xE6, the SVECTOR the
      * spawner hands RotMatrix. A rocket's is set from its flight
-     * (q2_projectile_aim_rocket) and circles it; a grenade's and the BFG
-     * ball's are set once at launch (q2_projectile_set_attitude). `base` and
-     * `phase` are the rocket's +0x50/+0x4C and +0x48. Not saved: a restored
-     * rocket is re-aimed from its velocity (save.c).
+     * (q2_projectile_aim_rocket) and circles it; a grenade tumbles on each
+     * moving tick, while the BFG's attitude is set at launch. `base` and
+     * `phase` are the rocket's +0x50/+0x4C and +0x48. ZPOP v2 preserves them;
+     * legacy PROJ-only saves re-aim a rocket from its velocity (save.c).
      */
     s16 angles[3];
     s16 base[2];
@@ -308,6 +321,7 @@ typedef struct q2_projectile {
      * the arithmetic for a long-lived ball.
      */
     u16  beam_time;
+    u32  zone_serial; /* map-local identity, independent of this reusable slot */
 } q2_projectile;
 
 #define Q2_PROJ_NODE_UNKNOWN (-1)
@@ -346,8 +360,7 @@ s32 q2_projectile_raw_velocity(const q2_projectile *p, int axis);
 void q2_projectile_aim_rocket(q2_projectile *p, s32 shooter_yaw);
 
 /*
- * An attitude set once and kept — entity+0xE6, which three spawners write and
- * no think of theirs writes again:
+ * The initial attitude at entity+0xE6, written by three spawners:
  *
  *     Grenade2  AnyoneFireGrenadeL 0x8004A2B8..0x8004A2EC: three rand()s
  *     Grenade3  PrimaryGrenadeActive's release, 0x8004A6FC..0x8004A770:
@@ -356,8 +369,8 @@ void q2_projectile_aim_rocket(q2_projectile *p, s32 shooter_yaw);
  *               view, (-pitch, -yaw, roll), or a shooter with no client's
  *               own (-pitch, yaw, roll)
  *
- * So a grenade lands and bounces at the attitude it left with, and the ball's
- * turning is its animation (q2_projectile_spin_bfg), not its matrix.
+ * Released grenades subsequently tumble through the shared toss routine.
+ * The BFG ball turns through its animation (q2_projectile_spin_bfg).
  */
 void q2_projectile_set_attitude(q2_projectile *p, s32 r0, s32 r1, s32 r2);
 
@@ -424,18 +437,28 @@ void q2_projectile_step(q2_projectiles *list, u32 index, s32 gravity, s32 dt,
 /* Commit a move that met nothing. */
 void q2_projectile_commit(q2_projectiles *list, u32 index, const s32 to[3]);
 
+/* Call before movement. Grenades stop ignoring their owner once outside its
+ * world bounds plus 40 in X/Z; Y is not tested. Other projectile kinds retain
+ * their owner exclusion. A held Grenade3 has not entered this movement path. */
+bool q2_projectile_ignore_owner(q2_projectile *p, const q2_actor *owner);
+
+/* 0x800463E8/0x80046B98: reflect the remaining displacement, apply the native
+ * 2304/4096 speed factor and rest threshold, and flip tumble on a fast hit.
+ * desired is the destination passed to the hull query, clipped its result.
+ * The collision normal points out of the cell, along the incoming motion. */
+void q2_projectile_rebound(q2_projectile *p, const s32 desired[3],
+                            const s32 clipped[3], const s16 normal[3]);
+
 /*
  * Resolve an impact at `point`.
  *
- * `hit` is the actor struck, or NULL for the world. Grenades bounce off the
- * world — reflected about `normal` and losing half their speed, which is
- * MODELLED, not read — and detonate on anything else. Everything else
- * detonates on contact.
+ * `hit` is the actor struck, or NULL for the world. This resolves a damaging
+ * contact; grenade geometry contacts use q2_projectile_rebound instead.
  *
  * Returns true when the projectile was consumed.
  */
 bool q2_projectile_impact(q2_projectiles *list, u32 index,
-                          const s32 point[3], const s32 normal[3],
+                          const s32 point[3],
                           q2_actor *attacker, q2_actor *hit,
                           q2_actor **targets, u32 target_count,
                           const q2_combat_rules *rules);
@@ -451,15 +474,14 @@ bool q2_projectile_impact(q2_projectiles *list, u32 index,
  * pass. The sim supplies a real one.
  */
 bool q2_projectile_impact_traced(q2_projectiles *list, u32 index,
-                                 const s32 point[3], const s32 normal[3],
+                                 const s32 point[3],
                                  q2_actor *attacker, q2_actor *hit,
                                  q2_actor **targets, u32 target_count,
                                  const q2_combat_rules *rules,
                                  q2_combat_clear_fn clear, void *clear_ctx);
 
-/* How much of its speed a grenade keeps when it bounces. MODELLED. */
-#define Q2_GRENADE_BOUNCE_NUM 1
-#define Q2_GRENADE_BOUNCE_DEN 2
+#define Q2_GRENADE_RESTITUTION 2304
+#define Q2_GRENADE_REST_SPEED_SQ 0xC34FFu
 
 /* Detonate a projectile where it stands, applying its splash. Used by the fuse
  * path and by a caller that wants to clear the world. */

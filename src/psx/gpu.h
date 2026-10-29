@@ -41,6 +41,9 @@ typedef enum psx_prim_kind {
     PSX_PRIM_TPAGE,    /* draw-mode change                  */
     PSX_PRIM_MOVE,     /* VRAM -> VRAM rectangle copy       */
     PSX_PRIM_DRAW_ENV, /* clipped-region draw environment   */
+    PSX_PRIM_TWINDOW,  /* GP0 E2 texture window             */
+    PSX_PRIM_MASK,     /* GP0 E6 framebuffer mask control   */
+    PSX_PRIM_CACHE_CLEAR, /* GP0 01 texture AND palette cache */
     PSX_PRIM_KIND_COUNT
 } psx_prim_kind;
 
@@ -87,11 +90,22 @@ typedef struct psx_prim {
     psx_prim_kind kind;
 
     psx_xy   xy[4];        /* 3 for triangles, 4 for quads, 2 for lines  */
+    /* DRAW_ENV: xy[0] clip origin, xy[1] extent, xy[2] draw origin.
+     * Overlay coordinates use the
+     * native UI canvas; viewport packets are local to their viewport. */
     psx_uv   uv[4];
     psx_rgb  rgb[4];       /* [0] only for flat primitives               */
 
     u16      tpage;
     u16      clut;
+    u32      texture_window; /* E2's low 20 bits; also part of DRAW_ENV */
+    u8       mask_mode;      /* E6: bit 0 force mask, bit 1 check mask  */
+
+    /* A preceding DR_TPAGE folded into this logical primitive (HUD sprites
+     * and panel tiles). Raw untextured packets have no page: they inherit
+     * the GPU register. Textured polygons always write their page themselves. */
+    bool     set_tpage;
+    bool     clear_cache; /* preceding GP0(01), e.g. retail Water Moves */
 
     bool     semi_transparent;  /* the primitive's ABE bit                */
     bool     textured_blend;    /* modulate texture by rgb (libgpu "raw") */
@@ -103,9 +117,9 @@ typedef struct psx_prim {
      *         store: the four corners walk round the quad. The console converts
      *         that to Z order by exchanging corners 2 and 3 on the way into the
      *         packet, so the hardware's split expressed in THESE indices is
-     *         (0,1,3)+(1,2,3) — see the diagonal note in render/raster.c.
+     *         (0,1,3)+(1,3,2) — see the diagonal note in render/raster.c.
      * true  — libgpu Z ORDER, which is what the hardware's own POLY_x4 packets
-     *         use: 0 1 / 2 3 across two rows, splitting (0,1,2)+(1,3,2).
+     *         use: 0 1 / 2 3 across two rows, splitting (0,1,2)+(1,2,3).
      *
      * The flare pass builds real console packets and therefore hands over Z
      * order; splitting those on the perimeter rule drew half of every sector as
@@ -115,6 +129,12 @@ typedef struct psx_prim {
      * told which convention it is looking at.
      */
     bool     quad_zorder;
+
+    /* Host presentation metadata, never a PSX packet bit. */
+    bool     ui;
+
+    /* Source texel extent for host-scaled UI sprites; zero keeps PSX 1:1. */
+    u16      sprite_w, sprite_h;
 
     u16      otz;          /* ordering-table bucket this landed in       */
 
@@ -150,9 +170,9 @@ typedef struct psx_prim {
 /*     coordinates are absolute. The water warp relies on it: it computes its */
 /*     own `view.x + buffer origin` and would land twice as far off if the    */
 /*     draw env's offset were applied on top.                                 */
-/*   - Overlapping source and destination are allowed and are the normal      */
-/*     case, so the copy must behave as though the source were read whole     */
-/*     before the destination is written.                                     */
+/*   - Transfers run top-to-bottom and left-to-right in chunks of up to 128   */
+/*     words. Each chunk is read before it is written. Overlap can feed back  */
+/*     into later chunks/rows; a whole-rectangle snapshot is not equivalent.  */
 /* ------------------------------------------------------------------------- */
 #define PSX_MOVE_SRC  0
 #define PSX_MOVE_DST  1
@@ -315,6 +335,8 @@ s32 psx_ot_batch_begin_point(psx_ot *ot, u32 area, bool quick, s16 order,
                              const s32 point[3], const s32 camera[3]);
 psx_prim *psx_ot_batch_add(psx_ot *ot, s32 batch);
 bool psx_ot_batch_link_prim(psx_ot *ot, s32 batch, psx_prim *prim);
+/* Attach a packet to the far end of an entity's private chain (AddPrimEnd). */
+bool psx_ot_batch_append_prim(psx_ot *ot, s32 batch, psx_prim *prim);
 void psx_ot_flush_batches(psx_ot *ot);
 
 /* How many buckets an emitter may address right now — the window if one is
@@ -485,16 +507,24 @@ Q2PSX_INLINE u16 psx_make_clut(int x, int y)
 /* ------------------------------------------------------------------------- */
 /* VRAM                                                                       */
 /*                                                                            */
-/* 1024x512 16-bit words, exactly as on hardware. Textures, palettes and both  */
-/* framebuffers all live in here and can overlap — the original relied on that */
-/* layout, so the port keeps it rather than using separate texture objects.    */
+/* Texture/palette memory, with the hardware's 1024x512 word addressing.       */
+/* Native screen targets mirror writes here, so texture fetches and transfers */
+/* see rendered pixels. Adaptive targets retain extended host buffers.        */
 /* ------------------------------------------------------------------------- */
 #define PSX_VRAM_WIDTH   1024
 #define PSX_VRAM_HEIGHT  512
 
 typedef struct psx_vram {
     u16 px[PSX_VRAM_HEIGHT][PSX_VRAM_WIDTH];
+    u32 transfer_serial; /* CPU upload/read commands invalidate texture words */
 } psx_vram;
+
+/* Call for a CPU<->VRAM transfer, including direct host asset uploads. Drawing
+ * and framebuffer fills must NOT call this. Transfers retain the CLUT cache. */
+Q2PSX_INLINE void psx_vram_transfer(psx_vram *vram)
+{
+    if (vram) ++vram->transfer_serial;
+}
 
 /* RGB555 with the mask bit in bit 15. */
 Q2PSX_INLINE u16 psx_rgb555(u8 r, u8 g, u8 b)

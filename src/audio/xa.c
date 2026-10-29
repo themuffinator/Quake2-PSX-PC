@@ -3,6 +3,42 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "xa_impulse.h"
+
+void q2_xa_resampler_reset(q2_xa_resampler *resampler)
+{
+    if (resampler) memset(resampler, 0, sizeof(*resampler));
+}
+
+u32 q2_xa_resample_sector(q2_xa_resampler *r, const s16 *input,
+                         s16 *output, u32 output_capacity)
+{
+    u32 frame, consumed = 0, ch, tap;
+    if (!r || !input || !output || output_capacity < XA_OUTPUT_FRAMES_PER_SECTOR)
+        return 0;
+    for (frame = 0; frame < XA_OUTPUT_FRAMES_PER_SECTOR; frame++) {
+        for (ch = 0; ch < XA_CHANNELS; ch++) {
+            s64 sum = 0;
+            for (tap = 0; tap < 25; tap++)
+                sum += (s32)r->history[ch][(r->position + 32 - 25 + tap) & 31] *
+                       XA_IMPULSE[r->phase][tap];
+            sum >>= 15;
+            if (sum > 32767) sum = 32767;
+            if (sum < -32768) sum = -32768;
+            output[frame * XA_CHANNELS + ch] = (s16)sum;
+        }
+        r->phase += 6;
+        if (r->phase >= 7) {
+            r->phase -= 7;
+            for (ch = 0; ch < XA_CHANNELS; ch++)
+                r->history[ch][r->position] = input[consumed * XA_CHANNELS + ch];
+            consumed++;
+            r->position = (r->position + 1) & 31;
+        }
+    }
+    return XA_OUTPUT_FRAMES_PER_SECTOR;
+}
+
 /* XA's predictor. Only four filters, unlike SPU-ADPCM's five. */
 static const s32 XA_K0[4] = { 0, 60, 115,  98 };
 static const s32 XA_K1[4] = { 0,  0, -52, -55 };
@@ -66,13 +102,13 @@ u32 q2_xa_decode_sector(q2_xa_decoder *dec, const u8 *adpcm, s16 *out, u32 out_c
                 s32 nibble = (s32)((word >> (4 * b)) & 0x0F);
                 s32 sample;
 
-                /* Sign-extend the 4-bit residual from bit 3, then scale up by
-                 * (12 - shift) rather than down: XA stores the shift as an
-                 * attenuation, the opposite sense to SPU-ADPCM. */
+                /* Sign-extend the 4-bit residual from bit 3, then scale by
+                 * (12 - shift). Both XA and SPU encode shift as attenuation. */
                 if (nibble > 7)
                     nibble -= 16;
 
-                sample = nibble << (12 - shift);
+                /* Multiplication also defines the negative residual case in C. */
+                sample = nibble * (1 << (12 - shift));
                 sample += (XA_K0[filter] * dec->prev1[ch] +
                            XA_K1[filter] * dec->prev2[ch]) / 64;
 
@@ -168,10 +204,9 @@ static u64 xa_try_block(const s16 *src, u32 have, int filter, int shift,
  *
  * A residual has to survive `nibble << (12 - shift)` with the nibble in -8..7,
  * so the step must be at least |residual| / 7 — and a LARGER shift is a FINER
- * step, which is the opposite sense to SPU-ADPCM and the thing to get wrong
- * here. This estimates the residuals against the source rather than against the
- * reconstruction, so it can be off by one either way; the caller tries the
- * neighbours.
+ * step, as in SPU-ADPCM. This estimates the residuals against the source rather
+ * than the reconstruction, so it can be off by one either way; the caller tries
+ * the neighbours.
  */
 static int xa_guess_shift(const s16 *src, u32 have, int filter, s32 in1, s32 in2)
 {
@@ -415,16 +450,18 @@ void q2_xa_cd_mix(s16 *pcm, u32 samples, s32 volume, bool stereo)
     if (!stereo) {
         /*
          * 0x80071A08..0x80071A1C writes volume/2 into all four mix bytes, so
-         * each output is (left + right) at half level. The halving is on the
+         * each input contributes at half the requested gain. The halving is on the
          * VOLUME and truncates toward zero — `srl v0, v1, 31 / addu / sra v0,
          * v0, 1` is the compiler's signed divide by two — which is why this is
-         * not tidied into ((l + r) / 2 * volume): at an odd volume the two
-         * differ, and the console's answer is the quieter one.
+         * not tidied into ((l + r) / 2 * volume). Each product has seven
+         * fractional bits; truncate it before adding the other channel.
          */
         s32 half = volume / 2;
 
         for (i = 0; i + 1 < samples; i += XA_CHANNELS) {
-            s32 m = (pcm[i] * half + pcm[i + 1] * half) / 255;
+            s32 m = ((pcm[i] * half) >> 7) + ((pcm[i + 1] * half) >> 7);
+            if (m > 32767) m = 32767;
+            if (m < -32768) m = -32768;
 
             pcm[i]     = (s16)m;
             pcm[i + 1] = (s16)m;
@@ -434,10 +471,15 @@ void q2_xa_cd_mix(s16 *pcm, u32 samples, s32 volume, bool stereo)
 
     /* Stereo: left-to-left and right-to-right carry the volume and both cross
      * terms are zero (0x800719F4..0x80071A04), i.e. each channel scaled on its
-     * own. 255 is unity and there is nothing to do. */
-    if (volume >= 255)
+     * own. The controller's unity byte is 128; 255 is nearly double gain.
+     * Saturation happens in the CD path before SPU input gain and mixing. */
+    if (volume == 128)
         return;
 
-    for (i = 0; i < samples; i++)
-        pcm[i] = (s16)((pcm[i] * volume) / 255);
+    for (i = 0; i < samples; i++) {
+        s32 sample = (pcm[i] * volume) >> 7;
+        if (sample > 32767) sample = 32767;
+        if (sample < -32768) sample = -32768;
+        pcm[i] = (s16)sample;
+    }
 }

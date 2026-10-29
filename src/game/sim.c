@@ -110,6 +110,7 @@ void q2_sim_free(q2_sim *sim)
 {
     if (!sim)
         return;
+    q2_fx_flash_clear(&sim->fx);
     q2_event_rt_free(&sim->event_rt);
     q2_entity_set_free(&sim->entities);
     free(sim->item_group_run);
@@ -412,7 +413,7 @@ static void scene_logo_sub_think(q2_entity *e, q2_entity_world *w)
 void q2_sim_scene_page(q2_sim *sim, bool title, bool visible)
 {
     q2_entity *e;
-    u32 p;
+    u32 p, i;
 
     if (!sim || !sim->scene_ready || sim->entities.count == 0)
         return;
@@ -426,6 +427,23 @@ void q2_sim_scene_page(q2_sim *sim, bool title, bool visible)
         e->taken[p] = !visible;
 
     e->think = title ? scene_logo_title_think : scene_logo_sub_think;
+    for (i = 1; i < sim->entities.count && i <= 4; i++)
+        for (p = 0; p < Q2_MAX_PLAYERS; p++)
+            sim->entities.ent[i].taken[p] = true;
+}
+
+void q2_sim_scene_players(q2_sim *sim, const s16 colours[4], int players)
+{
+    u32 i, p;
+    if (!sim || !sim->scene_ready) return;
+    /* QFRONT +0x9C24: each viewport sees its chosen coloured Male2 only.
+     * +0x5A94 installs the title's full-intensity spin on all four models. */
+    for (i = 0; i < sim->entities.count && i <= 4; i++) {
+        q2_entity *e = &sim->entities.ent[i];
+        for (p = 0; p < Q2_MAX_PLAYERS; p++)
+            e->taken[p] = i == 0 || (int)p >= players || i != (u32)(colours[p] + 1);
+        if (i) e->think = scene_logo_title_think;
+    }
 }
 
 /*
@@ -564,9 +582,8 @@ u32 q2_sim_attach_scene(q2_sim *sim, const q2_common_file *common,
 
         /*
          * module+0x3414 hides all five — bit 0x80 of every player's block —
-         * and then shows exactly one back. So the four coloured player models
-         * are spawned and never drawn on any page this port reaches, and that
-         * is the module's doing rather than a gap here.
+         * and then shows the logo on ordinary pages. Player setup (+0x59CC)
+         * instead reveals each viewport's chosen body through +0x9C24.
          */
         {
             u32 p;
@@ -700,16 +717,16 @@ static u32 record_env_mask(const q2_events *ev, const q2_userfuncs *uf,
  * not depend on it.
  *
  * LASERWALL's attacker is the TARGET, not nobody — `a0` still holds the entity
- * at its call site where the other four zero it. It changes nothing here (the
- * player is the only thing these volumes can reach) and it is recorded because
- * it is the sort of asymmetry that looks like a transcription slip later.
+ * at its call site where the other four zero it. Preserve that attribution
+ * and the entity-origin contact point in the environment walk below.
  *
  * A record with more than one of them takes the LAST, which is the engine's
  * outcome too: the calls run in order and each one hurts, but the throttle the
  * first arms suppresses the rest within its window.
  */
 static void record_hazard(const q2_events *ev, const q2_userfuncs *uf,
-                          u32 record_offset, s16 *out_damage, s16 *out_mod)
+                          const q2_uf_operands *ops, u32 record_offset,
+                          s16 *out_damage, s16 *out_mod)
 {
     q2_event_record rec;
     u32 i;
@@ -746,27 +763,31 @@ static void record_hazard(const q2_events *ev, const q2_userfuncs *uf,
             *out_mod    = Q2_MOD_LAVA;
             break;
         case Q2_UF_LASERWALL: {
-            q2_uf_call call;
-            s32        amount = 0;
-
-            if (q2_uf_decode_call(&call, uf, &item) != Q2_OK)
-                break;
-            if (!q2_uf_operand_s32(&call, 1, 0, &amount))
-                break;
+            const u8 *p;
+            if (item.len != 24) break;
+            p = q2_uf_operand_at(ops, item.payload - 2, 24);
             /* `bltz` on the object slot at +18 returns before the damage, so a
              * wall with no object never fires. */
-            {
-                s16 slot = 0;
-
-                if (q2_uf_operand_slot_raw(&call, 0, 0, &slot) && slot < 0)
-                    break;
-            }
-            *out_damage = (s16)amount;
+            if (q2_rd_s16(p + 18) < 0) break;
+            *out_damage = q2_rd_s16(p + 20);
             *out_mod    = Q2_MOD_LASER;
             break;
         }
         default: break;
         }
+    }
+}
+
+void q2_sim_bind_hazards(q2_sim *sim, const q2_uf_operands *ops)
+{
+    u32 i;
+    if (!sim || !sim->volume_damage || !sim->volume_mod ||
+        !sim->triggers_ready || !sim->events_ready || !sim->userfuncs_ready) return;
+    for (i = 0; i < sim->triggers.count; i++) {
+        q2_trigger t;
+        if (q2_trigger_get(&sim->triggers, i, &t))
+            record_hazard(&sim->events, &sim->userfuncs, ops, t.event_offset,
+                          &sim->volume_damage[i], &sim->volume_mod[i]);
     }
 }
 
@@ -803,9 +824,8 @@ static void build_volume_env(q2_sim *sim)
 
         sim->volume_env[i] = record_env_mask(&sim->events, &sim->userfuncs,
                                              t.event_offset);
-        record_hazard(&sim->events, &sim->userfuncs, t.event_offset,
-                      &sim->volume_damage[i], &sim->volume_mod[i]);
     }
+    q2_sim_bind_hazards(sim, NULL);
 }
 
 q2_result q2_sim_attach_gameplay(q2_sim *sim, const q2_common_file *common)
@@ -957,7 +977,7 @@ static bool volume_dispatchable(const q2_trigger *t, s32 area)
  * bits because several volumes can name one record; `trigger_inside` remains
  * the per-volume edge used by diagnostics and save games.
  */
-static void update_triggers(q2_sim *sim)
+static void update_triggers(q2_sim *sim, bool touch)
 {
     s32 at[3];
     s32 area;
@@ -998,7 +1018,7 @@ static void update_triggers(q2_sim *sim)
 
     for (i = 0; sim->triggers_ready &&
                 i < sim->triggers.count && i < sim->trigger_capacity; i++) {
-        q2_trigger trig;
+        q2_trigger trig = {0};
         bool was = sim->trigger_inside[i] != 0;
         bool inside;
 
@@ -1008,7 +1028,7 @@ static void update_triggers(q2_sim *sim)
          * so a refused volume is not "inside" for any purpose — no contact,
          * no category bit, and no entry edge in `trigger_inside`.
          */
-        inside = q2_trigger_get(&sim->triggers, i, &trig) &&
+        inside = touch && q2_trigger_get(&sim->triggers, i, &trig) &&
                  volume_dispatchable(&trig, area) &&
                  q2_trigger_contains(&sim->triggers, i, at);
 
@@ -1235,12 +1255,9 @@ static void sim_bodies_rebuild(q2_sim *sim)
         if (i > 0 && i >= sim->player_count)
             continue;
 
-        /*
-         * A DEAD PLAYER IS STILL A BODY. The console's gate is bit 0x8000 at
-         * entity+0x10C (0x800513F0) and nothing in the death chain sets it —
-         * `0x8007F740` appends a corpse to this very list. So no health test
-         * here; the owner can clear `solid` on an entry it wants out.
-         */
+        /* A corpse remains a body until the down transition sets 0x8000
+         * (0x8003966C), the separation gate at 0x800513F0. Health alone
+         * cannot decide solidity: an animating corpse still blocks others. */
         b = &sim->bodies[n++];
         memset(b, 0, sizeof(*b));
         for (k = 0; k < 3; k++) {
@@ -1254,7 +1271,8 @@ static void sim_bodies_rebuild(q2_sim *sim)
         b->sweep_radius = Q2_SWEEP_HALF_EXTENT;
         b->height       = (s16)(Q2_SWEEP_HALF_EXTENT * 2);
         b->id           = sim_body_id_for_player(i);
-        b->solid        = true;
+        b->solid        = p->motion == Q2_PLAYER_MOTION_LIVE ||
+                          p->motion == Q2_PLAYER_MOTION_CORPSE;
     }
 
     if (sim->extra_bodies && sim->extra_body_count) {
@@ -1490,7 +1508,7 @@ void q2_sim_movers_update(q2_sim *sim, const q2_mover_set *set)
              * from the node's own bbox — so a crate is still something you
              * cannot walk through.
              */
-            if (m->external) {
+            if (m->external == Q2_MV_EXTERNAL_CRATES) {
                 for (k = 0; k < 3; k++) {
                     t->min[k] = base[k];
                     t->max[k] = base[3 + k];
@@ -1687,11 +1705,21 @@ void q2_sim_spawn(q2_sim *sim, const s32 pos[3], s32 yaw)
     sim->player[sim->cur_player].yaw    = yaw;
     sim->player[sim->cur_player].pitch  = 0;
     sim->player[sim->cur_player].roll   = 0;
+    memset(sim->player[sim->cur_player].aim_direction, 0,
+           sizeof(sim->player[sim->cur_player].aim_direction));
+    memset(sim->player[sim->cur_player].aim_eye, 0,
+           sizeof(sim->player[sim->cur_player].aim_eye));
+    sim->player[sim->cur_player].aim_pitch = 0;
+    sim->player[sim->cur_player].aim_assist = 0;
+    sim->player[sim->cur_player].aim_node = -1;
+    sim->player[sim->cur_player].aim_ready = false;
+    sim->player[sim->cur_player].aim_view_valid = false;
 
     sim->player[sim->cur_player].wish[0] = sim->player[sim->cur_player].wish[1] = sim->player[sim->cur_player].wish[2] = 0;
     sim->player[sim->cur_player].pitch_rate = sim->player[sim->cur_player].yaw_rate = 0;
 
     sim->player[sim->cur_player].impulse[0] = sim->player[sim->cur_player].impulse[1] = sim->player[sim->cur_player].impulse[2] = 0;
+    sim->player[sim->cur_player].jumped_this_tick = false;
     sim->player[sim->cur_player].impulse_armed = false;
     sim->player[sim->cur_player].jump_hold     = 0;
 
@@ -1727,6 +1755,8 @@ void q2_sim_spawn(q2_sim *sim, const s32 pos[3], s32 yaw)
     sim->player[sim->cur_player].look_hist     = 0;
     sim->player[sim->cur_player].recentring    = false;
     sim->player[sim->cur_player].autocentre    = 0;
+    sim->player[sim->cur_player].motion        = Q2_PLAYER_MOTION_LIVE;
+    sim->player[sim->cur_player].corpse_separate = false;
     sim->player[sim->cur_player].ent2_flags    = 0;
     sim->player[sim->cur_player].prev_health   = sim->combat.inv.health;
     sim->player[sim->cur_player].prev_armour   = sim->combat.inv.armour;
@@ -2008,13 +2038,16 @@ static void update_env_flags(q2_sim *sim)
              * per-target throttle, which is what stops twenty points of lava
              * three hundred times a second.
              *
-             * Nobody is the attacker. Lava is not a frag.
+             * LASERWALL passes the victim itself; acid and lava pass nobody.
              */
             if (hazard) {
                 q2_damage_result dr =
-                    q2_sim_hurt_player(sim, NULL, sim->volume_damage[i],
+                    q2_sim_hurt_player(sim,
+                                       sim->volume_mod[i] == Q2_MOD_LASER ? &sim->combat.self : NULL,
+                                       sim->volume_damage[i],
                                        sim->volume_mod[i],
-                                       sim->player[sim->cur_player].ent.pos);
+                                       sim->volume_mod[i] == Q2_MOD_LASER ? at :
+                                           sim->player[sim->cur_player].ent.pos);
 
                 if (!dr.blocked)
                     sim->hazard_hits++;
@@ -2343,7 +2376,7 @@ static bool player_jump(q2_sim *sim, bool pressed, s32 dt)
      * The queue carries the sound; the client's drain raises the noise beside
      * it, because the creature world is the client's to reach.
      */
-    q2_ent_sound_at(&sim->ent_world.events, Q2_SND_JUMP, p->pos);
+    q2_ent_sound_player(&sim->ent_world.events, sim->cur_player, Q2_SND_JUMP, p->pos);
     return true;
 }
 
@@ -2513,20 +2546,11 @@ static void update_roll(q2_sim *sim)
 static void ground_project(q2_sim *sim)
 {
     q2_player *p = &sim->player[sim->cur_player];
-    s32 ny = p->ent.ground_normal[1];
-
-    if (p->ent.max_slope_ny >= ny)
-        return;
-    if (!(p->ent.flags & (Q2_ENT_ON_GROUND | Q2_ENT_ON_ENTITY | 0x2000u)))
-        return;
-    if (p->ent.flags & (Q2_ENT_WALL_CONTACT | Q2_ENT_UNDERWATER |
-                        Q2_ENT_NO_FOOTSTEP))
-        return;
-    if (ny == 0)
-        return;                 /* the original would trap; it cannot happen */
-
-    p->vel[1] = (s16)(-((s32)(s16)p->vel[0] * p->ent.ground_normal[0] +
-                        (s32)(s16)p->vel[2] * p->ent.ground_normal[2]) / ny);
+    s16 velocity[3];
+    int k;
+    for (k = 0; k < 3; k++) velocity[k] = (s16)p->vel[k];
+    q2_move_ground_project(&p->ent, velocity);
+    for (k = 0; k < 3; k++) p->vel[k] = velocity[k];
 }
 
 /*
@@ -2551,130 +2575,18 @@ static void ground_project(q2_sim *sim)
  */
 static void integrate_vertical(q2_sim *sim, s32 dt, s16 out_delta[3])
 {
-    q2_player *p  = &sim->player[sim->cur_player];
-    s32        g  = sim->gravity ? sim->gravity : Q2_GRAVITY;
-    s32        dv = g * dt;
-    s32        dvdt;
-    s32        half;
-    bool       no_gravity;
-
-    /* 0x80045E74: the horizontal deltas are computed for both arms, before any
-     * impulse, and only the gravity arm's re-derivation can replace them. */
-    out_delta[0] = (s16)(((s32)(s16)p->vel[0] * dt) / Q2_VEL_DIV);
-    out_delta[2] = (s16)(((s32)(s16)p->vel[2] * dt) / Q2_VEL_DIV);
-
-    /*
-     * 0x80045EE0..0x80045F0C, in the original's own short-circuit order.
-     *
-     * The FIRST test is entity+0x10C bit 12, which this transcription described
-     * and did not implement — so the fly cheat steered movement by the view
-     * basis while still falling. It is checked before the +0x98 word because
-     * that is the order the branches sit in, and being first is what lets it
-     * override the liquid and ladder arms rather than compete with them.
-     */
-    no_gravity = (p->ent2_flags & Q2_ENT2_FLY) != 0
-              || (p->ent.flags & (Q2_ENT_UNDERWATER | Q2_ENT_NO_FOOTSTEP)) != 0
-              || ((p->ent.flags & Q2_ENT_WALL_CONTACT) && !p->impulse_armed);
-
-    if (no_gravity) {
-        /* 0x80045F14. The vertical delta comes from the velocity BEFORE the
-         * impulse, so a jump off a ladder shows up on the following frame. */
-        out_delta[1] = (s16)(((s32)(s16)p->vel[1] * dt) / Q2_VEL_DIV);
-
-        p->ent.flags &= ~(u32)(Q2_ENT_ON_GROUND | Q2_ENT_ON_ENTITY);
-        p->on_ground  = false;
-
-        p->vel[0] = (s16)(p->vel[0] + p->impulse[0]);
-        p->vel[1] = (s16)(p->vel[1] + p->impulse[1]);
-        p->vel[2] = (s16)(p->vel[2] + p->impulse[2]);
-
-        /*
-         * The three halfwords are zeroed at 0x80045F44..0x80045F4C, and the arm
-         * bit is NOT. The whole weightless arm, 0x80045F14..0x80045FA0, contains
-         * exactly one word store — 0x80045F68 to entity+0x98 — and never touches
-         * entity+0x10C; the 0x4000 bit's only clear site in the function is
-         * 0x80046118, down in the gravity arm.
-         *
-         * Clearing it here disarmed the accumulator a frame early, so an impulse
-         * posted while weightless — a jump off a ladder, the buoyancy kick on
-         * leaving water — never reached 0x80046094's block on the following
-         * frame and the entity kept its ground flags and its ceiling clamp.
-         */
-        p->impulse[0] = p->impulse[1] = p->impulse[2] = 0;
-        return;
-    }
-
-    /*
-     * 0x80045FA4. (dv*dt)/2 carries the sign-bit bias the compiler emitted at
-     * 0x80045FE0, which makes the halving truncate toward zero and not -inf.
-     */
-    dvdt = dv * dt;
-    half = (dvdt + (s32)(((u32)dvdt) >> 31)) >> 1;
-
-    out_delta[1] = (s16)((((s32)(s16)p->vel[1] * dt) + half) / Q2_VEL_DIV);
-    p->vel[1]    = (s16)(p->vel[1] + dv);
-
-    /*
-     * The three vertical rules, mutually exclusive and in the original's order.
-     * The 0x08 arm is the one an earlier pass had inverted: 0x80046050 branches
-     * on `vel.y < 1024` into the `-= dt*24` arm, so a 0x0200 volume pushes you
-     * UP until you are falling faster than 1024 and only then caps the fall.
-     */
-    if (p->ent.flags & Q2_ENT_LIQUID_FLOAT) {
-        p->vel[1] = ease32(p->vel[1], Q2_LIQUID_FLOAT_VY,
-                           dt * Q2_LIQUID_EASE_RATE);
-    } else if (p->ent.flags & Q2_ENT_LIQUID_SINK) {
-        if ((s16)p->vel[1] < Q2_LIQUID_SINK_VY)
-            p->vel[1] = (s16)(p->vel[1] - dt * Q2_LIQUID_SINK_PUSH);
-        else
-            p->vel[1] = ease32(p->vel[1], Q2_LIQUID_SINK_VY,
-                               dt * Q2_LIQUID_EASE_RATE);
-    } else if ((s16)p->vel[1] > Q2_TERMINAL_VY) {
-        p->vel[1] = Q2_TERMINAL_VY;
-    }
-
-    /* 0x80046094 — the impulse, and only when the poster armed it. */
-    if (!p->impulse_armed)
-        return;
-
-    /*
-     * 0x800460A4..0x800460FC: the entity leaves the ground, its ground normal
-     * is cleared and its last contact is replaced by the flat (0, 4096, 0) at
-     * 0x800AE928. Without this a jump that starts on a floor keeps the floor's
-     * normal and the velocity clip takes the jump straight back off.
-     */
-    p->ent.flags &= ~(u32)(Q2_ENT_ON_GROUND | Q2_ENT_ON_ENTITY |
-                           Q2_ENT_WALL_CONTACT | 0x2000u);
-    p->on_ground = false;
-    p->ent.ground_normal[0] = p->ent.ground_normal[1] = p->ent.ground_normal[2] = 0;
-    p->ent.last_normal[0]   = 0;
-    p->ent.last_normal[1]   = 4096;
-    p->ent.last_normal[2]   = 0;
-
-    p->vel[0] = (s16)(p->vel[0] + p->impulse[0]);
-    p->vel[1] = (s16)(p->vel[1] + p->impulse[1]);
-
-    /*
-     * 0x80046140. Single player only, and it is the same -3072 the jump posts —
-     * so a plain jump lands exactly on the ceiling and no stack of impulses,
-     * rocket jump included, can beat it.
-     */
-    if (!sim->multiplayer && (s16)p->vel[1] < Q2_IMPULSE_CEILING)
-        p->vel[1] = Q2_IMPULSE_CEILING;
-
-    p->vel[2] = (s16)(p->vel[2] + p->impulse[2]);
-
-    /*
-     * 0x800461DC — all three deltas re-derived from the post-impulse velocity,
-     * with no gravity half-step. It still lands on the NEXT frame's move, but it
-     * lands one tick earlier than waiting for the following integration would.
-     */
-    out_delta[0] = (s16)(((s32)(s16)p->vel[0] * dt) / Q2_VEL_DIV);
-    out_delta[1] = (s16)(((s32)(s16)p->vel[1] * dt) / Q2_VEL_DIV);
-    out_delta[2] = (s16)(((s32)(s16)p->vel[2] * dt) / Q2_VEL_DIV);
-
-    p->impulse[0] = p->impulse[1] = p->impulse[2] = 0;
-    p->impulse_armed = false;
+    q2_player *p = &sim->player[sim->cur_player];
+    s16 velocity[3];
+    u32 flags = p->ent2_flags;
+    int k;
+    for (k = 0; k < 3; k++) velocity[k] = (s16)p->vel[k];
+    flags = (flags & ~0x4000u) | (p->impulse_armed ? 0x4000u : 0u);
+    q2_move_integrate(&p->ent, velocity, p->impulse, &flags,
+                       sim->gravity ? sim->gravity : Q2_GRAVITY,
+                       dt, sim->multiplayer, out_delta);
+    for (k = 0; k < 3; k++) p->vel[k] = velocity[k];
+    p->impulse_armed = (flags & 0x4000u) != 0;
+    p->on_ground = (p->ent.flags & Q2_ENT_GROUNDED_MASK) != 0;
 }
 
 /*
@@ -2830,14 +2742,14 @@ static void fall_damage(q2_sim *sim, s32 vy_before)
      * on the loud arm below — so a landing that kills you still makes this one.
      */
     if (sev < Q2_FALL_SOFT) {
-        q2_ent_sound_at(&sim->ent_world.events, Q2_SND_LAND_SOFT, p->pos);
+        q2_ent_sound_player(&sim->ent_world.events, sim->cur_player, Q2_SND_LAND_SOFT, p->pos);
         return;
     }
 
     /* 0x80039D5C: the sound is gated on being alive, so a killing fall lands
      * silently and the death sound has the frame to itself. */
     if (sim->combat.inv.health > 0)
-        q2_ent_sound_at(&sim->ent_world.events, Q2_SND_LAND, p->pos);
+        q2_ent_sound_player(&sim->ent_world.events, sim->cur_player, Q2_SND_LAND, p->pos);
 
     dmg = (sev - Q2_FALL_DMG_BASE) / 2;
     if (dmg <= 0)
@@ -2879,11 +2791,11 @@ static void update_footsteps(q2_sim *sim)
      */
     if (p->ent.flags & Q2_ENT_INWATER) {
         p->footstep_time = sim->level_time + Q2_FOOTSTEP_PERIOD_WET;
-        q2_ent_sound_at(&sim->ent_world.events, Q2_SND_FOOTSTEP_WET, p->pos);
+        q2_ent_sound_player(&sim->ent_world.events, sim->cur_player, Q2_SND_FOOTSTEP_WET, p->pos);
     } else {
         p->footstep_time = sim->level_time + Q2_FOOTSTEP_PERIOD;
         p->foot = p->foot ? 0 : 1;
-        q2_ent_sound_at(&sim->ent_world.events,
+        q2_ent_sound_player(&sim->ent_world.events, sim->cur_player,
                         p->foot ? Q2_SND_FOOTSTEP_A : Q2_SND_FOOTSTEP_B,
                         p->pos);
     }
@@ -2953,7 +2865,7 @@ static void world_effects(q2_sim *sim)
             /* 0x8003D2D0: `sltu`, so the sound is skipped while the wade's own
              * cooldown is still running. */
             if ((u32)p->splash_time < (u32)sim->level_time)
-                q2_ent_sound_at(&sim->ent_world.events, Q2_SND_WATER_IN,
+                q2_ent_sound_player(&sim->ent_world.events, sim->cur_player, Q2_SND_WATER_IN,
                                 p->pos);
             p->water_air = 1;
             p->water_next = sim->level_time + 300;
@@ -2971,7 +2883,15 @@ static void world_effects(q2_sim *sim)
         if ((u32)p->water_next >= (u32)sim->level_time)
             return;
 
-        if (p->water_air < 3601) {
+        /*
+         * 0x8003D358 `slti v0, a2, 3601` / `bne v0, zero, 0x8003D3E0`: air
+         * BELOW 3601 takes the long ambience arm, and only a breath held past
+         * it (twelve seconds of dt) drowns, at `air >> 10` capped at 7. The
+         * two arms used to be the other way round, so a submerged player took
+         * 0..3 points every second for twelve seconds and then nothing at all
+         * for as long as they stayed under.
+         */
+        if (p->water_air >= 3601) {
             s32 damage = p->water_air >> 10;
 
             p->water_next = sim->level_time + 300;
@@ -2990,14 +2910,15 @@ static void world_effects(q2_sim *sim)
                 q2_ent_sound sound = (q2_random_next() & 1) ? Q2_SND_DROWN
                                                    : Q2_SND_GASP;
 
-                q2_ent_sound_at(&sim->ent_world.events, sound, p->pos);
+                q2_ent_sound_player(&sim->ent_world.events, sim->cur_player, sound, p->pos);
             }
         } else {
-            /* 0x8003D3E0 / 0x8003D434: long-submerge warning cadence. A live
-             * rebreather has already reset air above, so this is the reachable
-             * no-rebreather arm on the retail disc. */
+            /* 0x8003D3E0 / 0x8003D434: the underwater ambience, every 750
+             * ticks while the breath lasts. With a live rebreather the console
+             * plays its breathing here instead (0x8003D3FC); no shipped map
+             * places one, so this is the arm the retail disc reaches. */
             p->water_next = sim->level_time + 750;
-            q2_ent_sound_at(&sim->ent_world.events, Q2_SND_WATER_UNDER,
+            q2_ent_sound_player(&sim->ent_world.events, sim->cur_player, Q2_SND_WATER_UNDER,
                             p->pos);
         }
         return;
@@ -3005,14 +2926,14 @@ static void world_effects(q2_sim *sim)
 
     /* 0x8003D450: the surface EDGE, taken only if we were under. */
     if (p->water_air != 0)
-        q2_ent_sound_at(&sim->ent_world.events, Q2_SND_WATER_OUT, p->pos);
+        q2_ent_sound_player(&sim->ent_world.events, sim->cur_player, Q2_SND_WATER_OUT, p->pos);
 
     p->water_air = 0;
 
     /* 0x8003D480: shallow water, and only the tick you step into it. */
     if (p->ent.flags & Q2_ENT_INWATER) {
         if (p->wade == 0) {
-            q2_ent_sound_at(&sim->ent_world.events, Q2_SND_WATER_IN, p->pos);
+            q2_ent_sound_player(&sim->ent_world.events, sim->cur_player, Q2_SND_WATER_IN, p->pos);
             p->splash_time = sim->level_time + 100;
 
             /*
@@ -3082,7 +3003,7 @@ static void update_pain(q2_sim *sim)
              */
             if (q2_player_death_cries_out(sim->combat.self.last_attacker,
                                           sim->combat.self.last_mod))
-                q2_ent_sound_at(&sim->ent_world.events,
+                q2_ent_sound_player(&sim->ent_world.events, sim->cur_player,
                                 (p->ent.flags & Q2_ENT_UNDERWATER)
                                     ? Q2_SND_DROWN : Q2_SND_DEATH,
                                 p->pos);
@@ -3108,18 +3029,11 @@ static void update_pain(q2_sim *sim)
             else                  which = Q2_SND_PAIN_100;
 
             p->pain_time = sim->level_time + 210;
-            q2_ent_sound_at(&sim->ent_world.events, which, p->pos);
+            q2_ent_sound_player(&sim->ent_world.events, sim->cur_player, which, p->pos);
         }
 
-        /*
-         * 0x8003ADF8..0x8003AE0C: the FLINCH, which is not the same edge as
-         * the voice above. The console reads the damage byte at entity+0xDF,
-         * so a recorded hit that took nothing off either bar still asks for
-         * the pain move, where `hurt` — a health/armour diff, 0x8003AE10 —
-         * would miss it. Only the living ask: the death arm at 0x8003ADB8
-         * returns before this read, which is why it sits in the `else`.
-         */
-        p->pain_serial = sim->combat.self.damage_serial;
+        /* Body-animation damage consumption runs after the client's weapon
+         * driver, at the native animation point rather than in rendering. */
     }
 
     /* 0x8003AFA8: unconditionally, at the very end of the frame. */
@@ -3292,15 +3206,281 @@ void q2_sim_trace(q2_sim *sim, const s32 start[3], const s32 end[3],
 /* ------------------------------------------------------------------------- */
 /* One logic tick                                                             */
 /* ------------------------------------------------------------------------- */
+/* Only the live player think at 0x8003A1C8 dispatches volumes, reads the
+ * controls and changes the view. corpse_think and respawn_think share the
+ * mover below, but never call this part of the frame. */
+static void player_control(q2_sim *sim, const q2_input *input, s32 dt)
+{
+    q2_player *p = &sim->player[sim->cur_player];
+    bool was_underwater, moving;
+    u32 buttons;
+
+    /*
+     * 0x8003A41C — the fly bit, mirrored out of the GAME VARIABLES word before
+     * anything reads it. It has to be here rather than wherever the setting is
+     * written, because the original re-derives it every frame and a caller that
+     * clears `full_basis_movement` mid-game must see the flag go with it.
+     */
+    if (sim->full_basis_movement)
+        p->ent2_flags |=  (u32)Q2_ENT2_FLY;
+    else
+        p->ent2_flags &= ~(u32)Q2_ENT2_FLY;
+
+    /* 0x8003A208 — view offset, from flags that have not been cleared yet. */
+    update_view_offset(sim, dt);
+
+    /* 0x8003A25C — clear the environment flags, then let the volumes re-assert
+     * them. `was_underwater` is latched at 0x8003A264, before the clear. */
+    was_underwater = (p->ent.flags & Q2_ENT_UNDERWATER) != 0;
+    update_env_flags(sim);
+
+    /*
+     * 0x8003A29C — the SCRIPT half of the same dispatcher call, and it belongs
+     * here beside the flag half rather than after the move.
+     *
+     * `xrefs 0x80027E64` gives exactly one call site, at instruction 54 of the
+     * player frame: before the pad, before the wish, before the jump and before
+     * the move. One call re-runs the events of every volume the entity is
+     * inside, and the environment primitives are simply the events that do
+     * nothing but OR a bit. The port had split it in two and left this half at
+     * the very end of the tick.
+     *
+     * The point being tested does not change — `update_triggers` already
+     * samples the origin. What moving it buys is that whatever a trigger does
+     * reaches the move and the entity sweep on the SAME tick the console would,
+     * instead of a tick later. A door told to open now opens against the frame
+     * you are walking into it on.
+     *
+     * Safe with respect to the two things a trigger can do that would be
+     * alarming here: a TELEPORT and a zone change are both queued rather than
+     * applied (`pending_teleport`, `q2_sim_take_zone_change`), so neither can
+     * relocate the player into the middle of this tick's move.
+     */
+    update_triggers(sim, true);
+
+    /* 0x8003A2B8: acquire before this tick moves or reads the pad. Easing
+     * client+0x46 belongs to this logic tick too, not the display driver. */
+    q2_sim_find_target(sim, dt);
+
+    /* 0x8003A4A4 — the pad. 0x8003A4EC may add a jump the player did not ask
+     * for, so the button word is taken by value from here on. */
+    buttons = input->buttons;
+
+    /*
+     * 0x8003A4AC — the AUTOCENTRE timer, and it goes here because it reads the
+     * button word the pad JUST returned, before the water-exit jump writes a
+     * synthesised bit into it (0x8003A55C). So `input->buttons` and not
+     * `buttons`.
+     *
+     *     8003A4AC  lw    v0, 40(sp)          ; the button word
+     *     8003A4B4  bgez  v0, 0x8003A4E8      ; bit 31 clear -> clear the timer
+     *     8003A4BC  lh    v0, 13122(v0)       ; 0x800B3342, the setting
+     *     8003A4C4  beq   v0, zero, 0x8003A4E8
+     *     8003A4CC  lhu   v0, 38(s1)          ; UNSIGNED load
+     *     8003A4DC  addu  v0, v0, v1          ; += dt
+     *     8003A4E4  sh    v0, 38(s1)
+     *
+     * `bgez` on the whole word tests bit 31, which is Q2_BTN_MOVING — so the
+     * timer counts only while the forward axis is deflected and resets the
+     * moment it is not. The add is UNSIGNED and the threshold test below is
+     * SIGNED, so the counter is allowed to wrap; that is retail behaviour on an
+     * airborne player and is not something to saturate away.
+     */
+    if ((input->buttons & Q2_BTN_MOVING) && sim->autocentre_setting)
+        p->autocentre = (s16)((u16)p->autocentre + (u16)dt);
+    else
+        p->autocentre = 0;
+
+    water_exit_jump(sim, was_underwater, &buttons);
+
+    /* 0x8003A584 — the wish velocity. */
+    moving = ((u16)input->forward | (u16)input->side) != 0;
+    update_wish(sim, input, dt);
+
+    /* 0x8003A658 — the look rates. */
+    update_look(sim, input, dt);
+
+    /* 0x8003A780 — the look-button chord, and the pitch it walks back to zero.
+     * Between the rate and the integration, so a recentring tick contributes no
+     * rate of its own. */
+    update_recentre(sim, input, dt);
+
+    /*
+     * 0x8003A8FC — the jump, and the two gates in front of it: entity+0x10C bit
+     * 12 (flying) at 0x8003A8F0, and flags & 0x700, so you cannot jump while
+     * crouching, low-crouching or submerged. The whole call is skipped, which
+     * means the hold timer does not tick down either — walk into a crouch zone
+     * mid-jump and the timer freezes.
+     */
+    /*
+     * And the OUTERMOST of the three gates, which was missing: 0x8003A8B0 tests
+     * entity+0x10C bit 19 and 0x8003A8BC branches past the weapon think, the
+     * weapon switch AND the jump when it is set. That bit is Q2_ENT2_DEAD, set
+     * at 0x80039640/0x80039694 and mirrored here at the death check below, so a
+     * corpse could still press jump and hop.
+     *
+     * Folded into the same `if` because retail's branch skips the whole call:
+     * `jump_hold` does not decay while any of these gates hold, which is the
+     * behaviour the hold timer's comment describes.
+     */
+    if (!(p->ent2_flags & (Q2_ENT2_DEAD | Q2_ENT2_FLY)) &&
+        !(p->ent.flags & (Q2_ENT_UNDERWATER | Q2_ENT_INCROUCH |
+                          Q2_ENT_INLOWCROUCH)))
+        p->jumped_this_tick = player_jump(sim, (buttons & Q2_BTN_JUMP) != 0, dt);
+
+    /*
+     * 0x8003A938 — and the AUTOCENTRE timer's other half, which arms the same
+     * recentre the look-button chord arms.
+     *
+     *     8003A93C  lw    v0, 0x800AEBCC   ; deathmatch
+     *     8003A944  bne   v0, zero, ...    ; multiplayer never recentres
+     *     8003A954  srl   v1, v0, 5        ; ON_GROUND
+     *     8003A95C  srl   v0, v0, 6        ; ON_ENTITY
+     *     8003A968  beq   v1, zero, ...    ; airborne never recentres
+     *     8003A978  slti  v0, v0, 200      ; SIGNED, against the timer
+     *     8003A984  sh    v0, 38(s1)       ; clamp AT 200
+     *     8003A98C  sb    v0, 37(s1)       ; recentring = true
+     *
+     * This sits at 0x8003A938, which is where 0x8003A8F4, 0x8003A908,
+     * 0x8003A924 and 0x8003A92C all branch to — so it runs whether or not the
+     * jump above was gated out, and must stay outside that `if`.
+     *
+     * The clamp is not a bound on an airborne timer (it cannot be — it is
+     * inside the grounded arm). It holds the counter AT the threshold so the
+     * flag re-asserts on every later grounded frame until you stop walking.
+     */
+    if (!sim->multiplayer &&
+        (p->ent.flags & (Q2_ENT_ON_GROUND | Q2_ENT_ON_ENTITY)) &&
+        p->autocentre >= 200) {
+        p->autocentre = 200;
+        p->recentring = true;
+    }
+
+    /* 0x8003A990 — integrate the angles from the rates. */
+    integrate_look(sim, dt);
+
+    /* 0x8003AA3C, 0x8003AB18 — footsteps and the strafe roll. */
+    update_footsteps(sim);
+    update_roll(sim);
+
+    /* 0x8003AB68 — swimming up. */
+    swim_up(sim, input, dt);
+
+    /* 0x8003ABC4 — wish velocity into world velocity, plus the ground stick. */
+    wish_to_world(sim, moving, dt);
+
+    /*
+     * 0x8003AD80 — the wall-contact flag is cleared immediately before the move,
+     * so it describes the PREVIOUS frame's contact everywhere above and is
+     * re-established by the contents query below.
+     */
+    p->ent.flags &= ~(u32)Q2_ENT_WALL_CONTACT;
+}
+
+static void player_move(q2_sim *sim, s32 dt, bool separate)
+{
+    q2_player *p = &sim->player[sim->cur_player];
+    s32 vy_before;
+
+    /* The mover's frame: the entity origin, Q2_EYE_BASE above the feet. */
+    p->ent.pos[0] = p->pos[0];
+    p->ent.pos[1] = q2_sim_origin_y(p->pos[1]);
+    p->ent.pos[2] = p->pos[2];
+
+    /* 0x80039AC4 — the move. Everything from here to fall_damage is 0x80039AA4
+     * and the mover it calls. */
+    vy_before = (s16)p->vel[1];
+
+    /*
+     * 0x800458A0 runs the volume query at the top of the mover, with mask
+     * 0x3360, and turns the answer into the entity's own liquid and wall flags.
+     * Those flags choose the integrator's arm and halve the step height, so it
+     * has to come before both.
+     */
+    update_contents(sim);
+
+    /*
+     * 0x800459E8 — snap the velocity to the surface being stood on. This is the
+     * rule that makes standing still stand still, and the one that produces the
+     * velocity change fall damage measures.
+     */
+    ground_project(sim);
+
+    /*
+     * 0x80045AC8 — the last contact normal is reset to the flat (0, 4096, 0) at
+     * 0x800AE928 before the moves, so a move that hits nothing leaves a normal
+     * the velocity clip will ignore rather than last frame's wall.
+     */
+    p->ent.last_normal[0] = 0;
+    p->ent.last_normal[1] = 4096;
+    p->ent.last_normal[2] = 0;
+
+    if (sim->coll_ready) {
+        /*
+         * Lift, slide, drop — 0x80045B24. Ground is decided by the drop alone,
+         * which is why walking into a wall does not read as landing on it, and
+         * why a step up to Q2_STEP_HEIGHT costs nothing.
+         *
+         * The delta is LAST tick's, per q2_player.frame_delta.
+         */
+        q2_move_step(&sim->coll, &p->ent, p->frame_delta,
+                     sim->move_world.count ? &sim->move_world : NULL,
+                     separate && sim->body_world.count ? &sim->body_world : NULL,
+                     sim_body_id_for_player(sim->cur_player),
+                     q2_player_body_mins, q2_player_body_maxs,
+                     &sim->combat.rng);
+
+        p->pos[0] = p->ent.pos[0];
+        p->pos[1] = q2_sim_feet_y(p->ent.pos[1]);
+        p->pos[2] = p->ent.pos[2];
+
+        p->on_ground      = (p->ent.flags & Q2_ENT_GROUNDED_MASK) != 0;
+        sim->current_node = p->ent.node;
+    } else {
+        /* Without a hull, fall back to the seeded ground plane so the player
+         * does not drop forever in a zone that failed to parse. */
+        p->pos[0] += p->frame_delta[0];
+        p->pos[1] += p->frame_delta[1];
+        p->pos[2] += p->frame_delta[2];
+
+        p->on_ground = false;
+        if (p->pos[1] >= p->ground_y) {
+            p->pos[1]    = p->ground_y;
+            p->ent.flags |= Q2_ENT_ON_GROUND;
+            p->ent.ground_normal[1] = 4096;
+            p->on_ground = true;
+        }
+    }
+
+    /* 0x80045E74 — and now next tick's delta. */
+    integrate_vertical(sim, dt, p->frame_delta);
+
+    /*
+     * 0x80039AE4 — clip the velocity into the surface just hit, but only when
+     * that surface was too steep to stand on. A landing is left alone, because
+     * the ground state and the fall-damage delta both depend on it.
+     */
+    clip_velocity(sim);
+
+    /*
+     * Nothing zeroes the velocity on landing, and that is deliberate: the mover
+     * stops the POSITION and leaves the full falling speed in vel.y. The next
+     * tick's ground_project is what removes it, which is why fall damage arrives
+     * a tick after the impact. Adding a "landing kills velocity" rule here — the
+     * obvious thing to write, and what this function used to do — destroys the
+     * measurement fall damage depends on and makes every landing painless.
+     */
+
+    /* 0x80039CB4 — fall damage, from how much the landing changed vel.y. */
+    fall_damage(sim, vy_before);
+}
+
 void q2_sim_tick(q2_sim *sim, const q2_input *input, s32 dt)
 {
     q2_player *p;
     q2_input   corpse;
     bool run_world;
-    bool was_underwater;
-    bool moving;
-    u32  buttons;
-    s32  vy_before;
+    bool dead;
 
     if (!sim || !input || dt <= 0)
         return;
@@ -3322,49 +3502,17 @@ void q2_sim_tick(q2_sim *sim, const q2_input *input, s32 dt)
     sim->cur_dt = dt;
 
     p = &sim->player[sim->cur_player];
+    p->jumped_this_tick = false;
 
-    /*
-     * A CORPSE'S PAD IS NEVER READ, and that is not a rule the engine states —
-     * it is what the death handler's LAST act makes true.
-     *
-     * 0x8003A4A4 is the only caller of the pad read (0x80019154), and it is
-     * instruction 54 of the player think at 0x8003A1C8. `player_die` ends by
-     * overwriting `entity+0x3C` with the corpse think (0x80039818), so the
-     * player think is not installed any more and NOTHING in it runs again: not
-     * the pad, not the wish, not the look integration, not the jump, and not
-     * the view weapon driver at 0x8004EE0C, whose one and only call site is
-     * 0x8003AD98 in the same function. What still moves the body is
-     * `corpse_think`'s own physics — gravity, the ground plane and the dt * 5
-     * friction — which is a different and much smaller integrator.
-     *
-     * This port has one tick function and no think pointer to swap, so the
-     * substitution is made here: a dead player is ticked with a NEUTRAL pad.
-     * The body still falls, slides and settles, because the mover still runs;
-     * it just has nobody driving it. Without this a corpse walked, turned,
-     * jumped and fired — reported from play, and the reason the death page had
-     * a live player standing behind it.
-     *
-     * The three individual gates further down (the jump at 0x8003A8B0, the
-     * strafe roll at 0x8003AB08, the splash at 0x8003D260) are kept as they
-     * are: each is a real test in the executable, and they are what a dead
-     * player would still hit if some other path ever ticked one with input.
-     */
-    if (p->ent2_flags & Q2_ENT2_DEAD) {
+    /* The console replaces the think function on death. Clearing the input
+     * alone is insufficient: live movement also changes buoyancy, the view,
+     * environment flags and trigger scripts. Keep only the shared physics. */
+    dead = (p->ent2_flags & Q2_ENT2_DEAD) != 0 ||
+           p->motion != Q2_PLAYER_MOTION_LIVE;
+    if (dead) {
         memset(&corpse, 0, sizeof(corpse));
         input = &corpse;
 
-        /*
-         * And the accumulators the think would have been writing, because a
-         * neutral pad only stops them GROWING. `yaw_rate` and `pitch_rate` are
-         * eased toward the stick and then integrated at 0x8003A990, so a body
-         * that died mid-turn went on turning for a second after it fell; the
-         * wish is the same thing for the walk, and `recentring` would have
-         * walked the corpse's pitch back to level.
-         *
-         * `vel` is deliberately NOT cleared. That is momentum, and the body is
-         * supposed to keep it: on the console `corpse_think` inherits whatever
-         * the last move left and takes it down with `approach(v, 0, dt * 5)`.
-         */
         p->yaw_rate   = 0;
         p->pitch_rate = 0;
         p->wish[0]    = 0;
@@ -3431,254 +3579,25 @@ void q2_sim_tick(q2_sim *sim, const q2_input *input, s32 dt)
     if (run_world)
         sim->tick_count++;
 
-    /*
-     * 0x8003A41C — the fly bit, mirrored out of the GAME VARIABLES word before
-     * anything reads it. It has to be here rather than wherever the setting is
-     * written, because the original re-derives it every frame and a caller that
-     * clears `full_basis_movement` mid-game must see the flag go with it.
-     */
-    if (sim->full_basis_movement)
-        p->ent2_flags |=  (u32)Q2_ENT2_FLY;
-    else
-        p->ent2_flags &= ~(u32)Q2_ENT2_FLY;
-
-    /* 0x8003A208 — view offset, from flags that have not been cleared yet. */
-    update_view_offset(sim, dt);
-
-    /* 0x8003A25C — clear the environment flags, then let the volumes re-assert
-     * them. `was_underwater` is latched at 0x8003A264, before the clear. */
-    was_underwater = (p->ent.flags & Q2_ENT_UNDERWATER) != 0;
-    update_env_flags(sim);
-
-    /*
-     * 0x8003A29C — the SCRIPT half of the same dispatcher call, and it belongs
-     * here beside the flag half rather than after the move.
-     *
-     * `xrefs 0x80027E64` gives exactly one call site, at instruction 54 of the
-     * player frame: before the pad, before the wish, before the jump and before
-     * the move. One call re-runs the events of every volume the entity is
-     * inside, and the environment primitives are simply the events that do
-     * nothing but OR a bit. The port had split it in two and left this half at
-     * the very end of the tick.
-     *
-     * The point being tested does not change — `update_triggers` already
-     * samples the origin. What moving it buys is that whatever a trigger does
-     * reaches the move and the entity sweep on the SAME tick the console would,
-     * instead of a tick later. A door told to open now opens against the frame
-     * you are walking into it on.
-     *
-     * Safe with respect to the two things a trigger can do that would be
-     * alarming here: a TELEPORT and a zone change are both queued rather than
-     * applied (`pending_teleport`, `q2_sim_take_zone_change`), so neither can
-     * relocate the player into the middle of this tick's move.
-     */
-    update_triggers(sim);
-
-    /* The mover's frame: the entity origin, Q2_EYE_BASE above the feet. */
-    p->ent.pos[0] = p->pos[0];
-    p->ent.pos[1] = q2_sim_origin_y(p->pos[1]);
-    p->ent.pos[2] = p->pos[2];
-
-    /* 0x8003A4A4 — the pad. 0x8003A4EC may add a jump the player did not ask
-     * for, so the button word is taken by value from here on. */
-    buttons = input->buttons;
-
-    /*
-     * 0x8003A4AC — the AUTOCENTRE timer, and it goes here because it reads the
-     * button word the pad JUST returned, before the water-exit jump writes a
-     * synthesised bit into it (0x8003A55C). So `input->buttons` and not
-     * `buttons`.
-     *
-     *     8003A4AC  lw    v0, 40(sp)          ; the button word
-     *     8003A4B4  bgez  v0, 0x8003A4E8      ; bit 31 clear -> clear the timer
-     *     8003A4BC  lh    v0, 13122(v0)       ; 0x800B3342, the setting
-     *     8003A4C4  beq   v0, zero, 0x8003A4E8
-     *     8003A4CC  lhu   v0, 38(s1)          ; UNSIGNED load
-     *     8003A4DC  addu  v0, v0, v1          ; += dt
-     *     8003A4E4  sh    v0, 38(s1)
-     *
-     * `bgez` on the whole word tests bit 31, which is Q2_BTN_MOVING — so the
-     * timer counts only while the forward axis is deflected and resets the
-     * moment it is not. The add is UNSIGNED and the threshold test below is
-     * SIGNED, so the counter is allowed to wrap; that is retail behaviour on an
-     * airborne player and is not something to saturate away.
-     */
-    if ((input->buttons & Q2_BTN_MOVING) && sim->autocentre_setting)
-        p->autocentre = (s16)((u16)p->autocentre + (u16)dt);
-    else
-        p->autocentre = 0;
-
-    water_exit_jump(sim, was_underwater, &buttons);
-
-    /* 0x8003A584 — the wish velocity. */
-    moving = ((u16)input->forward | (u16)input->side) != 0;
-    update_wish(sim, input, dt);
-
-    /* 0x8003A658 — the look rates. */
-    update_look(sim, input, dt);
-
-    /* 0x8003A780 — the look-button chord, and the pitch it walks back to zero.
-     * Between the rate and the integration, so a recentring tick contributes no
-     * rate of its own. */
-    update_recentre(sim, input, dt);
-
-    /*
-     * 0x8003A8FC — the jump, and the two gates in front of it: entity+0x10C bit
-     * 12 (flying) at 0x8003A8F0, and flags & 0x700, so you cannot jump while
-     * crouching, low-crouching or submerged. The whole call is skipped, which
-     * means the hold timer does not tick down either — walk into a crouch zone
-     * mid-jump and the timer freezes.
-     */
-    /*
-     * And the OUTERMOST of the three gates, which was missing: 0x8003A8B0 tests
-     * entity+0x10C bit 19 and 0x8003A8BC branches past the weapon think, the
-     * weapon switch AND the jump when it is set. That bit is Q2_ENT2_DEAD, set
-     * at 0x80039640/0x80039694 and mirrored here at the death check below, so a
-     * corpse could still press jump and hop.
-     *
-     * Folded into the same `if` because retail's branch skips the whole call:
-     * `jump_hold` does not decay while any of these gates hold, which is the
-     * behaviour the hold timer's comment describes.
-     */
-    if (!(p->ent2_flags & (Q2_ENT2_DEAD | Q2_ENT2_FLY)) &&
-        !(p->ent.flags & (Q2_ENT_UNDERWATER | Q2_ENT_INCROUCH |
-                          Q2_ENT_INLOWCROUCH)))
-        player_jump(sim, (buttons & Q2_BTN_JUMP) != 0, dt);
-
-    /*
-     * 0x8003A938 — and the AUTOCENTRE timer's other half, which arms the same
-     * recentre the look-button chord arms.
-     *
-     *     8003A93C  lw    v0, 0x800AEBCC   ; deathmatch
-     *     8003A944  bne   v0, zero, ...    ; multiplayer never recentres
-     *     8003A954  srl   v1, v0, 5        ; ON_GROUND
-     *     8003A95C  srl   v0, v0, 6        ; ON_ENTITY
-     *     8003A968  beq   v1, zero, ...    ; airborne never recentres
-     *     8003A978  slti  v0, v0, 200      ; SIGNED, against the timer
-     *     8003A984  sh    v0, 38(s1)       ; clamp AT 200
-     *     8003A98C  sb    v0, 37(s1)       ; recentring = true
-     *
-     * This sits at 0x8003A938, which is where 0x8003A8F4, 0x8003A908,
-     * 0x8003A924 and 0x8003A92C all branch to — so it runs whether or not the
-     * jump above was gated out, and must stay outside that `if`.
-     *
-     * The clamp is not a bound on an airborne timer (it cannot be — it is
-     * inside the grounded arm). It holds the counter AT the threshold so the
-     * flag re-asserts on every later grounded frame until you stop walking.
-     */
-    if (!sim->multiplayer &&
-        (p->ent.flags & (Q2_ENT_ON_GROUND | Q2_ENT_ON_ENTITY)) &&
-        p->autocentre >= 200) {
-        p->autocentre = 200;
-        p->recentring = true;
-    }
-
-    /* 0x8003A990 — integrate the angles from the rates. */
-    integrate_look(sim, dt);
-
-    /* 0x8003AA3C, 0x8003AB18 — footsteps and the strafe roll. */
-    update_footsteps(sim);
-    update_roll(sim);
-
-    /* 0x8003AB68 — swimming up. */
-    swim_up(sim, input, dt);
-
-    /* 0x8003ABC4 — wish velocity into world velocity, plus the ground stick. */
-    wish_to_world(sim, moving, dt);
-
-    /*
-     * 0x8003AD80 — the wall-contact flag is cleared immediately before the move,
-     * so it describes the PREVIOUS frame's contact everywhere above and is
-     * re-established by the contents query below.
-     */
-    p->ent.flags &= ~(u32)Q2_ENT_WALL_CONTACT;
-
-    /* 0x80039AC4 — the move. Everything from here to fall_damage is 0x80039AA4
-     * and the mover it calls. */
-    vy_before = (s16)p->vel[1];
-
-    /*
-     * 0x800458A0 runs the volume query at the top of the mover, with mask
-     * 0x3360, and turns the answer into the entity's own liquid and wall flags.
-     * Those flags choose the integrator's arm and halve the step height, so it
-     * has to come before both.
-     */
-    update_contents(sim);
-
-    /*
-     * 0x800459E8 — snap the velocity to the surface being stood on. This is the
-     * rule that makes standing still stand still, and the one that produces the
-     * velocity change fall damage measures.
-     */
-    ground_project(sim);
-
-    /*
-     * 0x80045AC8 — the last contact normal is reset to the flat (0, 4096, 0) at
-     * 0x800AE928 before the moves, so a move that hits nothing leaves a normal
-     * the velocity clip will ignore rather than last frame's wall.
-     */
-    p->ent.last_normal[0] = 0;
-    p->ent.last_normal[1] = 4096;
-    p->ent.last_normal[2] = 0;
-
-    if (sim->coll_ready) {
-        /*
-         * Lift, slide, drop — 0x80045B24. Ground is decided by the drop alone,
-         * which is why walking into a wall does not read as landing on it, and
-         * why a step up to Q2_STEP_HEIGHT costs nothing.
-         *
-         * The delta is LAST tick's, per q2_player.frame_delta.
-         */
-        q2_move_step(&sim->coll, &p->ent, p->frame_delta,
-                     sim->move_world.count ? &sim->move_world : NULL,
-                     sim->body_world.count ? &sim->body_world : NULL,
-                     sim_body_id_for_player(sim->cur_player),
-                     q2_player_body_mins, q2_player_body_maxs,
-                     &sim->combat.rng);
-
-        p->pos[0] = p->ent.pos[0];
-        p->pos[1] = q2_sim_feet_y(p->ent.pos[1]);
-        p->pos[2] = p->ent.pos[2];
-
-        p->on_ground      = (p->ent.flags & Q2_ENT_GROUNDED_MASK) != 0;
-        sim->current_node = p->ent.node;
+    if (!dead) {
+        player_control(sim, input, dt);
     } else {
-        /* Without a hull, fall back to the seeded ground plane so the player
-         * does not drop forever in a zone that failed to parse. */
-        p->pos[0] += p->frame_delta[0];
-        p->pos[1] += p->frame_delta[1];
-        p->pos[2] += p->frame_delta[2];
+        /* Queued world scripts still run; the corpse touches no volumes. */
+        update_triggers(sim, false);
 
-        p->on_ground = false;
-        if (p->pos[1] >= p->ground_y) {
-            p->pos[1]    = p->ground_y;
-            p->ent.flags |= Q2_ENT_ON_GROUND;
-            p->ent.ground_normal[1] = 4096;
-            p->on_ground = true;
+        if (p->motion != Q2_PLAYER_MOTION_BODY &&
+            p->motion != Q2_PLAYER_MOTION_NONE) {
+            int axis;
+
+            /* corpse_think, 0x80039590..0x800395FC. The old neutral-pad
+             * substitution only braked X/Z and still accelerated the fall. */
+            for (axis = 0; axis < 3; axis++)
+                p->vel[axis] = ease32(p->vel[axis], 0, dt * Q2_PDEATH_FRICTION);
         }
     }
 
-    /* 0x80045E74 — and now next tick's delta. */
-    integrate_vertical(sim, dt, p->frame_delta);
-
-    /*
-     * 0x80039AE4 — clip the velocity into the surface just hit, but only when
-     * that surface was too steep to stand on. A landing is left alone, because
-     * the ground state and the fall-damage delta both depend on it.
-     */
-    clip_velocity(sim);
-
-    /*
-     * Nothing zeroes the velocity on landing, and that is deliberate: the mover
-     * stops the POSITION and leaves the full falling speed in vel.y. The next
-     * tick's ground_project is what removes it, which is why fall damage arrives
-     * a tick after the impact. Adding a "landing kills velocity" rule here — the
-     * obvious thing to write, and what this function used to do — destroys the
-     * measurement fall damage depends on and makes every landing painless.
-     */
-
-    /* 0x80039CB4 — fall damage, from how much the landing changed vel.y. */
-    fall_damage(sim, vy_before);
+    if (p->motion != Q2_PLAYER_MOTION_NONE)
+        player_move(sim, dt, !dead || p->corpse_separate);
 
     /*
      * The level clock the weapons gate on is this same dt counter: 300 units to
@@ -3758,10 +3677,6 @@ void q2_sim_tick(q2_sim *sim, const q2_input *input, s32 dt)
 
         /* The timed beams age by the frame delta, as 0x80048CE8 does. */
         q2_fx_timed_tick(&sim->fx, dt);
-
-        /* The glint's bands advance once per tick, not once per viewport — see
-         * q2_fx_glint_advance. */
-        q2_fx_glint_advance(&sim->glint);
     }
 
     /*
@@ -3798,6 +3713,8 @@ void q2_sim_tick(q2_sim *sim, const q2_input *input, s32 dt)
              * latched at attach. */
             sim->ent_world.weapons_stay = sim->weapons_stay;
             q2_entity_run(&sim->entities, &sim->ent_world);
+            q2_sim_glint_tick(sim);
+            q2_sim_glint_evacuation_tick(sim, dt);
         }
     }
     q2_item_mega_health_tick(&sim->combat.inv, sim->level_time);

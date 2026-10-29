@@ -5,12 +5,36 @@
 #include <string.h>
 
 /*
- * The SPU's four-tap predictor. Coefficients are divided by 64. Index 0 is
+ * The SPU's two-tap ADPCM predictor. Coefficients are divided by 64. Index 0 is
  * "no prediction", which is why a silent or freshly-started sample decodes
  * cleanly without special-casing.
  */
 static const s32 SPU_F0[5] = { 0, 60, 115,  98, 122 };
 static const s32 SPU_F1[5] = { 0,  0, -52, -55, -60 };
+
+void q2_sfx_request_init(q2_sfx_request *r)
+{
+    memset(r, 0, sizeof(*r));
+    q2_sfx_pitch_init(&r->pitch);
+    r->volume = r->volume_upper = r->volume_lower = Q2_SFX_VOLUME_DEFAULT;
+}
+
+void q2_sfx_request_params(q2_sfx_request *r, s32 pitch, s32 volume, s32 parameter)
+{
+    q2_sfx_pitch_set(&r->pitch, pitch);
+    if (volume != 128) r->volume = (u8)volume;
+    if (parameter != -1) r->parameter = (u8)parameter;
+}
+
+void q2_sfx_request_begin(q2_sfx_request *r, bool entity_path, int (*next)(void))
+{
+    if (!entity_path || !next) return;
+    if (q2_sfx_pitch_needs_random(&r->pitch, true))
+        q2_sfx_pitch_begin(&r->pitch, true, (u32)next());
+    if (r->vary_volume && r->volume_upper > r->volume_lower)
+        r->volume = (u8)(r->volume_lower +
+            (u32)next() % (r->volume_upper - r->volume_lower));
+}
 
 /* ------------------------------------------------------------------------- */
 /* Sound-request pitch and the SPU rate                                       */
@@ -227,13 +251,14 @@ bool q2_sound_bank_get(const q2_sound_bank *bank, u32 index, q2_vag *out)
     const u8 *hdr;
     u32 offset;
 
-    if (!bank || !out || index >= bank->count)
+    if (!bank || !out || !bank->offsets || index >= bank->count)
         return false;
 
     memset(out, 0, sizeof(*out));
 
     offset = bank->offsets[index];
-    if (offset + VAG_HEADER_SIZE > bank->section_size)
+    if (!bank->section || offset > bank->section_size ||
+        bank->section_size - offset < VAG_HEADER_SIZE)
         return false;
 
     hdr = bank->section + offset;
@@ -248,7 +273,7 @@ bool q2_sound_bank_get(const q2_sound_bank *bank, u32 index, q2_vag *out)
     memcpy(out->name, hdr + 0x20, 16);
     out->name[16] = '\0';
 
-    if (offset + VAG_HEADER_SIZE + out->data_size > bank->section_size)
+    if (out->data_size > bank->section_size - offset - VAG_HEADER_SIZE)
         return false;
 
     out->body = hdr + VAG_HEADER_SIZE;
@@ -338,8 +363,8 @@ u32 q2_spu_voice_block(q2_spu_voice *v, s16 *out)
 
     if (filter > 4)
         filter = 0;
-    /* A shift above 12 is undefined on hardware; treat it as maximum
-     * attenuation rather than shifting by a wild amount. */
+    /* Reserved shifts retain the host's maximum-attenuation fallback. The
+     * hardware edge capture is not yet matched; retail banks use 0..12. */
     if (shift > 12)
         shift = 12;
 
@@ -352,7 +377,11 @@ u32 q2_spu_voice_block(q2_spu_voice *v, s16 *out)
         sample = (s32)((u32)nibble << 12);
         sample = (s32)((s16)sample) >> shift;
 
-        sample += (SPU_F0[filter] * v->prev1 + SPU_F1[filter] * v->prev2) / 64;
+        /* The two products retain one fractional bit before addition. This
+         * differs from both a combined /64 and two independent >>6 taps;
+         * the silicon capture vectors in test_spu distinguish all three. */
+        sample += (((SPU_F0[filter] * v->prev1) >> 5) +
+                   ((SPU_F1[filter] * v->prev2) >> 5)) >> 1;
 
         if (sample >  32767) sample =  32767;
         if (sample < -32768) sample = -32768;
@@ -419,9 +448,6 @@ u32 q2_spu_adpcm_decode(const u8 *adpcm, u32 size, s16 *out, u32 out_capacity)
          * would fill `out_capacity` with repeats of a two-second ambience. The
          * VOICE path is the one that loops; see q2_spu_voice.looped.
          */
-        if (v.looped)
-            break;
-
         /* A capacity that ends mid-block keeps the samples that fit, which is
          * what the flat decoder has always done. */
         take = n;
@@ -431,7 +457,9 @@ u32 q2_spu_adpcm_decode(const u8 *adpcm, u32 size, s16 *out, u32 out_capacity)
         memcpy(out + written, block, take * sizeof(s16));
         written += take;
 
-        if (written >= out_capacity)
+        /* The block that carries END|REPEAT is still part of the first pass.
+         * Stop AFTER copying it, before decoding at the repeat address. */
+        if (v.looped || written >= out_capacity)
             break;
     }
 

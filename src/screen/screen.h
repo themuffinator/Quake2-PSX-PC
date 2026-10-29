@@ -625,6 +625,9 @@ typedef struct q2_screen {
     q2_video_std      video;
 
     q2_screen_view    view[Q2_SCREEN_MAX_VIEWS];
+    /* Authored geometry stays available for UI and resize without drift. */
+    q2_screen_view    native_view[Q2_SCREEN_MAX_VIEWS];
+    bool             adaptive;
     int               view_count;      /* 0x800B2C2C                         */
     q2_screen_layout  layout;
 
@@ -663,6 +666,10 @@ typedef struct q2_screen {
 
     /* The two buffers. `buf[disp.draw_buffer]` is the one being drawn. */
     psx_framebuffer   buf[2];
+    /* Optional scene-only colour and exact UI coverage, paired with buf[]. */
+    psx_framebuffer   scene[2];
+    u8              *ui_mask[2];
+    psx_draw_state    gpu;              /* one GPU register, not per buffer */
 
     q2_screen_exit    exit_code;       /* 0x800B2E28                         */
     s32               dt;              /* 0x800B2DB4, clamped                */
@@ -805,8 +812,8 @@ void q2_screen_pixel_aspect(const q2_screen *s, int *num, int *den);
 typedef enum q2_screen_fit {
     /*
      * The drawn buffer as exactly 4:3, letterboxed or pillarboxed into whatever
-     * the window is. THE DEFAULT, and it is the default because it is what
-     * capture of the running game shows: a 4:3 picture pillarboxed inside a 16:9
+     * the window is. This preserves the console presentation seen in retail
+     * captures: a 4:3 picture pillarboxed inside a 16:9
      * frame, with the 512 x 248 buffer filling it.
      *
      * It differs from FIT_TELEVISION below by 3%, because this treats the 248
@@ -834,10 +841,24 @@ typedef enum q2_screen_fit {
     /* Fill the window. Whatever shape it is. */
     Q2_SCREEN_FIT_STRETCH,
 
+    /* Expand the camera and fit UI to the host's actual aspect ratio. */
+    Q2_SCREEN_FIT_AUTO,
+
     Q2_SCREEN_FIT_COUNT
 } q2_screen_fit;
 
 const char *q2_screen_fit_name(q2_screen_fit fit);
+
+/* Allocate a bounded software render target for a host aspect. Zero/negative
+ * dimensions are ignored (minimized windows). Legacy modes restore native size.
+ * The display record remains the console's authored coordinate system. */
+q2_result q2_screen_resize(q2_screen *s, bool adaptive, int width, int height);
+void q2_screen_ui_rect(const q2_screen *s, int view,
+                       int *x, int *y, int *w, int *h);
+/* Transform freshly emitted per-view UI; edge anchoring keeps the status bar
+ * at the bottom and pickup messages at the top in tall viewports. */
+void q2_screen_ui_range(const q2_screen *s, int view, psx_ot *ot,
+                        u32 first, bool edges);
 
 /*
  * Where the picture goes inside a window of any size or shape: the largest
@@ -1040,7 +1061,11 @@ u16 q2_screen_overlay_otz(const q2_screen *s, u32 z);
  * each correctly clipped, with no second pass.
  */
 void q2_screen_compose(q2_screen *s, psx_ot *ot,
-                       const psx_vram *vram, const psx_raster_opts *opts);
+                       psx_vram *vram, const psx_raster_opts *opts);
+
+/* Enable/resize the scene capture used by bloom, or release it when disabled.
+ * Call after resizing the screen and before composing the next frame. */
+q2_result q2_screen_capture_scene(q2_screen *s, bool enabled);
 
 /* Flip: the buffer just drawn becomes the buffer being shown. */
 void q2_screen_present(q2_screen *s);

@@ -1,14 +1,18 @@
 #include "entity.h"
+#include "trace.h"
 
 #include <stdlib.h>
 #include <string.h>
 
 void q2_entity_init(q2_entity *e)
 {
+    static u32 audio_generation;
     if (!e)
         return;
 
     memset(e, 0, sizeof(*e));
+    if (++audio_generation == 0) ++audio_generation;
+    e->audio_generation = audio_generation;
 
     /* 0x800587C0: the spawner's first act is to write this word, so a port that
      * starts from zero renders nothing. Bit 0 is cleared again by the item
@@ -106,6 +110,7 @@ static q2_ent_event *event_push(q2_ent_events *ev)
 
     e = &ev->e[ev->count++];
     memset(e, 0, sizeof(*e));
+    e->sound_player = -1;
     return e;
 }
 
@@ -133,6 +138,25 @@ void q2_ent_sound_at(q2_ent_events *ev, q2_ent_sound which, const s32 pos[3])
     e->kind  = Q2_ENT_EVENT_SOUND;
     e->sound = (u8)which;
     event_fill(e, pos, NULL);
+}
+
+void q2_ent_sound_entity(q2_ent_events *ev, q2_ent_sound which, const q2_entity *owner)
+{
+    u32 before;
+    if (!ev || !owner) return;
+    before = ev->count;
+    q2_ent_sound_at(ev, which, owner->origin);
+    if (ev->count > before) ev->e[before].sound_entity = owner->audio_generation;
+}
+
+void q2_ent_sound_player(q2_ent_events *ev, int player, q2_ent_sound which,
+                          const s32 pos[3])
+{
+    u32 before;
+    if (!ev || player < 0 || player >= Q2_MAX_PLAYERS) return;
+    before = ev->count;
+    q2_ent_sound_at(ev, which, pos);
+    if (ev->count > before) ev->e[before].sound_player = (s8)player;
 }
 
 void q2_ent_light_at(q2_ent_events *ev, const s32 pos[3], const u8 glow[3],
@@ -167,7 +191,7 @@ void q2_ent_light_timed_at(q2_ent_events *ev, const s32 pos[3],
 }
 
 void q2_ent_burst_at(q2_ent_events *ev, const s32 pos[3], const u8 glow[3],
-                     s32 model_index)
+                     s32 model_index, const struct q2_model_bank *bank)
 {
     q2_ent_event *e = event_push(ev);
 
@@ -176,13 +200,15 @@ void q2_ent_burst_at(q2_ent_events *ev, const s32 pos[3], const u8 glow[3],
 
     e->kind        = Q2_ENT_EVENT_BURST;
     e->model_index = model_index;
+    e->model_bank  = bank;
     event_fill(e, pos, glow);
 }
 
 /* ------------------------------------------------------------------------- */
 /* The shared placement drop — see entity.h                                   */
 /* ------------------------------------------------------------------------- */
-bool q2_entity_drop_to_floor(q2_collision *coll, s32 pos[3], s32 dist,
+bool q2_entity_drop_to_floor(q2_collision *coll, const q2_move_world *world,
+                             s32 pos[3], s32 dist,
                              s32 *out_node)
 {
     s32 dest[3], end[3];
@@ -193,13 +219,15 @@ bool q2_entity_drop_to_floor(q2_collision *coll, s32 pos[3], s32 dist,
     if (!pos)
         return false;
 
-    /* No hull to drop against, or a caller that asked for no drop: the
-     * position stands. That is the item flag's arm, not a failure. */
-    if (!coll || dist <= 0)
+    /* Asset-only callers have no resident hull. Even a retail "no drop"
+     * item otherwise sweeps back through the 30-unit initial nudge. */
+    if (!coll)
         return true;
+    if (dist < 0 || (s64)pos[1] + dist + Q2_ENTITY_SPAWN_NUDGE > INT32_MAX)
+        return false;
 
     dest[0] = pos[0];
-    dest[1] = pos[1] + dist;      /* +Y is down */
+    dest[1] = pos[1] + dist + Q2_ENTITY_SPAWN_NUDGE; /* +Y is down */
     dest[2] = pos[2];
 
     /*
@@ -210,16 +238,31 @@ bool q2_entity_drop_to_floor(q2_collision *coll, s32 pos[3], s32 dist,
     if (!q2_coll_move(coll, pos, dest, -1, end, &node) && node < 0)
         return false;
 
-    /*
-     * A COMPLETED move means the sweep never met anything in `dist` units.
-     * collision.h warns that a completed move returns `end` verbatim, which
-     * here is 1024 units below the authored floor — so taking it would bury
-     * the entity rather than place it. The original's caller treats an
-     * unplaced entity as a failure; a completed drop is the same situation
-     * seen from the other side, and the position is left where it was.
-     */
-    if (end[1] < dest[1])
-        pos[1] = end[1];
+    /* Platforms and scripted scene solids are entity boxes, not cells in
+     * SecondaryCol. Find the first top plane crossed by the 286-unit body.
+     * A general segment trace can return a zero-distance side/ceiling overlap
+     * with no normal, hiding a valid floor farther down. It also gives no
+     * normal when the drop starts exactly on the top. Neither may discard
+     * support: consider top planes inclusively and retain the nearest one. */
+    if (world) {
+        u32 i;
+        for (i = 0; world->targets && i < world->count; i++) {
+            const q2_move_target *t = &world->targets[i];
+            s64 top = (s64)t->min[1] - Q2_EYE_BASE;
+            if (!t->active || t->kind != Q2_MOVE_KIND_ENTITY ||
+                (s64)pos[0] < (s64)t->min[0] - Q2_EYE_BASE ||
+                (s64)pos[0] > (s64)t->max[0] + Q2_EYE_BASE ||
+                (s64)pos[2] < (s64)t->min[2] - Q2_EYE_BASE ||
+                (s64)pos[2] > (s64)t->max[2] + Q2_EYE_BASE ||
+                top < pos[1] || top > end[1]) continue;
+            end[1] = (s32)top;
+        }
+        node = q2_coll_find_node(coll, end, node, true);
+    }
+
+    /* 0x800511C0 copies the final path Y unconditionally. A valid full
+     * sweep is not a placement failure: it can be an authored airborne item. */
+    pos[1] = end[1];
 
     if (out_node)
         *out_node = node;

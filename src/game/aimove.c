@@ -23,12 +23,12 @@ void q2_ai_set_link_hooks(q2_link_fn link, q2_touch_fn touch, void *user)
 /*
  * 0x8005C8C8 — copy the entity's position and facing into the object the
  * renderer and the collision world read. `what` is the original's second
- * argument: bit 0 the origin, bit 2 the yaw, bit 7 suppressing the second copy
- * the interpolator keeps. A port with no link stage can ignore it entirely,
- * which is why it is a hook rather than a call into the renderer.
+ * argument: bit 0 the origin, bit 2 the yaw, bit 7 suppressing the immediate
+ * physical copy. The destination copy is made in both cases.
  */
 void q2_link_entity(q2_monster *m, u32 what)
 {
+    if (m) q2_cre_motion_link(m, what);
     if (g_link && m)
         g_link(m, what, g_link_user);
 }
@@ -95,14 +95,14 @@ bool q2_M_ChangeYaw(q2_monster *m)
      */
     if (m->bigturn_threshold && labs((long)raw) > m->bigturn_threshold
         && m->bigturn) {
-        m->bigturn(m);
-        return true;
+        m->bigturn(m, move);
+        return move != raw;
     }
 
     m->angles[2] = (s16)q2_anglemod(current + move);
     q2_link_entity(m, 4);
 
-    return true;
+    return move != raw;
 }
 
 /* ------------------------------------------------------------------------- */

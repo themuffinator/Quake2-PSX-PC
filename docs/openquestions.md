@@ -2,6 +2,23 @@
 
 ## Where this stands
 
+**Current status (28 October 2026):** this file is a chronological research
+notebook, not the current completion checklist. The
+[functional audit's remaining-work table](FUNCTIONAL-AUDIT.md#consolidated-remaining-work-28-october)
+and the linked subsystem audits describe the current limits. All 22 creature
+modules, including Jorg, Rider and Medic, now have native implementations and
+the shared actor path is reconstructed. Historical claims below that those
+implementations are missing, or that no questions remain open, are superseded.
+Unresolved markers in older entries still need reconciliation with subsequent
+native evidence; they do not by themselves establish a current gameplay bug.
+
+**Historical creature coverage correction (2026-10-23):** the earlier seven-module census
+searched COMMON.DAT only. Including zone files finds 22 distinct modules; Jorg,
+Rider and Medic still lack native implementations, and shared creature physics
+remains unfinished. Historical claims below about all creatures
+being implemented are superseded by the [creature audit](CREATURE-AUDIT.md).
+Reaching the ending through scripted level transitions does not verify boss combat.
+
 **The game plays from the front end to the credits.** One run walks all five units and eleven levels, takes
 every unit boundary and its mission screen, and ends on `Extro FMV` — the level table's own name for the map
 `QFMV` — playing `OUTRO1P.STX` (#121, #124). Every conformance command the harness carries passes over the
@@ -1148,8 +1165,8 @@ The residues of the resolved blockers keep their parents' numbers.
 
       **AND IT IS NOT A WEAPON TRAIL.** "A mesh dragged behind an entity with a band running along it" reads
       as a trail, and that is what it was recorded as until the decoded mesh was drawn: BIGGUN's 216 quads
-      over 218 vertices are a SPHERE and the band sweeps its surface. Which means nothing in this engine
-      draws a weapon trail at all — the blaster bolt is its own oriented hull and leaves nothing behind it.
+      over 218 vertices are a SPHERE and the band sweeps its surface. The blaster and railgun particle
+      trails, and the BFG's timed beams described below, are separate effects.
 
       **What raises the glint flag is a LEVEL SCRIPT, not the engine.** Bit `0x04000000` of entity `+0x10C`
       gates the draw, and nothing in the executable sets it: all thirty-nine writes to `+0x10C` raise at
@@ -1158,9 +1175,8 @@ The residues of the resolved blockers keep their parents' numbers.
       bytecode — carries it at chunk `+0x1998` (`lw +0x10C; lui 0x0400; or; sw`) and tests it at `+0x1B00`,
       alongside `sb 6, 695(a0)` (the band count) and `sh 4, 702(a0)` (the phase). That 4 is the check that
       the band formula reads the right way round: `(width/4) * (4 - phase)` sweeps forward as the phase
-      counts down, and the reversed subtraction looks identical standing still. The port therefore draws no
-      glint by default — it cannot run relocated level modules — and puts the reconstruction behind a
-      toggle rather than inventing an entity to wear one.
+      counts down, and the reversed subtraction looks identical standing still. The port now decodes the
+      generator's tables and reconstructs its frame driver; `--glint` remains a diagnostic override.
 
       **The particle CLUT is built-in palette 75.** `[0x800E3FC2]` is not a standalone global, which is why
       the address sweep found no writer: `0x80030DB8` materialises `0x800E3F2C` — the CLUT-id table the boot
@@ -1185,8 +1201,8 @@ The residues of the resolved blockers keep their parents' numbers.
       neither adjacent to their stores nor near each other (the phase's `addiu` is five instructions before
       its `sh`, and the sites are 0x168 apart), so each source is found by walking back for a load of the
       store's own register. On this disc that reads **6 bands, phase 4** out of BIGGUN and nothing out of
-      the other forty-eight maps. The glint is therefore ON automatically wherever a script turns it on,
-      with the script's own numbers — no interpreter and no special case.
+      the other forty-eight maps. The angle, lightning and UV table readers recognize BIGGUN's known
+      instruction sequences and bounds-check their offsets. This does not interpret arbitrary scripts.
 
       **AND THE GAME DOES HAVE A WEAPON TRAIL — the BFG's.** Two earlier passes here said it did not, on
       the grounds that every *particle* spawn site is an impact or a death. That is true and it is not the
@@ -1200,36 +1216,40 @@ The residues of the resolved blockers keep their parents' numbers.
       early. This also corrects the claim that beam styles 3 and 4 are unreachable — they are unreachable
       *from the laser dispatcher*, and reached from here.
 
-      *Still open:* only WHICH ENTITY wears the glint. The script's search loop takes the record whose
-      `+0xD2` is 46 and `+0xDA` is 20, over 48 entries of 768 bytes; the rule is recorded and the lookup
-      becomes exact once the port's entity records carry those two fields. Nothing else is unread.
+      **The owner and driver are now connected.** Kind 46 / id 20 is BIGGUN zone 1's `Blackhole P`,
+      resolved against the zone model bank. Its bob, turns, animations and six randomized bands drive
+      the attached glint and six `Squiggle.lbm` lightning ribbons. The real `Destroy Grav` callback
+      runs the power-down, crack reveals, glass event, white screen flash and escape-teleporter enable.
+      Same-map zone re-entry preserves the sequence and does not resurrect a finished generator.
+      The post-removal 300-tick acid-damage hook now uses the normal combat, burn-sound and HUD paths.
+      The supplied recording's broad white/purple arcs exposed a separate scale error: `0x80055AF8`
+      divides by 256, not 4096. The glint and lightning attachments now use the native scale of 3,
+      restoring arcs that were sixteen times too small. Phases advance after rendering, including
+      black bands, while every split viewport shares the same phase. See FORMATS §18.8.2–3.
 
 - [x] **13. Which in-game situation selects which music id. — SOLVED. It is the level's own playlist, and
       the id names a file and a channel.** Two tables, and neither had been read.
       The id at `gp+18524` (`0x800B2E5C`) indexes a **22-record, 6-byte table at `0x800A1DD8`**, with the
       stride spelled out at `0x80071760` as `(id*2 + id)*2`: `+0` is a signed file index into the five
-      `QUAKE_x.XAI` names at `0x800A1E5C` — negative meaning silence, which is what ids 0 and 1 hold and
-      which `0x80071778`'s `bltz` branches on — `+1` is the channel, and `+4` is the duration in **tenths of
+      `QUAKE_x.XAI` names at `0x800A1E5C` — negative selecting the reserved CD-DA branch for ids 0/1,
+      which no named PAL/US playlist uses — `+1` is the channel, and `+4` is the duration in **tenths of
       a second**. That last is checked rather than asserted: `q2psx-inspect music` demultiplexes and measures
       every stream on the disc and **19 of 20 agree exactly**, the exception being id 13 (QUAKE_C channel 3),
       whose table value is 175.1 s against a measured 176.1 — one second short, not a scale error, and worth
       leaving visible. Ids 2..21 are therefore the twenty (file, channel) pairs in file-major order.
       What WRITES the id is the cursor walk at `0x80071A68`, and the list it walks is in the **level table**:
       `p = cursor; cursor = p+1; v = *cursor`, where zero ends the list and a NEGATIVE byte is a relative
-      jump back. A level record's `+0x22..+0x28` are seven track ids and `+0x29` is `0xF9` — minus seven,
-      landing back on `+0x22` — so every level loops a seven-track playlist. The `s32` "always `0xF900 | n`"
-      that leveltable.h recorded at `+0x28` was that seventh id, the loop byte and two zeros read as one
-      word; and the "+0x22 varies without an obvious pattern" was the playlist's lead track. The seven are a
-      lead and then six consecutive from lead + 3, wrapped into 2..17 — BASE0 is 14, 17, 2, 3, 4, 5, 6 —
-      and ids 18..21, QUAKE_E's four channels, are in no level's list at all.
-      Two records are not seven-and-loop and are what make the walk worth implementing rather than
-      hard-coding: **QFRONT is one id then `-1`**, a single track looping for the title screen, and
-      **MAGDEMO is four then `-4`**.
+      jump back. Native execution of all 51 named records per revision confirms 37 seven-track loops,
+      **QFRONT's one id then `-1`**, **MAGDEMO's four then `-4`**, and 12 immediately stopped lists.
+      The seven-track records contain a lead and then six consecutive ids from lead + 3, wrapped into
+      2..17 — BASE0 is 14, 17, 2, 3, 4, 5, 6. Contrary to the earlier note, all four QUAKE_E channels
+      are used as opening tracks: ids 18..21 occur in BASE3, BASE2, WASTE2 and WASTE4 respectively.
       `src/build/musictable.[ch]`, `q2_level_playlist_next`; the client plays its map's playlist and
-      advances on end of stream.
+      advances on its authored countdown, independently of decoded EOF. See the
+      [native music audit](AUDIO-AUDIT.md#cd-da-and-playlist-scope).
 
-- [x] **13a. (was 13) What, other than a stream ending, moves the playlist cursor. — SOLVED: nothing does.**
-      The cursor at `gp+1536` has exactly **two** writers and both are now read.
+- [x] **13a. What advances or resets the playlist cursor — SOLVED: countdown expiration and level loads.**
+      The cursor at `gp+1536` is written by playlist setup and the cursor walk.
       `0x80071B34` is the entry point: it clears `0x800B2710`, sets the music-enabled flag at `gp+1532`, and
       parks the cursor at `list - 1` — one before the first id, which is what the walk's pre-increment
       wants. It has a **single caller**, `0x800796C8`, and that caller passes `*(gp+18832) + 34`.
@@ -1237,15 +1257,17 @@ The residues of the resolved blockers keep their parents' numbers.
       resolves a level), and 34 is `0x22`. So the only thing that starts a playlist is a level load, and the
       list it starts is the level record's own — which corroborates the `+0x22` reading from the CONSUMER
       side, independently of the data's shape.
-      The other writer is the walk itself at `0x80071A68`, and it runs when a stream ends. A zero byte ends
+      The other writer is the walk itself at `0x80071A68`, and it runs when the countdown expires. A zero byte ends
       the list and calls `0x80071B6C`, which stops the CD; a negative byte jumps back and loops.
-      So there is no scripted music change: a level's seven tracks cycle for as long as the level lasts, and
-      nothing in a boss room or a set piece can jump the cursor. That is a negative result about the game's
-      design, not about the search.
-- [x] **14. Does the engine loop XA tracks?** *(#104: no. It fades each in and out over 64 ticks and advances the playlist when the duration expires.)* The duration field is converted to 50 Hz ticks and stored to
-      two globals with a 30.0 s fallback — that looks like a countdown to a restart or fade — but the
-      consuming code was not disassembled. One entry is **1.0 s short** of its measured stream length, hinting
-      the value is a deliberate restart point rather than a length.
+      Zone loading clears the countdown at `0x800794F8` without resetting the cursor, so it advances
+      to the next entry. A full level load resets the list. The exported `PlayThisXA` is a no-op on both
+      supported revisions; this is not a general proof about arbitrary indirect writes in modified modules.
+- [x] **14. Does the engine loop XA tracks? — SOLVED.** The player fades each track in and out over
+      64 fields and advances when the authored duration expires, using five PAL or six US fields per
+      tenth. Missing file/TOC selection uses a 30-second fallback. QUAKE_C channel 3's extra audio
+      second is cut off. A zero playlist terminator stops; only an explicit negative byte loops.
+      The 28 October native fixtures exposed and corrected an implicit client restart at zero,
+      including the synthetic clock test that had wrongly expected it.
 - [x] **15. MDEC output depth for the movies (24-bit vs 15-bit). — the frames decode now (#115), and the
       question is answered from the other side.** The MDEC's own output is 24-bit RGB and the console has a
       24-bit display mode for exactly this; nothing in the bitstream chooses a depth, because the depth is
@@ -1311,11 +1333,10 @@ The residues of the resolved blockers keep their parents' numbers.
       and `tests/test_screen.c` checks the behaviour, including the property the whole thing rests on — that
       no strip copy reaches outside its own viewport.
 
-      *Residue, and it is small:* these tiles carry no texture page, so the hardware's blend mode for them is
-      whatever the last polygon drawn before them left in the register and is not statically determined. The
-      port picks `B + F` for both this and the damage flash, on the grounds that both fade to `(0,0,0)` and
-      only a mode where zero is a no-op makes that fade continuous — and that the world's own selector table
-      makes an unset selector additive anyway. Reasoned, not transcribed, and marked as such in `screen.c`.
+      **Blend inheritance is now executed.** These tiles carry no texture page, so the compositor uses
+      the GPU mode left by preceding draw environments and textured polygons in the final OT. It no longer
+      substitutes `B + F`. One register persists across viewports and buffers, with the original explicit
+      DR_TPAGE setup retained for HUD sprites and panels. Textured ABE packets blend only texels with STP set.
 - [x] **41. Which of the view weapon's two angle triples is the aim and which the kick.** *(#103: `player+230` is the aim; `0x80038260` returns the kick.)* The transform at
       `0x8004F40C` sums the triple at player+230 with the one `0x80038260` returns, negates x, and hands the
       result to `RotMatrix`. Nothing at the call site distinguishes them — both are three signed angles added
@@ -1539,6 +1560,19 @@ The residues of the resolved blockers keep their parents' numbers.
 - [~] 24. **`Resources` `unk0` and `unk4` are authored constants, not derived budgets — measured against
       six properties of the zone each one names and correlated with none of them.** Over all 115
       record/zone pairs:
+
+      **28 October correction:** the negative inference below was wrong. These
+      are allocation controls: `+0x1C` supplies subdivision meshes; `+0x18`
+      supplies particle groups through `0x80030C70` (149 declared records use
+      64, two use 80). The client now consumes the particle count and shares its
+      quad budget across viewports. `+0x0C` is a signed selector: negative forces
+      the absolute packet count, while nonnegative uses the largest contiguous
+      heap payload after particle allocation. The parent adapter now handles
+      the signed overrides; native heap-based automatic allocation remains open.
+      Field semantics are resolved. See FORMATS §2.1 and the
+      [renderer follow-up](RENDERER-AUDIT.md#follow-up-authored-particle-pools-and-shared-view-budget).
+      The original correlation measurements below are retained as history, not
+      evidence that these fields are unrelated to allocation.
 
           unk4 vs scene nodes 0.07   coll nodes 0.03   areas 0.13   points 0.09   sort 0.00   lights 0.17
           unk0 vs scene nodes 0.20   coll nodes 0.27   areas 0.26   points 0.16   sort 0.24   lights 0.20
@@ -2369,10 +2403,12 @@ scale call at all. The squeeze is the game's, not the reconstruction's, and must
       to the interpolated weapon rotation. The earlier write search missed an indirect store:
       `0x8003A44C` passes `client+70` to Seek (`0x8006FE3C`), targeting the halfword at client+68 and
       stepping by four times the frame delta. FindPlayerTarget (`0x80039DDC`) writes that target at
-      `0x8003A138`; `0x8003B424` clears client[0]+70 at initialization. The view-weapon transform and
-      easing are implemented, but `client_advance_view_weapon` still feeds a target of zero. Target
-      selection remains an implementation gap; the old conclusion that this operand was always zero
-      was incorrect.
+      `0x8003A138`; `0x8003B424` clears client[0]+70 at initialization. Target acquisition, normalized
+      firing direction and logic-tick easing are now implemented and saved. The eleven elevation rays
+      use the full actor list: retail overwrites its initial projected-screen filter. The client copies
+      the eased value into the view weapon without advancing it on display-only frames. All 256 cases
+      on each PAL/US executable agree; see the auto-aim follow-up in `FUNCTIONAL-AUDIT.md`. The old
+      conclusion that this operand was always zero was incorrect.
 
       *And the weapon was drawn from RAW VERTICES.* `q2_vw_build_ot` passed `pose = NULL`, so the one model
       in the frame that never got its rest transform was the one in the player's hands. That is now fixed
@@ -3449,58 +3485,29 @@ not think, and it does not walk.
       **Open as 51f: find the loader that builds the runtime move table from block D.** It should sit near
       the 140 strict `x5` sites, which are now the obvious place to look.
 
-- [x] 51f. **There is no load-time multiply by 5. The `x5` idiom is a 20-BYTE RECORD STRIDE.**
-      Following 51e's own pointer to the `x5` sites finds the one that writes a move record's `+12` and
-      `+14` — and it is not scaling anything:
+- [x] 51f. **Correction, 28 October: block D is multiplied by five at load.**
+      The earlier conclusion that no such loader existed was incorrect. The
+      record-stride sequence at `0x80066954` is indeed address arithmetic, but
+      that did not exclude the separate conversion at `0x8006C214`.
+      Instructions `0x8006C284..0x8006C2B0` load and multiply the three halfwords
+      at `+12/+14/+16` by five, storing them back into the same record.
+      `generate_player_animation_reference.py` executes the complete loader on
+      both verified PAL/US executable images with synthetic block D records;
+      all ten records receive all three conversions. No loader instructions
+      are hooked. The original block D interpretation in FORMATS.md was right.
+      `q2_model_move_get` retains disc units, so its runtime consumers multiply
+      by five. The live cursor is entity `+0x100`; record `+16` is the reset
+      position used after passing the end, not the current cursor.
 
-          80066954  sll  v0, v1, 2     ; index * 4
-          80066958  addu v0, v0, v1    ; index * 5
-          8006695C  sll  v0, v0, 2     ; index * 20   <-- a SECOND shift
-          80066960  addu v0, v0, s0
-          80066968  addu v0, v0, s3    ; &record[index]
-          8006696C  sh   v1, 12(v0)    ; start = an unscaled value from a0+158
-          80066990  sh   t2, 14(v0)    ; end   = 45, likewise unscaled
-
-      `sll 2; addu; sll 2` is `x5` then `x4`, which is **`x20` — this table's own record size**. Classifying
-      every strict `sll rX,rY,2; addu rX,rX,rY` in the EXE by the shift that follows it settles the shape of
-      the whole population:
-
-          x20 = 44     x80 = 13     x40 = 11     x10 = 34     bare x5 = 62
-
-      So the `x5` shape is dominantly address arithmetic for 20-, 40- and 80-byte records, and `x10` is the
-      tenths-of-a-frame divide from 51d. **No site scales `+12/+14/+16` by 5.** The note at the head of
-      `model.h` claimed one; it is now marked as unsupported there, and 51e's inference from the even spans
-      is withdrawn in place.
-
-      What survives untouched, because each was read off bytes or instructions rather than inferred:
-      block D's layout, the tiling with gap 2, the 92-move census, the tenths unit, and the fact that block D
-      is not the table `0x8007E9DC` walks. What is now open is narrower and better posed than 51f was:
-      **51g — what units are block D's `start`/`end` in, given no scale factor exists, and why is every span
-      even?** `0x80066954` is the place to resume: it builds records, and whatever feeds `a0+158` is the
-      answer.
-
-- [~] 51h. **The scale between block D and the animation position is FIVE after all, and a
-      constant in the weapon code is what says so.** — *no loader found; the inference is forced.*
-      51f is not withdrawn: its sweep is right, there is no load-time multiply, and `0x8006D330` walks
-      block D itself (a 20-byte stride off `model+0x38`, names compared three words at a time), so the
-      `start` and `end` a caller gets are the disc's own numbers.
-      What 51f could not see is a caller that pins the two systems together. `0x80050454` is one:
-      it stores a move record's `+12` straight into **viewmodel+256**, which is `entity+0x100` — the
-      halfword the pose selector at `0x8006B924` consumes — and ends the move when the position walks
-      past `+14`. Five weapons reach it, each naming one move (`Fire`, `Set`, `Spin`), and the model
-      banks carry exactly those names on exactly those models.
-      Taken literally that makes the two unit systems the same, which contradicts 51d and 51g. **One
-      constant rules the literal reading out.** `0x800503F8` refuses to prime the hand grenade until
-      viewmodel+256 reaches **380**, and `HandGren G`'s `Set` move runs **0..94**. Unscaled the position
-      tops out at 94, the test can never pass, and a grenade can never be cooked — which the console
-      plainly does. The threshold must land inside the span, so the scale is at least 4.05; five is the
-      ratio 51d and 51g already established (two per frame against ten), and at five the span is 0..470
-      with the prime four fifths of the way through the arm coming up.
-      The port applies the five in `src/game/viewweapon.c::anim_step` and says at the call site that the
-      instruction for it has not been found. **What is still open is where the five happens on the
-      console** — a patch of the loaded block D, a scaled copy, or a second position field. `0x80066954`
-      writes a record's `+12`/`+14` on a 20-byte stride and is the nearest thing seen so far, but it
-      writes a creature's numbers, not a scale.
+- [x] 51h. **The block D-to-position scale is five; the loader is now located.**
+      The old weapon-based inference remains a useful consistency check:
+      HandGren G's disc `Set` range `0..94` becomes `0..470`, containing the
+      native cook threshold 380. The direct loader execution in 51f now proves
+      the mechanism, superseding the former "no loader found" status.
+      Executed player-model binding also confirms `0x8003CBF4` and `0x8003CC04`
+      rewrite Stand/Run's reset positions to start. Terminal moves retain end.
+      The animation fixture checks the complete advance/install routines and
+      their use of those fields; see tests/fixtures/README.md for scope.
 
 - [x] 51g. **Two units per animation frame — and move `i` IS clip `i`.**
       Answered by comparison rather than by more disassembly. BASE1 model 15 carries 31 clips and 31 moves;
@@ -3513,10 +3520,9 @@ not think, and it does not walk.
       0 mismatches.** So block D counts **2 units per animation frame**, a move of span S is `S/2 + 1`
       frames, the two-unit gap between moves is exactly one frame, and **the k-th move drives the k-th clip**.
 
-      That also recovers the factor of 5 arithmetically, with no load site needed: block D counts 2 per
-      frame, the position counts 10 per frame, and 2 * 5 = 10. **The old note was right about the ratio and
-      wrong about the mechanism**, which is exactly why it survived three rounds of checking — 51f could
-      refute the multiply without touching the ratio it implied.
+      That also recovers the factor of five arithmetically: block D counts two per
+      frame on disc, the position counts ten per frame, and 2 * 5 = 10. The
+      executed loader in corrected note 51f now establishes the mechanism too.
 
       Shipped, because this one is finally implementable: `q2_model_clip_for_move()` maps a move to its clip
       **by index**, replacing `q2_model_anim_by_length()`'s match-on-length-with-a-`skip`-to-break-ties. An
@@ -8806,26 +8812,27 @@ frame exists, "the weapon looks smaller" is an impression from mid-play footage 
           BASE1, a creature killed    BEFORE 1 dead               AFTER 1 dead
 
       Before this pass all three of those AFTER columns were zero.
-- [x] 123. **VIEW CREDITS: the front end offered it and the port bounced off it. The whole roll is on the
-      disc, and none of it is a page record.**
-      `Q2_MREQ_CREDITS` fell through to `Q2_MREQ_NOT_BUILT` — "that page is not reconstructed yet" — and
-      went back to the title. The words were there the whole time: QFRONT's text pool carries the credit
-      roll as **101 contiguous strings**, from `HAMMERHEAD LTD` to `DAVID GRIJNS`, ending immediately
-      before `PLEASE WAIT WHILE`, which is the disc-swap prompt and the first string past the roll.
+- [x] 123. **VIEW CREDITS: native row tables and callback reconstructed.**
+      Corrected 26 October 2026: the earlier claim that no credit line had a menu record was false.
+      The general page scanner rejects empty strings and single-row pages, so its output could not
+      establish that absence. QFRONT `+0x35C8` installs DEVELOPED BY from `+0xFAF4`, reserves sixteen
+      scrolling objects and starts a second table cursor at `+0xFB24`. Its callback `+0x36A0` advances
+      before reading: `+0xFB3C` supplies the first streamed blank. The combined roll has **177 rows,
+      103 nonempty**, including repeated headings and authored blank spacing.
 
-      **And it is not a page array, which is the finding.** `q2_levelbin_menu_pages` reads 45 pages and 186
-      rows out of this module and exactly ONE of them mentions the credits: the `VIEW CREDITS` row on the
-      OPTIONS page, at 256,163. There is no `{text, x, y}` record for a single credit line, so how the roll
-      is paged or scrolled, and which lines are headings rather than names, lives in the module's CODE.
+      Every sixteen native ticks the callback replaces the next object in a sixteen-slot ring;
+      every tick moves every object up one pixel. Text clears below y=45. The 32-pixel CREDITS title
+      stays at (256,32), and 16-pixel menu text scrolls inside x=0..511, y=60..203. The last table row
+      is a blank with y=223 and a Back callback; streaming ignores those fields and starts it at 210.
+      The normal return callback is `+0xCCA4` (Options), on Triangle or one tick after the last name
+      clears. Drawing no longer advances the roll. Host frame rates share the disc's logical video clock.
 
-      So the port does what it did for the deathmatch scoreboard (#106): **the words are the module's and
-      the layout is this port's, and it is marked at the reader rather than left to be discovered.** The
-      roll is presented in module order — the order it was written in — as a centred scroll in the game's
-      own font. What the port does NOT do is guess the pairing of role to name.
-
-      Anchored on the two strings rather than on offsets, so a build that moves the pool still finds it.
-      `q2psx-inspect menu <disc> pages QFRONT` prints the roll beside the pages, so "the words are on the
-      disc and the layout is not" is a claim that can be checked rather than taken.
+      `q2psx-inspect menu <disc> pages QFRONT` now prints the authored row order. Unit tests cover raw
+      and relocated tables, malformed input, ring wrap, timing and native/adaptive clipping; the real
+      disc fixture checks all 177 rows and the 2966th-tick return. Hardware capture equivalence remains
+      unverified. The campaign's outro -> credits -> unlock-file flow is now also reconstructed;
+      all three rewards persist through LOAD SETTINGS, and Gold's ALL WEAPONS grant is wired. See
+      [functional audit](FUNCTIONAL-AUDIT.md).
 - [x] 124. **The cinematics were decoded and were not WIRED, and the disc says where all three go — including
       the one no table can name.**
       `stx.h` had decoded all 5,301 frames of all three films and the campaign ended on the outro, and that
@@ -9972,8 +9979,8 @@ unit, 4095.3 mean over every part of `Blaster G`) or the GTE reaches it.
       simulation's actual tick. QMRESULT `+0x1580` reads the fire predicate at engine `+0x158`, latches
       each READY byte at module `+0x5250`, and resets `+0x5254` to 150 while anyone is unready. Once all
       agree it subtracts dt and raises request 18 only below zero (`0x801016CC..0x801016E0`). The port
-      reproduces that readiness/timing and returns to its multiplayer setup; its frozen-arena score
-      layout and that destination remain port adapters rather than a reconstruction of QMRESULT's art.
+      reproduces that readiness/timing. The subsequent [multiplayer audit](MULTIPLAYER-AUDIT.md)
+      reconstructs the sorted rows, shared font, backdrop and return to QFRONT's MULTIPLAYER menu.
 
       Regression coverage includes real SDL virtual-controller events and hotplug, 60/144/240 Hz input
       taps, all owners' pickups and damage, own-button respawning, simultaneous teleports, lighting

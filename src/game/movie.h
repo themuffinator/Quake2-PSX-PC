@@ -79,6 +79,8 @@ typedef struct q2_movie {
     q2_stx_frame frame;       /* the frame most recently demuxed            */
     bool  frame_valid;
     u32   frames_shown;
+    u32   frames_skipped;
+    bool  frame_pending;      /* demuxed frame waiting for its presentation time */
 
     /*
      * Stop when a frame's own number reaches this. 0 plays the file out.
@@ -113,10 +115,10 @@ bool q2_movie_open(q2_movie *m, const disc *d, const char *path);
  * not moved on to the next frame yet — in which case the caller keeps showing
  * what it has — or when the film has ended, which `q2_movie_finished` reports.
  *
- * Frames are decoded at most one per call: a caller that stalls for a second
- * does not then burn twenty-five decodes in one frame, it drops the interval
- * and carries on. That is what the console does too, since the drive keeps
- * streaming whether or not the MDEC kept up.
+ * Frame numbers set presentation time. Demux and discard overdue frames, then
+ * decode at most one due frame per call. A stalled caller catches up without
+ * decoding the skipped pictures or slowing the soundtrack. Device clients
+ * supply elapsed consumed-audio time; headless clients use the same sample clock.
  */
 bool q2_movie_advance(q2_movie *m, double dt, u8 *rgb);
 
@@ -163,11 +165,12 @@ Q2PSX_INLINE bool q2_movie_finished(const q2_movie *m) { return m->finished; }
  * intro, **1,499 of the 1,559 in the outro** — the last 2.4 seconds are on the
  * disc and are never seen — and 2,456 of the opening reel.
  *
- * The other three arguments are read the same way and are not timing: 0x10000
+ * The other three arguments are read the same way: 0x10000
  * is the size in bytes of each of the two VLC buffers, allocated by name at
  * 0x80102F0C / 0x80102F28 ("vlc buffer 0", "vlc buffer 1") and defaulting to
- * 0x20400 when zero; the 1 gates two engine calls; the 255 is pushed at sp+16.
- * None of them changes what a port that is not managing the MDEC's DMA does.
+ * 0x20400 when zero; the 1 gates two engine calls. The 255 at sp+16 is the
+ * movie's CD volume: the player ramps it over 16 picture iterations, then
+ * fades out through 255/191/127/63 on four video fields before stopping the CD.
  */
 u32 q2_movie_retail_length(const char *file);
 

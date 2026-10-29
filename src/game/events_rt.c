@@ -185,6 +185,25 @@ bool q2_event_rt_trigger_named(q2_event_rt *rt, const char *name)
     return false;
 }
 
+bool q2_event_rt_disable_named(q2_event_rt *rt, const char *name, bool disabled)
+{
+    u32 i;
+    if (!rt || !name || !rt->flags)
+        return false;
+    for (i = 0; i < rt->events.dir_count; i++) {
+        q2_event_dir_entry e;
+        s32 slot;
+        if (!q2_events_get_dir_entry(&rt->events, i, &e) || strcmp(e.name, name))
+            continue;
+        slot = record_slot(rt, e.offset);
+        if (slot < 0) return false;
+        if (disabled) rt->flags[slot] |= Q2_EVREC_DISABLED;
+        else rt->flags[slot] &= (u8)~Q2_EVREC_DISABLED;
+        return true;
+    }
+    return false;
+}
+
 void q2_event_rt_contacts_begin(q2_event_rt *rt)
 {
     u32 i;

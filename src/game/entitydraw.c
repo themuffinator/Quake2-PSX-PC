@@ -162,7 +162,8 @@ u32 q2_entity_build_ot(q2_entity_set *set, const q2_entity_draw_ctx *ctx,
             continue;
         }
 
-        if (!q2_entity_resolve_model(e, ctx->bank)) {
+        if (!q2_entity_resolve_model(e, ctx->bank) &&
+            !q2_entity_resolve_model(e, ctx->zone_bank)) {
             if (stats)
                 stats->no_model++;
             continue;
@@ -199,8 +200,27 @@ u32 q2_entity_build_ot(q2_entity_set *set, const q2_entity_draw_ctx *ctx,
          */
         if (m.hdr.num_parts <= POSE_MAX) {
             q2_model_anim clip;
-
-            if (q2_model_anim_get(&m, 0, &clip)) {
+            bool scripted = ctx->glint && ctx->glint->owner_active &&
+                            e->kind == Q2_FX_GLINT_TARGET_KIND &&
+                            e->place_id == Q2_FX_GLINT_TARGET_ID;
+            q2_model_move move;
+            if (scripted && q2_model_move_by_name(&m,
+                    ctx->glint->dying ? "Death" : "Activate", &move)) {
+                /* BIGGUN +0x1978 selects Activate by name. As with other
+                 * named moves, convert block D to the animation cursor's
+                 * tenths of a frame before advancing by the engine dt. */
+                u32 span = move.end > move.start
+                         ? ((u32)move.end - move.start) * 5 : 0;
+                u32 time = ctx->glint->dying ? (u32)ctx->glint->death_time
+                                             : ctx->glint->script_time;
+                u32 frame = ctx->glint->dying ? (time < span ? time : span)
+                                             : span && time ? (time - 1) % span + 1 : 0;
+                u32 position = (u32)move.start * 5 + frame;
+                u32 within;
+                if (q2_model_anim_at_position(&m, position, &clip, &within) &&
+                    q2_model_pose_at(&m, &clip, within, pose) == Q2_OK)
+                    posed = true;
+            } else if (q2_model_anim_get(&m, 0, &clip)) {
                 s32 frame = clip.frames > 0 ? (e->frame % clip.frames) : 0;
                 if (q2_model_pose_at(&m, &clip, (u32)frame, pose) == Q2_OK)
                     posed = true;
@@ -218,7 +238,12 @@ u32 q2_entity_build_ot(q2_entity_set *set, const q2_entity_draw_ctx *ctx,
         inst.yaw           = e->angles[1];
         /* A gib's tumble: all three angles, not the yaw alone — see
          * q2_entity_draw_rotation. Everything else keeps the yaw path. */
-        if (q2_entity_draw_rotation(e, tumble))
+        if (ctx->glint && ctx->glint->owner_active &&
+            e->kind == Q2_FX_GLINT_TARGET_KIND &&
+            e->place_id == Q2_FX_GLINT_TARGET_ID) {
+            q2_rotation_euler(tumble, e->angles[0], e->angles[1], e->angles[2]);
+            inst.rot = (const s16 (*)[3])tumble;
+        } else if (q2_entity_draw_rotation(e, tumble))
             inst.rot = (const s16 (*)[3])tumble;
         /*
          * +0xFC/+0xFE DO NOT SCALE GEOMETRY.
@@ -302,6 +327,10 @@ u32 q2_entity_build_ot(q2_entity_set *set, const q2_entity_draw_ctx *ctx,
             sort_area = cell.contents & 0x7F;
         }
         inst.sort_area = sort_area;
+        if (ctx->glint && ctx->glint->raised &&
+            e->kind == Q2_FX_GLINT_TARGET_KIND &&
+            e->place_id == Q2_FX_GLINT_TARGET_ID)
+            inst.glint = ctx->glint;
         inst.sort_quick = (e->render_flags & Q2_RF_QUICK_SORT) != 0;
         {
             int axis;
@@ -363,6 +392,8 @@ u32 q2_entity_build_ot(q2_entity_set *set, const q2_entity_draw_ctx *ctx,
             stats->drawn++;
             stats->faces_emitted += ms.faces_emitted;
             stats->shadows_emitted += ms.shadows_emitted;
+            stats->glint_emitted += ms.glint_emitted;
+            stats->glint_draws += ms.glint_draws;
             stats->ot_overflow   += ms.ot_overflow;
         }
     }

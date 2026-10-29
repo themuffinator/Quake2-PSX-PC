@@ -13,23 +13,12 @@
 #include "model.h"
 #include "monster.h"
 #include "reloc.h"
+#include "sha256.h"
 #include "vag.h"
 
 /* Where a module image is relocated for inspection. Any address works; this
  * one is far from the executable's own so a stray pointer is obvious. */
 #define CRE_BASE 0x80100000u
-
-/* The disc's level directories. Kept here rather than read from the level
- * table so the command works on a disc whose table location is unknown. */
-static const char *const g_maps[] = {
-    "BASE0", "BASE1", "BASE2", "BASE3", "BIGGUN", "BOSS1", "BOSS2",
-    "CITY1", "CITY2", "CITY3", "COMMAND", "COMPLEX", "CORE", "FACT1",
-    "FACT2", "FACT3", "HANGAR1", "HANGAR2", "JAIL2", "JAIL3", "JAIL4",
-    "JAIL5", "LAB", "MAGDEMO", "MINE1", "MINE2", "MINE3", "MINE4",
-    "MINTRO", "POWER1", "POWER2", "SECURITY", "SEWER1", "SPACE",
-    "STRIKE", "TRAIN", "WARE1", "WARE2", "WASTE1", "WASTE2", "WASTE3",
-    "WASTE4", NULL
-};
 
 static int g_modules;
 static int g_distinct;
@@ -40,7 +29,6 @@ static int g_actions_done;
 static int g_actions_empty;
 static const u8 *g_img;
 static size_t g_img_size;
-static bool g_last_full;
 static int g_named;
 static int g_unnamed;
 
@@ -213,8 +201,8 @@ static void report(const q2_creature *c, const q2_cre_impl *impl)
                             if (un[z])
                                 printf("      %3d-%-3d  \"%.16s\"  "
                                        "(no decoded move has this range)\n",
-                                       (int)q2_rd_u16((const u8 *)un[z] + 16),
-                                       (int)q2_rd_u16((const u8 *)un[z] + 18),
+                                       (int)(s16)q2_rd_u16((const u8 *)un[z] - 4),
+                                       (int)(s16)q2_rd_u16((const u8 *)un[z] - 2),
                                        un[z]);
                     }
                 }
@@ -336,19 +324,14 @@ static void report(const q2_creature *c, const q2_cre_impl *impl)
     n = q2_creature_think_indices(c, idx, sizeof(idx));
     printf("    think     :");
     for (i = 0; i < n; i++) {
-        /*
-         * An index is covered when the implementation writes it OR the generic
-         * one runs the decoded action, which is what a PARTIAL transcription
-         * relies on and what `q2_creature_bind` falls back to. Counting only
-         * `impl->method` reported "Tankcomm — 0 of 7 indices" for a creature
-         * whose every index acts and whose attack is hand-written: it read as
-         * missing work and was the opposite of the truth.
-         */
-        bool own  = impl && impl->method[idx[i]] != NULL;
-        bool acts = own || q2_cre_generic.method[idx[i]] != NULL;
+        /* A generic trampoline exists for every index. Its existence does
+         * not establish that the function's branches or attacks are ported. */
+        bool own  = impl && impl->name && impl->method[idx[i]] != NULL &&
+                    impl->method[idx[i]] != q2_cre_generic.method[idx[i]];
+        bool acts = q2_cre_generic.method[idx[i]] != NULL;
 
         printf(" %u%s", idx[i], own ? "" : (acts ? "d" : "*"));
-        if (!acts)
+        if (!own)
             missing++;
     }
     if (n == 0)
@@ -434,7 +417,6 @@ static void report(const q2_creature *c, const q2_cre_impl *impl)
         }
         g_actions_total += n;
         g_actions_done  += got;
-        g_last_full = (n > 0 && got == n);
     }
 
     if (impl && impl->name) {
@@ -449,17 +431,20 @@ static void report(const q2_creature *c, const q2_cre_impl *impl)
                 cb_own++;
         }
 
+        if (impl->scripted) {
+            printf("    port      : %s — native spawn-installed think/use/pain "
+                   "handlers (no monsterinfo callback table)\n", impl->name);
+            g_covered++;
+            return;
+        }
         printf("    port      : %s — %u of %u callbacks written by hand, "
-               "%u of %u think indices act (d = decoded)\n",
+               "%u of %u think indices written by hand (d = decoded only)\n",
                impl->name, cb_own, cb_have, n - missing, n);
-        if (missing == 0)
+        if (missing == 0 && cb_own == cb_have)
             g_covered++;
     } else {
-        printf("    port      : decoded actions — %s\n",
-               g_last_full ? "every index acts"
-                           : "some indices do not decode");
-        if (g_last_full)
-            g_covered++;
+        printf("    port      : UNSUPPORTED native behavior; decoded actions "
+               "do not establish working weapons or control flow\n");
     }
 }
 
@@ -469,9 +454,9 @@ static void report(const q2_creature *c, const q2_cre_impl *impl)
  * wakes it, and what its eye and turn rate came out as.
  *
  * The decode above says what each module IS. This says what the port DOES with
- * it once a map is loaded. q2_creature_world_load spawns the records and runs
- * each module's spawn hook, which is where the Insane picks the fly or the
- * walk wrapper on its prone bit (module+0x974). Each creature's `model_ext2` is
+ * it once a map is loaded. q2_creature_world_load binds dormant records; wake
+ * runs export 0 only for active actors. The Insane then picks the fly or walk
+ * wrapper on its prone bit (module+0x974). Each creature's `model_ext2` is
  * then filled from its own CastList model — the halfword the console's loader
  * writes to obj+0xF8 at 0x80056710, and what the client's creature model loop
  * has to copy from the q2_model it resolves, before it wakes the world — and
@@ -643,16 +628,20 @@ static int census_wake(const disc *d)
             q2_buf_free(&buf);
             continue;
         }
-        if (q2_creature_world_load(w, d, &id, &cf, NULL) != Q2_OK ||
-            w->set.count == 0) {
+        if (q2_creature_world_load(w, d, &id, &cf, NULL, NULL, NULL) != Q2_OK) {
+            q2_creature_world_free(w);
+            q2_common_close(&cf);
+            continue;
+        }
+        st_records += w->stats.records;
+        st_nomod   += w->stats.no_module;
+        if (w->set.count == 0) {
             q2_creature_world_free(w);
             q2_common_close(&cf);
             continue;
         }
         map_ord++;
         maps_with++;
-        st_records += w->stats.records;
-        st_nomod   += w->stats.no_module;
 
         /* The models: COMMON's bank, then every zone's, which is where most
          * creature models live (see `mob`). */
@@ -836,7 +825,7 @@ static int census_wake(const disc *d)
         printf("\n");
     }
     printf("  %u creatures on %u maps, from %u spawn records (%u name a class"
-           " with no module)\n", total, maps_with, st_records, st_nomod);
+           " with no loaded implementation)\n", total, maps_with, st_records, st_nomod);
     printf("  %u found no model to read ext2 from and kept the %d stand-in\n",
            unresolved, stand_in);
     printf("  flyer -250/114, swimmer -100/114, walker ~ext2/228: %s\n",
@@ -877,50 +866,62 @@ static int census_wake(const disc *d)
 
 int cmd_creatures(const disc *d)
 {
-    int mi;
+    int mi, files = disc_file_count(d);
     char seen[32][13];
+    u8 seen_hash[32][SHA256_DIGEST_SIZE];
     int nseen = 0;
+    int variants = 0;
 
     printf("Creature modules, decoded from their own code\n");
 
-    for (mi = 0; g_maps[mi]; mi++) {
-        char path[160];
+    for (mi = 0; mi < files; mi++) {
+        const char *path = disc_file_at(d, mi)->path;
         q2_buf b;
-        q2_common_file cf;
+        dat_archive ar;
         const dat_chunk *bin, *rel;
         u32 boff = 0, roff = 0;
 
-        snprintf(path, sizeof(path), "Q2DATA/LEVELS/%s/COMMON.DAT", g_maps[mi]);
+        if (*path == '/') path++;
+        if (strncmp(path, "Q2DATA/LEVELS/", 14) != 0 ||
+            !strstr(path, ".DAT"))
+            continue;
         if (disc_read_file(d, path, &b) != Q2_OK)
             continue;
-        if (q2_common_open(&cf, &b) != Q2_OK) {
+        if (dat_open_buf(&ar, &b) != Q2_OK) {
             q2_buf_free(&b);
             continue;
         }
 
-        bin = cf.chunk[q2_common_chunk_index("CreAIBin")];
-        rel = cf.chunk[q2_common_chunk_index("CreAIRel")];
+        bin = dat_find(&ar, "CreAIBin");
+        rel = dat_find(&ar, "CreAIRel");
 
-        while (bin && rel && bin->size > 4 && boff + 16 < bin->size) {
+        while (bin && rel && bin->size > 4 && boff + 16 < bin->size &&
+               roff + 16 < rel->size) {
             char nm[13];
             u32 bnext, rnext;
             size_t body;
             u8 *img;
             q2_reloc_stats st;
-            int k, dup = 0;
+            int k, dup = -1;
 
             memcpy(nm, bin->data + boff, 12);
             nm[12] = 0;
             bnext = q2_rd_u32(bin->data + boff + 12);
             rnext = q2_rd_u32(rel->data + roff + 12);
+            if ((bnext && (bnext <= boff + 16 || bnext > bin->size)) ||
+                (rnext && (rnext <= roff + 16 || rnext > rel->size))) {
+                printf("  invalid module chain: %s at %u/%u\n", path, boff, roff);
+                g_reloc_fail++;
+                break;
+            }
 
             g_modules++;
 
             for (k = 0; k < nseen; k++)
                 if (strcmp(seen[k], nm) == 0)
-                    dup = 1;
+                    dup = k;
 
-            if (!dup) {
+            {
                 body = (bnext > boff ? bnext : bin->size) - boff - 16;
                 img  = (u8 *)malloc(body);
                 if (img) {
@@ -929,22 +930,33 @@ int cmd_creatures(const disc *d)
                                        (rnext > roff ? rnext : rel->size)
                                            - roff - 16,
                                        CRE_BASE, &st) == Q2_OK) {
-                        q2_creature c;
-                        g_img = img; g_img_size = body;
-                        if (q2_creature_decode(&c, img, body, CRE_BASE, nm)) {
-                            const q2_cre_impl *impl = q2_cre_impl_find(nm);
-                            g_distinct++;
-                            report(&c, impl);
+                        u8 digest[SHA256_DIGEST_SIZE];
+                        sha256_buffer(img, body, digest);
+                        if (dup >= 0) {
+                            if (memcmp(digest, seen_hash[dup], sizeof(digest))) {
+                                printf("  DIFFERENT module body: %s in %s\n", nm, path);
+                                variants++;
+                            }
+                        } else {
+                            q2_creature c;
+                            printf("\n  source: %s\n", path);
+                            g_img = img; g_img_size = body;
+                            if (q2_creature_decode(&c, img, body, CRE_BASE, nm)) {
+                                const q2_cre_impl *impl = q2_cre_impl_find(nm);
+                                g_distinct++;
+                                report(&c, impl);
+                            }
+                            if (nseen < 32) {
+                                memcpy(seen[nseen], nm, 13);
+                                memcpy(seen_hash[nseen], digest, sizeof(digest));
+                                nseen++;
+                            }
                         }
                     } else {
                         printf("\n  %-10s  RELOCATION FAILED\n", nm);
                         g_reloc_fail++;
                     }
                     free(img);
-                }
-                if (nseen < 32) {
-                    memcpy(seen[nseen], nm, 13);
-                    nseen++;
                 }
             }
 
@@ -954,16 +966,18 @@ int cmd_creatures(const disc *d)
             roff = rnext;
         }
 
-        q2_common_close(&cf);
+        dat_close(&ar);
     }
 
     printf("\n  %d modules over the disc, %d distinct, %d relocation failures\n",
            g_modules, g_distinct, g_reloc_fail);
-    printf("  %d of %d creatures act: animations off the disc, and every think"
-           " index they use resolves to a real action\n",
+    printf("  %d of %d modules have native callback/frame-method or "
+           "direct-think implementations\n",
            g_covered, g_distinct);
+    printf("  %d same-name copies differ from the first relocated module body\n",
+           variants);
     printf("  %d of %d moves carry the module's own name for them — a 20-byte"
-           " {char[16], u16 first, u16 last} record, matched by frame range\n",
+           " {s16 first, s16 last, char[16]} record, matched by frame range\n",
            g_named, g_moves);
     printf("  %d moves the module does not name, and %d name records no decoded"
            " move claims\n", g_unnamed, g_unclaimed);
@@ -973,8 +987,8 @@ int cmd_creatures(const disc *d)
         printf("  %d of the remainder is an EMPTY function on the disc — `jr ra`"
                " and nothing else, which is an answer rather than a gap\n",
                g_actions_empty);
-    printf("  a * marks an index with no hand transcription — it runs from the"
-           " decoded action instead\n");
+    printf("  d marks a generic decoded callback, not verified behavior; "
+           "* marks an index with no callback\n");
 
     {
         int rc = g_reloc_fail ? 1 : 0;

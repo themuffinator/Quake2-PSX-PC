@@ -15,6 +15,8 @@
 #include <string.h>
 
 #include "sim.h"
+#include "ai.h"
+#include "random.h"
 #include "explosive.h"
 #include "lighting.h"     /* q2_light_glow_fade — 0x80075E14 */
 #include "modeldraw.h"    /* q2_model_world_vertex, 0x8006CC44: the blur */
@@ -29,6 +31,7 @@ void q2_sim_attach_effects(q2_sim *sim, const q2_fx_tables *tab, u32 seed)
     if (!sim)
         return;
 
+    q2_fx_flash_clear(&sim->fx);
     q2_fx_world_init(&sim->fx, tab);
     q2_rng_seed(&sim->fx_rng, seed);
     sim->fx_ready = (tab != NULL && tab->loaded);
@@ -56,12 +59,9 @@ bool q2_sim_attach_glint(q2_sim *sim, const q2_common_file *common)
         return false;
 
     /*
-     * ASK THE LEVEL SCRIPT whether it turns a glint on, and take its numbers.
-     *
-     * The flag, the band count and the phase are all written by `LevelBin`, and
-     * this port does not execute one — but it can read it, which is enough. A
-     * map whose script raises no glint gets none; a map whose script uses
-     * different numbers gets those rather than BIGGUN's.
+     * Decode the known generator script's flag, band count, phase and tables.
+     * The frame driver below reconstructs BIGGUN's behavior; the scanner does
+     * not execute arbitrary LevelBin code. An unrecognized table stays off.
      */
     {
         const dat_chunk *lb = common->chunk[Q2_COMMON_LEVEL_BIN];
@@ -74,33 +74,142 @@ bool q2_sim_attach_glint(q2_sim *sim, const q2_common_file *common)
             return true;
         }
 
-        sim->glint.raised     = true;
+        sim->glint.scripted   = script.bands_found;
+        sim->glint.lightning_ready = script.lightning_found;
+        memcpy(sim->glint.lightning_target, script.target, sizeof(script.target));
+        memcpy(sim->glint.lightning_uv, script.uv, sizeof(script.uv));
+        memcpy(sim->glint.spark_origin, script.spark_origin, sizeof(script.spark_origin));
+        sim->glint.power_left = 3600;
+        sim->glint.evacuation_left = 300;
         sim->glint.band_count = script.band_count ? script.band_count
                                                   : Q2_FX_GLINT_BANDS;
         sim->glint.phase      = script.phase ? script.phase
                                              : Q2_FX_GLINT_PHASE_START;
 
-        /*
-         * The band records themselves are the one thing not readable: the
-         * script writes them through its import table (effect.h), into memory
-         * rather than into any chunk. The port lays them out evenly and says
-         * so — it is the only invented quantity left in the effect system, and
-         * it moves where the highlights sit, not whether or how they sweep.
-         */
-        sim->glint.tint[0] = 255;
-        sim->glint.tint[1] = 220;
-        sim->glint.tint[2] = 160;
-
+        q2_rng_seed(&sim->glint.script_rng, 0); /* module+0x43B0 */
         for (i = 0; i < sim->glint.band_count &&
                     i < Q2_FX_GLINT_BANDS_MAX; i++) {
-            sim->glint.band[i].angle[1] =
-                (s16)((s32)i * Q2_ONE_12 / (s32)sim->glint.band_count);
-            sim->glint.band[i].phase  = (u8)(sim->glint.phase - (i & 3u));
-            sim->glint.band[i].colour = 0x3AA0DCFFu;
+            memcpy(sim->glint.base_angle[i], script.angle[i],
+                   sizeof(script.angle[i]));
         }
     }
 
     return true;
+}
+
+void q2_sim_glint_tick(q2_sim *sim)
+{
+    q2_fx_glint *g;
+    u32 i;
+    if (!sim)
+        return;
+    g = &sim->glint;
+    g->raised = false;
+    g->owner_active = false;
+    if (!g->ready || !g->scripted || !g->zone_active)
+        return;
+
+    /* BIGGUN +0x1870..+0x18C0: the first live item 20, Blackhole P.
+     * Never substitute the camera when the owner is absent or collected. */
+    for (i = 0; i < sim->entities.count; i++) {
+        q2_entity *e = &sim->entities.ent[i];
+        if (!e->in_use || e->kind != Q2_FX_GLINT_TARGET_KIND ||
+            e->place_id != Q2_FX_GLINT_TARGET_ID)
+            continue;
+        if (g->finished) {
+            e->in_use = false; /* a streamed zone can recreate its Population */
+            return;
+        }
+        if (e->hidden) continue;
+        g->owner_active = true;
+        if (g->shutting_down) {
+            g->power_left -= sim->ent_world.dt;
+            if (g->power_left < 0) g->power_left = 0;
+        }
+        if (g->dying) {
+            s32 fade;
+            g->death_time += sim->ent_world.dt;
+            fade = (1390 - g->death_time) * 4096 / 200;
+            if (fade <= 0) {
+                e->in_use = false;
+                g->owner_active = false;
+                g->finished = true;
+                return;
+            }
+            if (fade <= 4096) {
+                e->scale = (s16)fade;
+                if (!g->burst_done) {
+                    g->burst_done = true;
+                    g->burst_pending = true;
+                }
+            }
+            if (g->crack_time > 0) {
+                g->crack_time -= sim->ent_world.dt;
+                if (g->crack_time < 0) g->crack_time = 0;
+            }
+        }
+        /* +0x1A74..+0x1AFC uses two sine-table byte offsets, then a signed
+         * divide toward zero. Preserve the unsigned 32-bit clock shift. */
+        {
+            u32 t = (u32)sim->level_time << 12;
+            u32 a = (u32)(((u64)t * 0x6FCFF4A5u) >> 43);
+            u32 b = (u32)(((u64)t * 0x10624DD3u) >> 36);
+            s32 wave = (q2_sin12((s32)((a & 0x3FFCu) >> 2)) + 8192) * 2;
+            wave *= q2_sin12((s32)((b & 0x3FFCu) >> 2));
+            e->origin[1] = 1500 + wave / 409600;
+        }
+        if (sim->ent_world.dt > 0)
+            g->script_time += (u32)sim->ent_world.dt;
+        /* +0x1578..+0x17E8: the owner alternates a random turn and a pause.
+         * Its two private RNG draws precede the six draws for each band. */
+        g->turn_left = (s16)(g->turn_left - sim->ent_world.dt);
+        if (g->turn_left <= 0) {
+            if (g->power_left == 0 && g->shutting_down) {
+                g->dying = true;
+                g->death_time = 0;
+                g->turn_left = 30000;
+                g->crack_time = 1600;
+            } else {
+                s32 power = g->power_left * 4096 / 3600;
+                s32 speed = q2_rng_next(&g->script_rng) * 96 / 32768;
+                s32 duration;
+                if (speed < 48)
+                    speed = -speed - 48;
+                speed = speed * 3072 / (power / 2 + 1024);
+                duration = (q2_rng_next(&g->script_rng) * 300 / 32768 + 140)
+                         * (power + 4096) / 8192 + 10;
+                if (g->turn_speed) {
+                    g->turn_speed = 0;
+                    duration /= 2;
+                } else {
+                    g->turn_speed = (s16)speed;
+                }
+                g->turn_left = (s16)duration;
+            }
+        }
+        e->angles[1] = (s16)(e->angles[1] + g->turn_speed);
+        g->raised = !g->burst_done;
+        memcpy(g->origin, e->origin, sizeof(g->origin));
+        memcpy(g->angles, e->angles, sizeof(g->angles));
+        g->area = q2_sim_fx_area(sim, e->surface, e->origin);
+        if (g->raised) {
+            q2_fx_glint_refresh(g, e->angles);
+        }
+        if (!g->burst_done && g->sparks_visible && sim->fx_ready) {
+            s16 vel[15][3];
+            const q2_fx_ramp *ramp = q2_fx_ramp_by_id(sim->fx.tab, 0);
+            u32 p;
+            for (p = 0; p < 15; p++) {
+                vel[p][0] = (s16)((q2_rng_next(&sim->fx_rng) - 16384) >> 12);
+                vel[p][1] = (s16)((q2_rng_next(&sim->fx_rng) - 16384) >> 12);
+                vel[p][2] = (s16)(-q2_rng_next(&sim->fx_rng) >> 8);
+            }
+            (void)q2_fx_group_spawn(&sim->fx, g->spark_origin,
+                                     (const s16 (*)[3])vel, 15,
+                                     ramp, ramp, 23, 20000, g->area);
+        }
+        break;
+    }
 }
 
 /*
@@ -212,18 +321,18 @@ u8 q2_sim_fx_area(q2_sim *sim, u8 area, const s32 at[3])
  * 0x800486EC, is the EXPLOSION site and is what the missile tick's world arm
  * uses — not the bullet's.
  */
+/*
+ * `at` is the point the native caller holds when it gets here: the body's
+ * entry from 0x800544EC when one was hit, else the world trace's own stop.
+ * `world` says the world stopped the shot short of its range.
+ */
 static void fx_hitscan_impact(q2_sim *sim, const s32 origin[3],
-                              const s32 dir[3], s32 frac, u8 area, s32 victim,
+                              const s32 dir[3], const s32 at[3], bool world,
+                              u8 area, s32 victim,
                               const q2_damage_result *dr, s16 damage)
 {
-    s32 at[3];
-    int k;
-
     if (!sim->fx_ready)
         return;
-
-    for (k = 0; k < 3; k++)
-        at[k] = origin[k] + (s32)(((s64)dir[k] * frac) >> Q2_FRAC_12);
 
     if (victim >= 0) {
         /* Flesh only: armour taking the whole hit is the case the HUD's damage
@@ -251,7 +360,7 @@ static void fx_hitscan_impact(q2_sim *sim, const s32 origin[3],
         return;
     }
 
-    if (frac < 4096) {
+    if (world) {
         /*
          * The area byte the console forwards here is `lbu s1, 32(v1)` at
          * 0x80048854 — the TRACE's own area record, not a fresh lookup of the
@@ -386,15 +495,9 @@ void q2_sim_rail_trail(q2_sim *sim, const s32 start[3], const s32 end[3],
  *     0x8004D400   sw 14, 16(sp)          0b1110 — bit 3 set
  *     0x800620EC   sw 11 or 14, 16(sp)    both arms, bit 3 set
  *
- * Every bolt on the disc carries the bit, so every bolt detonates through the
- * world arm — the same orange two-group burst every other missile gets. The
- * blue spark was never any part of it.
- *
- * STILL OWED: the gate ITSELF. This port raises a detonation burst for every
- * kind unconditionally, where the original tests bit 3 per record. It happens
- * to agree for the bolt because the bit is always set there; it will not agree
- * for whatever kind is spawned without it, and that kind has not been looked
- * for.
+ * Every shipped bolt carries the bit. Its actor arm emits only blood, and its
+ * world arm emits the orange burst. bolt_contact_tick keeps those arms and the
+ * flag gate separate; the generic projectile path handles the other kinds.
  */
 static q2_fx_preset_id fx_for_projectile(q2_proj_kind kind)
 {
@@ -458,6 +561,25 @@ static void projectile_explosion(q2_sim *sim, q2_proj_kind kind,
 }
 
 /* ------------------------------------------------------------------------- */
+static void environment_sound(void *user, const q2_actor *target, s16 mod)
+{
+    q2_sim *sim = (q2_sim *)user;
+    int pi;
+    if (sim->settling) return;
+    for (pi = 0; pi < sim->player_count && pi < Q2_SIM_MAX_PLAYERS; pi++) {
+        const q2_actor *a = pi == sim->cur_player ? &sim->combat.self : &sim->pcombat[pi].self;
+        s32 at[3];
+        if (a != target) continue;
+        /* The retail helper increments before requesting a voice. A full
+         * event queue or mixer therefore still consumes this admitted hit. */
+        if (mod == Q2_MOD_LAVA && (sim->lava_burn_calls++ & 3u)) return;
+        memcpy(at, sim->player[pi].pos, sizeof(at));
+        at[1] = q2_sim_origin_y(at[1]);
+        q2_ent_sound_player(&sim->ent_world.events, pi, Q2_SND_BURN, at);
+        return;
+    }
+}
+
 void q2_sim_combat_init(q2_sim *sim)
 {
     if (!sim)
@@ -467,6 +589,8 @@ void q2_sim_combat_init(q2_sim *sim)
 
     q2_inventory_init(&sim->combat.inv);
     q2_combat_rules_default(&sim->combat.rules);
+    sim->combat.rules.environment_sound = environment_sound;
+    sim->combat.rules.environment_sound_user = sim;
     q2_projectiles_init(&sim->combat.projectiles);
     q2_rng_seed(&sim->combat.rng, 0x51ED2701u);
 
@@ -498,6 +622,50 @@ void q2_sim_combat_init(q2_sim *sim)
 }
 
 /* ------------------------------------------------------------------------- */
+void q2_sim_set_aim_view(q2_sim *sim, int player, const s32 eye[3], s32 node)
+{
+    q2_player *p;
+    if (!sim || !eye || player < 0 || player >= Q2_SIM_MAX_PLAYERS) return;
+    p = &sim->player[player];
+    memcpy(p->aim_eye, eye, sizeof(p->aim_eye));
+    p->aim_node = node;
+    p->aim_view_valid = true;
+}
+
+static bool player_aim_visible(void *user, const s32 start[3],
+                               const s32 end[3], int ray)
+{
+    q2_sim *sim = user;
+    const q2_player *p = &sim->player[sim->cur_player];
+    s32 point[3], node;
+    (void)ray;
+    /* FindPlayerTarget queries only PrimaryColl, never solid entities. */
+    return !sim->coll_primary_ready ||
+           q2_coll_move(&sim->coll_primary, start, end,
+                        p->aim_view_valid ? p->aim_node : -1, point, &node);
+}
+
+void q2_sim_find_target(q2_sim *sim, s32 dt)
+{
+    q2_player *p;
+    s32 eye[3], angles[3], current, target, step;
+    if (!sim || dt <= 0) return;
+    p = &sim->player[sim->cur_player];
+    if (p->aim_view_valid) memcpy(eye, p->aim_eye, sizeof(eye));
+    else q2_sim_eye(sim, eye);
+    angles[0] = (s32)(0u - (u32)p->pitch); angles[1] = p->yaw; angles[2] = p->roll;
+    q2_combat_find_target(eye, angles, &sim->combat.self, sim->combat.targets,
+                          sim->combat.target_count, player_aim_visible, sim,
+                          p->aim_direction, &p->aim_pitch);
+    p->aim_ready = true;
+    /* Seek halfword, 0x8006FE3C, with the caller's signed dt*4 halfword. */
+    current = p->aim_assist; target = p->aim_pitch;
+    step = (s16)((u32)dt * 4u);
+    if (current < target) current = current + step < target ? current + step : target;
+    else current = target < current - step ? current - step : target;
+    p->aim_assist = (s16)current;
+}
+
 void q2_sim_aim(const q2_sim *sim, s16 out[3])
 {
     s32 sy, cy, sp, cp;
@@ -509,10 +677,15 @@ void q2_sim_aim(const q2_sim *sim, s16 out[3])
         return;
     }
 
+    if (sim->player[sim->cur_player].aim_ready) {
+        memcpy(out, sim->player[sim->cur_player].aim_direction, sizeof(s16) * 3);
+        return;
+    }
+
     sy = q2_sin12(sim->player[sim->cur_player].yaw);   cy = q2_cos12(sim->player[sim->cur_player].yaw);
     sp = q2_sin12(sim->player[sim->cur_player].pitch); cp = q2_cos12(sim->player[sim->cur_player].pitch);
 
-    /* The engine keeps this triple at player+0x3C..0x40 as a 1.3.12 unit
+    /* The engine keeps this triple at client+0x3C..0x40 as a 1.3.12 unit
      * vector; every fire function then scales it for itself — >> 6 for a
      * blaster bolt, << 2 for a bullet — so the port has to hand over the same
      * magnitude or every weapon's range and spread come out wrong together. */
@@ -746,16 +919,16 @@ static s32 world_fraction_for(q2_sim *sim, const s32 origin[3],
  * compare against the sim's player actors is exact, and a creature — whose
  * actor the client owns — can never compare equal.
  */
-static bool is_player_origin(const q2_sim *sim, const s32 *origin)
+static int player_for_actor_origin(const q2_sim *sim, const s32 *origin)
 {
     int k;
 
     if (origin == sim->combat.self.origin)
-        return true;
+        return sim->cur_player;
     for (k = 0; k < Q2_SIM_MAX_PLAYERS; k++)
         if (origin == sim->pcombat[k].self.origin)
-            return true;
-    return false;
+            return k;
+    return -1;
 }
 
 /*
@@ -782,19 +955,16 @@ static bool is_player_origin(const q2_sim *sim, const s32 *origin)
  * cell a boundary point is placed in, and q2_coll_point_in_node is inclusive,
  * so a blast sitting on the face it struck is still inside that cell.
  *
- * Two port-side adjustments, both because the port's inputs differ from the
- * console's rather than because the rule does:
+ * Two host-side adjustments:
  *
- *   - A PLAYER'S actor carries the FEET in `origin` (q2_actor_from_player is
- *     handed `player.pos`), where retail's candidate+0x54 is the entity
- *     origin, Q2_EYE_BASE above them. The segment is aimed at the origin, so
- *     a floor lip between a blast and a player's feet hides nothing the
- *     console's segment would not also meet.
+ *   - Player actor origins vary across adapters, but the player's simulation
+ *     position always holds its feet. Resolve a player by pointer identity
+ *     and aim at the canonical entity origin, without subtracting eye height
+ *     twice from an actor already seated by player_damage_begin.
  *   - A blast point in NO CELL (tr.node < 0) is let through. The console's
  *     blast is where its projectile's own move left it, always inside a cell;
- *     the port detonates a direct hit at the step's unclipped end, which can
- *     lie inside a wall behind the victim. There the question has no console
- *     answer, so it keeps the distance-only one it had before occlusion, and
+ *     malformed host inputs can still place one outside the hull. There the
+ *     question has no console answer, so it keeps the distance-only result, and
  *     `q2_sim_proj_scan.splash_unplaced` counts every such blast.
  *
  * Behind `coll_ready`, exactly as world_fraction_for is: no movement hull, no
@@ -805,12 +975,20 @@ static bool splash_clear(void *ctx, const s32 from[3], const s32 to[3])
     q2_sim *sim = (q2_sim *)ctx;
     q2_trace tr;
     s32 aim[3];
+    int player;
+
+    /* --god is a host capture aid. Keep the body in collision while refusing
+     * its splash damage, including when the published world list contains it.
+     * Radius damage passes the candidate's actual origin array to this hook. */
+    if (sim && sim->invulnerable && to == sim->combat.self.origin)
+        return false;
 
     if (!sim || !sim->coll_ready || !from || !to)
         return true;
 
+    player = player_for_actor_origin(sim, to);
     aim[0] = to[0];
-    aim[1] = is_player_origin(sim, to) ? q2_sim_origin_y(to[1]) : to[1];
+    aim[1] = player >= 0 ? q2_sim_origin_y(sim->player[player].pos[1]) : to[1];
     aim[2] = to[2];
 
     q2_sim_proj_scan.splash_asked++;
@@ -851,26 +1029,6 @@ static void player_damage_begin(q2_sim *sim)
     }
 }
 
-/*
- * Integer square root, for the one place in this file that has to turn a
- * separation into a unit direction (the hit point q2_sim_hurt_player rebuilds).
- * combat.c keeps its own for apply_knockback's normalise; this is the same
- * binary search rather than a second formula, and it truncates the same way.
- */
-static s32 hurt_isqrt(s64 v)
-{
-    s64 lo = 0, hi = 0x7FFFFFFF, best = 0;
-
-    if (v <= 0)
-        return 0;
-    while (lo <= hi) {
-        s64 mid = lo + (hi - lo) / 2;
-        if (mid * mid <= v) { best = mid; lo = mid + 1; }
-        else hi = mid - 1;
-    }
-    return (s32)best;
-}
-
 static void player_damage_impulse(q2_sim *sim, int pi, q2_actor *actor)
 {
     int axis;
@@ -895,6 +1053,49 @@ static void player_damage_end(q2_sim *sim)
         q2_actor_to_player(a, inv);
         player_damage_impulse(sim, pi, a);
     }
+}
+
+/* BIGGUN +0x2DC0..+0x2F2C: after the generator disappears, zone 1
+ * periodically hurts living clients, creature kinds 0..37 and kind 47.
+ * Player zero's entity+0x98 bit 0x4000 pauses the ENTIRE countdown. The
+ * module adds 300 once, preserving overshoot, and calls ordinary T_Damage
+ * (NULL, target, 5, 9, origin), including its armour/environment throttle. */
+void q2_sim_glint_evacuation_tick(q2_sim *sim, s32 dt)
+{
+    q2_actor **list;
+    u32 count, i;
+    int pi;
+    q2_fx_glint *g;
+    if (!sim || sim->settling || dt <= 0) return;
+    g = &sim->glint;
+    if (!g->scripted || !g->zone_active || !g->finished ||
+        (sim->player[0].ent.flags & 0x4000u)) return;
+    g->evacuation_left -= dt;
+    if (g->evacuation_left > 0) return;
+    g->evacuation_left += 300;
+    sync_rules(sim);
+    player_damage_begin(sim);
+    for (pi = 0; pi < sim->player_count && pi < Q2_SIM_MAX_PLAYERS; pi++) {
+        q2_actor *a = pi == sim->cur_player ? &sim->combat.self
+                                           : &sim->pcombat[pi].self;
+        if (a->health > 0) {
+            (void)q2_combat_damage(NULL, a, 5, Q2_MOD_ACID, a->origin,
+                                   &sim->combat.rules);
+        }
+    }
+    list = sim->world_targets ? sim->world_targets : sim->combat.targets;
+    count = sim->world_targets ? sim->world_target_count : sim->combat.target_count;
+    for (i = 0; list && i < count; i++) {
+        q2_actor *a = list[i];
+        bool player = a == &sim->combat.self;
+        for (pi = 0; pi < Q2_SIM_MAX_PLAYERS; pi++)
+            player = player || a == &sim->pcombat[pi].self;
+        if (!a || player || a->health <= 0) continue;
+        if (a->has_client || a->entity_kind < 38 || a->entity_kind == 47)
+            (void)q2_combat_damage(NULL, a, 5, Q2_MOD_ACID, a->origin,
+                                   &sim->combat.rules);
+    }
+    player_damage_end(sim);
 }
 
 /*
@@ -962,6 +1163,13 @@ static void clip_muzzle(q2_sim *sim, q2_fire_result_v2 *r)
 
 q2_fire_result_v2 q2_sim_fire(q2_sim *sim)
 {
+    return q2_sim_fire_weapon(sim, sim ? sim->combat.weapon_id : 0,
+                              sim ? sim->combat.chaingun_bullets : 0);
+}
+
+q2_fire_result_v2 q2_sim_fire_weapon(q2_sim *sim, int weapon_id,
+                                    int chaingun_bullets)
+{
     q2_fire_result_v2 r;
     s32 eye[3];
     s16 aim[3];
@@ -983,7 +1191,7 @@ q2_fire_result_v2 q2_sim_fire(q2_sim *sim)
     q2_actor_from_player(&sim->combat.self, &sim->combat.inv, sim->player[sim->cur_player].pos);
 
     r = q2_weapon_fire(&sim->combat.inv, &sim->combat.rng, NULL,
-                       sim->combat.weapon_id, eye,
+                       weapon_id, eye,
                        sim->player[sim->cur_player].yaw,
                        sim->player[sim->cur_player].pitch,
                        sim->player[sim->cur_player].roll, aim,
@@ -1003,7 +1211,7 @@ q2_fire_result_v2 q2_sim_fire(q2_sim *sim)
                         */
                        sim->level_time < sim->combat.inv.quad_until,
                        sim->combat.rules.deathmatch,
-                       sim->combat.chaingun_bullets);
+                       chaingun_bullets);
 
     sim->combat.last_shot = r;
     sim->combat.shot_serial++;
@@ -1046,7 +1254,7 @@ q2_fire_result_v2 q2_sim_fire(q2_sim *sim)
     {
         q2_muzzle_light ml;
 
-        if (q2_light_muzzle_preset((u8)sim->combat.weapon_id, &ml)) {
+        if (r.shot_count && q2_light_muzzle_preset((u8)weapon_id, &ml)) {
             s32 inner = ml.inner;
             s32 outer = ml.outer;
             s32 lit[3];
@@ -1063,7 +1271,7 @@ q2_fire_result_v2 q2_sim_fire(q2_sim *sim)
                 s32 ra = q2_rng_next(&sim->combat.rng);
                 s32 rb = q2_rng_next(&sim->combat.rng);
 
-                q2_weapon_muzzle_light((u8)sim->combat.weapon_id, ra, rb,
+                q2_weapon_muzzle_light((u8)weapon_id, ra, rb,
                                        &inner, &outer);
             }
 
@@ -1138,15 +1346,17 @@ q2_fire_result_v2 q2_sim_fire(q2_sim *sim)
             s32 frac = world_fraction_for(sim, s->origin, s->dir,
                                           &frac_area);
             q2_damage_result dr;
-            s32 victim;
+            s32 victim, at[3];
 
-            victim = q2_combat_fire_bullet(&sim->combat.self, s->origin,
-                                           s->dir, s->damage, frac,
-                                           Q2_HITSCAN_RADIUS,
-                                           sim->combat.targets,
-                                           sim->combat.target_count,
-                                           &sim->combat.rules, &dr);
-            fx_hitscan_impact(sim, s->origin, s->dir, frac, frac_area,
+            /* The blood lands where the round entered the body — the point
+             * 0x800544EC writes back — not at the wall behind it. */
+            victim = q2_combat_hitscan(&sim->combat.self, s->origin, s->dir,
+                                       s->damage, Q2_MOD_BULLET, frac,
+                                       sim->combat.targets,
+                                       sim->combat.target_count,
+                                       &sim->combat.rules, &dr, at);
+            fx_hitscan_impact(sim, s->origin, s->dir, at,
+                              victim < 0 && frac < 4096, frac_area,
                               victim, &dr, s->damage);
         }
         break;
@@ -1155,29 +1365,36 @@ q2_fire_result_v2 q2_sim_fire(q2_sim *sim)
         const q2_shot *s = &r.shot[0];
         u8  frac_area;
         s32 frac = world_fraction_for(sim, s->origin, s->dir, &frac_area);
-        u32 hits = q2_combat_fire_rail(&sim->combat.self, s->origin, s->dir,
-                                       s->damage, frac, Q2_HITSCAN_RADIUS,
-                                       sim->combat.targets,
-                                       sim->combat.target_count,
-                                       &sim->combat.rules);
+        q2_damage_result dr;
+        s32 at[3], world_end[3], victim;
+        int k;
 
-        /* The rail does not stop at the first target, so it always marks the
-         * world where the beam ends and blood is left to the per-target pass
-         * this port does not get back from `fire_rail`. */
-        fx_hitscan_impact(sim, s->origin, s->dir, frac, frac_area, -1, NULL,
-                          s->damage);
-        (void)hits;
+        /*
+         * ONE BODY. 0x80049318 asks 0x800544EC once and 0x80049334 deals one
+         * DoDamage; the beam itself keeps the world's end (s2+48), so it is
+         * drawn through the body it stopped in. This port used to visit every
+         * cylinder on the line, which is the PC game's rail, not this one.
+         */
+        victim = q2_combat_hitscan(&sim->combat.self, s->origin, s->dir,
+                                   s->damage, Q2_MOD_RAIL, frac,
+                                   sim->combat.targets,
+                                   sim->combat.target_count,
+                                   &sim->combat.rules, &dr, at);
+        if (victim >= 0)
+            fx_hitscan_impact(sim, s->origin, s->dir, at, false, frac_area,
+                              victim, &dr, s->damage);
+        for (k = 0; k < 3; k++)
+            world_end[k] = s->origin[k] +
+                           (s32)(((s64)s->dir[k] * frac) >> Q2_FRAC_12);
+        fx_hitscan_impact(sim, s->origin, s->dir, world_end, frac < 4096,
+                          frac_area, -1, NULL, s->damage);
 
         /* And the spiral, from the muzzle to where the trace stopped. */
         if (sim->fx_ready) {
             const q2_player *p = &sim->player[sim->cur_player];
-            s32 end[3];
-            int k;
 
-            for (k = 0; k < 3; k++)
-                end[k] = s->origin[k] +
-                         (s32)(((s64)s->dir[k] * frac) >> Q2_FRAC_12);
-            q2_sim_rail_trail(sim, s->origin, end, p->yaw, p->pitch, p->roll);
+            q2_sim_rail_trail(sim, s->origin, world_end, p->yaw, p->pitch,
+                              p->roll);
         }
         break;
     }
@@ -1237,7 +1454,7 @@ q2_fire_result_v2 q2_sim_fire(q2_sim *sim)
             /* Grenade3 has only been primed here; its ammo is not charged
              * until the 411 release crossing, so there is nothing to refund. */
             if (r.kind != Q2_FK_HAND_GRENADE)
-                q2_weapon_refund(&sim->combat.inv, sim->combat.weapon_id);
+                q2_weapon_refund(&sim->combat.inv, weapon_id);
             sim->combat.next_fire = prev_next_fire;
             r.fired = false;
             /* The same attempt amended, not a new one, so the serial stays
@@ -1269,10 +1486,7 @@ q2_damage_result q2_sim_hurt_player(q2_sim *sim, q2_actor *attacker,
                                     s16 damage, s16 mod, const s32 point[3])
 {
     q2_damage_result out;
-    /* The rebuilt hit point, when the shot arm below has to rebuild one.
-     * It outlives that block because `point` is read again for the blood
-     * and the flinch, so it lives here rather than inside the branch. */
-    s32 aimed[3] = { 0, 0, 0 };
+    s32 origin[3];
 
     memset(&out, 0, sizeof(out));
     if (!sim)
@@ -1290,102 +1504,44 @@ q2_damage_result q2_sim_hurt_player(q2_sim *sim, q2_actor *attacker,
     if (sim->invulnerable)
         return out;
 
-    /* Health and armour live in the inventory, everything else in the actor, so
-     * the two are synchronised around the call rather than duplicated. */
-    q2_actor_from_player(&sim->combat.self, &sim->combat.inv, sim->player[sim->cur_player].pos);
+    /*
+     * Health and armour live in the inventory, everything else in the actor, so
+     * the two are synchronised around the call rather than duplicated.
+     *
+     * AT THE ENTITY ORIGIN, entity+0x54, which is mid-body: 286 above the feet
+     * (q2_sim_origin_y), where player_damage_begin also puts it. DoDamage forms
+     * the knockback as `target+0x54 - point` (0x80057EF0..0x80057F28), and
+     * only the knockback reads this field (apply_knockback). The feet used to
+     * stand here, which left a 286-unit downward shove in every shot that
+     * carried a real impact point, and so the shot arm below rebuilt a level
+     * point 286 back toward the shooter to cancel it: every creature round
+     * pushed the player purely horizontally, where the console's round, which
+     * enters the cylinder near its top, pushes back AND down.
+     */
+    origin[0] = sim->player[sim->cur_player].pos[0];
+    origin[1] = q2_sim_origin_y(sim->player[sim->cur_player].pos[1]);
+    origin[2] = sim->player[sim->cur_player].pos[2];
+    q2_actor_from_player(&sim->combat.self, &sim->combat.inv, origin);
     sync_rules(sim);
 
     /*
-     * A CONTACT HIT LANDS AT THE ATTACKER, and that is not the caller's choice
-     * to make. `0x800612F0` passes the creature's own origin as the damage
-     * point — `q2_combat_melee` is that one line — and everything downstream of
-     * `point` is DIRECTIONAL: the knockback, where the blood sprays, and the
-     * flinch's roll, which is the hit point measured against the view's own
-     * right vector.
+     * The point is the caller's: fire_hit's computed contact at sp+88 for a
+     * claw (0x800612E4 stores s0 as T_Damage's fifth argument), the body
+     * entry 0x800544EC writes back for a round or a rail (0x80048970,
+     * 0x80049338), a projectile's contact. Only the knockback set — mods 3,
+     * 13, 15 and 18 (0x80057ED0..0x80057EE8) — reads it as a direction; a
+     * claw's kick is fire_hit's own. The attacker's origin is a host fallback
+     * for a melee caller that supplies none.
      *
-     * The client used to hand this the PLAYER's own position for a melee, which
-     * makes that difference the zero vector. `side` came out 0 on every claw
-     * that ever landed, so a hit from the left rolled the view exactly as far
-     * as a hit from the right — which is to say not at all — and the blood
-     * sprayed from the player's own feet. Overriding the point here rather than
-     * trusting the caller is what stops that being reintroduced: a melee is the
-     * one mod whose point is not free.
+     * Still open: for a CLIENT target the bullet arm adjusts the entry with
+     * GenMissileHitPlane (0x80048930..0x80048954) against the previous
+     * frame's view plane before DoDamage. That shift is bounded to a few
+     * dozen units and is not reproduced here.
      */
-    if (mod == Q2_MOD_MELEE && attacker) {
-        out   = q2_combat_melee(attacker, &sim->combat.self, damage,
-                                &sim->combat.rules);
+    if (mod == Q2_MOD_MELEE && !point && attacker)
         point = attacker->origin;
-    } else {
-        /*
-         * A SHOT ALSO ARRIVES FROM SOMEWHERE, and the creature hooks hand this
-         * the SIGHT CLIENT's position — which `sight_place` pins to the player
-         * every tick, so the "hit point" of every creature bullet, rail, rocket
-         * and grenade was the player's own origin. That is the failure the melee
-         * override above exists to stop, one mod family along, and unlike a claw
-         * these four ARE in the knockback set (0x80057ED0..0x80057EE8: mods 3,
-         * 13, 15 and 18).
-         *
-         * What that did was not "no knockback". `apply_knockback` forms
-         * `target->origin - point`; the player's actor carries the FEET in
-         * `origin` and the supplied point is the entity origin 286 above them,
-         * so the difference was (0, +286, 0) on every hit — straight DOWN, since
-         * +Y is down. Every creature bullet shoved the player into the floor
-         * and, through `player_damage_impulse` into 0x800460A4, cleared
-         * ON_GROUND and the ground normal with it.
-         *
-         * The console's point is where the trace landed on the victim:
-         * 0x8004874C sweeps the ray (0x8004891C `jal 0x800544EC`) and hands
-         * T_Damage the swept endpoint at sp+24 (0x80048974, with `sw s0,
-         * 16(sp)`), which is on the target's own hull facing the shooter. That
-         * is the same point this port's OWN hitscan already computes for the
-         * player's guns (q2_combat_fire_bullet, combat.c), so rebuild it in that
-         * shape rather than invent a third convention: keep the point ON the
-         * player and displace it one hull half-extent (Q2_EYE_BASE, 286) back
-         * along the shot's own direction.
-         *
-         * NOT `point = attacker->origin`: that is mod 7's rule and mod 7's only
-         * (0x800612F0), and moving a hitscan's point onto the shooter would put
-         * the blood on the creature at `fx_at` below.
-         *
-         * Only when the caller's point really is horizontally coincident with
-         * the player, so a caller that computed a real impact point — the
-         * player's own splash, a traced shot — keeps the one it computed.
-         */
-        s32  dx = 0, dz = 0, len = 0;
-        bool blind = attacker && attacker != &sim->combat.self && point &&
-                     point[0] == sim->combat.self.origin[0] &&
-                     point[2] == sim->combat.self.origin[2];
-
-        if (blind) {
-            dx  = point[0] - attacker->origin[0];
-            dz  = point[2] - attacker->origin[2];
-            len = hurt_isqrt((s64)dx * dx + (s64)dz * dz);
-        }
-
-        if (len > 0) {
-            aimed[0] = point[0] - (s32)(((s64)dx * Q2_EYE_BASE) / len);
-            aimed[2] = point[2] - (s32)(((s64)dz * Q2_EYE_BASE) / len);
-            /*
-             * THE VERTICAL IS THE PORT'S, and it is a deviation worth naming.
-             * `q2_actor_from_player` puts the FEET in the actor's origin where
-             * the console's entity+0x54 is mid-body, so a knockback point left
-             * at the console's impact height would leave the 286-unit
-             * feet-to-origin offset inside `target - point` and keep half of the
-             * old downward shove. The damage call therefore gets the actor's own
-             * Y, which makes that difference purely horizontal — what the
-             * console computes for a level shot — while the blood and the flinch
-             * below keep the impact height they already had.
-             */
-            aimed[1] = sim->combat.self.origin[1];
-            out = q2_combat_damage(attacker, &sim->combat.self, damage, mod,
-                                   aimed, &sim->combat.rules);
-            aimed[1] = point[1];
-            point    = aimed;
-        } else {
-            out = q2_combat_damage(attacker, &sim->combat.self, damage, mod,
-                                   point, &sim->combat.rules);
-        }
-    }
+    out = q2_combat_damage(attacker, &sim->combat.self, damage, mod,
+                           point, &sim->combat.rules);
 
     q2_actor_to_player(&sim->combat.self, &sim->combat.inv);
     player_damage_impulse(sim, sim->cur_player, &sim->combat.self);
@@ -1395,37 +1551,10 @@ q2_damage_result q2_sim_hurt_player(q2_sim *sim, q2_actor *attacker,
     if (out.taken > 0)
         fx_at(sim, Q2_FX_BLOOD, point);
 
-    /*
-     * The flinch. Amplitude scaled by how much got through, capped at the same
-     * 40 degrees the fall kick is capped at, and pitched UP and rolled with the
-     * sign of the knockback so a hit from the left throws the view right.
-     *
-     * The amplitude is the port's: 0x80038334 reads client+0x9C and +0x9E and
-     * this is the only path that could write them, but the write itself sits
-     * behind the damage callback rather than in T_Damage, so what the console
-     * puts there is not established. The DECAY is the console's — 150 ticks
-     * against the pain deadline — and that is the part that is felt.
-     */
-    if (out.taken > 0) {
-        s32 amp = out.taken * 8;
-        s32 side = 0;
-
-        if (amp > Q2_FALL_KICK_MAX)
-            amp = Q2_FALL_KICK_MAX;
-
-        /* Which side it came from: the hit point against the view's own right
-         * vector, so a shot from the left rolls the view right. */
-        if (point) {
-            s32 sy = q2_sin12(sim->player[sim->cur_player].yaw), cy = q2_cos12(sim->player[sim->cur_player].yaw);
-            s32 dx = point[0] - sim->player[sim->cur_player].pos[0];
-            s32 dz = point[2] - sim->player[sim->cur_player].pos[2];
-
-            side = (cy * dx - sy * dz) >> Q2_FRAC_12;
-        }
-
-        sim->player[sim->cur_player].hurt_kick[0] = (s16)(-amp);
-        sim->player[sim->cur_player].hurt_kick[1] = (s16)((side >= 0) ? -amp / 2 : amp / 2);
-    }
+    /* Native 0x80057D54 and PlayerThink's 0x8003AE10 feedback block preserve
+     * client+0x9C/+0x9E. Do not invent a damage-scaled weapon flinch here.
+     * The measured reader and saved amplitudes remain in the view composer;
+     * the separate MOD-dependent impact shock is delivered by the hit hook. */
 
     return out;
 }
@@ -1448,8 +1577,8 @@ q2_damage_result q2_sim_hurt_player(q2_sim *sim, q2_actor *attacker,
  * WHAT CAN BE HIT is everything the console's sweep tests: every creature but
  * the shooter (the sweep's ignore argument), and the player. A creature caught
  * in another's line of fire takes the round, as on the console; its reaction
- * is the client's drain, which credits the player — a stated approximation,
- * the actor sync having no inflictor to report.
+ * is the client's drain, which resolves the damage source back to the
+ * creature that fired it.
  *
  * THE PLAYER'S BOX is built here rather than taken from `combat.self`, whose
  * origin holds the FEET (q2_actor_from_player). The console's sweep measures
@@ -1462,23 +1591,18 @@ q2_damage_result q2_sim_hurt_player(q2_sim *sim, q2_actor *attacker,
  * Returns the creature's index in `sim->combat.targets`, Q2_SIM_HIT_PLAYER,
  * or -1 when the round hit only the world or nothing.
  */
-s32 q2_sim_creature_hitscan(q2_sim *sim, q2_actor *attacker,
-                            const s32 start[3], const s32 dir[3], s16 damage,
-                            s16 mod, bool mark_world, s32 impact[3])
+/*
+ * A creature round's candidates: every body but the shooter (the sweep's
+ * ignore argument) and then the player, at its entity origin. Returns the
+ * count and writes the player's slot, -1 when the player is down.
+ */
+static u32 hitscan_victims(q2_sim *sim, const q2_actor *attacker,
+                           q2_actor **list, q2_actor *player,
+                           s32 *player_slot)
 {
-    q2_actor  *list[Q2_SIM_CRE_HITSCAN_MAX + 1];
-    q2_actor   player;
-    q2_damage_result dr;
-    u32        n = 0, i;
-    u8         area;
-    s32        frac, idx, k;
-    s64        along = 0;
-    s32        player_slot = -1;
-    s32        at[3];
+    u32 n = 0, i;
 
-    if (!sim || !start || !dir)
-        return -1;
-
+    *player_slot = -1;
     for (i = 0; i < sim->combat.target_count && n < Q2_SIM_CRE_HITSCAN_MAX;
          i++) {
         if (sim->combat.targets[i] && sim->combat.targets[i] != attacker)
@@ -1489,44 +1613,59 @@ s32 q2_sim_creature_hitscan(q2_sim *sim, q2_actor *attacker,
         const s32 *feet = sim->player[sim->cur_player].pos;
 
         q2_actor_from_player(&sim->combat.self, &sim->combat.inv, feet);
-        player = sim->combat.self;
-        player.origin[1] = q2_sim_origin_y(feet[1]);
-        player_slot = (s32)n;
-        list[n++] = &player;
+        *player = sim->combat.self;
+        player->origin[1] = q2_sim_origin_y(feet[1]);
+        *player_slot = (s32)n;
+        list[n++] = player;
     }
+    return n;
+}
 
-    frac = world_fraction_for(sim, start, dir, &area);
-    idx  = q2_combat_nearest_hit(start, dir, frac, Q2_HITSCAN_RADIUS, list, n,
-                                 &along);
-    if (impact) {
-        s64 f = idx >= 0 ? along : frac;
+static s32 actor_hitscan(q2_sim *sim, q2_actor *attacker,
+                          const s32 start[3], const s32 dir[3], s16 damage,
+                          s16 mod, bool clip_world, bool mark_world,
+                          s32 impact[3])
+{
+    q2_actor  *list[Q2_SIM_CRE_HITSCAN_MAX + 1];
+    q2_actor   player;
+    q2_damage_result dr;
+    u32        n, i;
+    u8         area = 0;
+    s32        frac, idx, player_slot, stop[3], at[3];
+    int        k;
 
-        for (k = 0; k < 3; k++)
-            impact[k] = start[k] + (s32)(((s64)dir[k] * f) / 4096);
-    }
+    if (!sim || !start || !dir)
+        return -1;
 
+    n = hitscan_victims(sim, attacker, list, &player, &player_slot);
+    frac = clip_world ? world_fraction_for(sim, start, dir, &area) : 4096;
+
+    /*
+     * 0x8004891C (and the mission laser's 0x80048F8C): the native query from
+     * the muzzle to where the world stopped the round, which it overwrites
+     * with the nearest body's entry. An immune body is in the query, so it
+     * stops the round and shields whatever stands behind it; DoDamage is what
+     * refuses it. The old cylinder scan skipped such bodies outright.
+     */
+    for (k = 0; k < 3; k++)
+        stop[k] = start[k] + (s32)(((s64)dir[k] * frac) >> Q2_FRAC_12);
+    idx = q2_combat_trace_actors(start, stop, NULL, list, n, at);
+    if (impact)
+        memcpy(impact, at, sizeof(at));
+
+    /* The entry point itself goes to the player's DoDamage, as 0x80048970
+     * passes it: the knockback is formed against the entity origin there. */
     if (idx >= 0 && idx == player_slot) {
-        const s32 *feet = sim->player[sim->cur_player].pos;
-        s32 point[3];
-
-        /* Horizontally on the player, as the creature hooks have always
-         * passed it, so q2_sim_hurt_player rebuilds the impact facing the
-         * shooter — and at the height the round struck. */
-        point[0] = feet[0];
-        point[1] = start[1] + (s32)(((s64)dir[1] * along) / 4096);
-        point[2] = feet[2];
-        q2_sim_hurt_player(sim, attacker, damage, mod, point);
+        q2_sim_hurt_player(sim, attacker, damage, mod, at);
         return Q2_SIM_HIT_PLAYER;
     }
 
     memset(&dr, 0, sizeof(dr));
     if (idx >= 0) {
-        for (k = 0; k < 3; k++)
-            at[k] = start[k] + (s32)(((s64)dir[k] * along) / 4096);
         sync_rules(sim);
         dr = q2_combat_damage(attacker, list[idx], damage, mod, at,
                               &sim->combat.rules);
-        fx_hitscan_impact(sim, start, dir, (s32)along, area, idx, &dr, damage);
+        fx_hitscan_impact(sim, start, dir, at, false, area, idx, &dr, damage);
 
         for (i = 0; i < sim->combat.target_count; i++)
             if (sim->combat.targets[i] == list[idx])
@@ -1535,8 +1674,125 @@ s32 q2_sim_creature_hitscan(q2_sim *sim, q2_actor *attacker,
     }
 
     if (mark_world)
-        fx_hitscan_impact(sim, start, dir, frac, area, -1, NULL, damage);
+        fx_hitscan_impact(sim, start, dir, at, frac < 4096, area, -1, NULL,
+                          damage);
     return -1;
+}
+
+s32 q2_sim_creature_hitscan(q2_sim *sim, q2_actor *attacker,
+                            const s32 start[3], const s32 dir[3], s16 damage,
+                            s16 mod, bool mark_world, s32 impact[3])
+{
+    return actor_hitscan(sim, attacker, start, dir, damage, mod,
+                          true, mark_world, impact);
+}
+
+s32 q2_sim_mission_laser(q2_sim *sim, const s32 start[3], const s32 end[3],
+                          s16 damage, s16 mod)
+{
+    s32 dir[3];
+    int k;
+    if (!sim || !start || !end) return -1;
+    for (k = 0; k < 3; k++) dir[k] = end[k] - start[k];
+    /* 0x80048F8C calls the actor-only sweep 0x800544EC directly. The
+     * authored segment is already the beam's extent; no world clipping. */
+    return actor_hitscan(sim, NULL, start, dir, damage, mod,
+                          false, false, NULL);
+}
+
+/* 0x8006217C -> 0x8004917C: the player's rail, with the player among the
+ * bodies and the creature excluded. Like the player's it hurts the ONE
+ * nearest body (0x80049318 / 0x80049334) and draws to the world's end. */
+q2_cre_rail_result q2_sim_creature_rail(q2_sim *sim, q2_actor *attacker,
+                                       const s32 start[3], const s32 dir[3],
+                                       s16 damage)
+{
+    q2_cre_rail_result result = { 0 };
+    q2_actor *list[Q2_SIM_CRE_HITSCAN_MAX + 1], player;
+    q2_damage_result dr;
+    s32 frac, idx, player_slot, at[3];
+    u32 n;
+    u8 area;
+    int k;
+
+    if (!sim || !start || !dir)
+        return result;
+
+    frac = world_fraction_for(sim, start, dir, &area);
+    for (k = 0; k < 3; k++)
+        result.end[k] = start[k] + (s32)(((s64)dir[k] * frac) / 4096);
+
+    n = hitscan_victims(sim, attacker, list, &player, &player_slot);
+    idx = q2_combat_trace_actors(start, result.end, NULL, list, n, at);
+    if (idx >= 0 && idx == player_slot) {
+        q2_sim_hurt_player(sim, attacker, damage, Q2_MOD_RAIL, at);
+        result.player_hit = true;
+    } else if (idx >= 0) {
+        sync_rules(sim);
+        dr = q2_combat_damage(attacker, list[idx], damage, Q2_MOD_RAIL, at,
+                              &sim->combat.rules);
+        fx_hitscan_impact(sim, start, dir, at, false, area, idx, &dr, damage);
+        result.creatures_hit = 1;
+    }
+    fx_hitscan_impact(sim, start, dir, result.end, frac < 4096, area, -1,
+                      NULL, damage);
+    return result;
+}
+
+q2_cre_rail_result q2_sim_creature_laser(q2_sim *sim, q2_actor *attacker,
+                                        const s32 start[3], const s32 aim[3],
+                                        s16 damage)
+{
+    q2_cre_rail_result result = { 0 };
+    q2_actor *list[Q2_SIM_CRE_HITSCAN_MAX + 1], player;
+    q2_collision *hull;
+    q2_trace trace;
+    s32 from[3], end[3], delta[3], contact[3], node = -1, hit, player_slot;
+    u32 count;
+    u8 area;
+    int k;
+    if (!sim || !start || !aim) return result;
+    memcpy(from, start, sizeof(from));
+    hull = sim->coll_primary_ready ? &sim->coll_primary :
+           sim->coll_ready ? &sim->coll : NULL;
+    if (hull && attacker) {
+        q2_coll_move(hull, attacker->origin, start, -1, end, &node);
+        if (node >= 0) memcpy(from, end, sizeof(from));
+    }
+    for (k = 0; k < 3; k++) end[k] = from[k] + (s16)aim[k] * 8;
+    if (hull) {
+        s32 clipped[3];
+        q2_coll_move(hull, from, end, -1, clipped, &node);
+        if (node >= 0) memcpy(end, clipped, sizeof(end));
+    }
+    for (k = 0; k < 3; k++) delta[k] = end[k] - from[k];
+    count = hitscan_victims(sim, attacker, list, &player, &player_slot);
+    /* Retail chooses the body at 0x80049AA8 (the native query, from the
+     * hull-clipped start to the hull-clipped end, writing the entry to sp+48)
+     * before clipping entity boxes at 0x80049ABC. Keep that order, including
+     * its possible hit behind a door. */
+    hit = q2_combat_trace_actors(from, end, NULL, list, count, contact);
+    q2_sim_trace(sim, from, end, &trace);
+    memcpy(result.end, trace.end, sizeof(result.end));
+    q2_sim_breakable_shot(sim, from, result.end, damage);
+    area = q2_sim_fx_area(sim, 0, from);
+    if (hit >= 0) {
+        if (hit == player_slot) {
+            q2_sim_hurt_player(sim, attacker, damage, Q2_MOD_LASER, contact);
+            result.player_hit = true;
+        } else {
+            q2_damage_result dr;
+            sync_rules(sim);
+            dr = q2_combat_damage(attacker, list[hit], damage, Q2_MOD_LASER,
+                                   contact, &sim->combat.rules);
+            fx_hitscan_impact(sim, from, delta, contact, false, area, hit,
+                              &dr, damage);
+            result.creatures_hit = 1;
+        }
+    }
+    if (sim->fx_ready)
+        q2_fx_beam_add_style(&sim->fx, from, result.end, 32, area, 0);
+    return result;
 }
 
 /*
@@ -1575,16 +1831,14 @@ static q2_actor *proj_attacker(q2_sim *sim, const q2_projectile *p)
 }
 
 /*
- * Who a projectile in flight can hit — the world's list, and for a
- * CREATURE's shot in a single-player run the player as well. That list only
- * exists in multiplayer; alone, `combat.targets` is the creatures, which
- * left a creature's bolt nothing to hit but its own kind. The player's actor
- * is the one player_damage_begin placed for this tick, at the entity origin.
- * `with_player` false leaves the player out — a splash under god mode, which
- * projectile_owner_splash declines for the same reason.
+ * The published world list is authoritative when present. In single player,
+ * combat.targets normally contains only creatures, so append the player once.
+ * Owner exclusion belongs to the query, not this list: a released grenade can
+ * return to its shooter. player_damage_begin has placed the actor at its
+ * native entity origin. The client publishes at most 96 actors; this caller's
+ * buffer also accommodates the 128-actor simulation fixture plus the player.
  */
-static q2_actor **proj_targets(q2_sim *sim, const q2_projectile *p,
-                               bool with_player, q2_actor **buf, u32 cap,
+static q2_actor **proj_targets(q2_sim *sim, q2_actor **buf, u32 cap,
                                u32 *count)
 {
     q2_actor **list = sim->world_targets ? sim->world_targets
@@ -1593,9 +1847,11 @@ static q2_actor **proj_targets(q2_sim *sim, const q2_projectile *p,
                                : sim->combat.target_count;
     u32 i;
 
-    if (!p->shooter || sim->world_targets || !with_player ||
-        sim->combat.inv.health <= 0 || !sim->combat.self.takedamage ||
-        n >= cap) {
+    if (sim->world_targets || !sim->combat.self.takedamage || n >= cap) {
+        *count = n;
+        return list;
+    }
+    for (i = 0; i < n; i++) if (list[i] == &sim->combat.self) {
         *count = n;
         return list;
     }
@@ -1608,15 +1864,18 @@ static q2_actor **proj_targets(q2_sim *sim, const q2_projectile *p,
 
 s32 q2_sim_creature_launch(q2_sim *sim, q2_actor *shooter, q2_fire_kind kind,
                            const s32 start[3], const s32 aim[3], s16 damage,
-                           s32 shooter_yaw)
+                           s32 shooter_yaw, s32 speed, u32 effects)
 {
     q2_fire_result_v2 r;
     q2_shot *s;
     s32 index;
+    s32 toss[3];
     int k;
 
     if (!sim || !start || !aim ||
-        (kind != Q2_FK_BOLT && kind != Q2_FK_ROCKET))
+        (kind != Q2_FK_BOLT && kind != Q2_FK_ROCKET &&
+         kind != Q2_FK_GRENADE && kind != Q2_FK_BFG) ||
+        (kind == Q2_FK_GRENADE && speed <= 0))
         return -1;
 
     memset(&r, 0, sizeof(r));
@@ -1627,23 +1886,46 @@ s32 q2_sim_creature_launch(q2_sim *sim, q2_actor *shooter, q2_fire_kind kind,
     memcpy(s->origin, start, sizeof(s->origin));
     s->damage = damage;
 
+    if (kind == Q2_FK_GRENADE) {
+        s16 angles[3];
+        s32 right[3], up[3], spread;
+
+        /* 0x80061514..0x8006161C: derive up/right from the initial aim,
+         * then VectorMA twice. The magic multiply divides by 32767 with
+         * truncation, and the up draw precedes the right draw. */
+        q2_vectoangles(aim, angles);
+        q2_angle_vectors(angles, NULL, right, up);
+        spread = ((q2_random_next() - 16384) * 10) / 32767;
+        q2_vector_ma(aim, (200 + spread) * 4096 / speed, up, toss);
+        spread = ((q2_random_next() - 16384) * 10) / 32767;
+        q2_vector_ma(toss, spread * 4096 / speed, right, toss);
+        r.projectile_timer = 600; /* 0x80061724, not the player's 900 */
+    }
+
     for (k = 0; k < 3; k++) {
         if (kind == Q2_FK_BOLT) {
             /* 0x80062038..0x80062084: `bgez; addiu 63; sra 6` on each word —
              * the player blaster's own shift, rounding toward zero. */
             s32 a = aim[k];
             s->dir[k] = (a >= 0 ? a : a + 63) >> Q2_AIM_SHIFT_BOLT_BLASTER;
-        } else {
+        } else if (kind == Q2_FK_ROCKET) {
             /* 0x80062114..0x80062160: the low halfword times three, back to a
              * halfword, then `sra 17` of it — half again, where the player's
              * launcher doubles (Q2_AIM_SCALE_ROCKET). */
             s->dir[k] = (s16)((u16)aim[k] * 3u) >> 1;
+        } else if (kind == Q2_FK_BFG) {
+            s->dir[k] = (s16)aim[k];
+        } else {
+            /* 0x800616A4..0x80061704: signed word * 3 / 2, truncating
+             * BEFORE the halfword store (unlike the rocket wrapper). */
+            s->dir[k] = (s16)(toss[k] * 3 / 2);
         }
     }
-    /* 0x800620D4/0x800620DC: flags 11 with mod 6 — the effect-8 bolt every
-     * creature that fires one asks for. The hyper pair (14, 5) needs bit 0x40
-     * in that argument, which no module on this disc passes. */
-    r.mod = kind == Q2_FK_BOLT ? Q2_MOD_BOLT : Q2_MOD_ROCKET;
+    /* 0x800620A0..0x800620DC: the Flyer selects the hyper pair on three
+     * attack frames; the rest use the ordinary blaster pair. */
+    r.mod = kind == Q2_FK_BOLT ? ((effects & 0x40) ? Q2_MOD_BOLT_HYPER : Q2_MOD_BOLT)
+          : kind == Q2_FK_GRENADE ? Q2_MOD_GRENADE
+          : kind == Q2_FK_BFG ? Q2_MOD_ENERGY_BOLT : Q2_MOD_ROCKET;
 
     q2_sim_proj_scan.launched++;
     index = q2_projectile_launch(&sim->combat.projectiles, &r, -1,
@@ -1656,6 +1938,22 @@ s32 q2_sim_creature_launch(q2_sim *sim, q2_actor *shooter, q2_fire_kind kind,
     if (kind == Q2_FK_ROCKET)
         q2_projectile_aim_rocket(&sim->combat.projectiles.p[index],
                                  shooter_yaw);
+    else if (kind == Q2_FK_BFG) {
+        q2_model mdl;
+        q2_model_move mv;
+        s32 bfg = sim->model_bank ? q2_model_bank_find(sim->model_bank, "BFGBlast") : -1;
+        q2_projectile_set_attitude(&sim->combat.projectiles.p[index], 0, -shooter_yaw, 0);
+        if (bfg >= 0 && q2_model_get(sim->model_bank, (u32)bfg, &mdl) == Q2_OK &&
+            q2_model_move_by_name(&mdl, "Spin", &mv))
+            q2_projectile_spin_bfg(&sim->combat.projectiles.p[index],
+                                    (s32)mv.start * 5, (s32)mv.end * 5);
+    } else if (kind == Q2_FK_GRENADE) {
+        s32 r0 = q2_random_next();
+        s32 r1 = q2_random_next();
+        s32 r2 = q2_random_next();
+        q2_projectile_set_attitude(&sim->combat.projectiles.p[index],
+                                    r0, r1, r2);
+    }
     return index;
 }
 
@@ -1877,9 +2175,12 @@ static void present_actor(q2_sim *sim, q2_actor *a)
 {
     static const u8 energy[3] = { Q2_ENERGY_LIGHT_R, Q2_ENERGY_LIGHT_G,
                                   Q2_ENERGY_LIGHT_B };
-    static const u8 ambient_target[3] = { Q2_ACTOR_AMBIENT_DEFAULT,
+    static const u8 creature_target[3] = { Q2_ACTOR_AMBIENT_DEFAULT,
                                           Q2_ACTOR_AMBIENT_DEFAULT,
                                           Q2_ACTOR_AMBIENT_DEFAULT };
+    static const u8 player_target[3] = { Q2_PLAYER_AMBIENT_DEFAULT,
+                                         Q2_PLAYER_AMBIENT_DEFAULT,
+                                         Q2_PLAYER_AMBIENT_DEFAULT };
     q2_fx_present_report rep;
     q2_fx_mesh_src src;
     const q2_fx_mesh_src *sp;
@@ -1897,12 +2198,11 @@ static void present_actor(q2_sim *sim, q2_actor *a)
      * so an actor's own back colour never moved; the creature and body draws
      * fed q2_light_env_build a literal instead.
      *
-     * DEVIATION, stated: the target is the port's own 0x30 rather than the
-     * entity's +0x2B0, which nothing in the image is known to write after a
-     * spawn (combat.h, q2_actor.ambient). Seeded equal, so this changes only
-     * what happens AFTER a hit.
+     * Creature and gameplay-player spawning establish different targets at
+     * +0x2B0: respectively 0x40 and 0x20 (combat.h, q2_actor.ambient).
      */
-    q2_light_glow_fade(a->ambient, ambient_target, Q2_ACTOR_AMBIENT_STEPS);
+    q2_light_glow_fade(a->ambient, a->has_client ? player_target : creature_target,
+                        Q2_ACTOR_AMBIENT_STEPS);
 
     /*
      * THE AREA EVERY GROUP IN THIS CHAIN IS FILED UNDER. The console passes
@@ -2039,7 +2339,161 @@ static void proj_blur(q2_sim *sim, u32 slot, const q2_projectile *p,
     }
 }
 
+/* Grenade2/3 use the shared toss mover: entity boxes precede PrimaryColl;
+ * any geometry contact suppresses the subsequent actor sweep. */
+static bool grenade_geometry(q2_sim *sim, q2_projectile *p,
+                             const q2_proj_step *step)
+{
+    s32 desired[3], clipped[3];
+    s16 normal[3] = {0, 0, 0};
+    q2_move_seg_hit hit;
+    bool contact = false;
+    int k;
+    memcpy(desired, step->to, sizeof(desired));
+    if (q2_move_clip_segment(&sim->move_world, step->from, desired, NULL, &hit)) {
+        contact = true;
+        /* The high half of the native toss argument 0x00030900 is the
+         * shootable-box damage, independent of the grenade's blast damage. */
+        q2_sim_breakable_shot(sim, step->from, hit.pos, 3);
+        for (k = 0; k < 3; k++) {
+            normal[k] = hit.normal[k];
+            desired[k] = hit.pos[k] - (step->to[k] - step->from[k]);
+        }
+        q2_sim_proj_scan.stopped_on_entity++;
+    }
+    memcpy(clipped, desired, sizeof(clipped));
+    if (sim->coll_primary_ready || sim->coll_ready) {
+        q2_collision *hull = sim->coll_primary_ready ? &sim->coll_primary : &sim->coll;
+        s32 node = p->node;
+        if (!q2_coll_move(hull, step->from, desired, node, clipped, &node)) {
+            q2_coll_plane plane;
+            contact = true;
+            if (hull->hit_plane_index >= 0 &&
+                q2_collision_get_plane(hull, (u32)hull->hit_plane_index, &plane)) {
+                normal[0] = plane.nx; normal[1] = plane.ny; normal[2] = plane.nz;
+            }
+        }
+        p->node = node;
+    }
+    if (contact) {
+        q2_projectile_rebound(p, desired, clipped, normal);
+        q2_model_ent_sound_push(&sim->grenade_bounce_sounds, p->pos);
+    }
+    return contact;
+}
+
+static void grenade_fuse(q2_sim *sim, u32 index)
+{
+    q2_projectile *p = &sim->combat.projectiles.p[index];
+    q2_proj_kind kind = p->kind;
+    s32 where[3];
+    q2_actor *candidates[Q2_SIM_CRE_HITSCAN_MAX + 1];
+    u32 count;
+    q2_actor **targets = proj_targets(sim, candidates,
+                                      (u32)Q2PSX_ARRAY_COUNT(candidates), &count);
+    memcpy(where, p->pos, sizeof(where));
+    q2_sim_proj_scan.expired++;
+    projectile_owner_splash(sim, p, where, targets, count);
+    q2_projectile_detonate_traced(&sim->combat.projectiles, index,
+                                  proj_attacker(sim, p), targets, count,
+                                  &sim->combat.rules, splash_clear, sim);
+    fx_at(sim, fx_for_projectile(kind), where);
+    projectile_explosion(sim, kind, where);
+}
+
 /* ------------------------------------------------------------------------- */
+/* 0x80047C6C: lifetime/contact decisions precede flight effects; the cached
+ * hull check follows them. Full PAL/US sequences are in the bolt fixture. */
+static void bolt_flight_effects(q2_sim *sim, const q2_projectile *p)
+{
+    static const u8 glow[3] = {Q2_PROJ_LIGHT_R, Q2_PROJ_LIGHT_G, Q2_PROJ_LIGHT_B};
+    if (p->flags & Q2_PROJ_FLAG_LIGHT)
+        q2_ent_light_at(&sim->ent_world.events, p->pos, glow,
+                       Q2_PROJ_LIGHT_INNER, Q2_PROJ_LIGHT_OUTER);
+    if (p->flags & Q2_PROJ_FLAG_LIGHT_BIG)
+        q2_ent_light_at(&sim->ent_world.events, p->pos, glow, 800, 1600);
+    if ((p->flags & Q2_PROJ_FLAG_TRAIL) && sim->fx_ready) {
+        s16 disp[3];
+        int k;
+        for (k = 0; k < 3; k++)
+            disp[k] = (s16)((u32)q2_projectile_raw_velocity(p, k) * (u32)sim->cur_dt);
+        q2_fx_bolt_trail(&sim->fx, &sim->combat.rng, p->pos, disp,
+                         fx_area_resolve(sim, 0, p->pos));
+    }
+}
+
+static void bolt_impact_effect(q2_sim *sim, q2_fx_preset_id id, const s32 at[3])
+{
+    /* The sweep's trail and impact draws are consecutive BIOS rand calls.
+     * Keep them on the same saved stream, including hull-hit frames. */
+    if (sim->fx_ready)
+        q2_fx_spawn(&sim->fx, &sim->combat.rng, id, at,
+                    fx_area_resolve(sim, 0, at));
+}
+
+static void bolt_contact_tick(q2_sim *sim, u32 index, const q2_proj_step *step,
+                              q2_actor *attacker, q2_actor **targets, u32 count,
+                              s32 hit_index, const s32 contact[3])
+{
+    q2_projectile *p = &sim->combat.projectiles.p[index];
+    s32 end[3];
+    bool consumed = false;
+    q2_move_seg_hit hit;
+    memcpy(end, hit_index >= 0 ? contact : step->to, sizeof(end));
+
+    /* 0x80047DF4 tests the actor-limited segment against solid entities before
+     * damage. A type-2 contact with bit 8 set branches to sparks while the
+     * record still holds its OLD position; other kinds only clip the endpoint. */
+    if (q2_move_clip_segment(&sim->move_world, step->from, end, NULL, &hit)) {
+        memcpy(end, hit.pos, sizeof(end));
+        hit_index = -1;
+        q2_sim_proj_scan.stopped_on_entity++;
+        /* q2_move_clip_segment considers type-2 entity boxes only. */
+        if (sim->breakable_count)
+            q2_sim_breakable_shot(sim, step->from, end, (s16)p->damage);
+        consumed = true;
+        if (p->flags & Q2_PROJ_FLAG_IMPACT) {
+            bolt_impact_effect(sim, Q2_FX_EXPLOSION, p->pos);
+            q2_projectile_expire(&sim->combat.projectiles, index);
+            return;
+        }
+    }
+    if (hit_index >= 0) {
+        q2_actor *victim = targets[hit_index];
+        q2_actor *direct = sim->invulnerable && victim == &sim->combat.self
+                            ? NULL : victim;
+        q2_sim_proj_scan.hit++;
+        q2_projectile_impact_traced(&sim->combat.projectiles, index, end,
+                                    attacker, direct, targets, count,
+                                    &sim->combat.rules, splash_clear, sim);
+        consumed = true;
+        if (p->flags & Q2_PROJ_FLAG_IMPACT) {
+            /* The blood call at 0x80048638 does not test the damage result.
+             * There is no additional world burst on an actor contact. */
+            bolt_impact_effect(sim, Q2_FX_BLOOD, end);
+            return;
+        }
+    }
+
+    /* Flag-8-clear contacts fall through even though their lifetime was
+     * cleared. Direct assignment preserves that native edge case. */
+    memcpy(p->pos, end, sizeof(p->pos));
+    bolt_flight_effects(sim, p);
+    if (sim->coll_primary_ready || sim->coll_ready) {
+        q2_collision *hull = sim->coll_primary_ready ? &sim->coll_primary : &sim->coll;
+        s32 clipped[3], node = p->node;
+        bool complete = q2_coll_move(hull, step->from, end, node, clipped, &node);
+        p->node = node;
+        if (!complete) {
+            memcpy(p->pos, clipped, sizeof(p->pos));
+            consumed = true;
+            if (p->flags & Q2_PROJ_FLAG_IMPACT)
+                bolt_impact_effect(sim, Q2_FX_EXPLOSION, p->pos);
+        }
+    }
+    if (consumed) q2_projectile_expire(&sim->combat.projectiles, index);
+}
+
 void q2_sim_combat_tick(q2_sim *sim)
 {
     u32 i;
@@ -2152,11 +2606,12 @@ void q2_sim_combat_tick(q2_sim *sim)
         q2_projectile *p = &sim->combat.projectiles.p[i];
         q2_proj_step step;
         q2_actor **hit_list;
+        q2_actor *attacker, *ignore;
         q2_actor  *cand[Q2_SIM_CRE_HITSCAN_MAX + 1];
         u32 hit_count;
         s32 hit_index;
-        s32 dir[3];
-        bool held;
+        s32 dir[3], contact[3];
+        bool held, grenade;
         int k;
 
         if (!p->in_use)
@@ -2165,20 +2620,13 @@ void q2_sim_combat_tick(q2_sim *sim)
         q2_sim_proj_scan.stepped++;
         held = (p->kind == Q2_PROJ_HAND_GRENADE &&
                 p->node == Q2_PROJ_NODE_HELD);
+        grenade = p->kind == Q2_PROJ_GRENADE || p->kind == Q2_PROJ_HAND_GRENADE;
+        attacker = proj_attacker(sim, p);
+        ignore = q2_projectile_ignore_owner(p, attacker) ? attacker : NULL;
 
-        /*
-         * The light, from the preset the sweep at 0x80047C6C reads out of
-         * 0x800AE954 -- warm orange, outer radius 800. Raised before the step
-         * so it sits where the projectile was drawn this frame rather than
-         * where it is about to be.
-         *
-         * GATED, for a bolt, on bit 0x2 of its flags (0x800481C0). Both bolt
-         * values carry it, so nothing changes today; the gate is here because
-         * the same halfword decides the body and the trail and reading one bit
-         * of it in one place and not the others is how they drift apart.
-         */
-        if (!held && (p->kind != Q2_PROJ_BOLT ||
-                      (p->flags & Q2_PROJ_FLAG_LIGHT))) {
+        /* Entity projectiles keep their thinker light. Bolts emit theirs after
+         * lifetime/contact decisions and the endpoint commit below. */
+        if (!held && p->kind != Q2_PROJ_BOLT) {
             static const u8 glow[3]     = { Q2_PROJ_LIGHT_R, Q2_PROJ_LIGHT_G,
                                             Q2_PROJ_LIGHT_B };
             static const u8 bfg_glow[3] = { Q2_PROJ_BFG_LIGHT_R,
@@ -2194,45 +2642,16 @@ void q2_sim_combat_tick(q2_sim *sim)
                                 : Q2_PROJ_LIGHT_OUTER);
         }
 
-        /*
-         * AND THE TRAIL, which is the blaster bolt's only body.
-         *
-         * AFTER THE MOVE, NOT BEFORE IT. This used to run above the step,
-         * under a note saying 0x80048334 takes `pos - disp/2` with pos "still
-         * the old one". It is not: the sweep commits the new position to the
-         * record at 0x80047EE8 and 0x80047F30 — the contact arm and the clear
-         * arm — and BOTH of those are above the flags dispatch at 0x80047F44,
-         * so by the time the bit-0x1 arm loads 0(s6)/4(s6)/8(s6) at
-         * 0x800482E8 the record already holds where the bolt ended up. The
-         * group therefore spans `[newpos - disp, newpos]`, which is exactly
-         * the segment just travelled; raising it first spanned
-         * `[oldpos - disp, oldpos]`, the segment travelled on the PREVIOUS
-         * tick, and left a whole step of clear air between a bolt and the
-         * trail behind it.
-         */
+        /* The grenade thinker lays its ribbon before toss changes attitude. */
+        if (grenade && !held)
+            proj_blur(sim, i, p, p->pos);
         q2_projectile_step(&sim->combat.projectiles, i, sim->gravity,
                            sim->cur_dt, sim->level_time, &step);
 
         /* The blur ribbon its think lays from its own model's vertices, at
          * where it stood before this move (proj_blur). */
-        if (!held)
+        if (!held && !grenade)
             proj_blur(sim, i, p, step.from);
-
-        if (!held && (p->flags & Q2_PROJ_FLAG_TRAIL) && sim->fx_ready) {
-            s16 disp[3];
-            int d;
-
-            for (d = 0; d < 3; d++) {
-                /* The sweep's own `vel * dt`, 0x80047D50 against
-                 * [0x800B2DB4], truncated to a halfword by the `sh` at
-                 * 0x80047D58, in the velocity's raw halfword units. */
-                s32 raw_vel = q2_projectile_raw_velocity(p, d);
-
-                disp[d] = (s16)(raw_vel * sim->cur_dt);
-            }
-            q2_fx_bolt_trail(&sim->fx, &sim->combat.rng, p->pos, disp,
-                             fx_area_resolve(sim, 0, p->pos));
-        }
 
         /* State 1 has no mover, collision body, light or visible model. The
          * owner update after the view-model step attaches it and resolves an
@@ -2240,34 +2659,18 @@ void q2_sim_combat_tick(q2_sim *sim)
         if (held)
             continue;
 
-        if (step.expired) {
+        if (grenade && ((p->flags & Q2_PROJ_TOSS_STOPPED) ||
+                        grenade_geometry(sim, p, &step))) {
+            if (step.expired) grenade_fuse(sim, i);
+            continue;
+        }
+
+        if (step.expired && !grenade) {
             q2_sim_proj_scan.expired++;
-            /* Grenade2's +0xF4 is a fuse and calls its explosion. Rocket and
-             * BFGBlast use the same-looking field only as a safety lifetime:
+            /* Rocket and BFGBlast use +0xF4 only as a safety lifetime:
              * 0x8004ADB0 / 0x8004B8E4 free them without damage or an effect.
              * The bolt lifetime is quiet for the same reason. */
-            if (p->kind == Q2_PROJ_GRENADE ||
-                p->kind == Q2_PROJ_HAND_GRENADE) {
-                q2_fx_preset_id fx = fx_for_projectile(p->kind);
-                s32 where[3];
-                q2_actor **targets = sim->world_targets
-                                          ? sim->world_targets
-                                          : sim->combat.targets;
-                u32 count = sim->world_targets ? sim->world_target_count
-                                               : sim->combat.target_count;
-
-                memcpy(where, p->pos, sizeof(where));
-                projectile_owner_splash(sim, p, where, targets, count);
-                q2_projectile_detonate_traced(&sim->combat.projectiles, i,
-                                              attacker_for(sim, p->owner),
-                                              targets, count,
-                                              &sim->combat.rules,
-                                              splash_clear, sim);
-                fx_at(sim, fx, where);
-                projectile_explosion(sim, p->kind, where);
-            } else {
-                q2_projectile_expire(&sim->combat.projectiles, i);
-            }
+            q2_projectile_expire(&sim->combat.projectiles, i);
             continue;
         }
 
@@ -2388,13 +2791,26 @@ void q2_sim_combat_tick(q2_sim *sim)
                  * argument. Resolved from the ball's position here, on each
                  * refresh, rather than per submit — see q2_fx_timed_beam.area.
                  */
-                if (sim->fx_ready)
+                if (sim->fx_ready) {
+                    /*
+                     * The far end is the target's origin raised to the middle
+                     * of its hull: 0x80048D4C..0x80048D74 adds
+                     * `(572 - height) / 2`, truncated toward zero, to +0x58.
+                     * Ending the beam at the bare origin put it 14 units off
+                     * on a default 600-high creature and further on the tall
+                     * ones.
+                     */
+                    s32 to[3];
+                    to[0] = a->origin[0];
+                    to[1] = a->origin[1] + (572 - (s32)a->height) / 2;
+                    to[2] = a->origin[2];
                     q2_fx_beam_timed(&sim->fx, (s32)i, (s32)t,
-                                     p->pos, a->origin,
+                                     p->pos, to,
                                      Q2_FX_TIMED_BEAM_RADIUS,
                                      Q2_FX_TIMED_BEAM_STYLE,
                                      Q2_FX_TIMED_BEAM_LIFE,
                                      fx_area_resolve(sim, 0, p->pos));
+                }
 
                 /* 0x80049E34, the damage the beam does when it lands. */
                 if (hurt)
@@ -2417,23 +2833,18 @@ void q2_sim_combat_tick(q2_sim *sim)
                 p->beam_time = (u16)(p->beam_time - 30);
         }
 
-        /* A creature in the way takes it before the world does. */
+        /* Grenades already tested geometry; the other projectile thinkers
+         * retain their existing actor-first sweep. */
         for (k = 0; k < 3; k++)
             dir[k] = step.to[k] - step.from[k];
 
         /* The player stops a creature's shot even in god mode; it is the
          * damage that god mode refuses (q2_sim_hurt_player). */
-        hit_list = proj_targets(sim, p, true, cand, (u32)Q2PSX_ARRAY_COUNT(cand),
+        hit_list = proj_targets(sim, cand, (u32)Q2PSX_ARRAY_COUNT(cand),
                                 &hit_count);
 
-        hit_index = q2_combat_nearest_on_segment(step.from, dir,
-                                                 Q2_HITSCAN_RADIUS,
-                                                 hit_list, hit_count);
-
-        /* Never its own shooter: the world list holds everybody, including the
-         * player who fired this. */
-        if (hit_index >= 0 && hit_list[hit_index] == proj_attacker(sim, p))
-            hit_index = -1;
+        hit_index = q2_combat_trace_actors(step.from, step.to, ignore,
+                                           hit_list, hit_count, contact);
 
         /*
          * How close it came, whether or not it counted. Measured against the
@@ -2454,10 +2865,8 @@ void q2_sim_combat_tick(q2_sim *sim)
                 s64 along = 0, d2;
                 s64 reach;
 
-                /* Same rule as the sweep in combat.c: a corpse is a target
-                 * until its `takedamage` says otherwise, which is what lets a
-                 * rocket finish the job on a body already down. */
-                if (!t || t == proj_attacker(sim, p) || !t->takedamage)
+                /* Match collision membership, including immune bodies. */
+                if (!t || t == ignore)
                     continue;
 
                 d2 = q2_combat_ray_dist_sq(step.from, dir, t->origin, &along);
@@ -2482,45 +2891,24 @@ void q2_sim_combat_tick(q2_sim *sim)
             }
         }
 
-        if (hit_index >= 0 && p->shooter &&
-            hit_list[hit_index] == &sim->combat.self) {
-            /*
-             * A CREATURE'S SHOT ON THE PLAYER takes the path every other
-             * creature hit on the player takes, for the flinch, the blood and
-             * god mode — and that path re-seats the actor at the feet, so the
-             * origin this tick placed is put back for the next projectile. The
-             * splash then reaches everyone else; the victim of a direct hit is
-             * not in its own blast.
-             */
-            q2_fx_preset_id fx = fx_for_projectile(p->kind);
-            s32 keep[3];
-            u32 others;
-            q2_actor **rest;
-
-            q2_sim_proj_scan.hit++;
-            memcpy(keep, sim->combat.self.origin, sizeof(keep));
-            q2_sim_hurt_player(sim, p->shooter, p->damage, p->mod, step.to);
-            memcpy(sim->combat.self.origin, keep, sizeof(keep));
-
-            rest = proj_targets(sim, p, false, cand, (u32)Q2PSX_ARRAY_COUNT(cand),
-                                &others);
-            q2_projectile_impact_traced(&sim->combat.projectiles, i, step.to,
-                                        NULL, p->shooter, NULL, rest, others,
-                                        &sim->combat.rules, splash_clear, sim);
-            fx_at(sim, fx, step.to);
+        if (p->kind == Q2_PROJ_BOLT) {
+            bolt_contact_tick(sim, i, &step, attacker, hit_list, hit_count,
+                              hit_index, contact);
             continue;
         }
 
         if (hit_index >= 0) {
             q2_actor *victim = hit_list[hit_index];
+            q2_actor *direct = sim->invulnerable && victim == &sim->combat.self
+                                ? NULL : victim;
+            s32 health_before = victim->health;
 
             q2_sim_proj_scan.hit++;
             q2_fx_preset_id fx = fx_for_projectile(p->kind);
 
-            projectile_owner_splash(sim, p, step.to, hit_list, hit_count);
-            q2_projectile_impact_traced(&sim->combat.projectiles, i, step.to,
-                                        NULL, proj_attacker(sim, p),
-                                        victim, hit_list, hit_count,
+            projectile_owner_splash(sim, p, contact, hit_list, hit_count);
+            q2_projectile_impact_traced(&sim->combat.projectiles, i, contact,
+                                        attacker, direct, hit_list, hit_count,
                                         &sim->combat.rules,
                                         splash_clear, sim);
 
@@ -2533,14 +2921,14 @@ void q2_sim_combat_tick(q2_sim *sim)
              * (q2_fx_gib_spray) at the head of ThrowGibs, behind 0x8007CEB4,
              * and that needs a posed model this file does not carry.
              */
-            fx_at(sim, fx, step.to);
-            projectile_explosion(sim, p->kind, step.to);
-            if (victim)
-                fx_at(sim, Q2_FX_BLOOD, step.to);
+            fx_at(sim, fx, contact);
+            projectile_explosion(sim, p->kind, contact);
+            if (victim->health < health_before)
+                fx_at(sim, Q2_FX_BLOOD, contact);
             continue;
         }
 
-        if (sim->coll_ready || sim->coll_primary_ready) {
+        if (!grenade && (sim->coll_ready || sim->coll_primary_ready)) {
             s32 end[3], node = p->node;
             bool complete;
             q2_collision *phull = sim->coll_primary_ready
@@ -2604,27 +2992,20 @@ void q2_sim_combat_tick(q2_sim *sim)
             }
 
             if (!complete) {
-                /* The hull gives back the clipped point; the port has no
-                 * surface normal here, so a grenade landing on geometry stops
-                 * rather than bouncing. Called out because the bounce sound is
-                 * one of the twenty-two and the behaviour certainly exists. */
                 bool consumed;
                 q2_fx_preset_id fx = fx_for_projectile(p->kind);
                 u32 count;
                 /* A creature's rocket on the wall beside the player reaches
                  * the player too, unless god mode is holding the damage off. */
-                q2_actor **targets = proj_targets(sim, p, !sim->invulnerable,
-                                                  cand,
+                q2_actor **targets = proj_targets(sim, cand,
                                                   (u32)Q2PSX_ARRAY_COUNT(cand),
                                                   &count);
 
                 projectile_owner_splash(sim, p, end, targets, count);
                 consumed = q2_projectile_impact_traced(
-                    &sim->combat.projectiles, i, end, NULL,
+                    &sim->combat.projectiles, i, end,
                     proj_attacker(sim, p), NULL, targets, count,
                     &sim->combat.rules, splash_clear, sim);
-                /* A grenade that only bounced has not gone off, so it must not
-                 * leave a fireball behind. */
                 if (consumed) {
                     fx_at(sim, fx, end);
                     projectile_explosion(sim, p->kind, end);
@@ -2634,6 +3015,8 @@ void q2_sim_combat_tick(q2_sim *sim)
         }
 
         q2_projectile_commit(&sim->combat.projectiles, i, step.to);
+        /* Native Grenade2/3 decrement the fuse after movement and contact. */
+        if (grenade && step.expired) grenade_fuse(sim, i);
     }
 
     /*
@@ -3003,6 +3386,7 @@ u32 q2_sim_attach_breakables(q2_sim *sim, const q2_scene *scene,
     sim->node_vis_count       = 0;
     sim->blast_count          = 0;
     q2_model_ent_sounds_clear(&sim->explosion_sounds);
+    q2_model_ent_sounds_clear(&sim->grenade_bounce_sounds);
     sim->glass_count          = 0;   /* a smash from the last zone is not one
                                       * the new zone's mixer should hear */
     sim->explosive_destroyed  = 0;

@@ -139,6 +139,45 @@ bool q2_menu_item_rect(const q2_menu *m, int index,
     return true;
 }
 
+static bool player_hit_test(const q2_menu *m, int x, int y, q2_menu_hit *out)
+{
+    q2_menu_player_row rows[7];
+    const q2_menu_player_panel *v = &m->mp_panel[0];
+    int i, ox, oy, count = q2_menu_player_rows(m, 0, rows);
+    /* The one host mouse belongs to player one, even over another panel. */
+    q2_menu_player_origin(m, 0, &ox, &oy);
+    x -= ox; y -= oy;
+    for (i = 0; i < count; i++) {
+        q2_menu_hit hit = {i, Q2_MENU_HIT_LABEL, 0};
+        const q2_menu_face *face = q2_menu_face_get(rows[i].size);
+        int len = q2_menu_text_length(rows[i].text);
+        int left = 128 - q2_menu_font_width(rows[i].size, rows[i].text) / 2;
+        int selectable = v->page == Q2_MP_PLAYER_MAIN ? 2 :
+                         v->page == Q2_MP_PLAYER_OPTIONS ? 3 :
+                         v->page == Q2_MP_PLAYER_CONTROLLER ? 5 :
+                         v->page == Q2_MP_PLAYER_NAME || v->page == Q2_MP_PLAYER_COLOUR ? 1 : 0;
+        int col;
+        if (!face || i >= selectable || rows[i].disabled ||
+            x < left || x >= left + len * face->advance ||
+            y < rows[i].y - face->cell_h / 2 - 2 ||
+            y > rows[i].y - face->cell_h / 2 + face->cell_h + 1) continue;
+        col = (x - left) / face->advance;
+        if (v->page == Q2_MP_PLAYER_NAME) {
+            hit.index = col;
+            hit.part = Q2_MENU_HIT_CHAR;
+        } else if (v->page == Q2_MP_PLAYER_COLOUR ||
+                   (v->page == Q2_MP_PLAYER_CONTROLLER && (i == 0 || i == 4)))
+            hit.part = x < 128 ? Q2_MENU_HIT_PREV : Q2_MENU_HIT_NEXT;
+        else if (v->page == Q2_MP_PLAYER_CONTROLLER) {
+            if (col >= len - 3) hit.part = Q2_MENU_HIT_OFF;
+            else if (col >= len - 6 && col < len - 4) hit.part = Q2_MENU_HIT_ON;
+        }
+        if (out) *out = hit;
+        return true;
+    }
+    return false;
+}
+
 bool q2_menu_hit_test(const q2_menu *m, int x, int y, q2_menu_hit *out)
 {
     q2_menu_hit hit;
@@ -152,6 +191,8 @@ bool q2_menu_hit_test(const q2_menu *m, int x, int y, q2_menu_hit *out)
 
     if (!m || !m->open || !m->page)
         return false;
+    if (m->page_id == Q2_PAGE_FRONT_PLAYERS)
+        return player_hit_test(m, x, y, out);
 
     hit.index = -1;
     hit.part  = Q2_MENU_HIT_NONE;

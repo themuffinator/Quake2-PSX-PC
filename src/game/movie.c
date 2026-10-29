@@ -212,47 +212,46 @@ const char *q2_movie_start_reel(const disc *d)
 
 bool q2_movie_advance(q2_movie *m, double dt, u8 *rgb)
 {
-    double due;
+    double fps, due;
+    u32 target;
 
     if (!m || !rgb || m->finished)
         return false;
 
-    m->clock += dt;
-    due = (double)m->frames_shown / (m->fps > 0.0 ? m->fps : Q2_MOVIE_FPS);
-    if (m->frames_shown && m->clock < due)
+    if (dt > 0.0) m->clock += dt;
+    fps = m->fps > 0.0 ? m->fps : Q2_MOVIE_FPS;
+    due = m->clock * fps + 1.0 + 0.0000001;
+    target = due < 4294967295.0 ? (u32)due : 0xFFFFFFFFu;
+    if (m->frame_valid && !m->frame_pending && target <= m->frame.number)
         return false;
 
-    /*
-     * At most one frame per call. A caller that stalled does not get a burst of
-     * decodes to catch up with: the interval is dropped and the clock carries
-     * on, which is what a drive that kept streaming while the MDEC fell behind
-     * produces.
-     */
+    /* The old scheduler used frames_shown as its clock, so after a stall it
+     * decoded every missed frame and permanently lagged behind the audio. */
     for (;;) {
         size_t local;
         u32 blocks = 0, bits = 0;
 
-        if (!movie_window_load(m, m->cursor)) {
-            m->finished = true;
-            return false;
-        }
+        if (!m->frame_pending) {
+            if (!movie_window_load(m, m->cursor)) {
+                m->finished = true;
+                return false;
+            }
 
-        local = m->cursor - m->window_base;
-        if (!q2_stx_frame_next(m->window,
-                               (size_t)m->window_have * Q2_STX_SECTOR_SIZE,
-                               &local, &m->frame)) {
-            /*
-             * The window is guaranteed to hold a whole frame after the cursor,
-             * so a demuxer that cannot find one here has reached the end of the
-             * VIDEO region — which is not the end of the file: the audio runs
-             * on for a few seconds and the video slots are nulled rather than
-             * the file stopping.
-             */
-            m->finished = true;
-            return false;
-        }
+            local = m->cursor - m->window_base;
+            if (!q2_stx_frame_next(m->window,
+                                   (size_t)m->window_have * Q2_STX_SECTOR_SIZE,
+                                   &local, &m->frame)) {
+                /* The window holds a whole frame after the cursor. No frame
+                 * means the end of VIDEO; audio can continue in later slots. */
+                m->finished = true;
+                return false;
+            }
 
-        m->cursor = m->window_base + (u32)local;
+            m->cursor = m->window_base + (u32)local;
+            m->frame_pending = true;
+        }
+        if (m->frame.number > target) return false;
+        m->frame_pending = false;
 
         /*
          * The console's stop point, checked exactly where it checks it: on the
@@ -262,6 +261,11 @@ bool q2_movie_advance(q2_movie *m, double dt, u8 *rgb)
         if (m->frame_limit && m->frame.number >= m->frame_limit) {
             m->finished = true;
             return false;
+        }
+
+        if (m->frame.number < target) {
+            m->frames_skipped++;
+            continue;
         }
 
         if (!q2_stx_frame_decode(&m->frame, rgb, &blocks, &bits))

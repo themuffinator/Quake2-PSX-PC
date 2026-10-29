@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Install and play Q2PSX-PC: disc setup, controls, saves, local multiplayer and troubleshooting.">
+  <title>Q2PSX-PC · User guide</title>
+  <style>
+    /* Document mode: docs/DESIGN.md §§6–9, 16–19, 30. Colors are checked
+       against docs/design/tokens.json by the release-tooling tests.
+       Use installed reading fonts; commercial art and reconstructed fonts
+       do not belong in the distributable manual. */
+    :root {
+      color-scheme: light;
+      --void: #080B18;
+      --navy: #101932;
+      --panel: #1B284A;
+      --violet: #3E315E;
+      --blue: #4363C7;
+      --cyan: #8BD6F2;
+      --steel: #A7B9D7;
+      --orange: #EF8A3B;
+      --paper: #EDF1FA;
+      --ink: #141B2E;
+      --printOrange: #8C3F1D;
+      --printBlue: #263D85;
+      --white: #F4F6FF;
+      --rule: #A7B9D7;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-padding-top: 24px; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 17px/1.6 Arial, Helvetica, sans-serif; }
+    a { color: var(--printBlue); text-underline-offset: .2em; }
+    a:hover { text-decoration-thickness: 2px; }
+    a:focus-visible { outline: 3px solid var(--printBlue); outline-offset: 4px; }
+    .skip { position: absolute; z-index: 2; top: 8px; left: 8px; padding: 8px 16px; background: var(--white); transform: translateY(-160%); }
+    .skip:focus { transform: none; }
+    .cover { color: var(--white); background: var(--navy); border-top: 8px solid var(--violet); }
+    .cover-inner { max-width: 1184px; margin: auto; padding: 40px 32px 48px; }
+    .masthead { display: flex; justify-content: space-between; align-items: baseline; gap: 24px; padding-bottom: 24px; border-bottom: 1px solid var(--steel); }
+    .identity { font-size: 28px; font-weight: 800; letter-spacing: .025em; line-height: 1.2; }
+    .edition { color: var(--steel); font-size: 14px; text-align: right; }
+    .eyebrow { margin: 32px 0 8px; color: var(--orange); font-size: 13px; font-weight: bold; letter-spacing: .14em; text-transform: uppercase; }
+    h1, h2, h3 { font-family: "Arial Narrow", Arial, Helvetica, sans-serif; line-height: 1.15; }
+    h1 { margin: 0 0 16px; font-size: clamp(38px, 5vw, 56px); letter-spacing: -.025em; }
+    .deck { max-width: 640px; margin: 0; font-size: 19px; color: var(--white); }
+    .cover-note { margin: 24px 0 0; color: var(--steel); font-size: 15px; }
+    .layout { display: grid; grid-template-columns: 208px minmax(0, 1fr); gap: 48px; max-width: 1184px; margin: auto; padding: 48px 32px 64px; }
+    nav { align-self: start; position: sticky; top: 24px; font-size: 14px; }
+    .nav-title { margin: 0 0 16px; font-size: 12px; font-weight: bold; letter-spacing: .12em; text-transform: uppercase; }
+    nav ol { list-style: none; padding: 0; margin: 0; border-top: 2px solid var(--printBlue); }
+    nav li { border-bottom: 1px solid var(--rule); }
+    nav a { display: flex; gap: 12px; padding: 12px 0; text-decoration: none; }
+    nav .number { color: var(--printOrange); font-variant-numeric: tabular-nums; }
+    .nav-note { margin: 24px 0 0; font-size: 13px; }
+    main { min-width: 0; }
+    section { margin-bottom: 48px; }
+    h2 { margin: 0 0 24px; padding-top: 16px; border-top: 2px solid var(--printBlue); color: var(--printBlue); font-size: 32px; letter-spacing: -.02em; }
+    h2 .number { display: block; margin-bottom: 8px; color: var(--printOrange); font: bold 12px/1.5 Arial, sans-serif; letter-spacing: .12em; }
+    h3 { margin: 28px 0 12px; font-size: 21px; color: var(--printBlue); }
+    p { margin: 0 0 16px; }
+    strong { font-weight: 700; }
+    ul, ol { padding-left: 24px; }
+    li { margin: 8px 0; }
+    nav li { margin: 0; }
+    .steps { list-style: none; padding: 0; counter-reset: step; }
+    .steps > li { position: relative; padding-left: 48px; margin: 24px 0; counter-increment: step; }
+    .steps > li::before { content: counter(step, decimal-leading-zero); position: absolute; left: 0; top: 0; color: var(--printOrange); font: bold 18px/1.6 Consolas, monospace; }
+    .steps > li > strong { display: block; margin-bottom: 4px; }
+    .steps p { margin-bottom: 8px; }
+    .note { margin: 24px 0; padding: 16px 24px; background: var(--white); border-left: 4px solid var(--printBlue); }
+    .note p:last-child { margin-bottom: 0; }
+    .note-label { color: var(--printOrange); font-size: 13px; font-weight: bold; letter-spacing: .06em; text-transform: uppercase; }
+    table { width: 100%; border-collapse: collapse; margin: 16px 0 24px; font-size: 15px; }
+    caption { text-align: left; margin-bottom: 8px; font-size: 13px; }
+    th, td { padding: 12px 16px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--rule); overflow-wrap: anywhere; }
+    thead th { color: var(--white); background: var(--panel); font-weight: bold; }
+    tbody th { width: 34%; font-weight: normal; color: var(--printBlue); }
+    tbody tr:nth-child(even) { background: var(--white); }
+    code, kbd, pre { font-family: Consolas, "Liberation Mono", monospace; }
+    code { font-size: .9em; overflow-wrap: anywhere; }
+    kbd { display: inline-block; padding: 0 5px; border: 1px solid var(--printBlue); border-bottom-width: 2px; background: var(--white); color: var(--ink); font-size: .85em; line-height: 1.6; white-space: nowrap; }
+    pre { margin: 12px 0 20px; padding: 16px 24px; color: var(--white); background: var(--panel); font-size: 14px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+    pre code { font-size: inherit; }
+    .small { font-size: 14px; }
+    dl { margin: 16px 0; }
+    dt { font-weight: bold; color: var(--printBlue); margin-top: 24px; }
+    dd { margin: 8px 0 0; }
+    footer { padding: 24px 0 0; border-top: 1px solid var(--rule); font-size: 13px; }
+    @media (max-width: 800px) {
+      .layout { display: block; padding: 32px 24px; }
+      .cover-inner { padding: 24px 24px 32px; }
+      nav { position: static; margin-bottom: 40px; }
+      nav ol { display: grid; grid-template-columns: 1fr 1fr; column-gap: 24px; }
+      .nav-note { margin-top: 12px; }
+      h2 { font-size: 28px; }
+    }
+    @media (max-width: 480px) {
+      body { font-size: 16px; }
+      .masthead { align-items: start; flex-direction: column; gap: 8px; }
+      .edition { text-align: left; }
+      nav ol { column-gap: 16px; }
+      nav a { gap: 8px; }
+      th, td { padding: 10px 8px; }
+      tbody th { width: 38%; }
+      pre, .note { padding: 16px; }
+    }
+    @page {
+      size: A4; margin: 15mm;
+      @bottom-left { content: "Q2PSX-PC · User guide"; font: 8pt Arial, sans-serif; color: #263D85; }
+      @bottom-right { content: counter(page); font: 8pt Arial, sans-serif; color: #263D85; }
+    }
+    @media print {
+      body { background: white; color: #141B2E; font-size: 10.5pt; line-height: 1.43; }
+      nav, .skip, .back-top { display: none; }
+      .cover { background: white; color: #141B2E; border-top: 3pt solid #263D85; }
+      .cover-inner { padding: 12pt 0 24pt; }
+      .masthead { padding-bottom: 12pt; }
+      .identity { font-size: 24pt; }
+      .edition, .cover-note, .deck { color: #141B2E; }
+      .edition { font-size: 9pt; }
+      .eyebrow { color: #8C3F1D; margin-top: 18pt; }
+      h1 { font-size: 34pt; }
+      .deck { font-size: 12pt; }
+      .cover-note { font-size: 10pt; margin-top: 12pt; }
+      .layout { display: block; padding: 0; }
+      section { margin-bottom: 24pt; }
+      h2 { font-size: 22pt; margin-bottom: 14pt; }
+      h3 { font-size: 14pt; margin-top: 18pt; }
+      h2, h3, dt { break-after: avoid; }
+      p, li { orphans: 3; widows: 3; }
+      table { font-size: 9pt; }
+      th, td { padding: 6pt 8pt; }
+      thead { display: table-header-group; }
+      thead th { background: white; color: #263D85; border-bottom: 1.5pt solid #263D85; }
+      tr, .note, pre, .steps > li { break-inside: avoid; }
+      pre { background: white; color: #141B2E; border: 1pt solid #A7B9D7; padding: 8pt; font-size: 9pt; }
+      .note { padding: 10pt 14pt; }
+      .small, footer { font-size: 9pt; }
+      a { color: #263D85; }
+      kbd { font-size: 8.5pt; }
+    }
+  </style>
+</head>
+<body id="top">
+  <a class="skip" href="#first-launch">Skip to the guide</a>
+  <header class="cover">
+    <div class="cover-inner">
+      <div class="masthead">
+        <div class="identity">Q2PSX-PC</div>
+        <div class="edition"><span id="build-version">Development edition</span><br>Guide revised <time datetime="2026-10-28">28 October 2026</time></div>
+      </div>
+      <p class="eyebrow">Installation &amp; play</p>
+      <h1>User guide</h1>
+      <p class="deck">A native PC recreation of Quake II for the PlayStation. Bring your disc, choose your controls, and start playing.</p>
+      <p class="cover-note">For Windows, Linux and macOS. This guide works offline.</p>
+    </div>
+  </header>
+  <div class="layout">
+    <nav aria-label="Guide contents">
+      <p class="nav-title">In this guide</p>
+      <ol>
+        <li><a href="#first-launch"><span class="number">01</span> First launch</a></li>
+        <li><a href="#controls"><span class="number">02</span> Controls</a></li>
+        <li><a href="#saves"><span class="number">03</span> Save &amp; resume</a></li>
+        <li><a href="#multiplayer"><span class="number">04</span> Local multiplayer</a></li>
+        <li><a href="#presentation"><span class="number">05</span> Display &amp; sound</a></li>
+        <li><a href="#troubleshooting"><span class="number">06</span> Troubleshooting</a></li>
+        <li><a href="#commands"><span class="number">07</span> Launch options</a></li>
+        <li><a href="#about"><span class="number">08</span> About &amp; credits</a></li>
+      </ol>
+      <p class="nav-note">Use your browser’s Find command to search, or Print for a paper copy.</p>
+    </nav>
+    <main>
+      <section id="first-launch" aria-labelledby="first-launch-title">
+        <h2 id="first-launch-title"><span class="number">01 / Getting started</span>First launch</h2>
+        <p>You need your own Quake II <strong>PlayStation</strong> disc or disc image. The PC and Nintendo 64 editions do not work. No game data is included in this download.</p>
+        <ol class="steps">
+          <li><strong>Extract the whole release archive.</strong><p>Use the archive for your system: Windows x64, Linux x64, or macOS Apple silicon. Keep the executable and its runtime libraries together. Run from the extracted folder, not from inside the archive.</p></li>
+          <li><strong>Open Q2PSX-PC.</strong><p>On Windows, double-click <code>q2psx.exe</code>. On Linux or macOS, open a terminal in the extracted folder and run <code>./q2psx</code>. The disc selector opens in a window.</p></li>
+          <li><strong>Choose your disc.</strong><p>Select a listed disc, or choose <strong>BROWSE IMAGE</strong> and open your <code>.cue</code> file. You can also drop an image onto the selector. Select <strong>START GAME</strong>.</p><p class="small">Keep the CUE and every BIN track it names together, with their original filenames. If the disc is missing from the list, use Browse; you do not need to copy it into the game folder.</p></li>
+          <li><strong>Start the campaign.</strong><p>After the logos and intro, choose <strong>START → SINGLE PLAYER → NEW GAME</strong>, then a difficulty. The opening film leads into the first level. A key press or click skips the current logo or film.</p></li>
+        </ol>
+        <p>The selector remembers your last disc. To change it next time, run the executable without a <code>--disc</code> argument.</p>
+        <h3>Supported discs and image formats</h3>
+        <p>The identified releases are Europe <code>SLES-01534</code> and USA <code>SLUS-00757</code>. Other revisions are not established as supported.</p>
+        <table>
+          <caption>Choose the CUE when your image includes one.</caption>
+          <thead><tr><th scope="col">Source</th><th scope="col">What to use</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">CUE + BIN</th><td>Recommended. Raw Mode 2 / 2352-byte images retain the data needed for music and films. Multi-file and multi-track CUEs are supported.</td></tr>
+            <tr><th scope="row">BIN or IMG</th><td>Raw images are supported. A matching CUE is used when found; open the CUE directly when available.</td></tr>
+            <tr><th scope="row">ISO</th><td>Supported for data. A 2048-byte-sector image cannot retain the raw XA sectors needed for music and films.</td></tr>
+            <tr><th scope="row">Physical CD</th><td>Windows and Linux have drive support. Music and films require raw-sector access; compatibility depends on the drive and permissions.</td></tr>
+            <tr><th scope="row">Other formats</th><td>CHD, MDS/MDF and PBP are unsupported. CCD descriptors and SUB sidecars are not parsed; choose the associated raw IMG instead.</td></tr>
+          </tbody>
+        </table>
+        <p class="small">Windows also includes optional <code>Play.vbs</code> and <code>Play.cmd</code> launchers. <code>Play.vbs</code> opens the selector. <code>Play.cmd</code> uses <code>disc/game.cue</code> when present, or opens the selector otherwise.</p>
+      </section>
+
+      <section id="controls" aria-labelledby="controls-title">
+        <h2 id="controls-title"><span class="number">02 / Input</span>Controls</h2>
+        <table>
+          <caption>Keyboard and mouse during play.</caption>
+          <thead><tr><th scope="col">Action</th><th scope="col">Control</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Move</th><td><kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd></td></tr>
+            <tr><th scope="row">Look</th><td>Move the mouse, or use the arrow keys.</td></tr>
+            <tr><th scope="row">Fire</th><td>Left mouse button, <kbd>F</kbd>, or left <kbd>Alt</kbd>.</td></tr>
+            <tr><th scope="row">Jump / swim up</th><td><kbd>Space</kbd> or right mouse button. Hold to swim up.</td></tr>
+            <tr><th scope="row">Crouch</th><td>Hold left <kbd>Ctrl</kbd> or <kbd>C</kbd>. Some passages also crouch the player automatically.</td></tr>
+            <tr><th scope="row">Change weapon</th><td>Mouse wheel; <kbd>Q</kbd> / <kbd>[</kbd> for previous, <kbd>E</kbd> / <kbd>]</kbd> for next.</td></tr>
+            <tr><th scope="row">Pause / resume</th><td><kbd>Esc</kbd>. Use <strong>QUIT GAME</strong> in the pause menu to leave the game.</td></tr>
+            <tr><th scope="row">Mission briefing</th><td><kbd>F12</kbd></td></tr>
+            <tr><th scope="row">Screenshot</th><td><kbd>F11</kbd> writes <code>q2psx-000.ppm</code>, then numbered files, in the working folder. Move captures before another session; numbering restarts at zero.</td></tr>
+          </tbody>
+        </table>
+        <h3>Menus</h3>
+        <p>Use the arrows to navigate, <kbd>Enter</kbd> or <kbd>Space</kbd> to select, and <kbd>Esc</kbd> or <kbd>Backspace</kbd> to go back. The mouse can select rows and drag sliders; right-click goes back. At a mission tally, press <strong>Fire</strong> to continue.</p>
+        <h3>Gamepads</h3>
+        <p>A connected gamepad is assigned automatically in single-player. In menus, the D-pad or left stick navigates, the bottom face button selects, the right face button goes back, and Start pauses. On-screen prompts show the connected controller’s labels.</p>
+        <p>Change the control style under <strong>OPTIONS → PLAYER OPTIONS → CONTROLLER</strong>. During multiplayer, use <strong>PLAYER CONTROL</strong> in the pause menu. The control style determines the gameplay buttons; additional multiplayer pads use the <strong>RIGHT STICK</strong> layout below.</p>
+        <table>
+          <caption>RIGHT STICK layout for additional multiplayer controllers.</caption>
+          <thead><tr><th scope="col">Action</th><th scope="col">Control</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Move / look</th><td>Left stick or D-pad / right stick.</td></tr>
+            <tr><th scope="row">Fire / jump</th><td>Left shoulder / left trigger.</td></tr>
+            <tr><th scope="row">Change weapon</th><td>Right shoulder and right trigger.</td></tr>
+          </tbody>
+        </table>
+        <p class="small">For mouse sensitivity and inversion, open the Controller page. The title menu calls the settings <strong>MOUSE</strong>, <strong>MOUSE SPEED</strong> and <strong>SWAP Y</strong>; during play they are <strong>USE MOUSE</strong>, <strong>MOUSE SPEED</strong> and <strong>SWAP Y AXIS</strong>.</p>
+      </section>
+
+      <section id="saves" aria-labelledby="saves-title">
+        <h2 id="saves-title"><span class="number">03 / Progress</span>Save &amp; resume</h2>
+        <ol class="steps">
+          <li><strong>Save a single-player game with F7.</strong><p>Select one of the four slots and confirm. An occupied slot asks before overwriting.</p></li>
+          <li><strong>Resume with F8.</strong><p>Select the saved slot, or use <strong>START → SINGLE PLAYER → LOAD GAME</strong> from the title menu.</p></li>
+        </ol>
+        <aside class="note" aria-label="Quick save behavior">
+          <p class="note-label">Quick save uses slot 1</p>
+          <p>During play, <kbd>F9</kbd> overwrites slot 1 immediately and <kbd>F10</kbd> loads it. Close menus before using these keys. Keep a separate manual save in another slot if you want a fallback.</p>
+        </aside>
+        <p>Game saves include settings. Multiplayer’s <strong>SAVE SETTINGS</strong> and <strong>LOAD SETTINGS</strong> store setup choices, not an in-progress match. The memory-card screens use files on your computer; no PlayStation memory card is needed.</p>
+        <table>
+          <caption>Default save folders. Back up the whole folder before updating.</caption>
+          <thead><tr><th scope="col">System</th><th scope="col">Location</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Windows</th><td><code>%APPDATA%\Q2PSX-PC\saves</code></td></tr>
+            <tr><th scope="row">Linux / macOS</th><td><code>~/.local/share/q2psx-pc/saves</code>, or <code>$XDG_DATA_HOME/q2psx-pc/saves</code> when set.</td></tr>
+          </tbody>
+        </table>
+        <p>Use <code>--saves "path/to/saves"</code> to choose a different folder. If a save is missing, check that you launched with the same folder and user account. Keep the disc available when loading a saved game.</p>
+        <p class="small">To update, extract the new release into a new folder and select your disc again. Default saves remain in your user folder. If you use a custom save path, point the new build at it. Check the release notes for compatibility changes.</p>
+      </section>
+
+      <section id="multiplayer" aria-labelledby="multiplayer-title">
+        <h2 id="multiplayer-title"><span class="number">04 / Shared screen</span>Local multiplayer</h2>
+        <p>Two to four players can share one computer in <strong>DEATHMATCH</strong>, <strong>TEAM DEATHMATCH</strong> or <strong>VERSUS</strong>. Network play is not available.</p>
+        <ol class="steps">
+          <li><strong>Connect the controllers.</strong><p>Keyboard and mouse control player one. Connected gamepads fill players two through four in connection order. To use gamepads for every player, launch with <code>--gamepad-player-one</code>.</p></li>
+          <li><strong>Choose START → MULTI PLAYER.</strong><p>Select a mode, then set the player count, arena and limits. Use left/right to change values and <strong>PROCEED</strong> to continue through setup.</p></li>
+          <li><strong>Play and finish the match.</strong><p>In Deathmatch, press Fire after dying to respawn. Versus players wait for the next round. At the results screen, every player must press Fire before the game continues.</p></li>
+        </ol>
+        <p>For two players, <strong>VIDEO OPTIONS → HORIZONTAL SPLIT</strong> chooses the split direction. Three or four players use a four-view layout. If one pad disconnects, the others keep their player assignments.</p>
+      </section>
+
+      <section id="presentation" aria-labelledby="presentation-title">
+        <h2 id="presentation-title"><span class="number">05 / Preferences</span>Display &amp; sound</h2>
+        <p>The game opens in a resizable window. The default <code>--aspect auto</code> adapts the view to the window’s shape, while menus and films keep their proportions. For a traditional view, use <code>--aspect 4:3</code>. <kbd>V</kbd> cycles aspect modes.</p>
+        <table>
+          <caption>Open OPTIONS from the title or single-player pause menu.</caption>
+          <thead><tr><th scope="col">Setting</th><th scope="col">Effect</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Video Options → CRT Emulation</th><td>Adds scanlines, a phosphor grille and screen curvature. Off by default; a CPU fallback is available.</td></tr>
+            <tr><th scope="row">Video Options → Bloom</th><td>Adds glow to bright scene surfaces without blurring HUD text. Off by default; requires the OpenGL display backend.</td></tr>
+            <tr><th scope="row">Sound Options</th><td>Adjust music, sound effects and stereo output.</td></tr>
+            <tr><th scope="row">Player Options → Crosshair</th><td>Toggle the aiming crosshair.</td></tr>
+          </tbody>
+        </table>
+        <p><strong>RESET TO DEFAULTS</strong> resets the current options page; on Video Options it also turns CRT and bloom off. These presentation effects are optional additions to the recreated PlayStation rendering.</p>
+        <p class="small">The software renderer uses affine textures and 15-bit colour. Enlarging the window does not turn it into a modern perspective-correct renderer. A claim of complete hardware equivalence has not been established.</p>
+      </section>
+
+      <section id="troubleshooting" aria-labelledby="troubleshooting-title">
+        <h2 id="troubleshooting-title"><span class="number">06 / Recovery</span>Troubleshooting</h2>
+        <dl>
+          <dt>The disc is missing or will not open.</dt>
+          <dd>Use <strong>BROWSE IMAGE</strong> and select the CUE. Check that its referenced track files exist with matching names. If using a physical disc, insert it and refresh the selector with <kbd>F5</kbd>. On Linux, check your account’s permission to read the optical drive.</dd>
+          <dt>The selector says this is not a Quake II PlayStation disc.</dt>
+          <dd>Confirm the edition and serial against <a href="#first-launch">Supported discs</a>. Do not rename a compressed image to BIN or ISO; use a supported image of your own disc.</dd>
+          <dt>Levels work, but music or films are missing.</dt>
+          <dd>Use a complete raw CUE/BIN image. A 2048-byte ISO or a drive that only returns cooked sectors lacks the XA data needed for music and films. Also check the Music volume under Sound Options.</dd>
+          <dt>Windows reports a missing SDL3.dll.</dt>
+          <dd>Extract the complete release again. Keep its <code>SDL3.dll</code> beside <code>q2psx.exe</code>; copying the executable alone is insufficient.</dd>
+          <dt>The executable will not start.</dt>
+          <dd>Check that the archive matches your system and architecture. On Linux and macOS, launch <code>./q2psx</code> from a terminal to see the error. If an archive tool dropped the executable permission, run <code>chmod +x q2psx</code> in the extracted folder. A macOS security prompt is separate from a game error; review the download’s origin before approving it in system settings.</dd>
+          <dt>The display is slow or a display effect is missing.</dt>
+          <dd>Turn off CRT and bloom, then reduce the window size. <code>--crt-cpu</code> can help diagnose an OpenGL display problem, but it may be slower and does not provide bloom.</dd>
+          <dt>A controller controls the wrong player.</dt>
+          <dd>Quit, connect the pads in the intended order, and relaunch. Single-player takes the first pad; multiplayer reserves player one for keyboard and mouse unless <code>--gamepad-player-one</code> is supplied.</dd>
+          <dt>A save fails or appears to be missing.</dt>
+          <dd>Check the <a href="#saves">save folder</a>, write permissions and free space. A launch with <code>--saves</code> uses that path instead of the default. Quick save overwrites slot 1; use other slots for backups.</dd>
+        </dl>
+        <h3>Report a problem</h3>
+        <p>Include your operating system, the output of <code>q2psx --version</code>, the disc serial, level name, and steps to reproduce the issue in the <a href="https://github.com/themuffinator/Quake2-PSX-PC/issues">project issue tracker</a>. For a visual issue, attach an <kbd>F11</kbd> capture.</p>
+        <p>Normal Windows desktop launches write diagnostics to <code>%APPDATA%\Q2PSX-PC\q2psx.log</code>. On Linux or macOS, keep the terminal output. Review logs for personal paths before sharing; do not attach disc images or extracted game files.</p>
+      </section>
+
+      <section id="commands" aria-labelledby="commands-title">
+        <h2 id="commands-title"><span class="number">07 / Reference</span>Launch options</h2>
+        <p>Run commands from the extracted folder. Quote paths containing spaces.</p>
+        <h3>Windows PowerShell</h3>
+        <pre><code>.\q2psx.exe --disc "D:\Games\Quake II\game.cue"
+.\q2psx.exe --disc E:</code></pre>
+        <h3>Linux / macOS terminal</h3>
+        <pre><code>./q2psx --disc "/path/to/Quake II/game.cue"</code></pre>
+        <p class="small">For a physical drive on Linux, use <code>--disc /dev/sr0</code>. Physical-drive support is not implemented on macOS; use a disc image.</p>
+        <table>
+          <caption>Common options; --help lists the full diagnostic interface.</caption>
+          <thead><tr><th scope="col">Option</th><th scope="col">Purpose</th></tr></thead>
+          <tbody>
+            <tr><th scope="row"><code>--launcher</code></th><td>Show the selector even when a disc argument is supplied.</td></tr>
+            <tr><th scope="row"><code>--size 1280x720</code></th><td>Set the initial window size.</td></tr>
+            <tr><th scope="row"><code>--aspect 4:3</code></th><td>Use a traditional view. <code>auto</code> follows the window shape.</td></tr>
+            <tr><th scope="row"><code>--crt</code> / <code>--no-crt</code></th><td>Enable or disable CRT presentation for this launch.</td></tr>
+            <tr><th scope="row"><code>--bloom</code> / <code>--no-bloom</code></th><td>Enable or disable scene bloom for this launch.</td></tr>
+            <tr><th scope="row"><code>--saves "path"</code></th><td>Choose the save folder.</td></tr>
+            <tr><th scope="row"><code>--gamepad-player-one</code></th><td>Assign multiplayer pads starting with player one.</td></tr>
+            <tr><th scope="row"><code>--no-boot</code></th><td>Skip the logo and intro sequence before the title menu.</td></tr>
+            <tr><th scope="row"><code>--version</code> / <code>--help</code></th><td>Print build information or command help, then exit.</td></tr>
+          </tbody>
+        </table>
+        <p class="small">The bundled <code>q2psx-inspect</code> and <code>stx2avi</code> are optional inspection and movie-conversion tools. They are not needed to play. Contributor workflows and diagnostic captures are documented in the online <a href="https://github.com/themuffinator/Quake2-PSX-PC/blob/main/docs/DEVELOPMENT.md">developer reference</a>.</p>
+      </section>
+
+      <section id="about" aria-labelledby="about-title">
+        <h2 id="about-title"><span class="number">08 / Project</span>About &amp; credits</h2>
+        <p>Q2PSX-PC recreates Hammerhead’s 1999 PlayStation edition as a native application. It remains a work in progress: campaign and local multiplayer systems are implemented, but complete gameplay and hardware parity are not claimed. See the <a href="https://github.com/themuffinator/Quake2-PSX-PC/tree/main/docs">current subsystem audits</a> and the release notes for known limits.</p>
+        <p>The project’s source code is licensed under the GNU General Public License, version 2. Read the bundled <a href="LICENSE">LICENSE</a> and <a href="CREDITS.md">credits and source acknowledgements</a>. Quake II is a trademark of id Software LLC; the original game’s artwork and data remain with their respective rights holders.</p>
+        <p>The renderer and audio work acknowledge references from Mednafen, PCSX-Redux, ps1-tests and Nugget. This manual includes no commercial game artwork, disc-derived images or redistributed fonts.</p>
+      </section>
+      <footer>
+        <p>Q2PSX-PC · User guide · Revised 28 October 2026<br>Formatting follows the Q2PSX design reference’s document mode.</p>
+        <p class="back-top"><a href="#top">Back to top ↑</a></p>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

@@ -276,6 +276,7 @@ bool q2_model_get_part(const q2_model *m, u32 index, q2_model_part *out)
     out->num_faces = q2_rd_u16(p + 0);
     out->vert_base = q2_rd_u8(p + 2);
     out->num_verts = q2_rd_u8(p + 3);
+    out->force_draw = q2_rd_u32(p + 4);
 
     return true;
 }
@@ -503,7 +504,7 @@ bool q2_model_is_static(const q2_model *m)
 /* ------------------------------------------------------------------------- */
 
 /*
- * Block C runs from ofs_block_c to ofs_block_d. Everything below stays inside
+ * Block C runs from ofs_block_c to ofs_block_d. Clip metadata stays inside
  * that span: the clip chain is a linked list of byte deltas read from the file,
  * so a malformed one could otherwise walk the whole chunk, and the keyframe
  * offsets are file data too.
@@ -864,63 +865,6 @@ void q2_model_key_rotation(u32 r, s16 out[4])
     out[3] = (s16)(((cb * ccp) >> 12) + ((sb * ss) >> 12));
 }
 
-/*
- * Spherical interpolation, transcribed from 0x80069C64.
- *
- * Worth following exactly rather than substituting a textbook slerp, because
- * two of its details are visible: it flips the second quaternion when the dot
- * product is negative, so it always takes the short way round, and it falls
- * back to a straight lerp once the angle drops below its threshold — which is
- * where a "better" implementation would diverge from the original on nearly
- * every frame of nearly every animation.
- */
-static void quat_slerp(const s16 a[4], const s16 b[4], s32 t, s16 out[4])
-{
-    s32 bq[4];
-    s32 dot = 0, wa, wb;
-    int i;
-
-    for (i = 0; i < 4; i++) {
-        bq[i] = b[i];
-        dot  += (s32)a[i] * b[i];
-    }
-
-    if (dot < 0) {
-        for (i = 0; i < 4; i++)
-            bq[i] = -bq[i];
-        dot = -dot;
-    }
-
-    if (t <= 0) {
-        for (i = 0; i < 4; i++)
-            out[i] = a[i];
-        return;
-    }
-    if (t >= Q2_ONE_12) {
-        for (i = 0; i < 4; i++)
-            out[i] = (s16)bq[i];
-        return;
-    }
-
-    wa = Q2_ONE_12 - t;
-    wb = t;
-
-    /* `1 - cos(theta)` in 1.3.12. Below 0x80 the original does not bother with
-     * the trigonometry and lerps. */
-    if (Q2_ONE_12 - (dot >> 12) > 0x80) {
-        s32 ang = q2_acos12(dot >> 12);
-        s32 s   = q2_sin12(ang);
-
-        if (s != 0) {
-            wa = (q2_sin12((Q2_ONE_12 - t) * ang >> 12) << 12) / s;
-            wb = (q2_sin12(t * ang >> 12) << 12) / s;
-        }
-    }
-
-    for (i = 0; i < 4; i++)
-        out[i] = (s16)(((wa * a[i]) >> 12) + ((wb * bq[i]) >> 12));
-}
-
 /* One part's key stream in a variable-rate clip: a run of 4-bit durations in
  * frames, eight to a word, and a parallel list of 8-byte keys. */
 static bool rate_nibble(const q2_model *m, u32 rate, u32 end, u32 index, u32 *out)
@@ -981,7 +925,15 @@ bool q2_model_part_rotation_word(const q2_model *m, const q2_model_anim *clip,
 q2_result q2_model_pose_at(const q2_model *m, const q2_model_anim *clip,
                            u32 tick, q2_model_pose *out)
 {
+    return q2_model_pose_transition(m, clip, tick, NULL, out);
+}
+
+q2_result q2_model_pose_transition(const q2_model *m, const q2_model_anim *clip,
+                                   u32 tick, const q2_model_anim *next,
+                                   q2_model_pose *out)
+{
     u32 begin, end, entry, keys, part, duration;
+    u32 original_tick = tick;
 
     if (!m || !clip || !out)
         return Q2_ERR_INVALID_ARG;
@@ -1001,6 +953,8 @@ q2_result q2_model_pose_at(const q2_model *m, const q2_model_anim *clip,
      * 428 of the disc's 123,704 frames do under the looser rule.
      */
     duration = (u32)clip->frames * Q2_MODEL_TICKS_PER_FRAME;
+    if (duration < Q2_MODEL_TICKS_PER_FRAME)
+        return Q2_ERR_BAD_FORMAT;
     if (tick > duration - Q2_MODEL_TICKS_PER_FRAME)
         tick = duration - Q2_MODEL_TICKS_PER_FRAME;
 
@@ -1012,6 +966,7 @@ q2_result q2_model_pose_at(const q2_model *m, const q2_model_anim *clip,
 
         /* The key offset is relative to the entry, not to the clip. */
         keys = entry + q2_rd_u16(m->base + entry + 2);
+
         if (keys + (size_t)m->hdr.num_parts * 8 > end)
             return Q2_ERR_BAD_FORMAT;
 
@@ -1029,6 +984,8 @@ q2_result q2_model_pose_at(const q2_model *m, const q2_model_anim *clip,
      * A part holds a key for as many frames as its nibble says, and the pose
      * between keys is interpolated.
      */
+    /* 0x8006BA54 leaves the pose scratch untouched for this mixed format. */
+    if (next && !(next->flags & 1u)) return Q2_OK;
     for (part = 0; part < m->hdr.num_parts; part++) {
         u32 rate, k = 0, frames_left, sub, span, pos, dur = 0;
         s16 t0[3], t1[3], q0[4], q1[4];
@@ -1042,6 +999,14 @@ q2_result q2_model_pose_at(const q2_model *m, const q2_model_anim *clip,
 
         rate = entry + q2_rd_u16(m->base + entry + 0);
         keys = entry + q2_rd_u16(m->base + entry + 2);
+
+        /* 0x8006B53C has a first-key fast path, including zero-duration keys. */
+        if (!tick) {
+            if (keys + 8 > end) return Q2_ERR_BAD_FORMAT;
+            key_translation(q2_rd_u32(m->base + keys), out[part].t);
+            q2_model_key_rotation(q2_rd_u32(m->base + keys + 4), out[part].q);
+            continue;
+        }
 
         frames_left = tick / Q2_MODEL_TICKS_PER_FRAME;
         sub         = tick % Q2_MODEL_TICKS_PER_FRAME;
@@ -1075,15 +1040,24 @@ q2_result q2_model_pose_at(const q2_model *m, const q2_model_anim *clip,
 
         ka = m->base + keys + (size_t)k * 8;
 
-        /*
-         * The original always reads the NEXT key, even on the last frame of the
-         * last clip, where the key list ends at block C and the read runs eight
-         * bytes into block D. On this disc that happens on 429 of 123,704
-         * frames — always the final frame of a model's final clip — so it is
-         * the tail of the data rather than a misread. Hold the last key instead
-         * of interpolating towards whatever follows the block.
-         */
-        kb = (keys + (size_t)(k + 2) * 8 <= end) ? ka + 8 : ka;
+        /* 0x8006B6DC reads the successor even across block C's end. It is
+         * still part of this model's allocated data (usually block D). Keep
+         * that native read, bounded by the complete model, not the clip. */
+        if (keys + (size_t)(k + 2) * 8 > m->size)
+            return Q2_ERR_BAD_FORMAT;
+        kb = ka + 8;
+
+        if (next && (next->flags & 1u)) {
+            u32 incoming = next->offset + 8 + part * 4;
+            if (incoming + 4 > end) return Q2_ERR_BAD_FORMAT;
+            incoming += q2_rd_u16(m->base + incoming + 2);
+            if (incoming + 8 > end || original_tick - tick > 10)
+                return Q2_ERR_BAD_FORMAT;
+            ka = kb;
+            kb = m->base + incoming;
+            span = 10;
+            pos = original_tick - tick;
+        }
 
         if (pos == span) {
             key_translation(q2_rd_u32(kb), out[part].t);
@@ -1101,7 +1075,7 @@ q2_result q2_model_pose_at(const q2_model *m, const q2_model_anim *clip,
 
         for (i = 0; i < 3; i++)
             out[part].t[i] = (s16)(t0[i] + (((t1[i] - t0[i]) * scale) >> 12));
-        quat_slerp(q0, q1, scale, out[part].q);
+        q2_quat_slerp(q0, q1, scale, out[part].q);
     }
 
     return Q2_OK;
@@ -1191,7 +1165,7 @@ bool q2_model_pose_low_y(const q2_model *m, const q2_model_pose *pose,
         bool posed = pose && part < pose_count;
         u32 v;
 
-        if (q2_model_get_part(m, part, &p) != Q2_OK)
+        if (!q2_model_get_part(m, part, &p))
             break;
 
         if (posed)
@@ -1287,9 +1261,8 @@ s32 q2_model_cursor_phase(q2_model_cursor *c, s32 base, s32 dt)
     if (dt < 0)
         dt = 0;
 
-    /* 0x8007ECAC writes the selected record's base PLUS a2, where a2 is the
-     * caller's remainder after consuming 30-unit AI intervals. A changed base
-     * is therefore a phase reset, not a destination to approach from behind. */
+    /* Generic display fallback. The native creature cursor is maintained by
+     * q2_cre_motion_animate independently of display-frame sampling. */
     if (base != c->target) {
         q2_model_cursor_reset(c, base);
         return base;

@@ -12,6 +12,9 @@ static int checks;
     fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #condition); \
     failures++; } } while (0)
 
+#include "client_fixture.h"
+#include "fixtures/player_animation_reference.h"
+
 static client *fixture(int players)
 {
     client *c = calloc(1, sizeof(*c));
@@ -108,6 +111,140 @@ static void test_inputs(void)
     CHECK(c->sim[0].pcombat[2].weapon_id == 2);
     CHECK(c->sim[0].combat.weapon_id == 1);
     CHECK(c->sim[0].cur_player == 0);
+    release_fixture(c);
+}
+
+static void test_single_player_controller(void)
+{
+    client *c = fixture(1);
+    SDL_Event e = {0};
+    c->mp_enabled = false; c->sim[0].multiplayer = false;
+    c->gamepads.first_slot = 1;
+    c->gamepads.id[1] = 101;
+    c->gamepads.axis[1][SDL_GAMEPAD_AXIS_LEFTY] = -26000;
+    c->gamepads.axis[1][SDL_GAMEPAD_AXIS_RIGHTX] = 22000;
+    CHECK(q2_gamepads_primary(&c->gamepads, false) == 1);
+    CHECK(q2_gamepads_primary(&c->gamepads, true) == 0);
+    client_apply_input(c);
+    CHECK(c->settings.v[Q2_SET_PAD_CLASS] == 1);
+    buttons(c, 1, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, true);
+    client_input_simulated(c, 1.0f/30.0f);
+    CHECK(c->pad_pend & Q2_PAD_L1);
+    c->frame_index++;
+    client_input_simulated(c, 1.0f/20.0f);
+    CHECK(c->pad.buttons & Q2_PAD_L1);
+    CHECK(c->pad.ly < 0 && c->pad.rx > 0);
+    e.type = SDL_EVENT_GAMEPAD_REMOVED; e.gdevice.which = 101;
+    CHECK(q2_gamepads_event(&c->gamepads, &e) == 1);
+    c->frame_index++;
+    client_input_simulated(c, 1.0f/20.0f);
+    CHECK(!(c->pad.buttons & Q2_PAD_L1) && !c->pad.ly && !c->pad.rx);
+    CHECK(c->primary_pad_id == 0);
+    release_fixture(c);
+}
+
+static void test_controller_profiles(void)
+{
+    client *c = fixture(4);
+    q2_settings_blob saved, legacy;
+    q2_input left, right;
+    s16 before[Q2_SET_COUNT];
+    int pi;
+    q2_menu_settings_defaults(&c->settings);
+    q2_menu_init(&c->menu, &c->settings, 248);
+    q2_menu_set_multiplayer(&c->menu, true);
+    c->settings.v[Q2_SET_USE_MOUSE] = 1;
+    for (pi = 1; pi < 4; pi++) {
+        c->gamepads.id[pi] = (SDL_JoystickID)(100 + pi);
+        c->settings.v[q2_menu_player_setting(Q2_SET_PAD_STYLE, pi)] =
+            (s16)(Q2_PAD_STYLE_RIGHT_STICK + (pi - 1) % 3);
+        c->settings.v[q2_menu_player_setting(Q2_SET_MOUSE_SPEED, pi)] = (s16)(30 + pi);
+    }
+    client_apply_input(c);
+    CHECK(c->sim[0].player[0].look_scheme == Q2_PAD_STYLE_RIGHT_MOUSE);
+    for (pi = 1; pi < 4; pi++)
+        CHECK(c->sim[0].player[pi].look_scheme == Q2_PAD_STYLE_RIGHT_STICK + (pi - 1) % 3);
+
+    /* The pauser's real menu edits only that player's config. */
+    CHECK(client_pause_open(c, 2));
+    q2_menu_advance(&c->menu, 0);
+    q2_menu_goto(&c->menu, Q2_PAGE_CONTROLLER);
+    c->menu.cursor = 0;
+    q2_menu_advance(&c->menu, Q2_PAD_RIGHT);
+    q2_menu_advance(&c->menu, 0);
+    client_apply_input(c);
+    CHECK(c->sim[0].player[2].look_scheme == Q2_PAD_STYLE_BOTH_STICKS);
+    CHECK(c->sim[0].player[1].look_scheme == Q2_PAD_STYLE_RIGHT_STICK);
+    CHECK(c->sim[0].player[0].look_scheme == Q2_PAD_STYLE_RIGHT_MOUSE);
+    client_menu_close(c);
+
+    /* Inversion reaches the owning pad's actual input, independently. */
+    c->settings.v[q2_menu_player_setting(Q2_SET_PAD_STYLE, 2)] = Q2_PAD_STYLE_RIGHT_STICK;
+    c->settings.v[q2_menu_player_setting(Q2_SET_SWAP_Y, 2)] = 1;
+    client_apply_input(c);
+    c->gamepads.axis[1][SDL_GAMEPAD_AXIS_RIGHTY] = 24000;
+    c->gamepads.axis[2][SDL_GAMEPAD_AXIS_RIGHTY] = 24000;
+    client_extra_input(c, 1, 12, false, &left);
+    client_extra_input(c, 2, 12, false, &right);
+    CHECK(left.pitch != 0 && left.pitch == -right.pitch);
+
+    /* Player one's mouse disables only their recenter timer. */
+    for (pi = 0; pi < 4; pi++) c->sim[0].player[pi].recentring = true;
+    client_apply_input(c);
+    CHECK(!c->sim[0].player[0].recentring);
+    for (pi = 1; pi < 4; pi++) CHECK(c->sim[0].player[pi].recentring);
+
+    /* Only player two enabled vibration. Headless slots have no SDL device;
+     * inspect the generated motor values without driving any hardware. */
+    c->frame_index = 1;
+    c->settings.v[q2_menu_player_setting(Q2_SET_VIBRATION, 1)] = 1;
+    for (pi = 0; pi < 4; pi++)
+        CHECK(q2_shock_set(&c->shock[pi], Q2_SHOCK_MACHINEGUN,
+                          Q2_SHOCK_FULL, NULL, NULL, 0, 0));
+    client_shock_tick(c, 6);
+    CHECK(c->shock_out[1][1] == 95 && c->shock_out[1][0] == 1);
+    CHECK(!c->shock_out[0][1] && !c->shock_out[2][1] && !c->shock_out[3][1]);
+
+    memcpy(before, c->settings.v, sizeof(before));
+    memcpy(c->menu.mp_name[1], "SARGE", 6);
+    c->menu.mp_team[1] = 0;
+    c->menu.mp_colour[1] = 3;
+    client_settings_pack(c, &saved);
+    q2_menu_reset_identities(&c->menu);
+    q2_menu_settings_defaults(&c->settings);
+    CHECK(client_settings_unpack(c, &saved));
+    CHECK(!memcmp(before, c->settings.v, sizeof(before)));
+    CHECK(!strcmp(c->menu.mp_name[1], "SARGE") &&
+          c->menu.mp_team[1] == 0 && c->menu.mp_colour[1] == 3);
+    {
+        q2_settings_blob malformed = saved;
+        malformed.count--;
+        CHECK(!client_settings_unpack(c, &malformed));
+        CHECK(!strcmp(c->menu.mp_name[1], "SARGE"));
+        malformed = saved;
+        malformed.value[2 + Q2_SET_COUNT + Q2_MP_SETTINGS_SETUP_WORDS] = 7;
+        CHECK(!client_settings_unpack(c, &malformed));
+        CHECK(!memcmp(before, c->settings.v, sizeof(before)));
+    }
+    /* Old schema-1 cards have the same setup, immediately after their shorter
+     * value array. Missing profiles must reset, not retain another session. */
+    legacy = saved;
+    legacy.value[0] = 1;
+    legacy.value[1] = Q2_SET_EXTRA_PAD_FIRST;
+    memcpy(&legacy.value[2 + Q2_SET_EXTRA_PAD_FIRST], &saved.value[2 + Q2_SET_COUNT],
+           Q2_MP_SETTINGS_SETUP_WORDS * sizeof(s16));
+    legacy.count = 2 + Q2_SET_EXTRA_PAD_FIRST + Q2_MP_SETTINGS_SETUP_WORDS;
+    CHECK(client_settings_unpack(c, &legacy));
+    CHECK(!strcmp(c->menu.mp_name[1], "PLAYER 2") &&
+          c->menu.mp_team[1] == 1 && c->menu.mp_colour[1] == 1);
+    for (pi = 1; pi < 4; pi++) {
+        CHECK(c->settings.v[q2_menu_player_setting(Q2_SET_MOUSE_SPEED, pi)] == 64);
+        CHECK(c->settings.v[q2_menu_player_setting(Q2_SET_SWAP_Y, pi)] == 0);
+    }
+    legacy.count--;
+    memcpy(before, c->settings.v, sizeof(before));
+    CHECK(!client_settings_unpack(c, &legacy));
+    CHECK(!memcmp(before, c->settings.v, sizeof(before)));
     release_fixture(c);
 }
 
@@ -359,54 +496,138 @@ static void test_damage(void)
  * arm (0x8003CF74) and its hold rule (0x8003D188) and then asked it for nothing
  * but DEATH, so Male2's Pain 1/2/3 were unreachable.
  */
+static void animation_ranges(client *c)
+{
+    int i;
+    for (i = 0; i < Q2_PMOVE_COUNT; i++) {
+        c->player_moves[i].start = (u16)(100 * i);
+        c->player_moves[i].end = (u16)(100 * i + 80);
+        c->player_moves[i].rest = i <= Q2_PMOVE_RUN ? c->player_moves[i].start : c->player_moves[i].end;
+    }
+    for (i = 0; i < Q2_MP_MAX_PLAYERS; i++) client_player_anim_reset(c, i);
+    c->player_anim_base_ok = true;
+}
+
 static void test_pain_animation(void)
 {
     client *c = fixture(2);
     q2_sim *sim = &c->sim[0];
     q2_input neutral = {0};
-    client_player_anim *a = &c->player_anim[0];
-    q2_player_move hurt_move, held, after_wrap;
-    int step;
-
-    /* Player 1 rails player 0, who is standing still. */
-    sim->player[0].pos[0] = 0;
-    sim->player[0].pos[2] = 0;
-    sim->player[1].pos[0] = 0;
-    sim->player[1].pos[2] = 1300;
+    q2_player_move hurt;
+    q2_inventory inv;
+    u32 random;
+    q2_inventory_init(&inv);
+    inv.health = 100; inv.armour = 100; inv.armour_class = 2;
+    q2_sim_player_loadout(sim, 0, &inv, 1);
+    animation_ranges(c);
+    sim->player[0].pos[0] = 0; sim->player[0].pos[2] = 1300;
+    sim->player[1].pos[0] = sim->player[1].pos[2] = 0;
     q2_sim_select_player(sim, 1);
     sim->combat.inv.ammo[Q2_AMMO_SLUGS] = 10;
     sim->combat.weapon_id = Q2_WID_RAILGUN;
-    sim->combat.inv.weapons |=
-        (u16)q2_weapon_tables_builtin()->owned_bit[Q2_WID_RAILGUN];
+    sim->combat.inv.weapons |= (u16)q2_weapon_tables_builtin()->owned_bit[Q2_WID_RAILGUN];
     sim->combat.next_fire = 0;
     client_targets_for(c, 1);
     CHECK(q2_sim_fire(sim).fired);
-
-    /* update_pain runs inside the victim's own tick, which is where the
-     * console's player think reads the byte. */
     q2_sim_select_player(sim, 0);
     client_targets_for(c, 0);
-    for (step = 0; step < 2; step++)
-        q2_sim_tick(sim, &neutral, 12);
-    CHECK(sim->combat.inv.health < 100);
-    CHECK(sim->player[0].pain_serial != 0);
+    q2_sim_tick(sim, &neutral, 12);
+    CHECK(sim->combat.inv.health < 100 && sim->combat.self.damage_serial != 0);
+    q2_random_seed(1);
+    client_player_anim_tick(c, 0, 12, false);
+    hurt = client_player_visual_move(c, 0);
+    CHECK(hurt == Q2_PMOVE_PAIN3); /* BIOS seed 1: 16838 % 3 == 2. */
+    random = q2_random_state();
+    client_player_anim_tick(c, 0, 12, false);
+    CHECK(client_player_visual_move(c, 0) == hurt && q2_random_state() == random);
+    c->player_anim[0].state.position = (s16)(c->player_moves[hurt].end - 12);
+    client_player_anim_tick(c, 0, 12, false);
+    CHECK(client_player_visual_move(c, 0) == Q2_PMOVE_STAND);
+    /* The serial is consumed even when the byte is zero; that does not
+     * request PAIN or draw random numbers on the console. */
+    sim->combat.self.damage_serial++;
+    sim->combat.self.last_mod = 0;
+    client_player_anim_tick(c, 0, 12, false);
+    CHECK(client_player_visual_move(c, 0) == Q2_PMOVE_STAND && q2_random_state() == random);
+    release_fixture(c);
+}
 
-    hurt_move = client_player_visual_move(c, 0);
-    CHECK(q2_player_move_is_pain(hurt_move));
+static void test_player_animation_clock(void)
+{
+    client *c = fixture(4);
+    q2_sim *sim = &c->sim[0];
+    int i, ticks;
+    animation_ranges(c);
+    /* All owners select their own combat block, including an active extra
+     * player and a parked player zero. Running uses wish, not drift speed. */
+    for (i = 0; i < 4; i++) {
+        q2_sim_select_player(sim, i);
+        c->vw[i].result = 1;              /* a shot, in the console's word */
+        sim->player[i].wish[0] = 1;
+        sim->player[i].vel[0] = 0;
+        client_player_anim_tick(c, i, 12, false);
+        CHECK(client_player_visual_move(c, i) == Q2_PMOVE_RUN);
+        client_player_anim_reset(c, i);
+        c->vw[i].result = 0;
+        sim->player[i].wish[0] = 0;
+        sim->player[i].vel[0] = 1000;
+        client_player_anim_tick(c, i, 12, false);
+        CHECK(client_player_visual_move(c, i) == Q2_PMOVE_STAND);
+        client_player_anim_reset(c, i);
+        sim->player[i].vel[0] = 0;
+    }
+    q2_sim_select_player(sim, 0);
+    /* No draw or viewport is needed. Non-ticking input frames leave the
+     * bodies still; a real game tick advances all four by the same amount. */
+    c->frame_index++;
+    client_input_simulated(c, 0.005f);
+    for (i = 0; i < 4; i++) CHECK(c->player_anim[i].state.position == 0);
+    c->frame_index++;
+    client_input_simulated(c, 0.05f);
+    for (i = 0; i < 4; i++) CHECK(c->player_anim[i].state.position == sim->cur_dt);
+    sim->pcombat[1].inv.health = 0;
+    c->frame_index++; client_input_simulated(c, 0.05f);
+    CHECK(c->death[1].stage == Q2_PDEATH_DYING && q2_player_move_is_death(c->death[1].move));
+    for (ticks = 0; ticks < 20 && c->death[1].stage == Q2_PDEATH_DYING; ticks++) {
+        c->frame_index++; client_input_simulated(c, 0.05f);
+    }
+    CHECK(c->death[1].stage == Q2_PDEATH_DOWN && ticks > 1 && ticks < 20);
+    CHECK(client_mp_respawn(c, 1));
+    CHECK(c->player_anim[1].state.move == Q2_PMOVE_STAND &&
+          c->player_anim[1].state.position == 0 && !c->player_anim[1].state.flags);
+    release_fixture(c);
+}
 
-    /* Installed, as client_player_pose installs it. The clip has not wrapped,
-     * so nothing displaces it -- 0x8003D188's rule. */
-    a->move = hurt_move;
-    held = client_player_visual_move(c, 0);
-    CHECK(held == hurt_move);
-
-    /* And once it has run past its end (0x8003DF90 raises bit 0 of +0x102) the
-     * standing player goes back to Stand. */
-    a->pain_latched = false;
-    a->wrapped      = true;
-    after_wrap = client_player_visual_move(c, 0);
-    CHECK(after_wrap == Q2_PMOVE_STAND);
-
+static void test_native_player_selection(void)
+{
+    static const q2_player_move expected[] = {
+        Q2_PMOVE_STAND, Q2_PMOVE_RUN, Q2_PMOVE_JUMP,
+        Q2_PMOVE_PAIN3, Q2_PMOVE_DEATH1, Q2_PMOVE_ATTAK
+    };
+    client *c = fixture(4);
+    q2_sim *sim = &c->sim[0];
+    size_t i;
+    int pi;
+    animation_ranges(c);
+    for (pi = 0; pi < 4; pi++) {
+        for (i = 0; i < sizeof(native_player_selection) / sizeof(native_player_selection[0]); i++) {
+            const int *row = native_player_selection[i];
+            q2_sim_select_player(sim, pi);
+            client_player_anim_reset(c, pi);
+            sim->player[pi].jumped_this_tick = row[0] != 0;
+            sim->player[pi].wish[0] = (s16)row[1];
+            sim->player[pi].wish[2] = (s16)row[2];
+            c->vw[pi].result = (s16)row[3];   /* 0x8004EE0C's return, dry 2 included */
+            sim->combat.self.damage_serial++;
+            sim->combat.self.last_mod = (s16)row[4];
+            /* Alternate active and parked ownership, including player zero. */
+            if (i & 1) q2_sim_select_player(sim, (pi + 1) % 4);
+            q2_random_seed(1);
+            client_player_anim_tick(c, pi, 12, false);
+            CHECK(client_player_visual_move(c, pi) == expected[row[5]]);
+            if (row[5] != Q2_PANIM_PAIN) CHECK(q2_random_state() == 1);
+        }
+    }
     release_fixture(c);
 }
 
@@ -541,17 +762,129 @@ static void test_game_variables(void)
     release_fixture(c);
 }
 
-int main(void)
+static void test_multiplayer_parity(void)
+{
+    client *c = fixture(4);
+    int pi, frame;
+    q2_menu_init(&c->menu, &c->settings, 248);
+    q2_mp_session_init(&c->mp, Q2_MP_TEAM_DEATHMATCH, 4);
+    for (pi = 0; pi < 4; pi++) {
+        CHECK(client_player_colour(c, pi) == (pi & 1));
+        c->gamepads.id[pi] = (SDL_JoystickID)(100 + pi);
+        c->gamepads.held[pi] = Q2_PAD_UP | Q2_PAD_L1 | Q2_PAD_R1;
+    }
+    c->mp.mode = Q2_MP_DEATHMATCH;
+    CHECK(client_player_colour(c, 2) == 2);
+    c->menu.mp_colour[2] = 3;
+    CHECK(client_player_colour(c, 2) == 3);
+    c->mp.end = Q2_MP_END_FRAG_LIMIT;
+    c->shoot = c->mp_stage = true;
+    for (frame = 0; frame < 6; frame++) {
+        client_input_simulated(c, 0.05f);
+        c->frame_index++;
+        for (pi = 0; pi < 4; pi++) {
+            CHECK(!c->mp_input[pi].attack && !c->mp_input[pi].forward);
+            CHECK(!c->mp_input[pi].buttons && !c->mp_shots[pi]);
+        }
+    }
+    CHECK(c->mp.banner_ticks < Q2_MP_BANNER_TICKS);
+    CHECK(c->sim[0].level_time > 0);
+    c->shoot = c->mp_stage = false;
+    c->gamepads.held[1] = Q2_PAD_L1;
+    CHECK(!client_mp_results_input(c, 0.01f));
+    CHECK(c->mp_results.ready == 0); /* held on entry is not a press */
+    buttons(c, 1, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, false);
+    buttons(c, 1, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, true);
+    CHECK(!client_mp_results_input(c, 0.01f));
+    CHECK(c->mp_results.ready == 2); /* release/repress between renders */
+
+    client_mp_configure(c, Q2_MP_VERSUS, 4, 10, 1, 3);
+    CHECK(c->mp.time_limit == Q2_MP_NO_LIMIT);
+    CHECK(c->menu.mp_team[2] == 0 && c->menu.mp_team[3] == 1);
+    release_fixture(c);
+}
+
+/* Optional disc run verifies the actual transition and render target. A
+ * scoreboard made solely of coloured bands passed the old lifecycle checks. */
+static void test_results_disc(const char *disc_path, const char *capture)
+{
+    client *c = open_client(disc_path);
+    q2_mp_session saved;
+    const psx_framebuffer *fb;
+    int pi, x, y, art_pixels = 0, bright_text = 0;
+
+    client_mp_configure(c, Q2_MP_TEAM_DEATHMATCH, 4, 10, 10, 3);
+    CHECK(client_load_zone(c, "MATRIX5", 0));
+    CHECK(c->screen.view_count == 4);
+    c->mp.frags[0] = 1;
+    c->mp.frags[1] = 2;
+    c->mp.frags[2] = -1;
+    c->mp.frags[3] = 5;
+    c->mp.team_frags[0] = 0;
+    c->mp.team_frags[1] = 7;
+    c->mp.end = Q2_MP_END_FRAG_LIMIT;
+    c->mp_scoreboard = true;
+    for (pi = 0; pi < 4; pi++)
+        c->sim[0].player[pi].look_scheme = Q2_PAD_STYLE_RIGHT_STICK + pi % 3;
+    saved = c->mp;
+
+    CHECK(client_mp_load_results(c));
+    CHECK(client_name_eq(c->map, "QMRESULT"));
+    CHECK(c->screen.view_count == 1);
+    CHECK(c->menu_font_ready && c->menu_font.item_resident);
+    CHECK(memcmp(&c->mp, &saved, sizeof(saved)) == 0);
+    for (pi = 0; pi < 4; pi++) {
+        CHECK(!c->sim_ready[pi]);
+        CHECK(c->sim[0].player[pi].look_scheme == Q2_PAD_STYLE_RIGHT_STICK + pi % 3);
+    }
+    c->mp_results.ready = 8;
+    client_frame(c);
+    fb = q2_screen_front(&c->screen);
+    for (y = 0; y < fb->height; y++) {
+        for (x = 0; x < fb->width; x++) {
+            u16 pixel = fb->px[y * fb->width + x];
+            int r = pixel & 31, g = (pixel >> 5) & 31, b = (pixel >> 10) & 31;
+            /* The artwork occupies the lower centre, below the menu rows.
+             * Its half-bright pixels cannot satisfy the bright glyph check. */
+            if (y > fb->height - 35 && x > 160 && x < 352 && r + g + b > 6)
+                art_pixels++;
+            if (r > 23 && g > 23 && b > 23) bright_text++;
+        }
+    }
+    CHECK(art_pixels > 500);
+    CHECK(bright_text > 100);
+    if (capture) CHECK(psx_fb_write_ppm(fb, capture) == Q2_OK);
+
+    /* Loading again must not erase READY or restart the countdown. */
+    c->mp_results.countdown = 42;
+    CHECK(client_mp_load_results(c));
+    CHECK(c->mp_results.ready == 8 && c->mp_results.countdown == 42);
+    client_mp_return_to_menu(c);
+    CHECK(client_name_eq(c->map, "QFRONT"));
+    CHECK(c->in_front_end && !c->mp_enabled && !c->mp_scoreboard);
+    CHECK(c->menu.page_id == Q2_PAGE_FRONT_MULTI);
+    CHECK(c->menu_font.item_resident);
+    close_client(c);
+}
+
+int main(int argc, char **argv)
 {
     test_inputs();
+    test_single_player_controller();
+    test_controller_profiles();
     test_game_variables();
+    test_multiplayer_parity();
     test_fast_frames();
     test_owned_respawn_input();
     test_pickups_and_respawn();
     test_damage();
+    test_pain_animation();
+    test_player_animation_clock();
+    test_native_player_selection();
     test_rounds_and_cameras();
     test_teleports_lighting_and_bodies();
     test_virtual_controllers();
+    if (argc > 1) test_results_disc(argv[1], argc > 2 ? argv[2] : NULL);
     printf("%d split client checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

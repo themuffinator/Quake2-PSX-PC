@@ -222,6 +222,50 @@ static void test_anim_at_holds_the_last_frame(void)
     check_eq(within, 4, "at the same frame — a hold does not drift");
 }
 
+static void test_clip_transition(void)
+{
+    q2_model m = {0};
+    q2_model_anim old, next;
+    q2_model_pose pose = {0};
+    memset(g_timeline, 0, sizeof(g_timeline));
+    m.base = g_timeline; m.size = sizeof(g_timeline);
+    m.hdr.ofs_block_c = 16; m.hdr.ofs_block_d = 128; m.hdr.num_parts = 1;
+    /* Two variable-rate clips, each with keys at t=0 and t=30. */
+    g_timeline[16] = g_timeline[80] = 4;
+    g_timeline[18] = g_timeline[82] = 1;
+    g_timeline[20] = 64;
+    g_timeline[24] = g_timeline[88] = 4;
+    g_timeline[26] = g_timeline[90] = 8;
+    g_timeline[28] = g_timeline[92] = 3;
+    g_timeline[40] = 50;  /* packed x=100 */
+    g_timeline[96] = 100; /* incoming x=200 */
+    check_eq(q2_model_anim_at(&m, 0, &old, NULL), 1, "outgoing clip resolves");
+    check_eq(q2_model_anim_at(&m, 4, &next, NULL), 1, "incoming clip resolves");
+    check_eq(q2_model_pose_at(&m, &old, 15, &pose), Q2_OK, "ordinary key interpolation");
+    check_eq(pose.t[0], 50, "ordinary midpoint");
+    check_eq(q2_model_pose_at(&m, &old, 35, &pose), Q2_OK, "outgoing last key holds");
+    check_eq(pose.t[0], 100, "outgoing endpoint");
+    check_eq(q2_model_pose_transition(&m, &old, 35, &next, &pose), Q2_OK, "transition midpoint decodes");
+    check_eq(pose.t[0], 150, "outgoing final key blends to incoming first key");
+    check_eq(q2_model_pose_transition(&m, &old, 40, &next, &pose), Q2_OK, "transition endpoint decodes");
+    check_eq(pose.t[0], 200, "incoming endpoint");
+    check_eq(q2_model_pose_transition(&m, &old, 41, &next, &pose), Q2_ERR_BAD_FORMAT, "invalid transition span fails safely");
+    g_timeline[28] = 0x30; /* native zero-position fast path ignores the zero nibble */
+    check_eq(q2_model_pose_at(&m, &old, 0, &pose), Q2_OK, "zero-duration first key decodes at zero");
+    check_eq(pose.t[0], 0, "first key is not skipped");
+    next.flags = 0; pose.t[0] = 77;
+    check_eq(q2_model_pose_transition(&m, &old, 35, &next, &pose), Q2_OK, "mixed-format transition returns");
+    check_eq(pose.t[0], 77, "native mixed-format branch leaves scratch unchanged");
+    /* The native decoder reads the successor even when it starts block D.
+     * Keeping ka here would silently hold zero instead of reaching x=100. */
+    g_timeline[28] = 3;
+    m.hdr.ofs_block_d = 40;
+    check_eq(q2_model_pose_at(&m, &old, 30, &pose), Q2_OK, "successor may cross block C");
+    check_eq(pose.t[0], 100, "the native cross-block successor is decoded");
+    m.size = 40;
+    check_eq(q2_model_pose_at(&m, &old, 30, &pose), Q2_ERR_BAD_FORMAT, "successor cannot escape the model allocation");
+}
+
 static void test_subframe_cursor(void)
 {
     q2_model_cursor c;
@@ -550,6 +594,24 @@ static void test_bodge_forces_the_additive_selector(void)
     check_eq(f.flags, 0x40, "0x00 -> 0x40: page 0 is still page 0");
 }
 
+static void test_pose_bounds(void)
+{
+    u8 data[64]={0}; q2_model m={0}; q2_model_pose pose[2]={0}; s32 low=999;
+    m.base=data; m.size=sizeof(data); m.hdr.ofs_parts=16; m.hdr.ofs_verts=32;
+    m.hdr.num_parts=2; m.hdr.num_verts=2;
+    data[19]=1; data[27]=1;
+    /* Vertex stride is twelve: signed 16-bit x,y,z and normal. */
+    data[34]=20; data[46]=40;
+    pose[0].q[3]=pose[1].q[3]=4096; pose[0].t[1]=100; pose[1].t[1]=-10;
+    check_eq(q2_model_pose_low_y(&m,pose,2,&low),1,"valid parts produce pose bounds");
+    check_eq(low,120,"lowest posed vertex includes part translation");
+    check_eq(q2_model_pose_low_y(&m,NULL,0,&low),1,"unposed bounds decode");
+    check_eq(low,40,"unposed scan includes the second part");
+    m.hdr.num_parts=0; low=999;
+    check_eq(q2_model_pose_low_y(&m,pose,2,&low),0,"empty model has no bounds");
+    check_eq(low,999,"failed bounds leave output untouched");
+}
+
 int main(void)
 {
     puts("block D: the move table");
@@ -561,6 +623,8 @@ int main(void)
     test_position_formula();
     test_anim_at_holds_the_last_frame();
     test_subframe_cursor();
+    test_clip_transition();
+    test_pose_bounds();
 
     puts("");
     puts("block A: the face draw order");

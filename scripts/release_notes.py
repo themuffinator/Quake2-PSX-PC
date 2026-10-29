@@ -47,30 +47,30 @@ ARCHIVE_SUFFIXES = (".zip", ".tar.gz")
 
 PREAMBLE = """\
 A native PC recreation of *Quake II* for the PlayStation — Hammerhead's 1999 port.
-Not an emulator: the game's logic runs natively, and the PlayStation's GPU and
-GTE semantics are reproduced so it still looks the way it did. The fidelity
-switches are individually toggleable, so the same build also runs
-perspective-correct at 4K.
+The recreated game logic runs natively, with rendering based on the PlayStation's
+GPU and GTE behavior. This remains a work in progress; complete gameplay and
+hardware parity are not claimed.
 """
 
 REQUIREMENT = """\
-**You need your own Quake II PSX disc.** This download contains no game assets
-and no id Software or Hammerhead code.
+**You need your own Quake II PlayStation disc or image.** This download contains
+no game assets. Europe (SLES-01534) and USA (SLUS-00757) are the identified releases.
 """
 
 USAGE = """\
-Unpack the archive and point the client at a `.cue`, `.bin`, `.img` or `.iso`,
-or at an optical drive:
+Extract the entire archive, then open **USER-GUIDE.html** in a browser for the
+offline manual. Keep the runtime libraries beside the executable.
 
-```
-q2psx --disc "Quake II (Europe).cue"
-q2psx --disc E:
-q2psx
-```
+On Windows, double-click `q2psx.exe`. On Linux or macOS, run `./q2psx` from a
+terminal in the extracted folder. Choose **BROWSE IMAGE**, select your CUE, then
+**START GAME**. Keep all referenced BIN tracks with the CUE.
 
-`q2psx-inspect` is the offline tool: it identifies a disc, verifies every level
-file against the documented schema, decodes the audio, textures and films, and
-renders a level or a model to an image without opening a window.
+A raw CUE/BIN image is recommended: 2048-byte ISO images lack the XA data needed
+for music and films. Physical-drive support is available on Windows and Linux;
+raw-sector access depends on the drive. CHD, MDS/MDF and PBP are unsupported.
+
+The bundled `q2psx-inspect` and `stx2avi` tools are optional; they are not needed
+to play.
 """
 
 
@@ -194,10 +194,11 @@ def compose(
         provenance.append(
             f"- Full commit log: https://github.com/{slug}/commits/{tag}"
         )
-    provenance.append(
-        "- Every format claim in `docs/FORMATS.md` has a `q2psx-inspect` check "
-        "behind it; `docs/openquestions.md` records what is still unknown."
-    )
+    if slug:
+        provenance.append(
+            f"- [Technical references and known limits](https://github.com/{slug}/tree/{tag}/docs) "
+            "are available in the source repository."
+        )
     parts.append("\n".join(provenance) + "\n")
 
     return "\n".join(part.rstrip() + "\n" for part in parts if part.strip())

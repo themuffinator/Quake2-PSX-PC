@@ -118,6 +118,54 @@ void q2_prompt_sync_menu(q2_prompt_bar *b, const q2_menu *m, bool front_end)
     q2_prompt_show(b, Q2_PROMPT_RULES, rules ? 220 : 260);
 }
 
+static u32 keycap(psx_ot *ot, u32 bucket, int x, int y, int w, int h,
+                   u8 r, u8 g, u8 blue)
+{
+    psx_prim *p = psx_ot_add_bucket(ot, bucket);
+    int k;
+    if (!p) return 0;
+    p->kind = PSX_PRIM_F4;
+    p->xy[0].x = (s16)x;     p->xy[0].y = (s16)y;
+    p->xy[1].x = (s16)(x+w); p->xy[1].y = (s16)y;
+    p->xy[2].x = (s16)(x+w); p->xy[2].y = (s16)(y+h);
+    p->xy[3].x = (s16)x;     p->xy[3].y = (s16)(y+h);
+    for (k = 0; k < 4; k++) {
+        p->rgb[k].r = r; p->rgb[k].g = g; p->rgb[k].b = blue;
+    }
+    return 1;
+}
+
+u32 q2_prompt_build_labels(const q2_prompt_bar *b, const q2_menu_font *font,
+                           psx_ot *ot, u32 bucket, int ox, int oy,
+                           const char *const labels[Q2_PROMPT_COUNT])
+{
+    u32 n = 0;
+    int i;
+    if (!b || !font || !ot || !labels) return 0;
+    for (i = 0; i < Q2_PROMPT_COUNT; i++) {
+        const q2_prompt_rec *r = &b->rec[i];
+        const char *action;
+        char key[16];
+        int kw, aw, x, len;
+        if (!labels[i] || !(action = strchr(labels[i], ' '))) continue;
+        len = (int)(action-labels[i]);
+        if (len >= (int)sizeof(key)) len = (int)sizeof(key)-1;
+        memcpy(key, labels[i], (size_t)len); key[len] = 0;
+        action++;
+        kw = q2_menu_font_width(Q2_MENU_FACE_SMALL, key)+8;
+        aw = q2_menu_font_width(Q2_MENU_FACE_SMALL, action);
+        x = r->centre-(kw+8+aw)/2;
+        n += q2_menu_font_print(font, ot, bucket, Q2_MENU_FACE_SMALL,
+            x+kw/2, r->y+8, true, ox, oy, key);
+        n += q2_menu_font_print(font, ot, bucket, Q2_MENU_FACE_SMALL,
+            x+kw+8+aw/2, r->y+8, false, ox, oy, action);
+        /* AddPrim prepends: the inset and border land behind the letters. */
+        n += keycap(ot, bucket, ox+x+1, oy+r->y+2, kw-2, 12, 29, 36, 40);
+        n += keycap(ot, bucket, ox+x, oy+r->y+1, kw, 14, 112, 100, 76);
+    }
+    return n;
+}
+
 u32 q2_prompt_build_ot(const q2_prompt_bar *b, const q2_menu_font *font,
                        psx_ot *ot, u32 bucket)
 {

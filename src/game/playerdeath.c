@@ -3,6 +3,7 @@
  * every number in here comes from.
  */
 #include "playerdeath.h"
+#include "random.h"
 
 #include "modelent.h"      /* q2_gib_player_body: 0x80039578 / 0x8003E2A4 */
 #include "monster.h"       /* the dissolve gate 0x8005B2A8, shared with the
@@ -115,6 +116,88 @@ q2_player_move q2_player_anim_pick(q2_player_anim want, q2_player_move cur,
         return Q2_PMOVE_NONE;
 
     return pick;
+}
+
+void q2_player_anim_step(q2_player_anim_state *state,
+                        const q2_player_anim_range moves[Q2_PMOVE_COUNT],
+                        q2_player_anim want, u32 entity_flags, s32 dt)
+{
+    q2_player_move pick = Q2_PMOVE_NONE;
+    const q2_player_anim_range *current;
+    bool lock = false, restart = false;
+    s32 remaining = dt, previous = dt - 1, progress = 0;
+
+    if (!state || !moves || dt <= 0 || state->move < Q2_PMOVE_NONE ||
+        state->move >= Q2_PMOVE_COUNT)
+        return;
+    current = state->move == Q2_PMOVE_NONE ? NULL : &moves[state->move];
+
+    switch (want) {
+    case Q2_PANIM_STAND:
+        if (state->move != Q2_PMOVE_ATTAK || (state->flags & Q2_PDEATH_ANIM_WRAPPED))
+            pick = Q2_PMOVE_STAND;
+        break;
+    case Q2_PANIM_RUN: pick = Q2_PMOVE_RUN; break;
+    case Q2_PANIM_JUMP: pick = Q2_PMOVE_JUMP; break;
+    case Q2_PANIM_ATTACK: pick = Q2_PMOVE_ATTAK; restart = true; break;
+    case Q2_PANIM_PAIN:
+        /* This draw precedes the current-pain/death installation lock. */
+        pick = (q2_player_move)(Q2_PMOVE_PAIN1 + q2_random_next() % 3);
+        break;
+    case Q2_PANIM_DEATH:
+        if (!q2_player_move_is_death(state->move))
+            pick = (q2_player_move)(Q2_PMOVE_DEATH1 + q2_random_next() % 3);
+        break;
+    default: break;
+    }
+
+    if (state->move == Q2_PMOVE_JUMP) {
+        if (pick == state->move) {
+            restart = true;
+        } else {
+            if (!(state->flags & Q2_PDEATH_ANIM_WRAPPED) && want != Q2_PANIM_DEATH)
+                lock = true;
+            if (!(state->flags & Q2_PDEATH_ANIM_OVERRUN) &&
+                (s32)state->position + remaining > (s32)current->start + 30) {
+                state->flags |= Q2_PDEATH_ANIM_OVERRUN;
+                state->position = (s16)(current->start + 30);
+                remaining = 0;
+            }
+            /* 0x8003D0E8: ground, entity, ladder and wall contact release
+             * the held jump key. Merely asking for RUN does not release it. */
+            if ((state->flags & Q2_PDEATH_ANIM_OVERRUN) &&
+                !(entity_flags & ((1u << 5) | (1u << 6) | (1u << 11) | (1u << 13))))
+                remaining = 0;
+        }
+    }
+
+    /* 0x8003DF48 consumes the old clip first. At rest == end it returns the
+     * same remainder on the next pass, so the outer loop has a progress gate. */
+    while (remaining && remaining != previous && current) {
+        s16 next = (s16)((u32)(u16)state->position + (u32)remaining);
+        previous = remaining;
+        state->position = next;
+        if ((s32)next > current->end) {
+            state->flags |= Q2_PDEATH_ANIM_WRAPPED;
+            progress = (s32)current->end - current->start + 10;
+            remaining = (s32)next - current->end;
+            state->position = (s16)current->rest;
+        } else {
+            progress = (s32)next - current->start;
+            remaining = 0;
+        }
+    }
+    if (q2_player_move_is_death(state->move) ||
+        (q2_player_move_is_pain(state->move) && want != Q2_PANIM_DEATH &&
+         progress < (s32)current->end - current->start))
+        lock = true;
+
+    if (pick != Q2_PMOVE_NONE && !lock &&
+        (pick != state->move || moves[pick].rest == moves[pick].end || restart)) {
+        state->move = pick;
+        state->position = (s16)moves[pick].start;
+        state->flags &= 0xFFFCu;
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -309,7 +392,7 @@ bool q2_player_death_tick_fx(q2_player_death *d, s16 health, s32 dt,
             return false;
         }
 
-        /* 0x800395A0: friction on all three axes at dt * 5. */
+        /* 0x800395A0..0x800395F8: friction on all axes at dt * 40. */
         for (i = 0; i < 3; i++)
             approach(&d->velocity[i], 0, dt * Q2_PDEATH_FRICTION);
 

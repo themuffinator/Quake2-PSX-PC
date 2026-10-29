@@ -55,8 +55,8 @@
 
 /*
  * Turn toward `ideal_yaw` by at most `yaw_speed`, the short way round.
- * Returns true when it turned — including the clamped case — and false when it
- * was already facing.
+ * Returns true only when the requested turn was clamped to yaw_speed. The
+ * native s1 flag stays zero when this step reaches the ideal angle.
  *
  * The big-turn hook fires here: when the turn the creature was about to make
  * exceeds `bigturn_threshold`, the callback runs INSTEAD of the turn.

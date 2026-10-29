@@ -6,6 +6,113 @@
 
 /* One bind per class byte, which is how the engine's own table is indexed. */
 static q2_cre_bind *g_bind[Q2_CLASS_COUNT];
+static void (*g_hurt)(q2_monster *, q2_monster *, s16, int, const s32 *, void *);
+static void (*g_beam)(q2_monster *, q2_monster *, s16, void *);
+static void *g_contact_user;
+static void (*g_explosion)(q2_monster *, const s32 *, s32, void *);
+static void *g_explosion_user;
+static void (*g_sound_owner)(q2_monster *, u32, const q2_monster *, void *);
+static void *g_sound_owner_user;
+static void (*g_named_sound)(q2_monster *, const char *, void *);
+static void *g_named_sound_user;
+static q2_monster *g_roster;
+static u32 g_roster_count;
+static q2_monster *(*g_spawn_child)(q2_monster *, u8, void *);
+static bool (*g_revive)(q2_monster *, q2_monster *, void *);
+static void *g_lifecycle_user;
+static void (*g_actor_effect)(q2_monster *, u32, u8, void *);
+static void (*g_actor_spawn)(q2_monster *, void *);
+static void *g_actor_user;
+
+void q2_cre_shared_capture(q2_cre_shared_state *s, const q2_cre_bind *b)
+{
+    memset(s, 0, sizeof(*s));
+    if (!b) return;
+    s->present = true; s->flyer_transition = b->flyer_transition;
+    s->strider_turn = b->strider_turn; s->strider_explosion_phase = b->strider_explosion_phase;
+    s->boss1_explosion_phase = b->boss1_explosion_phase; s->jorg_explosion_phase = b->jorg_explosion_phase;
+}
+void q2_cre_shared_restore(q2_cre_bind *b, const q2_cre_shared_state *s)
+{
+    if (!b || !s->present) return;
+    b->flyer_transition = s->flyer_transition; b->strider_turn = s->strider_turn;
+    b->strider_explosion_phase = s->strider_explosion_phase;
+    b->boss1_explosion_phase = s->boss1_explosion_phase; b->jorg_explosion_phase = s->jorg_explosion_phase;
+}
+
+void q2_cre_set_actor_hooks(void (*effect)(q2_monster *, u32, u8, void *),
+                            void (*spawn)(q2_monster *, void *), void *user)
+{ g_actor_effect = effect; g_actor_spawn = spawn; g_actor_user = user; }
+void q2_cre_actor_effect(q2_monster *m, u32 index, u8 ticks)
+{
+    if (!m || index >= sizeof(m->effect)) return;
+    m->effect[index] = ticks;
+    if (g_actor_effect) g_actor_effect(m, index, ticks, g_actor_user);
+}
+
+void q2_cre_set_named_sound_hook(void (*fn)(q2_monster *, const char *, void *), void *user)
+{ g_named_sound = fn; g_named_sound_user = user; }
+void q2_cre_play_named_sound(q2_monster *m, const char *name)
+{ if (g_named_sound) g_named_sound(m, name, g_named_sound_user); }
+void q2_cre_set_lifecycle_hooks(q2_monster *monsters, u32 count,
+    q2_monster *(*spawn)(q2_monster *, u8, void *),
+    bool (*revive)(q2_monster *, q2_monster *, void *), void *user)
+{
+    g_roster = monsters; g_roster_count = count;
+    g_spawn_child = spawn; g_revive = revive; g_lifecycle_user = user;
+}
+q2_monster *q2_cre_roster(u32 *count) { *count = g_roster_count; return g_roster; }
+q2_monster *q2_cre_spawn_child(q2_monster *m, u8 pop_class)
+{ return g_spawn_child ? g_spawn_child(m, pop_class, g_lifecycle_user) : NULL; }
+bool q2_cre_revive(q2_monster *medic, q2_monster *corpse)
+{ return g_revive && g_revive(medic, corpse, g_lifecycle_user); }
+
+q2_class_method q2_cre_method_for(const q2_monster *m, u32 index)
+{
+    q2_cre_bind *b = m ? m->cre_bind : NULL;
+    if (b && b->impl && index < Q2_CLASS_METHOD_COUNT && b->impl->method[index])
+        return b->impl->method[index];
+    return m ? q2_class_method_get(m->class_id, index) : NULL;
+}
+
+void q2_cre_set_sound_owner_hook(void (*fn)(q2_monster *, u32, const q2_monster *, void *),
+                                 void *user)
+{
+    g_sound_owner = fn; g_sound_owner_user = user;
+}
+void q2_cre_play_sound_owner(q2_monster *m, u32 handle, const q2_monster *owner)
+{
+    extern void (*q2_cre_sound_fn)(q2_monster *, int, void *);
+    extern void *q2_cre_sound_user;
+    if (g_sound_owner) g_sound_owner(m, handle, owner, g_sound_owner_user);
+    else if (q2_cre_sound_fn) q2_cre_sound_fn(m, (int)handle, q2_cre_sound_user);
+}
+
+void q2_cre_set_explosion_hook(void (*fn)(q2_monster *, const s32 *, s32, void *),
+                                 void *user)
+{
+    g_explosion = fn; g_explosion_user = user;
+}
+void q2_cre_explosion(q2_monster *self, const s32 point[3], s32 scale)
+{
+    if (g_explosion) g_explosion(self, point, scale, g_explosion_user);
+}
+
+void q2_cre_set_contact_hooks(
+    void (*hurt)(q2_monster *, q2_monster *, s16, int, const s32 *, void *),
+    void (*beam)(q2_monster *, q2_monster *, s16, void *), void *user)
+{
+    g_hurt = hurt; g_beam = beam; g_contact_user = user;
+}
+void q2_cre_hurt(q2_monster *self, q2_monster *target, s16 damage,
+                  int mod, const s32 point[3])
+{
+    if (g_hurt) g_hurt(self, target, damage, mod, point, g_contact_user);
+}
+void q2_cre_beam(q2_monster *self, q2_monster *target, s16 vertex)
+{
+    if (g_beam) g_beam(self, target, vertex, g_contact_user);
+}
 
 void q2_cre_bind_reset(void)
 {
@@ -16,7 +123,7 @@ q2_cre_bind *q2_cre_bind_for(const q2_monster *m)
 {
     if (!m)
         return NULL;
-    return g_bind[m->class_byte];
+    return m->cre_bind ? m->cre_bind : g_bind[m->class_byte];
 }
 
 /*
@@ -118,6 +225,10 @@ bool q2_creature_bind(q2_cre_bind *b, const q2_creature *c,
      * exactly as the module's own init does through import +0x118. */
     for (i = 0; i < c->class_count; i++) {
         u32 k;
+        /* Jorg registers two DIFFERENT tables. Never install its own
+         * methods over the embedded Rider's class. */
+        if (c->class_method_table[i] &&
+            c->class_method_table[i] != c->method_table_addr) continue;
         for (k = 0; k < Q2_CLASS_METHOD_COUNT; k++) {
             /*
              * A think index the implementation does not write falls back to the
@@ -159,7 +270,7 @@ void q2_creature_bind_thinks(q2_cre_bind *b, const q2_cre_think *think,
     b->think_count = count;
 }
 
-void q2_creature_spawn(q2_cre_bind *b, q2_monster *m, u32 class_index)
+void q2_creature_prepare(q2_cre_bind *b, q2_monster *m, u32 class_index)
 {
     const q2_creature *c;
 
@@ -171,8 +282,11 @@ void q2_creature_spawn(q2_cre_bind *b, q2_monster *m, u32 class_index)
     if (class_index >= c->class_count)
         class_index = 0;
 
-    m->class_byte = c->class_byte[class_index];
-    m->class_id   = c->class_byte[class_index];
+    m->cre_bind = b;
+    if (c->class_count) {
+        m->class_byte = c->class_byte[class_index];
+        m->class_id   = c->class_byte[class_index];
+    }
 
     if (c->speed_scale > 0)
         m->speed_scale = (u8)c->speed_scale;
@@ -204,7 +318,6 @@ void q2_creature_spawn(q2_cre_bind *b, q2_monster *m, u32 class_index)
     INSTALL(run,     4);
     INSTALL(attack,  6);
     INSTALL(melee,   7);
-    INSTALL(bigturn, 10);
 #undef INSTALL
 
     /* dodge, sight and checkattack take extra arguments, so they are wired
@@ -245,6 +358,8 @@ void q2_creature_spawn(q2_cre_bind *b, q2_monster *m, u32 class_index)
                    (void *)b->impl->callback[8];
     if (b->impl->callback[9] && c->callback[9])
         m->checkattack = (bool (*)(q2_monster *))(void *)b->impl->callback[9];
+    if (b->impl->callback[10] && c->callback[10])
+        m->bigturn = (void (*)(q2_monster *, s32))(void *)b->impl->callback[10];
 
     /*
      * Slots 11 and 12 — pain and die — which the install list simply did not
@@ -259,7 +374,7 @@ void q2_creature_spawn(q2_cre_bind *b, q2_monster *m, u32 class_index)
 
     m->in_use      = true;
     m->spawnflags |= Q2_SVFLAG_INUSE;
-    m->svflags    |= Q2_SVF_MONSTER;
+    if (!b->impl->scripted) m->svflags |= Q2_SVF_MONSTER;
 
     /*
      * AND IT CAN BE HURT, which nothing in this port had ever said.
@@ -272,7 +387,16 @@ void q2_creature_spawn(q2_cre_bind *b, q2_monster *m, u32 class_index)
      * living creature on the disc became invulnerable. `tests/test_combat.c`
      * caught it on the first run.
      */
-    m->takedamage = Q2_DAMAGE_AIM;
+    m->takedamage = b->impl->scripted ? Q2_DAMAGE_NO : Q2_DAMAGE_AIM;
+    if (b->impl->scripted) q2_cre_script_callbacks(m);
+}
+
+void q2_creature_spawn(q2_cre_bind *b, q2_monster *m, u32 class_index)
+{
+    if (!b || !b->ready || !m) return;
+    q2_creature_prepare(b, m, class_index);
+    m->spawn_initialized = true;
+    q2_cre_motion_init(m);
 
     /*
      * AND THE MODULE'S OWN SPAWN FUNCTION, WHICH HAD NO CALLER AT ALL.
@@ -317,8 +441,9 @@ void q2_creature_spawn(q2_cre_bind *b, q2_monster *m, u32 class_index)
      * Insane does not (its tail is the crucified override, 0x801009EC on), and
      * the other six were not read for it — INFERRED.
      */
-    if (!(m->aiflags & Q2_AI_GOOD_GUY))
+    if (!b->impl->scripted && !(m->aiflags & Q2_AI_GOOD_GUY))
         q2_level_state.total_monsters++;
+    if (g_actor_spawn) g_actor_spawn(m, g_actor_user);
 }
 
 const q2_mmove *q2_cre_find_move(const q2_monster *m, s32 first_frame)
@@ -510,6 +635,49 @@ extern void (*q2_cre_melee_fn)(q2_monster *m, const s32 aim[3],
                                s32 damage, s32 kick, void *user);
 extern void  *q2_cre_melee_user;
 
+bool q2_cre_melee_contact(const q2_monster *m, const s32 aim[3], s32 point[3])
+{
+    s32 reach[3], forward[3], right[3], up[3], distance, side;
+    int k;
+    if (!m || !m->enemy || !aim || !point) return false;
+    for (k = 0; k < 3; k++) reach[k] = m->enemy->pos[k] - m->pos[k];
+    distance = q2_vector_length(reach);
+    if (distance > aim[0]) return false;
+    side = aim[2];
+    if (side > m->mins[0] && side < m->maxs[0])
+        distance -= m->enemy->maxs[0];
+    else
+        side = side < 0 ? m->enemy->mins[0] : m->enemy->maxs[0];
+    q2_angle_vectors(m->angles, forward, right, up);
+    q2_vector_ma(m->pos, distance, forward, point);
+    q2_vector_ma(point, side, right, point);
+    q2_vector_ma(point, -aim[1], up, point);
+    return true;
+}
+
+void q2_cre_melee_impulse(q2_monster *victim, const s32 point[3], s32 kick,
+                          s16 impulse[3])
+{
+    s32 dir[3];
+    const s32 zero[3] = { 0, 0, 0 };
+    int k;
+    if (!victim || !point || !impulse) return;
+    /* GetAbsBounds + half the local extent, then hit -> centre. */
+    for (k = 0; k < 3; k++)
+        dir[k] = victim->pos[k] + victim->mins[k] +
+                   (victim->maxs[k] - victim->mins[k]) / 2 - point[k];
+    q2_vector_normalize(dir);
+    q2_vector_ma(zero, kick, dir, victim->velocity);
+    /* Vertical velocity is scaled in place; X/Z are scaled only at the
+     * halfword accumulator. The upward cap applies at every difficulty. */
+    victim->velocity[1] *= 16;
+    if (victim->velocity[1] < -3072) victim->velocity[1] = -3072;
+    impulse[0] = (s16)(victim->velocity[0] * 16);
+    impulse[1] = (s16)victim->velocity[1];
+    impulse[2] = (s16)(victim->velocity[2] * 16);
+    if (victim->velocity[1] < 0) victim->on_ground = false;
+}
+
 void q2_cre_fire_hit(q2_monster *m, const s32 aim[3], s32 damage, s32 kick)
 {
     s32 reach[3];
@@ -619,6 +787,21 @@ extern const q2_cre_impl q2_cre_infantry;
 extern const q2_cre_impl q2_cre_arachner;
 extern const q2_cre_impl q2_cre_berserk;
 extern const q2_cre_impl q2_cre_insane;
+extern const q2_cre_impl q2_cre_flyer;
+extern const q2_cre_impl q2_cre_gladiator;
+extern const q2_cre_impl q2_cre_hover;
+extern const q2_cre_impl q2_cre_parasite;
+extern const q2_cre_impl q2_cre_ironmaiden;
+extern const q2_cre_impl q2_cre_strider;
+extern const q2_cre_impl q2_cre_boss1;
+extern const q2_cre_impl q2_cre_boss2;
+extern const q2_cre_impl q2_cre_jorg;
+extern const q2_cre_impl q2_cre_rider;
+extern const q2_cre_impl q2_cre_medic;
+extern const q2_cre_impl q2_cre_riderstand;
+extern const q2_cre_impl q2_cre_rider2;
+extern const q2_cre_impl q2_cre_rider3;
+extern const q2_cre_impl q2_cre_deadcomm;
 
 static const q2_cre_impl *const g_impls[] = {
     &q2_cre_soldier,
@@ -628,6 +811,21 @@ static const q2_cre_impl *const g_impls[] = {
     &q2_cre_arachner,
     &q2_cre_berserk,
     &q2_cre_insane,
+    &q2_cre_flyer,
+    &q2_cre_gladiator,
+    &q2_cre_hover,
+    &q2_cre_parasite,
+    &q2_cre_ironmaiden,
+    &q2_cre_strider,
+    &q2_cre_boss1,
+    &q2_cre_boss2,
+    &q2_cre_jorg,
+    &q2_cre_rider,
+    &q2_cre_medic,
+    &q2_cre_riderstand,
+    &q2_cre_rider2,
+    &q2_cre_rider3,
+    &q2_cre_deadcomm,
     NULL
 };
 
@@ -649,10 +847,9 @@ const q2_cre_impl *q2_cre_impl_find(const char *module_name)
 
     /*
      * No hand-written implementation. The generic one gives the creature its
-     * decoded animations, its callbacks and the shared AI — everything except
-     * the per-frame actions, which it simply does not perform. That is a
-     * creature that walks, chases and dies correctly but never fires, which is
-     * an honest partial rather than a wrong guess.
+     * decoded animation/action fragments and shared AI. This is a development
+     * fallback, not a complete implementation: branch conditions, projectile
+     * arguments and special behavior still need native code.
      */
     return &q2_cre_generic;
 }

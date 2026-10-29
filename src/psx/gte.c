@@ -42,18 +42,33 @@ static void gte_flag_finish(gte_state *g)
         g->flag |= GTE_FLAG_ERROR;
 }
 
-/* MAC1..MAC3 are 44-bit accumulators; writing a wider value sets the
- * positive/negative overflow flags but the stored value simply truncates. */
-static s32 gte_set_mac(gte_state *g, int idx, s64 value)
+/* Check and wrap each 44-bit accumulation BEFORE sf shifts the result.
+ * Opposite overflows within one matrix row must both survive in FLAG. */
+static s64 gte_mac44(gte_state *g, int idx, s64 value)
 {
     static const u32 pos_flag[3] = { GTE_FLAG_MAC1_POS, GTE_FLAG_MAC2_POS, GTE_FLAG_MAC3_POS };
     static const u32 neg_flag[3] = { GTE_FLAG_MAC1_NEG, GTE_FLAG_MAC2_NEG, GTE_FLAG_MAC3_NEG };
 
-    if (value >  (s64)0x7FFFFFFFFFLL) g->flag |= pos_flag[idx];
-    if (value < -(s64)0x8000000000LL) g->flag |= neg_flag[idx];
+    if (value >  0x7FFFFFFFFFFLL) g->flag |= pos_flag[idx];
+    if (value < -0x80000000000LL) g->flag |= neg_flag[idx];
+    value = (s64)((u64)value & 0xFFFFFFFFFFFULL);
+    return (value & 0x80000000000LL) ? value - 0x100000000000LL : value;
+}
 
-    g->mac[idx] = (s32)value;
+static s32 gte_set_mac(gte_state *g, int idx, s64 value, int shift)
+{
+    g->mac[idx] = (s32)(gte_mac44(g, idx, value) >> shift);
     return g->mac[idx];
+}
+
+static s64 gte_matrix_row(gte_state *g, int idx, const s16 row[3],
+                          const s32 v[3], s32 translation)
+{
+    s64 acc = (s64)translation * 4096;
+    int col;
+    for (col = 0; col < 3; col++)
+        acc = gte_mac44(g, idx, acc + (s64)row[col] * v[col]);
+    return acc;
 }
 
 /* IR1..IR3 saturate to s16, or to [0,32767] when the limit-negative bit is set. */
@@ -209,10 +224,9 @@ u32 gte_divide(gte_state *g, u16 h, u16 sz3)
 
     n = (u32)(((u64)n * (u64)d + 0x8000u) >> 16);
 
-    if (n > 0x1FFFF) {
-        n = 0x1FFFF;
-        g->flag |= GTE_FLAG_DIV_OVERFLOW;
-    }
+    /* UNR can round up to 0x20000 even when H < 2*SZ3. Hardware clamps
+     * that result without raising FLAG.17; only the earlier test raises it. */
+    if (n > 0x1FFFF) n = 0x1FFFF;
     return n;
 }
 
@@ -224,33 +238,24 @@ static void gte_rtp_vertex(gte_state *g, const gte_vec16 *v, bool last)
     s64 mx, my, mz;
     s32 sx, sy;
     u32 quot;
+    const s32 vec[3] = {v->x, v->y, v->z};
 
     /* Rotate and translate. Translation is 1.19.12, so it is shifted up to meet
      * the 12-bit fractional product of the matrix multiply. */
-    mx = ((s64)g->tr.x << Q2_FRAC_12)
-       + (s64)g->rot.m[0][0] * v->x + (s64)g->rot.m[0][1] * v->y + (s64)g->rot.m[0][2] * v->z;
-    my = ((s64)g->tr.y << Q2_FRAC_12)
-       + (s64)g->rot.m[1][0] * v->x + (s64)g->rot.m[1][1] * v->y + (s64)g->rot.m[1][2] * v->z;
-    mz = ((s64)g->tr.z << Q2_FRAC_12)
-       + (s64)g->rot.m[2][0] * v->x + (s64)g->rot.m[2][1] * v->y + (s64)g->rot.m[2][2] * v->z;
+    mx = gte_matrix_row(g, 0, g->rot.m[0], vec, g->tr.x);
+    my = gte_matrix_row(g, 1, g->rot.m[1], vec, g->tr.y);
+    mz = gte_matrix_row(g, 2, g->rot.m[2], vec, g->tr.z);
 
-    gte_set_mac(g, 0, mx >> Q2_FRAC_12);
-    gte_set_mac(g, 1, my >> Q2_FRAC_12);
-    gte_set_mac(g, 2, mz >> Q2_FRAC_12);
+    gte_set_mac(g, 0, mx, Q2_FRAC_12);
+    gte_set_mac(g, 1, my, Q2_FRAC_12);
+    gte_set_mac(g, 2, mz, Q2_FRAC_12);
 
     gte_set_ir(g, 0, g->mac[0], false);
     gte_set_ir(g, 1, g->mac[1], false);
 
-    /* IR3's saturation flag is computed from the *unshifted* MAC3 — a hardware
-     * quirk that matters because games watch FLAG to reject bad geometry. */
-    {
-        s32 mac3_unshifted = (s32)(mz >> Q2_FRAC_12);
-        s32 check = (s32)(mz >> Q2_FRAC_12);
-        (void)mac3_unshifted;
-        if (check < -32768 || check > 32767)
-            g->flag |= GTE_FLAG_IR3_SAT;
-        g->ir[2] = (s16)q2_clamp_s32(check, 0, 32767);
-    }
+    /* This API executes sf=1, lm=0. SZ clamps negative depth to zero;
+     * IR3 is a separate signed result and must retain it. */
+    gte_set_ir(g, 2, g->mac[2], false);
 
     gte_push_sz(g, (s32)(mz >> Q2_FRAC_12));
 
@@ -275,6 +280,8 @@ static void gte_rtp_vertex(gte_state *g, const gte_vec16 *v, bool last)
     /* Depth cueing runs only on the final vertex of an RTPT. */
     if (last) {
         s64 dc = (s64)quot * (s64)g->dqa + (s64)g->dqb;
+        if (dc >  0x7FFFFFFFLL) g->flag |= GTE_FLAG_MAC0_POS;
+        if (dc < -0x80000000LL) g->flag |= GTE_FLAG_MAC0_NEG;
         g->mac0 = (s32)dc;
 
         {
@@ -363,6 +370,7 @@ void gte_avsz4(gte_state *g) { gte_avsz(g, g->zsf4, 4); }
 void gte_mvmva(gte_state *g, int sf, int mx, int vx, int tx, int lm)
 {
     const gte_matrix *m;
+    gte_matrix reserved;
     s32 vec[3];
     const s32 *t;
     static const s32 zero3[3] = { 0, 0, 0 };
@@ -375,7 +383,16 @@ void gte_mvmva(gte_state *g, int sf, int mx, int vx, int tx, int lm)
     case 0:  m = &g->rot;    break;
     case 1:  m = &g->light;  break;
     case 2:  m = &g->colour; break;
-    default: m = &g->rot;    break;   /* mx==3 selects a garbage matrix on HW */
+    default:
+        reserved.m[0][0] = (s16)(-(s32)g->rgbc.r * 16);
+        reserved.m[0][1] = (s16)((s32)g->rgbc.r * 16);
+        reserved.m[0][2] = g->ir0;
+        for (i = 0; i < 3; i++) {
+            reserved.m[1][i] = g->rot.m[0][2];
+            reserved.m[2][i] = g->rot.m[1][1];
+        }
+        m = &reserved;
+        break;
     }
 
     if (vx < 3) {
@@ -396,11 +413,19 @@ void gte_mvmva(gte_state *g, int sf, int mx, int vx, int tx, int lm)
     }
 
     for (i = 0; i < 3; i++) {
-        s64 acc = ((s64)t[i] << Q2_FRAC_12)
-                + (s64)m->m[i][0] * vec[0]
-                + (s64)m->m[i][1] * vec[1]
-                + (s64)m->m[i][2] * vec[2];
-        gte_set_mac(g, i, acc >> shift);
+        s64 acc;
+        if (tx == 2) {
+            /* FC selection is bugged in hardware: the first term affects
+             * flags, then is discarded before columns 2 and 3 are summed. */
+            acc = (s64)t[i] * 4096 + (s64)m->m[i][0] * vec[0];
+            gte_set_mac(g, i, acc, shift);
+            gte_set_ir(g, i, g->mac[i], false);
+            acc = gte_mac44(g, i, (s64)m->m[i][1] * vec[1]);
+            acc += (s64)m->m[i][2] * vec[2];
+        } else {
+            acc = gte_matrix_row(g, i, m->m[i], vec, t[i]);
+        }
+        gte_set_mac(g, i, acc, shift);
         gte_set_ir(g, i, g->mac[i], lm != 0);
     }
 
@@ -421,13 +446,12 @@ enum { GTE_NC_PLAIN = 0, GTE_NC_COLOUR = 1, GTE_NC_DEPTH_CUE = 2 };
  * rather than a negative amount — the hardware's own "unlit" rule. */
 static void gte_nc_light(gte_state *g, const gte_vec16 *v)
 {
+    const s32 vec[3] = {v->x, v->y, v->z};
     int i;
 
     for (i = 0; i < 3; i++) {
-        s64 acc = (s64)g->light.m[i][0] * v->x
-                + (s64)g->light.m[i][1] * v->y
-                + (s64)g->light.m[i][2] * v->z;
-        gte_set_mac(g, i, acc >> Q2_FRAC_12);
+        s64 acc = gte_matrix_row(g, i, g->light.m[i], vec, 0);
+        gte_set_mac(g, i, acc, Q2_FRAC_12);
         gte_set_ir(g, i, g->mac[i], true);
     }
 }
@@ -442,7 +466,7 @@ static void gte_nc_light(gte_state *g, const gte_vec16 *v)
  * further colour/4096.
  *
  * It is a matrix multiply: all three rows read the same input. The hardware
- * latches it; `gte_nc_depth_cue` below already snapshots for the same reason.
+ * latches it; the modulation/depth-cue stage below snapshots for the same reason.
  *
  * What it looked like: with ONE light reaching a model — the common case, and
  * true of BASE1's and BASE2's nearest Soldier — columns 1 and 2 of the colour
@@ -467,52 +491,34 @@ static void gte_nc_colour(gte_state *g)
     int i;
 
     for (i = 0; i < 3; i++) {
-        s64 acc = ((s64)bk[i] << Q2_FRAC_12)
-                + (s64)g->colour.m[i][0] * ir[0]
-                + (s64)g->colour.m[i][1] * ir[1]
-                + (s64)g->colour.m[i][2] * ir[2];
-        gte_set_mac(g, i, acc >> Q2_FRAC_12);
+        s64 acc = gte_matrix_row(g, i, g->colour.m[i], ir, bk[i]);
+        gte_set_mac(g, i, acc, Q2_FRAC_12);
         gte_set_ir(g, i, g->mac[i], true);
     }
 }
 
 /* Stage 3, NCC and NCD only: modulate by the primitive's own colour. The <<4
  * is the hardware's, and it is what makes RGBC 128 mean "unchanged". */
-static void gte_nc_modulate(gte_state *g)
+static void gte_nc_modulate(gte_state *g, bool depth_cue)
 {
     const s32 rgb[3] = { g->rgbc.r, g->rgbc.g, g->rgbc.b };
-    int i;
-
-    for (i = 0; i < 3; i++) {
-        s64 acc = ((s64)rgb[i] * (s64)g->ir[i]) << 4;
-        gte_set_mac(g, i, acc >> Q2_FRAC_12);
-        gte_set_ir(g, i, g->mac[i], true);
-    }
-}
-
-/*
- * Stage 4, NCD and CDP only: MAC += (FC - MAC) * IR0, the depth cue.
- *
- * The difference passes through IR *without* the limit-negative bit, which is
- * what lets the far colour pull a vertex down as well as up. IR0 is the 0.8.8
- * factor RTPS left behind on its last vertex.
- */
-static void gte_nc_depth_cue(gte_state *g)
-{
     const s32 fc[3] = { g->fc.x, g->fc.y, g->fc.z };
-    s32 base[3];
+    s64 base[3];
     int i;
 
     for (i = 0; i < 3; i++)
-        base[i] = g->mac[i];
-
+        base[i] = (s64)rgb[i] * g->ir[i] * 16;
     for (i = 0; i < 3; i++) {
-        gte_set_mac(g, i, (s64)fc[i] - (s64)base[i]);
-        gte_set_ir(g, i, g->mac[i], false);
-    }
-
-    for (i = 0; i < 3; i++) {
-        gte_set_mac(g, i, (((s64)g->ir[i] * g->ir0) >> Q2_FRAC_12) + base[i]);
+        s64 acc = base[i];
+        if (depth_cue) {
+            /* Keep the unshifted modulation product. Shifting it before the
+             * far-colour subtraction loses fractional bits and can change
+             * both the final colour and IR saturation flags. */
+            gte_set_mac(g, i, (s64)fc[i] * 4096 - base[i], Q2_FRAC_12);
+            gte_set_ir(g, i, g->mac[i], false);
+            acc += (s64)g->ir[i] * g->ir0;
+        }
+        gte_set_mac(g, i, acc, Q2_FRAC_12);
         gte_set_ir(g, i, g->mac[i], true);
     }
 }
@@ -523,9 +529,7 @@ static void gte_nc_vertex(gte_state *g, const gte_vec16 *v, int mode)
     gte_nc_colour(g);
 
     if (mode != GTE_NC_PLAIN)
-        gte_nc_modulate(g);
-    if (mode == GTE_NC_DEPTH_CUE)
-        gte_nc_depth_cue(g);
+        gte_nc_modulate(g, mode == GTE_NC_DEPTH_CUE);
 
     gte_push_rgb(g);
 }
@@ -551,7 +555,7 @@ void gte_cc(gte_state *g)
 {
     gte_flag_reset(g);
     gte_nc_colour(g);
-    gte_nc_modulate(g);
+    gte_nc_modulate(g, false);
     gte_push_rgb(g);
     gte_flag_finish(g);
 }
@@ -560,8 +564,7 @@ void gte_cdp(gte_state *g)
 {
     gte_flag_reset(g);
     gte_nc_colour(g);
-    gte_nc_modulate(g);
-    gte_nc_depth_cue(g);
+    gte_nc_modulate(g, true);
     gte_push_rgb(g);
     gte_flag_finish(g);
 }
@@ -578,7 +581,7 @@ void gte_sqr(gte_state *g, int sf)
 
     for (i = 0; i < 3; i++) {
         s64 v = (s64)g->ir[i] * (s64)g->ir[i];
-        gte_set_mac(g, i, v >> shift);
+        gte_set_mac(g, i, v, shift);
         gte_set_ir(g, i, g->mac[i], true);
     }
 

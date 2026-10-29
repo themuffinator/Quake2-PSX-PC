@@ -144,7 +144,8 @@ u32 q2_panel_body_ot(const q2_panel_rect *r, psx_ot *ot, u32 bucket)
         p->kind = PSX_PRIM_TILE;
         p->semi_transparent = true;
         p->textured_blend   = false;
-        p->tpage = psx_make_tpage(0, 0, PSX_BLEND_HALF, PSX_TEX_4BIT);
+        p->tpage = 0x0600u;
+        p->set_tpage = true; /* the paired E1000600 draw-mode packets */
         p->clut  = 0;
 
         /*

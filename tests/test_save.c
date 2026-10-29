@@ -105,6 +105,16 @@ static void build_state(q2_sim *sim, q2_inventory *inv)
 
     sim->player[0].pitch          = -250;
     sim->player[0].roll           = 33;
+    sim->player[0].aim_direction[0] = 123;
+    sim->player[0].aim_direction[1] = -994;
+    sim->player[0].aim_direction[2] = 3973;
+    sim->player[0].aim_pitch = -160;
+    sim->player[0].aim_assist = -48;
+    sim->player[0].aim_eye[0] = 1100;
+    sim->player[0].aim_eye[1] = -6000;
+    sim->player[0].aim_eye[2] = 8800;
+    sim->player[0].aim_node = 7;
+    sim->player[0].aim_ready = sim->player[0].aim_view_valid = true;
     sim->player[0].vel[0]         = 17;
     sim->player[0].vel[1]         = -900;
     sim->player[0].vel[2]         = 4;
@@ -542,6 +552,14 @@ static void test_round_trip(void)
     check_eq_i(loaded.player.yaw, saved.player.yaw, "yaw survives");
     check_eq_i(loaded.player.pitch, -250, "pitch survives, including negatives");
     check_eq_i(loaded.player.roll, 33, "roll survives");
+    check(memcmp(loaded.player.aim_direction, saved.player.aim_direction, 6) == 0,
+          "the acquired firing direction survives");
+    check_eq_i(loaded.player.aim_pitch, -160, "the acquired pitch survives");
+    check_eq_i(loaded.player.aim_assist, -48, "the partly eased barrel survives");
+    check(memcmp(loaded.player.aim_eye, saved.player.aim_eye, 12) == 0,
+          "the previous GameWindow eye survives");
+    check_eq_i(loaded.player.aim_node, 7, "the GameWindow PrimaryColl hint survives");
+    check(loaded.player.aim_ready && loaded.player.aim_view_valid, "aim validity survives");
     check_eq_i(loaded.player.wish[0], -120, "the wish velocity survives");
     check_eq_i(loaded.player.frame_delta[1], -7,
                "the one-tick frame delta survives");
@@ -977,7 +995,7 @@ static void test_rejects_pre_batch_v4(void)
 /* writer by construction.                                                     */
 /* ------------------------------------------------------------------------- */
 typedef struct save_image {
-    u8  b[512];
+    u8  b[2048];
     u32 len;
 } save_image;
 
@@ -1231,6 +1249,32 @@ static void test_event_scheduler_restore(void)
  * is 0x49 in a v5 file. Today's gate is DISABLED alone (0x8002799C) — loaded
  * as-is, that record would fire again. The reader gives it its DISABLED bit.
  */
+static void test_autoaim_player_tail(void)
+{
+    save_image image;
+    q2_save loaded;
+    u32 tail, i, at;
+    for (tail = 0; tail <= 33; tail++) {
+        memset(&image, 0, sizeof(image));
+        at = img_chunk_begin(&image, "PLYR");
+        /* The previous format's 136 player bytes and 34-byte mover record. */
+        for (i = 0; i < 170; i++) img_u8(&image, 0);
+        for (i = 0; i < tail; i++) img_u8(&image, i == 0 ? 1 : 0);
+        img_chunk_end(&image, at);
+        check(img_write(tmp_path(), Q2_SAVE_VERSION, &image), "write player-tail fixture");
+        if (tail == 0 || tail == 32) {
+            check(q2_save_read(&loaded, tmp_path()) == Q2_OK, "read old or complete player tail");
+            check(!loaded.player.aim_ready && !loaded.player.aim_view_valid,
+                  "legacy player aim starts unlatched");
+        } else {
+            check(q2_save_read(&loaded, tmp_path()) == Q2_ERR_BAD_FORMAT,
+                  "reject truncated or oversized player tail");
+        }
+        q2_save_free(&loaded);
+    }
+    remove(tmp_path());
+}
+
 static void test_projectile_chunk_order(void)
 {
     save_image image;
@@ -1501,6 +1545,458 @@ static void test_event_history_round_trip(void)
     remove(tmp_path());
 }
 
+static void test_zone_history_round_trip(void)
+{
+    q2_save saved = {0}, loaded = {0};
+    q2_zone_object objects[2] = {0};
+    q2_zone_population maps[2] = {0};
+    q2_zone_history history = {maps, 2};
+    save_image image;
+    u32 i, at;
+
+    printf("visited-zone population history\n");
+    objects[0].kind = Q2_ZONE_ITEM;
+    objects[0].id = 27; objects[0].group = 4; objects[0].slot = 7;
+    objects[0].zone = 3; objects[0].removed = 1;
+    objects[0].hidden = 1; objects[0].taken = 5; objects[0].shrink = 1;
+    objects[0].scale = 3072; objects[0].remove_in = 37; objects[0].respawn_at = 1234;
+    objects[1].kind = Q2_ZONE_CREATURE;
+    objects[1].id = 18; objects[1].group = 5; objects[1].slot = 8;
+    objects[1].zone = 1; objects[1].health = -47; objects[1].dead = 1;
+    objects[1].target = -1; objects[1].spawnflags = 0x12345678;
+    objects[1].pos[0] = -32000; objects[1].pos[1] = 100; objects[1].pos[2] = 25000;
+    objects[1].yaw = 4095; objects[1].frame = 98;
+    for (i = 0; i < 2; i++) {
+        snprintf(maps[i].map, sizeof(maps[i].map), "MAP%u", i);
+        maps[i].identity = 12345 + i;
+        maps[i].object = &objects[i]; maps[i].count = maps[i].capacity = 1;
+    }
+    snprintf(saved.map, sizeof(saved.map), "%s", "MAP0");
+    check(q2_zone_history_copy(&saved.zone_history, &history) == Q2_OK,
+          "population snapshot owns independent records");
+    saved.zone_history_present = true;
+    check(q2_save_write(&saved, tmp_path()) == Q2_OK &&
+          q2_save_read(&loaded, tmp_path()) == Q2_OK, "population chunk round trip");
+    check(loaded.zone_history_present && loaded.zone_history.count == 2,
+          "both visited maps survive the file");
+    for (i = 0; i < loaded.zone_history.count; i++) {
+        const q2_zone_population *p = &loaded.zone_history.map[i];
+        check(!strcmp(p->map, maps[i].map) && p->identity == maps[i].identity &&
+              p->count == 1 && !memcmp(p->object, &objects[i], sizeof(objects[i])),
+              "authored identity, removal, corpse, position and item latches survive");
+    }
+    q2_save_free(&loaded);
+    {
+        q2_zone_population *p = &saved.zone_history.map[1];
+        q2_zone_runtime *r = p->object[0].runtime = calloc(1, sizeof(*r));
+        if (!r) exit(2);
+        p->runtime_present = true; p->ai_time = 100; p->ai_frame = 101; p->ai_phase_us = 37000;
+        p->trail.head = 3; p->trail.active = true; p->trail.spot[2].timestamp = 98;
+        p->alerts[0].kind = Q2_ZREF_PLAYER; p->alert_frame[0] = 99;
+        r->sim_time = 1000; r->ai_time = 87; r->ai_frame = 88;
+        r->creature.state.in_use = true; r->creature.state.dead = true;
+        r->creature.state.frame = 91; r->creature.state.next_think = 88;
+        r->creature.state.dissolve_arm = 1; r->creature.state.dissolve = 1234;
+        r->creature.state.effect[3] = 42; r->creature.state.velocity[1] = -2000;
+        r->creature.has_move = r->creature.thinking = 1;
+        snprintf(r->creature.move_module, sizeof(r->creature.move_module), "Soldier");
+        r->creature.move_offset = 0x1234;
+        r->creature.refs[0].kind = Q2_ZREF_PLAYER;
+        r->creature.animation.cursor.ready = true;
+        r->creature.animation.cursor.target = 270;
+        r->creature.animation.cursor.position = 287;
+        r->creature.animation.source = 2;
+        check(q2_save_write(&saved, tmp_path()) == Q2_OK && q2_save_read(&loaded, tmp_path()) == Q2_OK,
+              "v2 live animation state round trips");
+        if (loaded.zone_history.count == 2 && loaded.zone_history.map[1].object[0].runtime) {
+            const q2_zone_population *out = &loaded.zone_history.map[1];
+            const q2_zone_runtime *got = out->object[0].runtime;
+            check(out->ai_time == 100 && out->ai_frame == 101 && out->ai_phase_us == 37000 &&
+                  out->trail.head == 3 && out->trail.spot[2].timestamp == 98 &&
+                  out->alerts[0].kind == Q2_ZREF_PLAYER && out->alert_frame[0] == 99,
+                  "map clock, fractional tick, alerts and pursuit trail survive");
+            check(got->sim_time == 1000 && got->ai_time == 87 && got->ai_frame == 88 &&
+                  got->creature.state.frame == 91 && got->creature.state.next_think == 88 &&
+                  got->creature.state.dissolve == 1234 && got->creature.state.effect[3] == 42 &&
+                  got->creature.state.velocity[1] == -2000,
+                  "suspended AI deadlines, corpse effects and velocity survive");
+            check(got->creature.move_offset == 0x1234 && !strcmp(got->creature.move_module, "Soldier") &&
+                  got->creature.refs[0].kind == Q2_ZREF_PLAYER && got->creature.animation.cursor.ready &&
+                  got->creature.animation.cursor.position == 287 && got->creature.animation.cursor.target == 270,
+                  "move identities and fractional render cursors survive");
+            check(!got->creature.state.currentmove && !got->creature.state.think &&
+                  !got->creature.state.enemy && !got->creature.animation.move && !got->materialized,
+                  "the file contains no live pointers or session materialization flags");
+        } else check(false, "v2 contains the full creature runtime");
+        q2_save_free(&loaded);
+        check(q2_zone_history_copy(&loaded.zone_history, &saved.zone_history) == Q2_OK &&
+              loaded.zone_history.map[1].object[0].runtime != r,
+              "runtime history copies own independent allocations");
+        r->creature.animation.cursor.position = 999;
+        check(loaded.zone_history.map[1].object[0].runtime->creature.animation.cursor.position == 287,
+              "later capture cannot change an existing snapshot");
+        q2_save_free(&loaded);
+        r->creature.has_move = 2;
+        check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT, "invalid runtime flags are rejected");
+        r->creature.has_move = 1;
+    }
+    saved.zone_history.map[1].object[0].removed = 2;
+    check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "invalid population flags cannot be written");
+    q2_save_free(&saved);
+
+    img_body(&image, NULL, 0);
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_OK &&
+          !loaded.zone_history_present && !loaded.zone_history.count,
+          "an older save without ZPOP starts with empty history");
+    q2_save_free(&loaded);
+    for (i = 0; i < 2; i++) {
+        at = img_chunk_begin(&image, "ZPOP");
+        img_u32(&image, 1); img_u32(&image, 0);
+        img_chunk_end(&image, at);
+    }
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "duplicate population chunks are rejected");
+    img_body(&image, NULL, 0);
+    at = img_chunk_begin(&image, "ZPOP");
+    img_u32(&image, 1); img_u32(&image, 1);
+    img_str(&image, "MAP0", Q2_ZONE_MAP_NAME);
+    img_u32(&image, 12345); img_u32(&image, Q2_ZONE_HISTORY_OBJECTS + 1);
+    img_chunk_end(&image, at);
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "population object allocation is bounded by the format and payload");
+    img_body(&image, NULL, 0);
+    at = img_chunk_begin(&image, "ZPOP");
+    img_u32(&image, 1); img_u32(&image, 1);
+    img_str(&image, "BASE1", Q2_ZONE_MAP_NAME); img_u32(&image, 12345); img_u32(&image, 1);
+    img_u32(&image, 4); img_u32(&image, 7); img_u32(&image, 3);
+    img_u8(&image, 27); img_u8(&image, 0); img_u8(&image, Q2_ZONE_ITEM); img_u8(&image, 1);
+    for (i = 0; i < 42; i++) img_u8(&image, 0);
+    img_chunk_end(&image, at);
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_OK && loaded.zone_history.count == 1 &&
+          loaded.zone_history.map[0].object[0].removed && !loaded.zone_history.map[0].runtime_present,
+          "authored objects from the original v1 payload remain readable");
+    q2_save_free(&loaded);
+    img_body(&image, NULL, 0);
+    at = img_chunk_begin(&image, "ZPOP");
+    img_u32(&image, 2); img_u32(&image, 1);
+    img_str(&image, "BASE1", Q2_ZONE_MAP_NAME); img_u32(&image, 12345); img_u32(&image, 1);
+    img_u32(&image, 1); img_u8(&image, 1); /* next serial, runtime present */
+    for (i = 0; i < 221; i++) img_u8(&image, 0); /* clocks, alerts and trail */
+    img_u32(&image, 0); img_u32(&image, 1); img_u32(&image, 0);
+    img_u8(&image, 0); img_u8(&image, 0); img_u8(&image, Q2_ZONE_PROJECTILE); img_u8(&image, 0);
+    for (i = 0; i < 42; i++) img_u8(&image, 0);
+    img_u8(&image, 2); /* invalid runtime presence flag */
+    img_chunk_end(&image, at);
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_ERR_BAD_FORMAT, "v2 rejects malformed runtime flags");
+    image.b[image.len - 1] = 1;
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_ERR_BAD_FORMAT, "v2 rejects a truncated runtime body");
+    remove(tmp_path());
+}
+
+static void test_native_mission_state(void)
+{
+    q2_save saved = {0}, loaded = {0};
+    save_image image;
+    u32 i, j, kind, at;
+    printf("native mission switches and active module clocks\n");
+    strcpy(saved.map, "LAB");
+    saved.native_mission_present = true;
+    saved.native_mission.flags = Q2_NATIVE_BRIDGE | Q2_NATIVE_PUMP1 | Q2_NATIVE_ORB_ACTIVE |
+                                Q2_NATIVE_SECURITY_BOSS | Q2_NATIVE_TRAIN_OPEN |
+                                Q2_NATIVE_SECURITY_LIFT_HELD;
+    saved.native_mission.lab_phase[0] = 6172;
+    saved.native_mission.lab_phase[1] = -59;
+    saved.native_mission.boss_phase[1] = 4095;
+    saved.native_mission.orb_arc[3].life = 1200;
+    saved.native_mission.orb_arc[3].velocity[0] = -32;
+    saved.native_mission.orb_arc[3].to[1] = -12345;
+    saved.native_mission.orb_arc[4].life = -29;
+    for (i = 0; i < 4; i++) saved.native_mission.security_wall[i] = 580 + 450 * (s32)i;
+    saved.native_mission.flags |= Q2_NATIVE_REACTOR_ACTIVE | Q2_NATIVE_REACTOR_DRAINED |
+                                 Q2_NATIVE_BASE3_WALL_OFF;
+    saved.native_mission.reactor_start = 12340;
+    saved.native_mission.reactor_alarm = 300;
+    saved.native_mission.reactor_glass = 3;
+    saved.native_mission.power1_next_blast = 0x80000123u;
+    saved.native_mission.power1_blast_phase = 15;
+    saved.native_mission.security_quake_phase = -17;
+    saved.native_mission.boss2_quake_time = -3000;
+    saved.native_mission.boss2_quake_phase = -29;
+    for (i = 0; i < Q2_NATIVE_LIFT_COUNT; i++) {
+        q2_native_lift *lift = &saved.native_mission.lift[i];
+        lift->valid = 1; lift->state = (u8)((1 + 2*i) % 7); lift->wait = (u16)(880 + i);
+        lift->offset = -3600 + 80*(s32)i; lift->dy = i ? 80 : -80;
+        for (j = 0; j < 3; j++) {
+            lift->min[j] = -2000 + 40*(s32)j;
+            lift->max[j] = 1000 + 30*(s32)j;
+            lift->env_min[j] = lift->min[j] - 100;
+            lift->env_max[j] = lift->max[j] + 100;
+        }
+    }
+    check(q2_save_write(&saved, tmp_path()) == Q2_OK &&
+          q2_save_read(&loaded, tmp_path()) == Q2_OK, "NMIS round trip");
+    check(loaded.native_mission_present &&
+          !memcmp(&saved.native_mission, &loaded.native_mission, sizeof(saved.native_mission)),
+          "switches, held exit lift, expired sweeps/arcs, walls, reactor, shaft, lift boxes and earthquake clocks resume exactly");
+    q2_save_free(&loaded);
+    saved.native_mission.lab_phase[1] = -60;
+    check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "LAB sweep expiry cannot exceed twice the native maximum frame decrement");
+    saved.native_mission.lab_phase[1] = 8193;
+    check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "LAB sweep phase beyond its retrigger value rejected");
+    saved.native_mission.lab_phase[1] = -59;
+    saved.native_mission.orb_arc[4].life = -30;
+    check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "orb expiry cannot exceed the native maximum frame decrement");
+    saved.native_mission.orb_arc[4].life = 1801;
+    check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "orb lifetime beyond its native range rejected");
+    saved.native_mission.orb_arc[4].life = -29;
+    for (kind = 0; kind < 7; kind++) {
+        saved.native_mission.security_quake_phase = kind == 0 ? -30 : kind == 1 ? 1 : -17;
+        saved.native_mission.boss2_quake_phase = kind == 2 ? -30 : kind == 3 ? 1 : -29;
+        saved.native_mission.boss2_quake_time = kind == 4 ? -3001 : kind == 5 ? -9998 : kind == 6 ? 3001 : -3000;
+        check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+              "writer rejects out-of-range earthquake phases and non-sentinel negative clocks");
+    }
+    saved.native_mission.security_quake_phase = -17;
+    saved.native_mission.boss2_quake_phase = -29;
+    saved.native_mission.boss2_quake_time = Q2_NATIVE_QUAKE_INACTIVE;
+    check(q2_save_write(&saved, tmp_path()) == Q2_OK &&
+          q2_save_read(&loaded, tmp_path()) == Q2_OK &&
+          loaded.native_mission.boss2_quake_time == Q2_NATIVE_QUAKE_INACTIVE,
+          "inactive earthquake sentinel round trips");
+    q2_save_free(&loaded);
+    for (i = 0; i < Q2_NATIVE_LIFT_COUNT; i++) {
+        q2_native_lift good = saved.native_mission.lift[i];
+        for (kind = 0; kind < 7; kind++) {
+            q2_native_lift *lift = &saved.native_mission.lift[i];
+            *lift = good;
+            if (kind == 0) lift->valid = 2;
+            if (kind == 1) lift->state = 7;
+            if (kind == 2) lift->offset = 32768;
+            if (kind == 3) lift->dy = -32769;
+            if (kind == 4) lift->min[1] = lift->max[1] + 1;
+            if (kind == 5) lift->env_max[0] = lift->max[0] - 1;
+            if (kind == 6) lift->env_min[2] = -16777217;
+            check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+                  "invalid lift flags, state, displacement and collision bounds cannot be saved");
+        }
+        saved.native_mission.lift[i] = good;
+    }
+    saved.native_mission.security_wall[0] = -1;
+    check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "negative native wall countdown rejected");
+    saved.native_mission.security_wall[0] = 601;
+    check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "native wall countdown beyond its authored delay rejected");
+    saved.native_mission.security_wall[0] = 0;
+    saved.native_mission.reactor_alarm = -1;
+    check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "negative reactor alarm accumulator rejected");
+    saved.native_mission.reactor_alarm = 301;
+    check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "reactor alarm past its period rejected");
+    saved.native_mission.reactor_alarm = 0;
+    saved.native_mission.reactor_glass = 64;
+    check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "unknown reactor glass bit rejected");
+    saved.native_mission.reactor_glass = 0;
+    saved.native_mission.power1_blast_phase = 16;
+    check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "shaft phase outside its 16-step cycle rejected");
+    saved.native_mission.power1_blast_phase = 0;
+    saved.native_mission.flags |= 0x80000000u;
+    check(q2_save_write(&saved, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "unknown mission state cannot be written");
+    q2_save_free(&saved);
+    img_body(&image, NULL, 0);
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_OK && !loaded.native_mission_present,
+          "older saves without NMIS remain readable");
+    q2_save_free(&loaded);
+    at = img_chunk_begin(&image, "NMIS");
+    img_u32(&image, 1);
+    img_u32(&image, Q2_NATIVE_PUMP1);
+    for (i = 0; i < 29; i++) img_u32(&image, 0);
+    img_chunk_end(&image, at);
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_OK && loaded.native_mission_present &&
+          loaded.native_mission.flags == Q2_NATIVE_PUMP1 &&
+          loaded.native_mission.security_wall[0] == 0 &&
+          loaded.native_mission.security_wall[3] == 0,
+          "NMIS v1 has no pending security wall countdowns");
+    q2_save_free(&loaded);
+    img_body(&image, NULL, 0);
+    at = img_chunk_begin(&image, "NMIS");
+    img_u32(&image, 2);
+    img_u32(&image, Q2_NATIVE_SECURITY_BOSS);
+    for (i = 0; i < 29; i++) img_u32(&image, 0);
+    for (i = 0; i < 4; i++) img_u32(&image, 580 + 450*i);
+    img_chunk_end(&image, at);
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_OK && loaded.native_mission_present &&
+          loaded.native_mission.security_wall[3] == 1930 &&
+          loaded.native_mission.reactor_start == 0 &&
+          loaded.native_mission.reactor_alarm == 0 && loaded.native_mission.reactor_glass == 0,
+          "NMIS v2 retains wall timers and initializes reactor state");
+    q2_save_free(&loaded);
+    img_body(&image, NULL, 0);
+    at = img_chunk_begin(&image, "NMIS");
+    img_u32(&image, 3);
+    img_u32(&image, Q2_NATIVE_REACTOR_ACTIVE);
+    for (i = 0; i < 33; i++) img_u32(&image, 0);
+    img_u32(&image, 12340);
+    img_u32(&image, 300);
+    img_u32(&image, 3);
+    img_chunk_end(&image, at);
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_OK && loaded.native_mission_present &&
+          loaded.native_mission.reactor_start == 12340 &&
+          loaded.native_mission.reactor_alarm == 300 && loaded.native_mission.reactor_glass == 3 &&
+          loaded.native_mission.power1_next_blast == 0 && loaded.native_mission.power1_blast_phase == 0,
+          "NMIS v3 retains reactor state and initializes shaft clocks");
+    q2_save_free(&loaded);
+    img_body(&image, NULL, 0);
+    at = img_chunk_begin(&image, "NMIS");
+    img_u32(&image, 4);
+    for (i = 0; i < 37; i++) img_u32(&image, 0);
+    img_u32(&image, 901); img_u32(&image, 7);
+    img_chunk_end(&image, at);
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_OK &&
+          loaded.native_mission.power1_next_blast == 901 &&
+          loaded.native_mission.power1_blast_phase == 7 &&
+          !loaded.native_mission.lift[0].valid && !loaded.native_mission.lift[1].valid,
+          "NMIS v4 retains shaft clocks without inventing unloaded lift history");
+    q2_save_free(&loaded);
+    img_body(&image, NULL, 0);
+    at = img_chunk_begin(&image, "NMIS");
+    img_u32(&image, 5);
+    for (i = 0; i < 39; i++) img_u32(&image, 0);
+    for (i = 0; i < 2; i++) {
+        img_u32(&image, 1u | ((i + 1) << 8) | ((880u + i) << 16));
+        img_u32(&image, (u32)(-3600 + 80*(s32)i));
+        for (j = 0; j < 12; j++) img_u32(&image, 0);
+        img_u32(&image, (u32)-80);
+    }
+    img_chunk_end(&image, at);
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_OK &&
+          loaded.native_mission.lift[0].offset == -3600 &&
+          loaded.native_mission.lift[1].wait == 881 && loaded.native_mission.lift[1].dy == -80,
+          "NMIS v5 retains both LAB lift states");
+    for (i = Q2_NATIVE_LIFT_SECURITY_A; i < Q2_NATIVE_LIFT_COUNT; i++)
+        check(!loaded.native_mission.lift[i].valid,
+              "NMIS v5 does not invent unrecorded SECURITY/BOSS lift history");
+    q2_save_free(&loaded);
+    for (kind = 0; kind < 15; kind++) {
+        img_body(&image, NULL, 0);
+        for (j = 0; j < (kind == 2 ? 2u : 1u); j++) {
+            at = img_chunk_begin(&image, "NMIS");
+            img_u32(&image, kind == 4 ? 8 : kind >= 12 ? 4 : kind >= 8 ? 3 : kind >= 5 ? 2 : 1);
+            img_u32(&image, kind == 0 ? 0x80000000u : 0);
+            img_u32(&image, kind == 1 ? 8193 : 0);
+            for (i = 0; i < (kind == 3 ? 27u : 28u); i++) img_u32(&image, 0);
+            if (kind >= 5) {
+                img_u32(&image, kind == 5 ? 0xFFFFFFFFu : kind == 6 ? 601 : 0);
+                for (i = 0; i < (kind == 7 ? 2u : 3u); i++) img_u32(&image, 0);
+            }
+            if (kind >= 8) {
+                img_u32(&image, 12340);
+                img_u32(&image, kind == 8 ? 0xFFFFFFFFu : kind == 9 ? 301 : 0);
+                if (kind != 11) img_u32(&image, kind == 10 ? 64 : 0);
+            }
+            if (kind >= 12) {
+                img_u32(&image, 0x80000123u);
+                if (kind != 14) img_u32(&image, kind == 12 ? 16 : 0xFFFFFFFFu);
+            }
+            img_chunk_end(&image, at);
+        }
+        check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+              q2_save_read(&loaded, tmp_path()) == Q2_ERR_BAD_FORMAT,
+              "malformed NMIS flags, clocks, duplicates, lengths and versions rejected");
+        q2_save_free(&loaded);
+    }
+    for (kind = 0; kind < 9; kind++) {
+        img_body(&image, NULL, 0);
+        at = img_chunk_begin(&image, "NMIS");
+        img_u32(&image, 5);
+        for (i = 0; i < 39; i++) img_u32(&image, 0);
+        img_u32(&image, kind == 0 ? 2 : kind == 1 ? 0x701 : 1);
+        img_u32(&image, kind == 2 ? 32768 : 0);
+        for (i = 0; i < 12; i++) {
+            u32 v = 0;
+            if (kind == 3 && i == 0) v = 1; /* min > max */
+            if (kind == 4 && i == 6) v = 1; /* envelope excludes min */
+            if (kind == 5 && i == 9) v = 16777217; /* out-of-range envelope */
+            img_u32(&image, v);
+        }
+        img_u32(&image, kind == 6 ? 32768 : 0);
+        for (i = 0; i < (kind == 7 ? 14u : 15u); i++) img_u32(&image, 0);
+        if (kind == 8) img_u8(&image, 0);
+        img_chunk_end(&image, at);
+        check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+              q2_save_read(&loaded, tmp_path()) == Q2_ERR_BAD_FORMAT,
+              "malformed NMIS v5 lift state and truncated/oversized records are refused");
+        q2_save_free(&loaded);
+    }
+    for (kind = 0; kind < 4; kind++) {
+        img_body(&image, NULL, 0);
+        at = img_chunk_begin(&image, "NMIS");
+        img_u32(&image, 6);
+        for (i = 0; i < 39 + 15*6; i++) img_u32(&image, 0);
+        img_u32(&image, kind == 0 ? 2 : kind == 1 ? 0x701 : 0);
+        for (i = 0; i < (kind == 2 ? 13u : 14u); i++) img_u32(&image, 0);
+        if (kind == 3) img_u8(&image, 0);
+        img_chunk_end(&image, at);
+        check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+              q2_save_read(&loaded, tmp_path()) == Q2_ERR_BAD_FORMAT,
+              "NMIS v6 validates the final BOSS2 entry and exact payload length");
+        q2_save_free(&loaded);
+    }
+    for (kind = 1; kind <= 6; kind++) {
+        static const u32 sizes[] = {0, 124, 140, 152, 160, 280, 580};
+        img_body(&image, NULL, 0);
+        at = img_chunk_begin(&image, "NMIS");
+        img_u32(&image, kind);
+        img_u32(&image, Q2_NATIVE_TRAIN_OPEN);
+        for (i = 2; i < sizes[kind] / 4; i++) img_u32(&image, 0);
+        img_chunk_end(&image, at);
+        check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+              q2_save_read(&loaded, tmp_path()) == Q2_OK &&
+              loaded.native_mission.flags == Q2_NATIVE_TRAIN_OPEN &&
+              loaded.native_mission.boss2_quake_time == Q2_NATIVE_QUAKE_INACTIVE &&
+              !loaded.native_mission.boss2_quake_phase && !loaded.native_mission.security_quake_phase,
+              "NMIS v1..v6 initialize phases without restarting a completed BOSS2 sequence");
+        q2_save_free(&loaded);
+    }
+    for (kind = 0; kind < 10; kind++) {
+        img_body(&image, NULL, 0);
+        at = img_chunk_begin(&image, "NMIS");
+        img_u32(&image, kind == 9 ? 8 : 7);
+        for (i = 0; i < 144; i++) img_u32(&image, 0);
+        img_u32(&image, (u32)(kind == 0 ? -30 : kind == 1 ? 1 : -29));
+        img_u32(&image, (u32)(kind == 4 ? -3001 : kind == 5 ? -9998 : kind == 6 ? 3001 : -9999));
+        if (kind != 7) img_u32(&image, (u32)(kind == 2 ? -30 : kind == 3 ? 1 : -29));
+        if (kind == 8) img_u8(&image, 0);
+        img_chunk_end(&image, at);
+        check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+              q2_save_read(&loaded, tmp_path()) == Q2_ERR_BAD_FORMAT,
+              "NMIS v7 rejects malformed earthquake clocks, lengths and unknown versions");
+        q2_save_free(&loaded);
+    }
+    remove(tmp_path());
+}
+
 static void test_saved_script_replay(void)
 {
     u8 raw[40];
@@ -1628,7 +2124,7 @@ static void test_history_rejects_bad_counts(void)
     q2_save loaded;
     u32 at;
     u32 i;
-    static const char *const new_tags[] = { "VWPN", "ERTS", "PRST" };
+    static const char *const new_tags[] = { "VWPN", "ERTS", "PRST", "ZPOP" };
 
     for (i = 0; i < sizeof(new_tags) / sizeof(new_tags[0]); i++) {
         memset(&image, 0, sizeof(image));
@@ -1772,6 +2268,7 @@ static q2_creature_world *save_ai_fixture(void)
         w->set.monsters[i].group = (u16)i;
         w->set.monsters[i].pop_class_id = 18;
         w->set.monsters[i].stand = q2_cre_generic_stand;
+        w->set.monsters[i].cre_bind = &mod->bind;
     }
     q2_monster_init(&w->sight);
     w->sight.health = 70;
@@ -1806,10 +2303,17 @@ static void test_ai_resume(void)
     m->aiflags = Q2_AI_LOST_SIGHT; m->last_sighting[2] = 1200;
     m->saved_goal[0] = 600; m->trail_time = 199;
     m->velocity[0] = 40; m->maxs[1] = 100; m->on_ground = true;
+    m->spawn_initialized = true;
+    live->mod[0].bind.flyer_transition = 3;
+    live->mod[0].bind.strider_turn = 2;
+    live->mod[0].bind.strider_explosion_phase = 17;
+    live->mod[0].bind.boss1_explosion_phase = 31;
+    live->mod[0].bind.jorg_explosion_phase = 61;
     body = &live->set.monsters[1];
     body->in_use = body->dead = body->corpse = true;
     body->class_id = Q2_CLASS_CORPSE; body->corpse_was_class = 87;
     body->dissolve = 12; body->effect[2] = 3; body->hit_height = 150;
+    live->set.monsters[2].spawn_pending = true;
     saved.skill_present = true; saved.skill = 2;
     check(q2_save_capture_ai(&saved, live, 33333) == Q2_OK, "capture AI state");
     m->enemy = &stranger;
@@ -1827,6 +2331,14 @@ static void test_ai_resume(void)
     rebuilt->set.monsters[2].group = 2;
     check(q2_save_apply_ai(&loaded, rebuilt, &phase) == Q2_OK, "restore AI");
     m = &rebuilt->set.monsters[0]; body = &rebuilt->set.monsters[1];
+    check(m->spawn_initialized && !rebuilt->set.monsters[2].spawn_initialized &&
+          rebuilt->mod[0].bind.flyer_transition == 3 && rebuilt->mod[0].bind.strider_turn == 2 &&
+          rebuilt->mod[0].bind.strider_explosion_phase == 17 &&
+          rebuilt->mod[0].bind.boss1_explosion_phase == 31 &&
+          rebuilt->mod[0].bind.jorg_explosion_phase == 61,
+          "module-shared decisions and spawn initialization survive disk restore");
+    check(rebuilt->set.monsters[2].spawn_pending && !m->spawn_pending &&
+          !body->spawn_pending, "only the unspawned batch remains summonable after disk restore");
     check(m->enemy == &rebuilt->sight && m->oldenemy == body &&
           m->goalentity == &rebuilt->corner[1] &&
           m->movetarget == &rebuilt->corner[0] &&
@@ -1861,6 +2373,113 @@ static void test_ai_resume(void)
     q2_save_free(&saved); q2_save_free(&loaded);
     free(live->set.monsters); free(live->corner); free(live);
     free(rebuilt->set.monsters); free(rebuilt->corner); free(rebuilt);
+    q2_level_reset(); q2_trail_init();
+    remove(tmp_path());
+}
+
+static void test_ai_batch_compatibility(void)
+{
+    q2_creature_world *w = save_ai_fixture();
+    q2_save loaded = {0};
+    save_image image = {0};
+    u32 at, i, j, phase = 0, last_state = 0;
+
+    printf("legacy and malformed deferred-batch save state\n");
+    /* An independent CAIS v1 fixture: 198-byte scalar/vector state, then
+     * five references, NAME13 move module, move offset, and two flags. */
+    at = img_chunk_begin(&image, "CAIS");
+    img_u32(&image, 1); img_u32(&image, 3); img_u32(&image, 2);
+    img_u32(&image, 0);
+    for (i = 0; i < 4; i++) img_u32(&image, 0); /* level counters */
+    for (i = 0; i < 4; i++) img_u32(&image, UINT32_MAX); /* level refs */
+    for (i = 0; i < 3; i++) img_u32(&image, 0); /* sight/sound stamps */
+    for (i = 0; i < 198; i++) img_u8(&image, 0); /* sight state */
+    img_u32(&image, 0); img_u8(&image, 0); /* trail head/active */
+    for (i = 0; i < 8 * 18; i++) img_u8(&image, 0); /* eight trail spots */
+    for (i = 0; i < 3; i++) {
+        u32 state = image.len;
+        for (j = 0; j < 198; j++) img_u8(&image, 0);
+        image.b[state + 21] = 18; /* authored pop_class_id */
+        image.b[state + 25] = (u8)i; /* group */
+        for (j = 0; j < 5; j++) img_u32(&image, UINT32_MAX);
+        for (j = 0; j < 13; j++) img_u8(&image, 0);
+        img_u32(&image, 0); img_u8(&image, 0);
+        img_u8(&image, i == 0 ? 1 : 0); /* freed/started, excluded, dormant */
+        last_state = state;
+    }
+    img_chunk_end(&image, at);
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_OK,
+          "CAIS v1 remains readable without a pending byte");
+    w->set.monsters[0].spawn_pending = true;
+    w->set.monsters[1].spawn_pending = false;
+    w->set.monsters[2].spawn_pending = true;
+    check(q2_save_apply_ai(&loaded, w, &phase) == Q2_OK &&
+          !w->set.monsters[0].spawn_pending && !w->set.monsters[1].spawn_pending &&
+          w->set.monsters[2].spawn_pending,
+          "legacy restore retains only a resident batch that never started");
+    q2_save_free(&loaded);
+
+    /* Older rosters omitted the three unsupported classes. Add them before
+     * and between saved actors and retain the old index-based links. */
+    {
+        q2_monster *expanded = calloc(6, sizeof(*expanded));
+        u32 first_state = last_state - 2 * 237;
+        if (!expanded) exit(2);
+        for (i = 0; i < 3; i++) expanded[i * 2 + 1] = w->set.monsters[i];
+        for (i = 0; i < 3; i++) {
+            q2_monster_init(&expanded[i * 2]);
+            expanded[i * 2].pop_class_id = (u8)(13 + i);
+            expanded[i * 2].group = 99;
+        }
+        expanded[0].spawn_initialized = true;
+        free(w->set.monsters); w->set.monsters = expanded;
+        w->set.count = w->set.capacity = 6;
+        q2_wr_u32(image.b + first_state + 198, 1);      /* enemy */
+        q2_wr_u32(image.b + first_state + 198 + 16, 2); /* owner */
+        q2_wr_u32(image.b + at + 4 + 36, 1);           /* sight_entity */
+        check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+              q2_save_read(&loaded, tmp_path()) == Q2_OK,
+              "legacy roster with creature references reads independently");
+        check(q2_save_apply_ai(&loaded, w, &phase) == Q2_OK &&
+              expanded[1].enemy == &expanded[3] && expanded[1].owner == &expanded[5] &&
+              q2_level_state.sight_entity == &expanded[3] && q2_level_state.total_monsters == 1,
+              "newly supported classes do not shift old targets or lose new kill totals");
+        expanded[2].pop_class_id = 18; expanded[1].health = 77;
+        check(q2_save_apply_ai(&loaded, w, &phase) == Q2_ERR_BAD_FORMAT && expanded[1].health == 77,
+              "legacy remapping rejects unrelated roster changes before mutation");
+        q2_save_free(&loaded);
+    }
+
+    /* Change that independent fixture to v2 by inserting one byte per record,
+     * working backwards so each old offset stays valid. */
+    for (i = 3; i > 0; i--) {
+        u32 end = last_state + 237 - (3 - i) * 237;
+        memmove(image.b + end + 1, image.b + end, image.len - end);
+        image.b[end] = i == 3 ? 1 : 0;
+        image.len++;
+    }
+    image.b[at + 4] = 2;
+    img_chunk_end(&image, at);
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_OK,
+          "independent CAIS v2 fixture reads its pending latch");
+    q2_save_free(&loaded);
+    image.b[image.len - 1] = 2;
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "non-boolean pending state is rejected");
+    image.b[image.len - 1] = 1;
+    image.b[last_state + 2 + 101] = 1; /* previous records inserted two bytes */
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "a live creature cannot also be pending");
+    image.b[last_state + 2 + 101] = 0;
+    image.b[last_state + 2 + 102] = 1;
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &image) &&
+          q2_save_read(&loaded, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "a dead creature cannot also be pending");
+    free(w->set.monsters); free(w->corner); free(w);
     q2_level_reset(); q2_trail_init();
     remove(tmp_path());
 }
@@ -1938,9 +2557,14 @@ static void test_mission_and_settings(void)
     q2_mission_set_row(&mission, 1, "INSTALLATION", 1, 1, 9, 9);
     q2_save_capture_mission(&saved, &mission);
     q2_save_set_settings(&saved, settings, 8);
+    saved.cheat_level_present = true;
+    saved.cheat_level = 3;
 
     check(q2_save_write(&saved, tmp_path()) == Q2_OK, "writes");
     check(q2_save_read(&loaded, tmp_path()) == Q2_OK, "reads back");
+
+    check(loaded.cheat_level_present && loaded.cheat_level == 3,
+          "a game's Game Config retains its unlocked tier");
 
     q2_mission_init(&restored);
     q2_save_apply_mission(&loaded, &restored);
@@ -2202,7 +2826,9 @@ static void test_settings_slots_and_ui(void)
     clear_settings_slots();
 
     memset(&source, 0, sizeof(source));
-    source.count = 9;
+    /* Exercise the complete bounded container, including room for the four
+     * player identities appended by the current client settings schema. */
+    source.count = Q2_SETTINGS_VALUE_MAX;
     for (i = 0; i < (int)source.count; i++)
         source.value[i] = (s16)(i == 7 ? -1 : i * 17 - 40);
 
@@ -2219,6 +2845,52 @@ static void test_settings_slots_and_ui(void)
           "reads settings back");
     check_eq_i(loaded.count, source.count, "the settings count survives");
     check_eq_i(loaded.value[7], -1, "signed settings survive");
+    check(!memcmp(source.value, loaded.value, sizeof(source.value)),
+          "every settings halfword survives the full-size file");
+    check(!loaded.unlock_file && loaded.cheat_level == 0,
+          "ordinary settings have no fabricated unlock");
+
+    /* Unlocks share the settings positions, including their overwrite gate. */
+    for (i = 1; i <= 3; i++) {
+        source.cheat_level = (u8)i;
+        q2_save_ui_init(&ui);
+        q2_save_ui_open_unlock_save(&ui, &source);
+        q2_save_ui_choose(&ui, 0);
+        q2_save_ui_request(&ui, Q2_SAVEUI_STATE_LIST);
+        if (i > 1) {
+            check(ui.state == Q2_SAVEUI_STATE_CHOICE,
+                  "an existing unlock asks before overwrite");
+            q2_save_ui_request(&ui, Q2_SAVEUI_STATE_START);
+            check(q2_settings_slot_read(&loaded, 0) == Q2_OK &&
+                  loaded.cheat_level == i - 1, "No keeps the older unlock");
+            q2_save_ui_request(&ui, Q2_SAVEUI_STATE_LIST);
+            q2_save_ui_request(&ui, Q2_SAVEUI_STATE_BUSY);
+        }
+        check(q2_save_ui_update(&ui) == Q2_SAVE_UI_SAVED,
+              "the unlock write completes through the deferred card flow");
+        check(strstr(q2_save_ui_row(&ui, 0), "MULTI UNLOCK") != NULL,
+              "the card directory labels the unlock file");
+        check(q2_settings_slot_read(&loaded, 0) == Q2_OK &&
+              loaded.cheat_level == i && loaded.unlock_file,
+              "each unlock tier survives the settings file");
+        check(!memcmp(source.value, loaded.value, sizeof(source.value)),
+              "the unlock also preserves the complete Game Config");
+        q2_save_ui_acknowledge(&ui);
+        q2_save_ui_open_settings_load(&ui);
+        q2_save_ui_choose(&ui, 0);
+        q2_save_ui_request(&ui, Q2_SAVEUI_STATE_LIST);
+        check(q2_save_ui_update(&ui) == Q2_SAVE_UI_LOADED &&
+              q2_save_ui_take_settings(&ui, &loaded) && loaded.cheat_level == i,
+              "LOAD SETTINGS restores an unlock file");
+        q2_save_ui_free(&ui);
+    }
+    source.cheat_level = 4;
+    check(q2_settings_slot_write(&source, 0) == Q2_ERR_RANGE,
+          "invalid tier is rejected before opening an existing file");
+    check(q2_settings_slot_read(&loaded, 0) == Q2_OK && loaded.cheat_level == 3,
+          "invalid writes preserve the previous reward");
+    source.cheat_level = 0;
+    q2_settings_slot_delete(0);
 
     /* The settings mode drives the same deferred card flow and does not list
      * game-save files as settings files. */
@@ -2274,6 +2946,59 @@ static void test_settings_slots_and_ui(void)
     }
 
     clear_settings_slots();
+}
+
+static void test_legacy_and_invalid_unlocks(void)
+{
+    save_image body;
+    q2_settings_blob loaded;
+    q2_save game = {0};
+    char path[512];
+    u32 at;
+    int variant;
+    FILE *f;
+    printf("legacy settings and malformed unlock metadata\n");
+    q2_save_set_dir(tmp_dir());
+    q2_settings_slot_path(0, path, sizeof(path));
+    /* Version 1 remains a valid settings file and implies tier NONE.
+     * The invalid v2 files have correct CRCs, so validation must check values. */
+    for (variant = 0; variant < 4; variant++) {
+        memset(&body, 0, sizeof(body));
+        img_u32(&body, 0); /* no opaque payload */
+        if (variant) {
+            img_u32(&body, variant == 1 ? 4u : variant == 2 ? 0x20003u : 0x10000u);
+        }
+        check(img_write(path, variant ? 2 : 1, &body), "writes settings fixture");
+        f = fopen(path, "r+b");
+        check(f != NULL, "opens settings fixture");
+        if (!f) continue;
+        fwrite("Q2CF", 1, 4, f); fclose(f);
+        if (!variant) {
+            check(q2_settings_slot_read(&loaded, 0) == Q2_OK &&
+                  !loaded.cheat_level && !loaded.unlock_file,
+                  "legacy settings remain readable without awarding a tier");
+        } else {
+            check(q2_settings_slot_read(&loaded, 0) == Q2_ERR_BAD_FORMAT,
+                  "invalid tier, type, or unlock without a tier is rejected");
+            check(!loaded.count && !loaded.cheat_level && !loaded.unlock_file,
+                  "failed reads expose no partial reward");
+        }
+    }
+    q2_settings_slot_delete(0);
+    memset(&body, 0, sizeof(body));
+    at = img_chunk_begin(&body, "UNLK"); img_u32(&body, 4); img_chunk_end(&body, at);
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &body) &&
+          q2_save_read(&game, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "invalid game-save reward is rejected");
+    memset(&body, 0, sizeof(body));
+    for (variant = 0; variant < 2; variant++) {
+        at = img_chunk_begin(&body, "UNLK"); img_u32(&body, 3); img_chunk_end(&body, at);
+    }
+    check(img_write(tmp_path(), Q2_SAVE_VERSION, &body) &&
+          q2_save_read(&game, tmp_path()) == Q2_ERR_BAD_FORMAT,
+          "duplicate game-save rewards are rejected");
+    q2_save_free(&game);
+    remove(tmp_path());
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2449,6 +3174,7 @@ int main(void)
     test_event_scheduler_restore();
     test_projectile_runtime_restore();
     test_projectile_chunk_order();
+    test_autoaim_player_tail();
     test_round_trip();
     test_apply();
     test_apply_rejects_mismatched_map();
@@ -2458,12 +3184,15 @@ int main(void)
     test_v5_spent_record_stays_spent();
     test_item_latches_round_trip();
     test_event_history_round_trip();
+    test_zone_history_round_trip();
+    test_native_mission_state();
     test_permanent_object_state();
     test_saved_script_replay();
     test_explosive_save_and_transient_models();
     test_history_rejects_bad_counts();
     test_rotator_resume();
     test_ai_resume();
+    test_ai_batch_compatibility();
     test_detects_corruption();
     test_mission_and_settings();
     test_level_counters_round_trip();
@@ -2471,6 +3200,7 @@ int main(void)
     test_slots();
     test_slot_scan_survives_rubbish();
     test_settings_slots_and_ui();
+    test_legacy_and_invalid_unlocks();
     test_ui_save_flow();
     test_ui_load_flow();
     test_ui_reports_failure();

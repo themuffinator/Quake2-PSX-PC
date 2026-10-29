@@ -469,6 +469,107 @@ static void test_sort_region_drawenv(void)
  * own clear off, or the split-screen gutters — the only pixels the full-screen
  * clear owns — would be the only thing it painted.
  */
+static void test_texture_window_drawenv(void)
+{
+    q2_screen s;
+    psx_ot ot;
+    psx_raster_opts opts;
+    psx_vram *vram = calloc(1, sizeof(*vram));
+    psx_prim *p;
+    const psx_framebuffer *fb;
+    int step;
+    CHECK(vram != NULL, "texture window VRAM allocates");
+    if (!vram) return;
+    q2_screen_init(&s, Q2_VIDEO_PAL);
+    q2_screen_set_layout(&s, Q2_SCREEN_LAYOUT_ONE, 1);
+    psx_ot_init(&ot, Q2_SCREEN_OT_ENTRIES, 16);
+    psx_raster_opts_default(&opts);
+    vram->px[0][0] = 0x03E0;
+    vram->px[0][8] = 0x001F;
+    q2_screen_frame_begin(&s, &ot);
+    psx_fb_clear(q2_screen_back(&s), 0);
+    q2_screen_view_begin(&s, 0, &ot, NULL);
+    p = psx_ot_add_bucket(&ot, psx_ot_authored_bucket(&ot, 2));
+    p->kind = PSX_PRIM_TWINDOW;
+    p->texture_window = 1u | (1u << 10);
+    p = psx_ot_add_bucket(&ot, psx_ot_authored_bucket(&ot, 2));
+    p->kind = PSX_PRIM_MASK; p->mask_mode = 1;
+    for (step = 0; step < 2; step++) {
+        p = psx_ot_add_bucket(&ot, psx_ot_authored_bucket(&ot, 3 + step*2));
+        p->kind = PSX_PRIM_SPRT;
+        p->set_tpage = true; p->tpage = 2 << 7;
+        p->xy[0].x = (s16)(10 + step*10); p->xy[0].y = 10;
+        p->xy[2].x = (s16)(11 + step*10); p->xy[2].y = 11;
+    }
+    p = psx_ot_add_bucket(&ot, psx_ot_authored_bucket(&ot, 4));
+    p->kind = PSX_PRIM_DRAW_ENV;
+    p->xy[1].x = s.view[0].w; p->xy[1].y = s.view[0].h;
+    q2_screen_view_end(&s, &ot);
+    q2_screen_compose(&s, &ot, vram, &opts);
+    q2_screen_present(&s);
+    fb = q2_screen_front(&s);
+    CHECK(fb->px[10*fb->width + 10] == 0x801F,
+          "E2 and E6 persist through E1 before the first sprite");
+    CHECK(fb->px[10*fb->width + 20] == 0x83E0,
+          "DRAWENV resets E2 while preserving E6 for the second sprite");
+    psx_ot_free(&ot);
+    q2_screen_free(&s);
+    free(vram);
+}
+
+static void test_native_vram_compose(void)
+{
+    q2_screen s;
+    psx_ot ot;
+    psx_raster_opts opts;
+    psx_vram *vram = calloc(1, sizeof(*vram));
+    psx_prim *p;
+    psx_framebuffer *fb;
+    int draw, other, ox;
+    CHECK(vram != NULL, "native composition VRAM allocates");
+    if (!vram) return;
+    q2_screen_init(&s, Q2_VIDEO_PAL);
+    psx_ot_init(&ot, Q2_SCREEN_OT_ENTRIES, 8);
+    psx_raster_opts_default(&opts);
+    q2_screen_frame_begin(&s, &ot);
+    draw = s.disp.draw_buffer; other = 1 - draw;
+    ox = s.disp.buf[draw].x;
+    fb = q2_screen_back(&s);
+    fb->px[3] = 0x7C00; /* a host loading/clear path before composition */
+    p = psx_ot_add_bucket(&ot, 0);
+    p->kind = PSX_PRIM_TILE; p->rgb[0].r = 248;
+    p->xy[0] = (psx_xy){10,10}; p->xy[2] = (psx_xy){11,11};
+    p = psx_ot_add_bucket(&ot, 1);
+    p->kind = PSX_PRIM_SPRT;
+    p->set_tpage = true; p->tpage = (u16)((2 << 7) | (ox >> 6));
+    p->uv[0] = (psx_uv){10,10};
+    p->xy[0] = (psx_xy){20,10}; p->xy[2] = (psx_xy){21,11};
+    p = psx_ot_add_bucket(&ot, 2);
+    p->kind = PSX_PRIM_MOVE;
+    p->xy[0] = (psx_xy){10,10};
+    p->xy[1] = (psx_xy){(s16)(s.disp.buf[other].x + 30 - ox),10};
+    p->xy[2] = (psx_xy){1,1};
+    q2_screen_compose(&s, &ot, vram, &opts);
+    CHECK(vram->px[0][ox+3] == 0x7C00, "host writes published to native VRAM");
+    CHECK(fb->px[10*fb->width+20] == 31, "rendered framebuffer sampled as texture");
+    CHECK(s.buf[other].px[10*s.buf[other].width+30] == 31,
+          "cross-buffer MOVE refreshes the other presentation buffer");
+    CHECK(!s.buf[0].vram && !s.buf[1].vram, "composition releases borrowed VRAM");
+
+    q2_screen_resize(&s, true, 1920, 1080);
+    q2_screen_frame_begin(&s, &ot);
+    vram->px[0][0] = 0x1234;
+    p = psx_ot_add_bucket(&ot, 0);
+    p->kind = PSX_PRIM_TILE; p->rgb[0].r = 248;
+    p->xy[0] = (psx_xy){0,0}; p->xy[2] = (psx_xy){1,1};
+    q2_screen_compose(&s, &ot, vram, &opts);
+    CHECK(vram->px[0][0] == 0x1234, "adaptive target does not overwrite native textures");
+    CHECK(q2_screen_back(&s)->px[0] == 31, "adaptive host framebuffer still draws");
+    psx_ot_free(&ot);
+    q2_screen_free(&s);
+    free(vram);
+}
+
 static void test_background(void)
 {
     q2_screen s;
@@ -1534,8 +1635,128 @@ static void test_view_fov(void)
 }
 
 /* ------------------------------------------------------------------------- */
+static void test_flash_inherited_blend(void)
+{
+    static const u16 expected[4] = {0x318C, 0x6318, 0x2108, 0x4A52};
+    static const u8 tint[3] = {64, 64, 64};
+    q2_screen s;
+    psx_ot ot;
+    psx_raster_opts opts;
+    int mode, view;
+    q2_screen_init(&s, Q2_VIDEO_PAL);
+    q2_screen_set_layout(&s, Q2_SCREEN_LAYOUT_TWO_V, 2);
+    psx_ot_init(&ot, Q2_SCREEN_OT_ENTRIES, 32);
+    psx_raster_opts_default(&opts);
+    opts.textures = opts.dither = false;
+    for (mode = 0; mode < 4; mode++) {
+        q2_screen_frame_begin(&s, &ot);
+        psx_fb_clear(q2_screen_back(&s), 0);
+        for (view = 0; view < 2; view++) {
+            psx_prim *p;
+            q2_screen_flash_set(&s, view, tint, 2, Q2_SCREEN_FLASH_FADE);
+            q2_screen_view_begin(&s, view, &ot, NULL);
+            p = psx_ot_add_bucket(&ot, ((u32)Q2_SCREEN_OT_VIEW_BASE +
+                    (u32)view * Q2_SCREEN_OT_VIEW_STRIDE + 44) * PSX_OT_SUBDIV);
+            if (!p) exit(2);
+            p->kind = PSX_PRIM_TILE;
+            p->xy[2].x = s.view[view].w;
+            p->xy[2].y = s.view[view].h;
+            p->rgb[0].r = p->rgb[0].g = p->rgb[0].b = 128;
+            if (!view) {
+                p = psx_ot_add_bucket(&ot, ((u32)Q2_SCREEN_OT_VIEW_BASE +
+                    (u32)view * Q2_SCREEN_OT_VIEW_STRIDE + 45) * PSX_OT_SUBDIV);
+                if (!p) exit(2);
+                p->kind = PSX_PRIM_FT4; /* no pixels, but page executes */
+                p->tpage = (u16)(mode << 5);
+            }
+            q2_screen_view_end(&s, &ot);
+        }
+        q2_screen_compose(&s, &ot, NULL, &opts);
+        for (view = 0; view < 2; view++) {
+            const psx_framebuffer *fb = q2_screen_back(&s);
+            int at = (s.view[view].y + 10) * fb->width + s.view[view].x + 10;
+            CHECK(fb->px[at] == expected[view ? 0 : mode],
+                  "flash view %d ABR %d got %04X expected %04X", view, mode,
+                  fb->px[at], expected[view ? 0 : mode]);
+        }
+    }
+    psx_ot_free(&ot);
+    q2_screen_free(&s);
+}
+
+static void test_adaptive_aspects(void)
+{
+    static const int sizes[][2] = {
+        {1280,1024}, {1024,768}, {1920,1200}, {1920,1080},
+        {2560,1080}, {5120,1440}, {1080,1920}, {1080,1080},
+        {7680,1440}, {640,1920}, {64,64}
+    };
+    static const q2_screen_layout layouts[] = {
+        Q2_SCREEN_LAYOUT_ONE, Q2_SCREEN_LAYOUT_FULL_SINGLE,
+        Q2_SCREEN_LAYOUT_TWO_H, Q2_SCREEN_LAYOUT_TWO_V, Q2_SCREEN_LAYOUT_QUAD
+    };
+    int video, a, l, p;
+    for (video = 0; video < 2; video++) {
+        q2_screen s;
+        CHECK(q2_screen_init(&s, video ? Q2_VIDEO_NTSC : Q2_VIDEO_PAL) == Q2_OK,
+              "adaptive init");
+        for (a = 0; a < (int)(sizeof(sizes) / sizeof(sizes[0])); a++) {
+            CHECK(q2_screen_resize(&s, true, sizes[a][0], sizes[a][1]) == Q2_OK,
+                  "resize %d", a);
+            CHECK(s.buf[0].width <= 960 && s.buf[0].height <= 480,
+                  "inside hardware coordinate bounds");
+            for (l = 0; l < (int)(sizeof(layouts) / sizeof(layouts[0])); l++) {
+                q2_screen_set_layout(&s, layouts[l], 4);
+                for (p = -1; p < s.view_count; p++) {
+                    int x, y, w, h;
+                    int dw = p < 0 ? s.buf[0].width : s.view[p].w;
+                    int dh = p < 0 ? s.buf[0].height : s.view[p].h;
+                    q2_screen_ui_rect(&s, p, &x, &y, &w, &h);
+                    CHECK(x >= 0 && y >= 0 && x + w <= dw && y + h <= dh,
+                          "UI contained: aspect %d layout %d view %d", a, l, p);
+                    CHECK(abs(2*x+w-dw) <= 1 && abs(2*y+h-dh) <= 1,
+                          "UI centered");
+                    if (p >= 0) {
+                        q2_screen_view *v = &s.view[p], *n = &s.native_view[p];
+                        double hr = (double)v->w * n->proj / (v->proj * n->w);
+                        double vr = (double)v->h * n->proj / (v->proj * n->h);
+                        CHECK(vr > 0.98 && vr < 1.02, "vertical FOV preserved %g", vr);
+                        if (v->w * n->h > n->w * v->h)
+                            CHECK(hr > 0.98, "wide views expand horizontal FOV");
+                        else
+                            CHECK(hr < 1.02, "tall views narrow horizontal FOV");
+                        CHECK(v->x >= 0 && v->y >= 0 &&
+                              v->x+v->w <= s.buf[0].width &&
+                              v->y+v->h <= s.buf[0].height, "viewport contained");
+                        if (p > 0) {
+                            q2_screen_view *prev = &s.view[p-1];
+                            CHECK(v->x >= prev->x+prev->w || v->y >= prev->y+prev->h,
+                                  "split views do not overlap");
+                        }
+                    }
+                }
+                /* Resizing is geometry-only: a pending damage flash survives. */
+                s.view[0].flash.strength = 7;
+                q2_screen_resize(&s, true, sizes[a][0], sizes[a][1]);
+                CHECK(s.view[0].flash.strength == 7, "resize retains live state");
+            }
+        }
+        {
+            int w = s.buf[0].width, h = s.buf[0].height;
+            q2_screen_resize(&s, true, 0, 0);
+            CHECK(s.buf[0].width == w && s.buf[0].height == h, "minimize retains buffers");
+            q2_screen_resize(&s, false, 1920, 1080);
+            CHECK(s.buf[0].width == 512 && s.buf[0].height == s.disp.height,
+                  "legacy size restored");
+            CHECK(s.view[0].proj == s.native_view[0].proj, "legacy FOV restored");
+        }
+        q2_screen_free(&s);
+    }
+}
+
 int main(void)
 {
+    test_adaptive_aspects();
     test_bringup();
     test_swap();
     test_ot_slices();
@@ -1543,6 +1764,8 @@ int main(void)
     test_layouts();
     test_compose_clip();
     test_sort_region_drawenv();
+    test_texture_window_drawenv();
+    test_native_vram_compose();
     test_background();
     test_shake();
     test_depth_direction();
@@ -1561,6 +1784,7 @@ int main(void)
     test_pixel_aspect();
     test_fit_rect();
     test_view_fov();
+    test_flash_inherited_blend();
 
     if (g_fail == 0)
         printf("test_screen: all checks passed\n");

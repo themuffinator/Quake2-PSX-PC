@@ -77,6 +77,7 @@ static void make_player(q2_monster *p, s32 x, s32 z)
 static int g_stand_calls, g_walk_calls, g_run_calls, g_idle_calls;
 static int g_search_calls, g_attack_calls, g_melee_calls, g_sight_calls;
 static int g_bigturn_calls;
+static s32 g_bigturn_delta;
 static bool g_checkattack_result;
 static int  g_checkattack_calls;
 
@@ -87,7 +88,8 @@ static void spy_idle(q2_monster *m)   { (void)m; g_idle_calls++;   }
 static void spy_search(q2_monster *m) { (void)m; g_search_calls++; }
 static void spy_attack(q2_monster *m) { (void)m; g_attack_calls++; }
 static void spy_melee(q2_monster *m)  { (void)m; g_melee_calls++;  }
-static void spy_bigturn(q2_monster *m){ (void)m; g_bigturn_calls++;}
+static void spy_bigturn(q2_monster *m, s32 turn)
+{ (void)m; g_bigturn_calls++; g_bigturn_delta = turn; }
 static void spy_sight(q2_monster *m, q2_monster *o)
 {
     (void)m; (void)o; g_sight_calls++;
@@ -429,7 +431,7 @@ static void test_vectors(void)
     v[0] = 0; v[1] = 0; v[2] = -1000;
     check_eq_i(q2_vectoyaw(v), Q2_ANGLE_180, "-Z is yaw 2048");
     v[0] = -1000; v[1] = 0; v[2] = 0;
-    check_eq_i(q2_vectoyaw(v), Q2_ANGLE_90 * 3, "-X is yaw 3072");
+    check_eq_i(q2_vectoyaw(v), -Q2_ANGLE_90, "-X retains native signed yaw -1024");
 
     /* Zero offset returns zero rather than an arbitrary angle. 0x8005F8FC. */
     v[0] = v[1] = v[2] = 0;
@@ -586,7 +588,7 @@ static void test_turning(void)
     place(&m, 0, 0, 0);
     m.yaw_speed = 200;
     m.ideal_yaw = 100;
-    q2_M_ChangeYaw(&m);
+    check(!q2_M_ChangeYaw(&m), "arriving within one step returns the native zero flag");
     check_eq_i(m.angles[2], 100, "a turn inside one step lands exactly");
     check(!q2_M_ChangeYaw(&m), "and reports nothing left to do");
 
@@ -599,6 +601,7 @@ static void test_turning(void)
     m.bigturn = spy_bigturn;
     q2_M_ChangeYaw(&m);
     check_eq_i(g_bigturn_calls, 1, "a turn past the threshold calls the hook");
+    check_eq_i(g_bigturn_delta, 200, "the hook receives the signed clamped step");
     check_eq_i(m.angles[2], 0, "and does NOT turn this tick");
 
     m.ideal_yaw = 100;
@@ -1954,7 +1957,8 @@ static void test_frame_driver(void)
         m.frame       = 10;
         m.dead        = true;
         m.in_use      = true;
-        m.think       = NULL;       /* a corpse has no AI to run */
+        m.think       = q2_M_MoveFrame; /* retail keeps the installed driver */
+        q2_level_state.time = q2_level_state.framenum;
         d = &m;
 
         q2_monster_set_tick(&set);
@@ -2272,6 +2276,17 @@ static void test_end_to_end(void)
 int main(void)
 {
     printf("Q2PSX-PC AI tests\n\n");
+
+    {
+        const s32 origin[3] = { 10, 20, 30 };
+        const s32 forward[3] = { -4095, 0, 4095 };
+        const s32 right[3] = { -1, 0, 1 };
+        const s16 offset[3] = { 1, 72, 1 };
+        s32 out[3];
+        q2_project_source(origin, offset, forward, right, out);
+        check(out[0] == 10 && out[1] == 92 && out[2] == 30,
+              "project source truncates each product before addition and keeps Y offset");
+    }
 
     test_constants();
     test_range_bands();

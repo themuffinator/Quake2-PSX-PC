@@ -19,7 +19,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import json
+import re
+from html.parser import HTMLParser
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -357,9 +361,56 @@ class Packaging(unittest.TestCase):
             expect=package.EXECUTABLES,
         )
         self.assertEqual(staging.name, "q2psx-pc-0.1.0-linux-x64")
-        for name in ("q2psx", "q2psx-inspect", "stx2avi", "README.md", "CHANGELOG.md"):
+        for name in ("q2psx", "q2psx-inspect", "stx2avi", "README.txt", "USER-GUIDE.html", "CHANGELOG.md", "CREDITS.md"):
             self.assertTrue((staging / name).is_file(), name)
-        self.assertTrue((staging / "docs" / "FORMATS.md").is_file())
+        self.assertFalse((staging / "README.md").exists())
+        self.assertFalse((staging / "docs").exists())
+
+    def test_multiconfig_uses_matching_executables_and_runtime(self):
+        for config in ("Debug", "Release"):
+            bindir = self.build / "bin" / config
+            bindir.mkdir()
+            for name in ("q2psx.exe", "q2psx-inspect.exe", "stx2avi.exe", "SDL3.dll"):
+                (bindir / name).write_text(config, encoding="utf-8")
+        staging = package.stage(
+            build_dir=self.build, out_dir=self.root / "dist", version="0.2.0",
+            platform="windows-x64", expect=package.EXECUTABLES, config="Release",
+        )
+        self.assertEqual((staging / "SDL3.dll").read_text(), "Release")
+        self.assertEqual((staging / "q2psx.exe").read_text(), "Release")
+
+    def test_every_platform_archive_contains_the_offline_release_guide(self):
+        import tarfile
+        import zipfile
+
+        for platform in ("windows-x64", "linux-x64", "macos-arm64"):
+            with self.subTest(platform=platform):
+                names = [package.executable_name(name, platform) for name in package.EXECUTABLES]
+                self.make_binaries(*names)
+                staging = package.stage(
+                    build_dir=self.build, out_dir=self.root / "dist", version="9.8.7",
+                    platform=platform, expect=package.EXECUTABLES,
+                )
+                archive = package.make_archive(staging, platform)
+                expected = set(names) | {"USER-GUIDE.html", "README.txt", "LICENSE", "CREDITS.md", "CHANGELOG.md"}
+                if platform.startswith("windows"):
+                    expected |= {"Play.cmd", "Play.vbs"}
+                    with zipfile.ZipFile(archive) as bundle:
+                        contents = {Path(name).name: bundle.read(name) for name in bundle.namelist()}
+                else:
+                    with tarfile.open(archive) as bundle:
+                        contents = {Path(m.name).name: bundle.extractfile(m).read()
+                                    for m in bundle.getmembers() if m.isfile()}
+                self.assertEqual(set(contents), expected)
+                guide = contents["USER-GUIDE.html"].decode("utf-8")
+                self.assertIn('<span id="build-version">Version 9.8.7</span>', guide)
+                self.assertNotIn("Development edition", guide)
+                self.assertIn("USER-GUIDE.html", contents["README.txt"].decode())
+                parsed = GuideParser()
+                parsed.feed(guide)
+                for href in parsed.links:
+                    if not href.startswith(("#", "https://")):
+                        self.assertIn(href, contents, f"broken offline link: {href}")
 
     def test_stage_uses_exe_names_on_windows(self):
         self.make_binaries("q2psx-inspect.exe")
@@ -504,6 +555,71 @@ class Packaging(unittest.TestCase):
         empty.mkdir()
         with self.assertRaises(package.PackageError):
             package.write_checksums(empty)
+
+
+class GuideParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.ids = []
+        self.links = []
+        self.dependencies = []
+        self.h1_count = 0
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if "id" in attrs:
+            self.ids.append(attrs["id"])
+        if tag == "a":
+            self.links.append(attrs.get("href", ""))
+        if tag in ("script", "link", "iframe", "img", "video", "audio", "object"):
+            self.dependencies.append((tag, attrs))
+        self.h1_count += tag == "h1"
+
+
+class UserGuide(unittest.TestCase):
+    def test_navigation_is_complete_and_content_is_self_contained(self):
+        guide = package.render_user_guide("0.2.0")
+        parsed = GuideParser()
+        parsed.feed(guide)
+        self.assertEqual(len(parsed.ids), len(set(parsed.ids)), "duplicate navigation IDs")
+        self.assertEqual(parsed.h1_count, 1)
+        self.assertFalse(parsed.dependencies, "offline manual must not fetch resources or execute scripts")
+        self.assertNotRegex(guide, r"@import|url\s*\(")
+        self.assertIn('<html lang="en">', guide)
+        self.assertIn('name="viewport"', guide)
+        for href in parsed.links:
+            self.assertTrue(href)
+            if href.startswith("#"):
+                self.assertIn(href[1:], parsed.ids, f"broken anchor: {href}")
+
+    def test_missing_or_ambiguous_version_marker_fails_packaging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(package, "ROOT", root):
+                with self.assertRaises(package.PackageError):
+                    package.render_user_guide("0.2.0")
+                for source in ("<html></html>", package.GUIDE_VERSION_MARKER * 2):
+                    (root / package.GUIDE_NAME).write_text(source, encoding="utf-8")
+                    with self.assertRaises(package.PackageError):
+                        package.render_user_guide("0.2.0")
+
+    def test_palette_matches_the_design_reference_and_text_contrast(self):
+        guide = package.render_user_guide("0.2.0")
+        palette = json.loads((package.ROOT / "docs/design/tokens.json").read_text(encoding="utf-8"))["colors"]
+        css = dict(re.findall(r"--([A-Za-z]+):\s*(#[0-9A-Fa-f]{6});", guide))
+        for name in ("navy", "panel", "violet", "orange", "paper", "ink", "printBlue", "printOrange", "white", "steel"):
+            self.assertEqual(css[name].upper(), palette[name]["value"].upper())
+
+        def luminance(color):
+            channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+            linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+            return sum(c * weight for c, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+
+        for foreground, background in (("ink", "paper"), ("printBlue", "paper"),
+                                       ("printOrange", "paper"), ("white", "navy"),
+                                       ("steel", "navy"), ("orange", "navy"), ("white", "panel")):
+            light, dark = sorted((luminance(css[foreground]), luminance(css[background])), reverse=True)
+            self.assertGreaterEqual((light + 0.05) / (dark + 0.05), 4.5, (foreground, background))
 
 
 class WindowsCheckoutablePaths(unittest.TestCase):

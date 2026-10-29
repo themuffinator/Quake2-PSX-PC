@@ -281,4 +281,10 @@ void q2_ai_run_melee(q2_monster *m);
  * the turn left to make is 45 degrees or less either way. */
 bool q2_facing_ideal(const q2_monster *m);
 
+/* Caller context for Strider's native unassigned-s2 exact-yaw branch.
+ * M_MoveFrame carries zero at move-end callbacks and the local frame index
+ * during AI/frame callbacks; ai_run replaces it with the nonzero player
+ * pointer. Scoped by the callers, never persistent actor/save state. */
+extern u32 q2_ai_native_s2;
+
 #endif /* Q2PSX_AI_H */

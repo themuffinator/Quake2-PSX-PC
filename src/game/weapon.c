@@ -333,12 +333,19 @@ void q2_weapon_muzzle_origin(const s16 muzzle[3], const s32 eye[3],
      * hand-rolled basis happens to be orthonormal — and pinned the inverted
      * sign as the expected answer.
      *
-     * ON THE ROLL, precisely. This is NOT the console's composition: the
-     * transpose of q2_rotation_view(Y,P,R) is Ry(Y)Rx(P)Rz(-R), while the
-     * engine's fire matrix is Rz(-r)Ry(Y)Rx(P), and the roll factor does not
-     * commute across. It is the PORT'S camera composition, which is the frame
-     * the shot has to be in for it to line up with what is drawn. Claiming it
-     * reproduces 0x8004C024 under roll would be false.
+     * ON THE ROLL. The fire functions apply RotateS (0x8006FC1C) with the
+     * player's own matrix at +0x2C0, which 0x8003AB60 builds with RotMatrix
+     * from the entity's angles just after storing the strafe roll
+     * (0x8003AB38). RotMatrix is Ry*Rx*Rz with the roll innermost, and with
+     * the Y negations the blaster applies around it (0x8004C01C, 0x8004C04C)
+     * the composition is Ry(yaw)Rx(pitch)Rz(-roll) — this transpose's, so the
+     * roll is the console's. An earlier note here read RotMatrix as Rz*Ry*Rx
+     * and called the two different; trig.c has since corrected that reading.
+     *
+     * What still differs is ROUNDING: RotateS floors each row in the frame
+     * whose Y is negated, this floors in the unnegated one, so a component can
+     * land one unit apart (the blaster at yaw 0, pitch 300 gives Y -60 there
+     * and -61 here). Not reproduced without a native fixture to pin it.
      */
     q2_rotation_view(rot, yaw, pitch, roll);
 
@@ -414,6 +421,19 @@ q2_fire_result_v2 q2_weapon_fire(q2_inventory *inv, q2_rng *rng,
     need = tab->ammo_per_shot[weapon_id];
     type = tab->ammo_type[weapon_id];
 
+    /* 0x8004CB18 spends the burst count, not the table's one-round minimum.
+     * The view driver clamps it to available ammo at 0x80050200. Keep that
+     * clamp here as well so direct sim callers cannot create free rounds. */
+    pellets = w->pellets;
+    if (weapon_id == Q2_WID_CHAINGUN) {
+        pellets = chaingun_bullets;
+        if (pellets < 0) pellets = 0;
+        if (pellets > 3) pellets = 3;
+        if (type >= 0 && type < Q2_AMMO_COUNT && inv->ammo[type] > 0 &&
+            pellets > inv->ammo[type])
+            pellets = inv->ammo[type];
+    }
+
     /* The BFG's `sltiu v0, cells, 50` at 0x8004EB38 is the same shape as every
      * other weapon's `bne ammo, zero` — a shot needs its whole cost up front. */
     if (need > 0) {
@@ -439,7 +459,8 @@ q2_fire_result_v2 q2_weapon_fire(q2_inventory *inv, q2_rng *rng,
          * the held entity's 411-crossing arm, after the throw sound and just
          * before state 3. Every other fire function spends here. */
         if (w->kind != Q2_FK_HAND_GRENADE)
-            inv->ammo[type] = (s16)(inv->ammo[type] - need);
+            inv->ammo[type] = (s16)(inv->ammo[type] -
+                (weapon_id == Q2_WID_CHAINGUN ? pellets : need));
     }
 
     res.fired = true;
@@ -492,19 +513,13 @@ q2_fire_result_v2 q2_weapon_fire(q2_inventory *inv, q2_rng *rng,
         break;
     }
 
-    pellets = w->pellets;
-    if (weapon_id == Q2_WID_CHAINGUN) {
-        /* 0x8004CAE0 reads the spin state's bullet count and spends exactly
-         * that much ammo; the loop then fires that many. */
-        pellets = chaingun_bullets > 0 ? chaingun_bullets : 1;
-    }
-    if (pellets < 1)
-        pellets = 1;
     if (pellets > Q2_FIRE_MAX_PELLETS)
         pellets = Q2_FIRE_MAX_PELLETS;
 
     switch (w->kind) {
     case Q2_FK_BULLET:
+        if (!pellets)
+            break; /* a zero-rate spin has no bullet, bang or shock */
         for (i = 0; i < pellets; i++) {
             q2_shot *s = &res.shot[res.shot_count++];
             int k;

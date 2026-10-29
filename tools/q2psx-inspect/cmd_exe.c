@@ -684,15 +684,22 @@ static int moddisasm(const disc *d, const char *map, const char *addr_s,
     u32 addr, i;
     bool to_end = (count <= 0);
 
-    snprintf(path, sizeof(path), "Q2DATA/LEVELS/%s/COMMON.DAT", map);
+    snprintf(path, sizeof(path), "Q2DATA/LEVELS/%s%s", map,
+             strchr(map, '/') ? "" : "/COMMON.DAT");
     if (disc_read_file(d, path, &file) != Q2_OK) {
         fprintf(stderr, "cannot read %s\n", path);
         return 1;
     }
-    if (q2_common_open(&cf, &file) != Q2_OK) {
-        fprintf(stderr, "%s is not a COMMON.DAT\n", path);
+    memset(&cf, 0, sizeof(cf));
+    if ((level ? q2_common_open(&cf, &file)
+               : dat_open_buf(&cf.ar, &file)) != Q2_OK) {
+        fprintf(stderr, "%s is not a valid level DAT file\n", path);
         q2_buf_free(&file);
         return 1;
+    }
+    if (!level) {
+        cf.chunk[q2_common_chunk_index("CreAIBin")] = dat_find(&cf.ar, "CreAIBin");
+        cf.chunk[q2_common_chunk_index("CreAIRel")] = dat_find(&cf.ar, "CreAIRel");
     }
     if (!level && cre) {
         char got[16];

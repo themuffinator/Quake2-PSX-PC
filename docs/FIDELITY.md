@@ -11,8 +11,11 @@ post-process gets the character wrong, because the artefacts are not noise laid
 on top of a clean image — they are the consequence of specific arithmetic. So the
 arithmetic is reproduced, and the artefacts follow.
 
-Everything below is individually toggleable via `r_psx_*` settings. The default
-for every one of them is faithful.
+This is a conformance target, not a claim of measured hardware equivalence.
+The [renderer audit](RENDERER-AUDIT.md) records implemented fixes and remaining
+gaps. There is no `r_psx_*` settings interface. The software backend always uses
+integer projected vertices, affine UVs, ordering tables and RGB555; its exposed
+diagnostics can disable textures, dithering or semi-transparency.
 
 ---
 
@@ -36,7 +39,7 @@ defining formula at init, the divide follows the hardware's exact sequence, and
 [-1024, 1023]. Vertex positions are never widened to float anywhere in the
 pipeline.
 
-**Setting.** `r_psx_vertex_snap` (default on). Off transforms at full precision.
+**Control.** Integer vertex projection is always enabled.
 
 ---
 
@@ -49,12 +52,18 @@ angle the texture visibly warps and slides, and the distortion changes as the
 camera moves.
 
 **Implementation.** `psx_prim` carries `u8` UVs and no W. The backend must
-interpolate them affinely. This is a *requirement on the backend*, not something
+interpolate them affinely. The software implementation uses fixed-point edges
+and twelve-bit fractional UV/RGB gradients, preserving packet vertex tie order
+and the hardware quad diagonal. Published GPU reference images constrain its
+coverage and interpolation; see `tests/fixtures/README.md`.
+
+This is a *requirement on the backend*, not something
 the frontend can enforce — a GPU backend has to explicitly avoid the perspective
 correction it would otherwise get for free, either by writing the interpolation
 by hand or by feeding it `noperspective` varyings.
 
-**Setting.** `r_psx_affine_uv` (default on).
+**Control.** Affine mapping is always enabled. The legacy `affine_uv` flag/F2
+binding has no rasterizer reader and does not enable perspective correction.
 
 **Note.** Because the original had no perspective correction, the artists and
 level designers worked around it by subdividing large surfaces. Turning this off
@@ -150,21 +159,25 @@ whole private chain as well as its point or absolute bounds; only the Quick
 merge orders directly by that depth.
 `psx_ot_add()` and `psx_ot_add_bucket()` do not, and behave exactly as before.
 
-**Setting.** `r_psx_ot_sort` (default on). Off enables a depth buffer.
+**Control.** No depth-buffer backend exists. `--depth-sort` changes the ordering
+policy, not the rasterizer's visibility model.
 
 ---
 
 ## 4. 15-bit colour and ordered dithering
 
-**Cause.** The framebuffer is RGB555. Gouraud shading and blending are computed
-at higher precision and then truncated to 5 bits per channel, which would band
-badly, so the GPU adds a 4x4 ordered dither pattern before truncating.
+**Cause.** The framebuffer is RGB555. Gouraud colour and texture modulation are
+reduced to five bits after optional dithering. Semi-transparency then combines
+those five-bit channels with the destination.
 
 **Implementation.** `psx_dither_matrix` in `src/psx/gpu.c`, applied per channel
 as a function of screen position. Bit 15 of each pixel is the mask bit, not
 alpha.
 
-**Setting.** `r_psx_dither` (default on), `r_psx_15bit` (default on).
+**Control.** F1 toggles the diagnostic dither override; GP0 E1 controls hardware
+dither eligibility. Flat untextured and raw textured polygons bypass it; shaded
+or modulated polygons and lines can use it. Rectangles never dither. RGB555 is
+always enabled.
 
 ### 4a. Channel order — red lives in the LOW bits
 
@@ -240,10 +253,17 @@ Consequences to preserve:
 - UVs are `u8`, so they **wrap within the page**. A UV of 260 is 4, not clamped.
 - The texture window register masks UVs, which is how the original tiled small
   textures without duplicating them in VRAM.
-- Because VRAM is shared, a texture can overlap the framebuffer. This was used
-  deliberately for effects and must not be "fixed" by giving textures their own
-  storage. `psx_vram` in `src/psx/gpu.h` is therefore one flat array, not a
-  texture atlas.
+- Native framebuffers alias `psx_vram`, so rendered pixels can be fetched as
+  textures and copied between display buffers. Adaptive buffers remain separate
+  host surfaces. A persistent 2 KB texture cache and separate CLUT cache model
+  command-ordered visibility; CPU/GPU cycle timing and scanout are not simulated.
+
+E2 texture windows and E6 force/check-mask state are implemented. Textured
+pixels retain texel bit 15; untextured writes clear it unless forced by E6.
+GP0(01) clears texture and palette caches. Transfers invalidate texture words
+without discarding a retained palette; ordinary drawing invalidates neither.
+CLUTs load before rasterization, even for clipped primitives. The water move
+packet includes its retail cache-clear command before the copy.
 
 ---
 
@@ -261,10 +281,11 @@ Three rules a backend must not "improve":
   and drawing offset are rasteriser state and do not apply, which is why the
   effect computes its own buffer-relative origin.
 - **Overlap is the normal case, not an edge case.** Source and destination
-  overlap on every single copy the effect makes, and the result must be as if
-  the source were read whole before the destination was written.
-- **Nothing else in the pipeline touches it.** No dither, no blend, no mask
-  test beyond the hardware's own — the halfwords are copied verbatim.
+  overlap in the water effect. Transfers read then write up to 128 words at a
+  time, left-to-right then top-to-bottom. Later chunks/rows can read earlier
+  writes. Native VRAM wraps at 1024x512; adaptive copies clip to host bounds.
+- **No dither or blend.** E6 can force bit 15 or protect masked destination
+  pixels. Both rules apply to the port's framebuffer copy path.
 
 A hardware backend implementing this as a render-to-texture pass must therefore
 resolve the framebuffer before the copy and not batch it with the surrounding
@@ -275,29 +296,42 @@ the ordering table.
 
 ## 7. Near-plane behaviour
 
-The GPU does not clip. Geometry crossing the projection plane produces garbage
-coordinates, so the original either rejected such polygons outright (watching the
-GTE's overflow flags) or subdivided them in software beforehand.
+The GPU does not clip against the projection plane. Crossing geometry produces
+saturated coordinates. This game's world linker can subdivide the quad, then
+reject only mesh cells touching SZ=0. A divide overflow alone is not a rejection
+predicate.
 
 This matters because it is *visible*: geometry very close to the camera vanishes
 rather than being clipped smoothly. `gte_project_point()` returns the flag state
 so the caller can make the same decision the original made.
 
-**Setting.** `r_psx_near_reject` (default on).
+**Control.** These emitter-specific rules are always enabled. Retail's rounded
+midpoint graph for XYZ, UV and RGB is implemented in `world.c`; a bilinear grid
+does not reproduce it. The per-zone subdivision budget comes from
+`Resources+0x1C`. Cached meshes belong to each viewport and share one free stack;
+pressure restricts new meshes and reserves the final three entries for SZ=0
+faces. The separate parent budget comes from `Resources+0x0C`, rounded to blocks
+of 32 paired packets. Nodes share 255 directory handles across views; failed
+construction leaves the per-view quota untouched. Unseen nodes return their
+directory immediately and their blocks after all views finish. Materials are
+resolved at parent construction and retained until that parent is rebuilt.
 
 ---
 
 ## 8. Timing
 
-PAL builds ran the game logic off the 50 Hz vertical blank; NTSC builds off 60 Hz.
-For many PAL ports of this era that made the game genuinely slower, and the PAL
-framebuffer was 256x256 rather than 256x240.
+PAL and NTSC have different display timing. The display records represented in
+`screen.h` describe 512x248 for PAL and 512x240 for NTSC, with executable addresses
+for both. This audit's disc runs cover PAL only; NTSC still needs paired frame
+validation.
 
 `q2_build_tick_rate()` reports the build's native rate. The renderer may
 interpolate to any display rate, but the *simulation* steps at the build's native
 rate by default so that physics, animation and AI behave as they did.
 
-**Setting.** `g_tick_rate` (default: the build's native rate).
+Deterministic captures use `--headless`, which advances by 1/30 second per
+rendered frame. `--frames` alone does not select that clock. This is an
+arithmetic renderer, not a cycle-timed GPU/GTE emulator.
 
 ---
 
@@ -319,5 +353,8 @@ Claims here are testable, and should be tested rather than eyeballed:
    running the original and from this port, and diff. Any pixel difference is a
    bug in one of the above.
 
-Items 1–3 are unit-testable today and should gate merges. Item 4 needs the
-renderer, and is the acceptance test for the project as a whole.
+Items 1–3 have structural and arithmetic tests plus 368 hardware-captured GTE
+vectors for the implemented opcode variants. Published GPU images constrain
+triangle/line coverage, UV/colour gradients and overlapping VRAM copies.
+Item 4 still requires paired retail and port states; deterministic port captures
+alone cannot establish it. See `tests/fixtures/README.md` for corpus limits.

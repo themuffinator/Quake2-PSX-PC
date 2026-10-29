@@ -89,8 +89,10 @@
 #include "spawn.h"
 #include "projectile.h"
 #include "q2psx.h"
+#include "nativemission.h"
 #include "sim.h"
 #include "viewweapon.h"
+#include "zonestate.h"
 
 #define Q2_SAVE_MAGIC      "Q2PS"
 
@@ -188,12 +190,29 @@
  * ROTR holds rotator angles, pending motion and timers. CAIS holds creature
  * behavior, stable target/move keys, the AI clock and pursuit trail. SKIL holds
  * the difficulty used to build the creature roster.
+ * CAIS v3 adds script callback/scale state; v4 adds export-0 initialization
+ * and module-shared decisions/explosion phases. Version 5 adds physical actor
+ * motion, pending impulses, local clock/phase and animation transition state.
+ * Versions 1..4 still read,
+ * remapping old roster indices around newly supported Jorg/Rider/Medic slots.
  * Missing ROTR/CAIS retains the older endpoint replay/basic creature restore.
  * Older readers skip these chunks under the existing container contract. */
 
 /* EOBJ records permanent script-object changes without a one-shot latch.
  * They also travel in EVHS on map departure. Older files retain normal EVE_
  * replay; they cannot recover an object change that was never recorded. */
+
+/* ZPOP preserves authored and dynamic objects in previously visited zones.
+ * Version 1: map count, map name[16], Population identity, object count and
+ * 58-byte authored records. Version 2 adds map clocks/trail/alerts, a serial
+ * allocator and a typed pointer-free runtime after each 58-byte prefix. Moves
+ * and references rebind by module offset/authored key; dynamics use a stable
+ * serial. Source slots only reconstruct resident native-save allocation order.
+ * Version 3 adds script callbacks and scale. Version 4 adds spawn initialization
+ * and module-shared creature state, including pending boss/revival transitions.
+ * Version 5 adds the same physical actor state as CAIS v5, rebasing its clock
+ * and invalidating its collision-cell cache when the zone is rebuilt.
+ * Version 1 and missing ZPOP remain readable; neither borrows session history. */
 
 /* RAND adds the shared gameplay random stream. Older files have no recorded
  * state for that stream, so their load retains the reconstructed world's state. */
@@ -506,6 +525,14 @@ typedef struct q2_save {
     bool           event_history_present;
     q2_event_store event_history;
 
+    /* ZPOP is additive: older saves start with no visited-zone populations. */
+    bool zone_history_present;
+    q2_zone_history zone_history;
+
+    /* NMIS is additive; old files reconstruct their available event latches. */
+    bool native_mission_present;
+    q2_native_mission native_mission;
+
     /* One byte per trigger volume: was the player inside it last tick. */
     u8  *trigger_inside;
     u32  trigger_count;
@@ -574,6 +601,8 @@ typedef struct q2_save {
 
     s16  settings[Q2_SAVE_SETTINGS_MAX];
     u32  settings_count;
+    bool cheat_level_present;
+    u8   cheat_level;            /* engine+378, included in native Game Config */
 } q2_save;
 
 void q2_save_free(q2_save *s);
@@ -757,15 +786,19 @@ const char *q2_save_slot_row(const q2_save_info *info, int slot,
 
 /*
  * LOAD/SAVE SETTINGS uses the same four memory-card positions but a different
- * file type from a saved game (QFRONT distinguishes them with engine flag
- * 0x01000000). The game layer keeps the payload opaque so menu.h remains a
+ * file type from a saved game (engine flag 0x01000000 selects game saves;
+ * zero selects settings, with bit 31 naming a MULTI UNLOCK file). Both kinds
+ * of settings file carry the current cheat tier, as native Game Config does.
+ * The game layer keeps the remaining payload opaque so menu.h remains a
  * one-way dependency: the client packs its settings and match setup into this
  * bounded run of signed words.
  */
-#define Q2_SETTINGS_VALUE_MAX 64
+#define Q2_SETTINGS_VALUE_MAX 96
 typedef struct q2_settings_blob {
     u32 count;
     s16 value[Q2_SETTINGS_VALUE_MAX];
+    u8 cheat_level;
+    bool unlock_file;
 } q2_settings_blob;
 
 q2_result q2_settings_slot_path(int slot, char *out, u32 out_size);

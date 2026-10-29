@@ -460,6 +460,7 @@ typedef struct q2_world_stats {
 
     /* Surface flags and blending — see surface.h for what each field means. */
     u32 nodes_hidden;          /* flags08 bit 15, or draw variant 3       */
+    u32 nodes_packet_denied;   /* parent packet blocks/directory/quota   */
     u32 nodes_sealing;         /* all-CLUT-0 node, never in a draw stream */
     u32 nodes_deferred;        /* flags08 bit 14                          */
     u32 nodes_deferred_culled; /* its +0x0E area has no live screen record */
@@ -506,14 +507,36 @@ typedef struct q2_world_stats {
  * The texture-page table is why this exists. The world's opaque path does not
  * merely read `tpageTable[page] | blendTable[2]` — it writes the result back
  * (0x80068320), so a page is permanently promoted from ABR 0 to ABR 1 the first
- * time an opaque polygon on it is drawn, and every later transparent polygon on
- * that page inherits the promotion. Holding the table in caller-owned state is
+ * time an opaque parent packet is constructed. Later transparent constructions
+ * inherit the promotion; already cached packets retain their original page. Holding the table in caller-owned state is
  * what lets that happen once per level instead of once per frame.
  *
  * Passing NULL gives a fresh table for the call. That is what the offline tools
  * want, and it costs one frame of half-blended transparency that nothing
  * offline can observe.
  */
+/* A cached mesh is 212 bytes and its native handle is a nonzero u16 offset.
+ * Resources+0x1C selects the count (40..180 on this disc); zero selects 112. */
+#define Q2_WORLD_SUBDIV_MAX 309
+#define Q2_WORLD_SUBDIV_DEFAULT 112
+#define Q2_WORLD_PACKET_DIRS 255
+#define Q2_WORLD_PACKET_BLOCKS 256
+#define Q2_WORLD_PACKET_DEFAULT 4096
+typedef struct q2_world_packet_slot {
+    u32 node;
+    u16 block[2];
+    u16 tpage[63]; /* fixed when the paired parent packets are constructed */
+    u8 view, blocks;
+    bool allocated, node_seen, prepared;
+} q2_world_packet_slot;
+typedef struct q2_subdiv_slot {
+    const u8 *poly;
+    u32 node;
+    s32 depth;
+    u8 view;
+    bool allocated, pending, node_seen;
+} q2_subdiv_slot;
+
 typedef struct q2_world_render {
     q2_tpage_table tpage;
 
@@ -530,10 +553,54 @@ typedef struct q2_world_render {
      */
     s32                   subdiv_threshold;
     q2_surf_pool_pressure pressure;
+    u8 subdiv_view; /* current viewport; packet owners are distinct per view */
+    u16 subdiv_capacity, subdiv_used, subdiv_pending_count;
+    u16 subdiv_free[Q2_WORLD_SUBDIV_MAX];
+    u16 subdiv_pending[Q2_WORLD_SUBDIV_MAX];
+    q2_subdiv_slot subdiv_slot[Q2_WORLD_SUBDIV_MAX];
+    /* Parent POLY_GT4 storage is separate from both the host OT and meshes.
+     * Each block owns 32 packets in EACH GPU buffer; each node/view owns one
+     * of 255 directories. Retiring a directory does not free its blocks yet. */
+    u16 packet_capacity, packet_used, packet_pending_count, packet_dirs_used;
+    u16 packet_free[Q2_WORLD_PACKET_BLOCKS];
+    u16 packet_pending[Q2_WORLD_PACKET_BLOCKS];
+    u8 packet_dir_free[Q2_WORLD_PACKET_DIRS];
+    u8 packet_quota, packet_remaining;
+    q2_world_packet_slot packet_slot[Q2_WORLD_PACKET_DIRS];
 } q2_world_render;
 
 /* Pages at ABR 0, subdivision off. */
 void q2_world_render_init(q2_world_render *r);
+void q2_world_subdiv_reset(q2_world_render *r, int capacity);
+void q2_world_packet_reset(q2_world_render *r, int packets);
+/* Call once per viewport walk. Retail initializes view+286 to 255; successful
+ * constructions consume the local copy, cached nodes and failures do not. */
+void q2_world_render_begin_view(q2_world_render *r);
+/* Returns a nonzero directory handle (slot+1), or zero on denial. */
+u16 q2_world_packet_request(q2_world_render *r, u32 node, unsigned polygons);
+/* Fallback for callers without native heap accounting. Resource overrides use
+ * their magnitude, unlike negative packet_reset arguments. Nonnegative values
+ * retain the provisional estimate; known client layouts use the helper below. */
+bool q2_world_subdiv_resources(q2_world_render *r, const q2_common_file *common,
+                              const char *zone_name);
+/* Retail automatic policy. Supply the largest contiguous native payload
+ * after particle allocation, before the parent packet/mesh pool allocation.
+ * This does not infer a heap size from the authored positive control. */
+bool q2_world_subdiv_resources_heap(q2_world_render *r, const q2_common_file *common,
+                                   const char *zone_name, u32 largest_payload);
+/* Node stamps are shared across views; each view owns a separate packet cache.
+ * The world walker touches nodes before face culling and evicts unseen owners
+ * after its walk. Direct users of the cache can use these same boundaries. */
+void q2_world_subdiv_touch_node(q2_world_render *r, u32 node);
+void q2_world_render_end_view(q2_world_render *r);
+/* Call after ALL viewports. Frees retired handles, then retires the farthest
+ * meshes to maintain six free entries; those retirements free next frame. */
+void q2_world_render_end_frame(q2_world_render *r);
+typedef enum q2_subdiv_result {
+    Q2_SUBDIV_FLAT, Q2_SUBDIV_MESH, Q2_SUBDIV_DROP
+} q2_subdiv_result;
+q2_subdiv_result q2_world_subdiv_request(q2_world_render *r, const u8 *poly,
+    u32 node, q2_surf_variant variant, u16 clut, const u16 depth[4]);
 
 /*
  * Transform the zone and fill the ordering table.

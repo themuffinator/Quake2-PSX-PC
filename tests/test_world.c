@@ -459,6 +459,56 @@ static void mob_put_u32(u8 *p, u32 v)
 
 static void mob_put_s32(u8 *p, s32 v) { mob_put_u32(p, (u32)v); }
 
+static void test_model_part_force_draw(void)
+{
+    u8 bytes[64 + 48 + 16 + 66 * 16] = {0};
+    q2_model model = {0};
+    q2_model_instance inst;
+    q2_model_draw_stats stats;
+    q2_camera cam;
+    psx_ot ot;
+    gte_state gte;
+    const s16 xy[4][2] = {{-100,-100},{100,-100},{100,100},{-100,100}};
+    int i;
+    model.base = bytes; model.size = sizeof(bytes);
+    model.hdr.num_verts = 4; model.hdr.num_parts = 2; model.hdr.num_faces = 66;
+    model.hdr.ofs_verts = 64; model.hdr.ofs_parts = 112; model.hdr.ofs_faces = 128;
+    for (i = 0; i < 4; i++) {
+        mob_put_u16(bytes + 64 + i*12, (u16)xy[i][0]);
+        mob_put_u16(bytes + 66 + i*12, (u16)xy[i][1]);
+    }
+    /* Both parts reuse the same projected scratch slots. Each has 33 backfaces
+     * so a wrapping mask or a mask read from the draw-order table is observable. */
+    mob_put_u16(bytes + 112, 33); bytes[115] = 4;
+    mob_put_u16(bytes + 120, 33);
+    for (i = 0; i < 66; i++) {
+        u8 *face = bytes + 128 + i*16;
+        face[0] = 0; face[1] = 1; face[2] = 2; face[3] = 3;
+        face[4] = (u8)i;
+    }
+    q2_camera_default(&cam, 512, 248);
+    q2_model_instance_init(&inst);
+    inst.model = &model; inst.origin[2] = 2000;
+    gte_init(&gte);
+    gte_set_projection(&gte, 160, 256, 124);
+    check(psx_ot_init(&ot, 256, 80) == Q2_OK, "model force test OT allocates");
+    check(q2_model_build_ot(&inst, &cam, &ot, &gte, &stats) == 0,
+          "unforced model backfaces are rejected");
+    check(stats.faces_rejected_back == 66, "both parts exercise NCLIP");
+    mob_put_u32(bytes + 116, 0x80000001u);
+    mob_put_u32(bytes + 124, 0x80000001u);
+    psx_ot_clear(&ot);
+    check(q2_model_build_ot(&inst, &cam, &ot, &gte, &stats) == 4,
+          "part masks force first and 32nd faces, restarting per part");
+    check(stats.faces_rejected_back == 62, "33rd face does not wrap to bit 31");
+    if (ot.prim_count == 4) {
+        check(ot.prims[0].uv[0].u == 0 && ot.prims[1].uv[0].u == 31 &&
+              ot.prims[2].uv[0].u == 33 && ot.prims[3].uv[0].u == 64,
+              "MSB-first force bits select exactly the retail faces");
+    }
+    psx_ot_free(&ot);
+}
+
 /* The quad's four corners, 1000 units square, 2000 in front of the camera. */
 static const s16 mob_pt[4][3] = {
     { -500, -500, 2000 },
@@ -607,6 +657,108 @@ static void test_mobile_light_repaints_the_world(void)
     check(half.mobile_unslotted == 1, "and is counted as unreachable");
 }
 
+/* Values obtained from the add/sra midpoint sequence at PAL 0x800AEEA0..
+ * 0x800AF0C0, with perimeter corners 7,102,239,31. The centre is 66,
+ * not the bilinear average 94. The odd values also expose intermediate
+ * rounding: the first quarter is 30, not a truncated-delta lerp's 31. */
+static void test_retail_subdivision(void)
+{
+    static const u8 value[5][5] = {
+        { 7, 30, 54, 78, 102 }, { 13, 36, 60, 84, 136 },
+        { 19, 42, 66, 118, 170 }, { 25, 48, 100, 152, 204 },
+        { 31, 83, 135, 187, 239 }
+    };
+    static const u8 corner[4] = { 7, 102, 239, 31 };
+    static const int dx[4] = {0, 1, 1, 0}, dy[4] = {0, 0, 1, 1};
+    u8 scene_nodes[Q2_SCENE_NODE_SIZE], mapmod[40] = {0};
+    u8 points[4 * Q2_POINT_SIZE];
+    q2_point_group group = {0, 4};
+    q2_world_zone z = {0};
+    q2_camera cam = {0};
+    q2_world_stats stats;
+    q2_world_render render;
+    psx_ot ot = {0};
+    gte_state gte, reference;
+    int i, x, y;
+    u32 emitted;
+
+    mob_build(scene_nodes, mapmod, points, mob_slot_of_vertex, 0);
+    mob_put_u32(mapmod + 4, 32);
+    for (i = 0; i < 4; i++) {
+        mapmod[12+i] = (u8)i;
+        memset(mapmod + 20+3*i, corner[i], 3);
+        mapmod[32+2*(3-i)] = mapmod[33+2*(3-i)] = corner[i];
+        mob_put_u16(points+i*Q2_POINT_SIZE+4, (u16)(2000+corner[i]));
+    }
+    z.scene.nodes = scene_nodes; z.scene.node_count = 1;
+    z.scene.mapmod = mapmod; z.scene.mapmod_size = sizeof(mapmod);
+    z.points.data = points; z.points.count = 4;
+    z.points.groups = &group; z.points.group_count = 1;
+    cam.projection = 160;
+    q2_world_render_init(&render);
+    render.subdiv_threshold = 40000;
+    if (psx_ot_init(&ot, 1024, 64) != Q2_OK) {
+        check(false, "allocate subdivision test OT");
+        return;
+    }
+    emitted = q2_world_build_ot(&z, &cam, 320, 240, &ot, &gte, &render, &stats);
+    check(emitted == 16 && stats.quads_subdivided == 1,
+          "one near world quad produces the retail sixteen packets");
+    reference = gte;
+    if (emitted == 16) for (y = 0; y < 4; y++) for (x = 0; x < 4; x++) {
+        const psx_prim *p = &ot.prims[y*4+x];
+        for (i = 0; i < 4; i++) {
+            int gx = x+dx[i], gy = y+dy[i];
+            u8 expected = value[gy][gx];
+            reference.v[0].x = (s16)(-500+gx*250);
+            reference.v[0].y = (s16)(-500+gy*250);
+            reference.v[0].z = (s16)(2000+expected);
+            gte_rtps(&reference, false);
+            check(p->xy[i].x == reference.sxy[2].x && p->xy[i].y == reference.sxy[2].y,
+                  "subdivision projects the retail midpoint geometry");
+            check(p->rgb[i].r == expected && p->rgb[i].g == expected && p->rgb[i].b == expected,
+                  "subdivision lighting follows rounded diagonal midpoints");
+            check(p->uv[i].u == expected && p->uv[i].v == expected,
+                  "subdivision UVs follow rounded diagonal midpoints");
+        }
+    }
+    /* Parent storage gates the real walker independently of the host OT and
+     * the mesh pool. Denial must not allocate a child or promote a material. */
+    q2_world_render_init(&render);render.subdiv_threshold=40000;
+    q2_world_packet_reset(&render,-1);
+    emitted=q2_world_build_ot(&z,&cam,320,240,&ot,&gte,&render,&stats);
+    check(!emitted && stats.nodes_packet_denied==1 && !render.subdiv_used,
+          "parent exhaustion denies a node before it can allocate meshes");
+    check(!(render.tpage.word[0]&0x60),"failed parent does not promote texture page");
+
+    q2_world_packet_reset(&render,32);
+    mob_put_u16(mapmod+16,0x0101); /* transparent on an unpromoted page */
+    emitted=q2_world_build_ot(&z,&cam,320,240,&ot,&gte,&render,&stats);
+    check(emitted==16 && !(ot.prims[0].tpage&0x60),
+          "new transparent parent and children retain original blend mode");
+    q2_tpage_world_opaque(&render.tpage,0);
+    q2_world_render_end_frame(&render);
+    emitted=q2_world_build_ot(&z,&cam,320,240,&ot,&gte,&render,&stats);
+    check(emitted==16 && !(ot.prims[0].tpage&0x60),
+          "later page promotion does not rewrite cached parent or children");
+    q2_world_render_end_frame(&render);
+    mob_put_u16(scene_nodes+8,0x8000);
+    q2_world_build_ot(&z,&cam,320,240,&ot,&gte,&render,&stats);
+    check(!render.packet_dirs_used && render.packet_pending_count==1,
+          "hidden node retires its parent while block remains pending");
+    q2_world_render_end_frame(&render);mob_put_u16(scene_nodes+8,0);
+    emitted=q2_world_build_ot(&z,&cam,320,240,&ot,&gte,&render,&stats);
+    check(emitted==16 && (ot.prims[0].tpage&0x60)==0x20,
+          "reconstructed parent samples the now-promoted texture page");
+
+    q2_world_render_init(&render);mob_put_u16(mapmod+16,0x0100);
+    mob_put_u16(scene_nodes+8,0x0C00); /* emitter hidden, parent still built */
+    emitted=q2_world_build_ot(&z,&cam,320,240,&ot,&gte,&render,&stats);
+    check(!emitted && render.packet_used==1 && (render.tpage.word[0]&0x60)==0x20,
+          "variant 3 constructs materials before dispatching its empty emitter");
+    psx_ot_free(&ot);
+}
+
 int main(void)
 {
     puts("world quad gates");
@@ -618,7 +770,9 @@ int main(void)
     test_backface();
     test_near_is_not_a_rejection();
     test_model_backface();
+    test_model_part_force_draw();
     test_mobile_light_repaints_the_world();
+    test_retail_subdivision();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

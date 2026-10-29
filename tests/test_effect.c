@@ -19,6 +19,8 @@
 #include "entitydraw.h"  /* q2_projectiles_build_ot: the other emitter       */
 #include "itemtable.h"   /* Q2_ITEM_GLOW_*: the materialise burst's colours */
 #include "projectile.h"
+#include "sim.h"
+#include "levelbin.h"
 #include "trig.h"        /* the spark's reference velocities                */
 
 static int g_failures;
@@ -1250,7 +1252,7 @@ static void test_creature_flash(void)
     check_eq_i(q2_fx_flash_angle(1000, 2), (1000 - 128) & 0xFFF,
                "an even frame reads it 128 behind (0x8003111C)");
 
-    q2_fx_flash_corners(centre, 0, corner);
+    q2_fx_flash_corners(centre, 0, Q2_FX_FLASH_SIZE, corner);
     check(corner[0][0] == 10 - 120 && corner[0][1] == 20 &&
               corner[1][0] == 10 && corner[1][1] == 20 - 120 &&
               corner[2][0] == 10 && corner[2][1] == 20 + 120 &&
@@ -1273,7 +1275,7 @@ static void test_creature_flash(void)
 
     q2_fx_world_init(&w, &g_tab);
     q2_fx_set_texture(&w, 0x10, 0x1234);
-    q2_fx_flash_corners(at, 300, corner);
+    q2_fx_flash_corners(at, 300, Q2_FX_FLASH_SIZE, corner);
     check(q2_fx_flash_add(&w, (const s32 (*)[3])corner, at, 0),
           "a flash is queued");
 
@@ -1282,17 +1284,42 @@ static void test_creature_flash(void)
                "and drawn as exactly one primitive");
     check_eq_i(w.stats.flashes_drawn, 1, "counted as a flash");
 
+    {
+        u32 i, viewport;
+        q2_fx_flash_clear(&w);
+        q2_fx_world_resize(&w, 0, 4);
+        /* More simultaneous actors than dynamic-light slots: retail's
+         * per-actor draw must not silently lose the seventeenth sprite. */
+        for (i = 0; i < 65; i++)
+            check(q2_fx_flash_add(&w, (const s32 (*)[3])corner, at, 0),
+                  "crowded volley keeps every flash");
+        for (viewport = 0; viewport < 4; viewport++) {
+            psx_ot_clear(&ot);
+            check_eq_i(q2_fx_build_ot(&w, &cam, viewport, &ot, &gte), 65,
+                       "every split viewport sees the entire volley");
+        }
+        q2_fx_world_clear(&w);
+        check(w.flash_extra == NULL && w.flash_count == 0,
+              "level clear releases overflow flash storage");
+    }
+
     q2_fx_flash_clear(&w);
     psx_ot_clear(&ot);
     check_eq_i(q2_fx_build_ot(&w, &cam, 0, &ot, &gte), 0,
                "and gone once the frame's flag is dropped (0x8007EE20)");
 
     at[2] = 200;
-    q2_fx_flash_corners(at, 300, corner);
+    q2_fx_flash_corners(at, 300, Q2_FX_FLASH_SIZE, corner);
     q2_fx_flash_add(&w, (const s32 (*)[3])corner, at, 0);
     psx_ot_clear(&ot);
     check_eq_i(q2_fx_build_ot(&w, &cam, 0, &ot, &gte), 0,
                "a muzzle nearer than 257 is not drawn (0x80031470)");
+
+    q2_fx_flash_corners(centre, 0, 240, corner);
+    check(corner[0][0] == 10 - 240 && corner[1][1] == 20 - 240 &&
+          corner[2][1] == 20 + 240 && corner[3][0] == 10 + 240,
+          "Boss1 export 1 supplies a 240-unit flash");
+    q2_fx_flash_clear(&w);
 
     psx_ot_free(&ot);
 }
@@ -2148,6 +2175,21 @@ static void test_timed_beams(void)
     q2_fx_timed_tick(&w, 100);
     check_eq_i(w.timed[0].timer, 0, "and clamps at zero rather than going negative");
     check_eq_i(q2_fx_timed_live(&w), 0, "an expired beam is not alive");
+    check(w.timed[0].present, "the expiry tick still presents the final beam");
+    q2_fx_timed_tick(&w, 1);
+    check(!w.timed[0].present, "the next tick no longer presents the expired beam");
+
+    /* A creature can hold two attachments on one target; neither replaces
+     * the BFG origin entry for the same identities. Refresh each separately. */
+    q2_fx_world_clear(&w);
+    check(q2_fx_beam_attached(&w, 1, 7, 97, a, b, 5), "a drain attachment is held");
+    check(q2_fx_beam_attached(&w, 1, 7, 98, a, b, 5), "another vertex is a separate beam");
+    q2_fx_beam_attached(&w, 1, 7, 97, a, b, 5);
+    check_eq_i(q2_fx_timed_live(&w), 2, "the owner/target/vertex triple refreshes");
+    check(w.timed[0].attachment == 97 && w.timed[0].radius == 10 &&
+          w.timed[0].timer == 45, "attached beam uses the native vertex, width and life");
+    q2_fx_beam_timed(&w, 1, 7, a, b, 64, 3, 45, 5);
+    check_eq_i(q2_fx_timed_live(&w), 3, "an origin beam has a distinct attachment key");
 
     /* And a live one reaches the ordering table every frame, unqueued. */
     if (psx_ot_init(&ot, 256, 4096) == Q2_OK) {
@@ -2260,7 +2302,7 @@ static void test_spawn_tick_is_drawable(void)
 
 static void test_glint_script_scan(void)
 {
-    u8 mod[128];
+    u8 mod[256];
     q2_fx_glint_script s;
     u32 i;
 
@@ -2304,6 +2346,20 @@ static void test_glint_script_scan(void)
     check_eq_i(s.raise_offset, 8, "at the `lw` that begins the triple");
     check_eq_i(s.band_count, 6, "the band count came off the sb's source");
     check_eq_i(s.phase, 4, "and the phase off the sh's, five back");
+
+    put32(mod + 128, 0x244200A0u); /* module +160, not a fixed data offset */
+    put32(mod + 132, 0x00161840u);
+    put32(mod + 136, 0x00628021u);
+    for (i = 0; i < 18; i++) {
+        mod[160 + i * 2] = (u8)(i * 13);
+        mod[161 + i * 2] = 0;
+    }
+    check(q2_fx_glint_scan(&s, mod, sizeof(mod)) && s.bands_found,
+          "the script's angle-table operand is followed");
+    check_eq_i(s.angle[5][2], 17 * 13, "all six pitch/yaw/roll triples load");
+    put32(mod + 128, 0x2442FFF8u);
+    check(q2_fx_glint_scan(&s, mod, sizeof(mod)) && !s.bands_found,
+          "an out-of-range table does not become invented band data");
 
     /*
      * The TEST site alone must not read as a raise — `and` and `or` differ by
@@ -2380,11 +2436,18 @@ static void test_glint_two_paths(void)
     check_eq_i(many, one * 3, "three bands draw the mesh three times");
 
     /* A count above the array's seven is clamped, not read off the end. */
+    for (u32 i = 3; i < Q2_FX_GLINT_BANDS_MAX; i++)
+        g.band[i] = g.band[0];
     g.band_count = 200;
     psx_ot_clear(&ot);
     check_eq_i(q2_fx_glint_draw(&g, origin, 0, &cam, &ot, &gte),
                one * Q2_FX_GLINT_BANDS_MAX,
                "and a silly count stops at the array's seven");
+
+    memset(g.band, 0, sizeof(g.band));
+    psx_ot_clear(&ot);
+    check_eq_i(q2_fx_glint_draw(&g, origin, 0, &cam, &ot, &gte), 0,
+               "black bands emit no packets (0x80064A38)");
 
     /* The two paths use DIFFERENT widths, which the shading formula turns into
      * different brightness — 0x80064D48 passes 8192 and 0x80064DFC 4096. */
@@ -2416,6 +2479,137 @@ static void test_glint_two_paths(void)
     check_eq_i(q2_fx_glint_draw(&g, origin, 0, &cam, &ot, &gte), 0,
                "an unloaded glint draws nothing");
 
+    psx_ot_free(&ot);
+}
+
+static void test_glint_attachment(void)
+{
+    static const s16 vert[4][4] = {
+        { -1024, -1024, 0, 1024 }, { 1024, -1024, 0, 1024 },
+        { 1024, 1024, 0, 1024 }, { -1024, 1024, 0, 1024 }
+    };
+    static const u8 index[8] = { 0, 1, 2, 3, 0, 3, 2, 1 };
+    q2_fx_glint g;
+    q2_camera cam;
+    psx_ot ot;
+    gte_state gte;
+    gte_matrix rotation, junk;
+    s32 at[3] = { 0, 0, 4096 }, angles[3] = { 0, 0, 0 };
+    s32 batch;
+    psx_xy base[4];
+    u32 i;
+
+    puts("glint: camera, perimeter, scale and the owner's private chain");
+    if (psx_ot_init(&ot, 256, 1024) != Q2_OK) {
+        check(false, "allocate glint ordering table");
+        return;
+    }
+    memset(&cam, 0, sizeof(cam));
+    cam.projection = 256;
+    cam.ofs_x = 256;
+    cam.ofs_y = 124;
+    cam.sort_range = Q2_CAMERA_SORT_RANGE;
+    gte_init(&gte);
+    gte_set_projection(&gte, 256, 256, 124);
+    q2_rotation_euler(rotation.m, 0, 0, 0);
+    q2_rotation_euler(junk.m, 1024, 512, 768);
+    memset(&g, 0, sizeof(g));
+    g.ready = true;
+    g.phase = 4;
+    g.tint[0] = g.tint[1] = g.tint[2] = 255;
+    g.mesh.vert = vert;
+    g.mesh.vert_count = 4;
+    g.mesh.index = index;
+    g.mesh.face_count = 2;
+
+    psx_ot_area_register(&ot, 23, 43);
+    batch = psx_ot_batch_begin_point(&ot, 23, false, 4096, at, cam.pos);
+    check(psx_ot_batch_add(&ot, batch) != NULL, "owner has a body packet");
+    gte_set_rotation(&gte, &junk);
+    gte_set_translation(&gte, 999, -999, 2000);
+    check_eq_i(q2_fx_glint_draw_attached(&g, at,
+                    (const s16 (*)[3])rotation.m, 23, batch, &cam, &ot, &gte),
+               2, "both windings join the owner");
+    check_eq_i(ot.batch_count, 1, "bands allocate no separate sort records");
+    check_eq_i(ot.batch[batch].head, 2, "negative NCLIP prepends");
+    check_eq_i(ot.next[2], 0, "prepended face links to body");
+    check_eq_i(ot.next[0], 1, "body links to appended positive face");
+    check_eq_i(ot.batch[batch].tail, 1, "positive NCLIP appends");
+    check_eq_i(ot.next[1], -1, "tail terminates the chain");
+    check_eq_i(ot.prims[1].xy[0].x, -32, "768/256 scale with anamorphic camera");
+    check_eq_i(ot.prims[1].xy[0].y, -68, "scaled top edge");
+    check_eq_i(ot.prims[1].xy[2].x, 544, "third perimeter corner is bottom right");
+    check_eq_i(ot.prims[1].xy[2].y, 316, "third perimeter corner keeps its y");
+    check_eq_i(gte.tr.x, 0, "view-weapon translation cannot leak into glint");
+    check_eq_i(gte.rot.m[0][0], 6144, "glint installs the frame camera");
+
+    psx_ot_clear(&ot);
+    psx_ot_area_register(&ot, 3, 43);
+    check_eq_i(q2_fx_glint_draw_entity(&g, at, angles, 23, &cam, &ot, &gte),
+               0, "unseen owner area emits no glint");
+    check_eq_i(ot.prim_count, 0, "no orphan packets for unseen areas");
+
+    psx_ot_clear(&ot);
+    g.band_count = 1;
+    g.band[0].phase = 4;
+    g.band[0].colour = 0xFFFFFF;
+    check_eq_i(q2_fx_glint_draw_entity(&g, at, angles, -1, &cam, &ot, &gte),
+               2, "one unrotated band");
+    memcpy(base, ot.prims[0].xy, sizeof(base));
+    for (i = 0; i < 3; i++) {
+        psx_ot_clear(&ot);
+        memset(g.band[0].angle, 0, sizeof(g.band[0].angle));
+        g.band[0].angle[i] = 512;
+        check_eq_i(q2_fx_glint_draw_entity(&g, at, angles, -1, &cam, &ot, &gte),
+                   2, "rotated band still draws");
+        check(memcmp(base, ot.prims[0].xy, sizeof(base)) != 0,
+              "each of pitch, yaw and roll changes projected geometry");
+    }
+    {
+        s16 window[8][4];
+        u8 faces[80 * 4];
+        memcpy(window, vert, sizeof(vert));
+        memcpy(window + 4, vert, sizeof(vert));
+        for (i = 0; i < 4; i++)
+            window[i][3] = 30000;
+        for (i = 0; i < 80; i++) {
+            u32 c;
+            for (c = 0; c < 4; c++)
+                faces[i * 4 + c] = (u8)(c + (i == 79 ? 4 : 0));
+        }
+        g.mesh.vert = (const s16 (*)[4])window;
+        g.mesh.vert_count = 8;
+        g.mesh.index = faces;
+        g.mesh.face_count = 80;
+        psx_ot_clear(&ot);
+        check_eq_i(q2_fx_glint_draw_entity(&g, at, angles, -1, &cam, &ot, &gte),
+                   0, "the 79-face limit includes black skipped faces");
+    }
+    {
+        u8 model[64] = { 0 };
+        q2_model_bank common = { NULL, 0, 0 };
+        q2_model_bank zone = { model, sizeof(model), 1 };
+        q2_entity e;
+        q2_entity_set set;
+        q2_entity_draw_ctx ctx;
+        q2_entity_draw_stats stats;
+        memcpy(model + 8, "Blackhole P", 11);
+        model[0x20] = model[0x24] = model[0x28] = 64;
+        memset(&e, 0, sizeof(e));
+        memset(&set, 0, sizeof(set));
+        memset(&ctx, 0, sizeof(ctx));
+        e.in_use = true;
+        e.model_index = -1;
+        memcpy(e.model, "Blackhole P", 12);
+        set.ent = &e;
+        set.count = 1;
+        ctx.bank = &common;
+        ctx.zone_bank = &zone;
+        psx_ot_clear(&ot);
+        q2_entity_build_ot(&set, &ctx, &cam, &ot, &gte, &stats);
+        check(e.model_bank == &zone, "item missing from common resolves in zone bank");
+        check_eq_i(stats.no_model, 0, "zone-only effect models are not discarded");
+    }
     psx_ot_free(&ot);
 }
 
@@ -3125,6 +3319,336 @@ static void test_bolt_body(void)
     psx_ot_free(&ot);
 }
 
+static void test_glint_lightning(void)
+{
+    q2_fx_glint g = {0};
+    q2_camera cam = {0};
+    psx_ot ot;
+    gte_state gte;
+    q2_rng rng;
+    psx_prim first;
+    u32 count, i;
+    puts("generator lightning: endpoints, animation, viewport repeat and shared pool");
+    if (psx_ot_init(&ot, 256, 128) != Q2_OK) {
+        check(false, "allocate lightning OT"); return;
+    }
+    cam.projection = 256; cam.ofs_x = 256; cam.ofs_y = 124;
+    cam.sort_range = Q2_CAMERA_SORT_RANGE;
+    gte_init(&gte);
+    gte_set_projection(&gte, 256, 256, 124);
+    g.ready = g.raised = g.lightning_ready = true;
+    g.band_count = 6;
+    /* 0x80065108 uses the same /256 scale as the glow: a local Z=512
+     * attachment lies 1536 world units from its owner, at depth 4096. */
+    g.origin[2] = 2560;
+    for (i = 0; i < 6; i++) {
+        g.lightning_target[i][0] = 2400;
+        g.lightning_target[i][2] = 4200;
+    }
+    for (i = 0; i < 8; i++) {
+        g.lightning_uv[i][0] = (u8)((i & 1) * 64);
+        g.lightning_uv[i][1] = (u8)(159 + (i / 2) * 24);
+    }
+    count = q2_fx_glint_lightning_draw(&g, 0x3D, 17, &cam, &ot, &gte);
+    check_eq_i(count, 32, "six long beams share a 32-polygon pool");
+    first = ot.prims[0];
+    check(first.kind == PSX_PRIM_FT4 && first.quad_zorder && first.semi_transparent,
+          "lightning uses the textured semi-transparent FT4 path");
+    check_eq_i(first.uv[0].v, 159, "lightning atlas begins at row 159");
+    check_eq_i(abs(first.xy[0].y - first.xy[2].y), 8,
+               "disc width is 2 * (256 << 6) / 4096 at the first endpoint");
+    check_eq_i(first.uv[1].u, 63, "full segments span 64 texels");
+    check_eq_i(first.uv[2].v, 182, "ribbon is 24 texels wide");
+    psx_ot_clear(&ot);
+    q2_fx_glint_lightning_draw(&g, 0x3D, 17, &cam, &ot, &gte);
+    check(!memcmp(first.xy, ot.prims[0].xy, sizeof(first.xy)),
+          "another viewport does not advance the noise");
+    q2_rng_seed(&rng, 1);
+    q2_fx_glint_lightning_tick(&g, &rng);
+    g.lightning_frame = 1;
+    psx_ot_clear(&ot);
+    q2_fx_glint_lightning_draw(&g, 0x3D, 17, &cam, &ot, &gte);
+    check_eq_i(ot.prims[0].uv[0].u, 0, "UV frame is held for two ticks");
+    check(!memcmp(&first.xy[0], &ot.prims[0].xy[0], sizeof(psx_xy)),
+          "the generator endpoint stays anchored while the ribbon jitters");
+    check(memcmp(&first.xy[1], &ot.prims[0].xy[1], sizeof(psx_xy)) != 0,
+          "interior points respond to the noise state");
+    q2_fx_glint_lightning_tick(&g, &rng);
+    g.lightning_frame = 2;
+    psx_ot_clear(&ot);
+    q2_fx_glint_lightning_draw(&g, 0x3D, 17, &cam, &ot, &gte);
+    check_eq_i(ot.prims[0].uv[0].u, 64, "second UV pair follows after two ticks");
+    g.lightning_frame = 14;
+    psx_ot_clear(&ot);
+    q2_fx_glint_lightning_draw(&g, 0x3D, 17, &cam, &ot, &gte);
+    check_eq_i(ot.prims[0].uv[0].v, 231, "UV follows a jump in the shared frame clock");
+    check_eq_i(q2_fx_sqrt_nr(65535), 256, "NR rounds up at a segment boundary");
+    check_eq_i(q2_fx_sqrt_nr(65536), 256, "exact segment square remains exact");
+    check_eq_i(q2_fx_sqrt_nr(0), 0, "zero beam length is inert");
+    check_eq_i(q2_fx_sqrt_nr(3), 2, "integer NR differs from a floor root");
+    psx_ot_clear(&ot);
+    psx_ot_area_register(&ot, 1, 42);
+    g.area = 2;
+    check_eq_i(q2_fx_glint_lightning_draw(&g, 0x3D, 17, &cam, &ot, &gte), 0,
+               "an invisible owner area cannot leak lightning");
+    psx_ot_area_clear(&ot);
+    psx_ot_clear(&ot);
+    cam.yaw = 2048;
+    check_eq_i(q2_fx_glint_lightning_draw(&g, 0x3D, 17, &cam, &ot, &gte), 0,
+               "ribbons behind the camera are clipped");
+    psx_ot_free(&ot);
+}
+
+static void test_laserwall_geometry(void)
+{
+    static const u8 funcs[16] = {1,0,0,0,'L','A','S','E','R','W','A','L','L',0,0,0};
+    u8 common[12 + 9*24] = {0}, zone[sizeof(common)], node[52] = {0};
+    q2_events ev = {0};
+    q2_userfuncs uf = {0};
+    q2_uf_operands ops = {common, zone, sizeof(zone)};
+    q2_scene scene = {0};
+    struct { q2_laserwall_set set; u32 guard[4]; } bounded;
+    q2_laserwall *wall;
+    s32 from[3], to[3];
+    u32 i;
+    printf("laser walls: resident slots, signed rows and moving bounds\n");
+    q2_wr_u16(common + 8, 4 + 9*24); common[10] = 9;
+    for (i = 0; i < 9; i++) {
+        u8 *p = common + 12 + 24*i;
+        p[0] = Q2_EVOP_CALL; p[1] = 24; p[5] = 3;
+        q2_wr_u16(p + 6, (u16)-500); q2_wr_u16(p + 8, 4970);
+        q2_wr_u16(p + 10, (u16)-40); q2_wr_u16(p + 12, 40);
+        q2_wr_u16(p + 14, 240); q2_wr_u16(p + 16, (u16)-5);
+        q2_wr_u16(p + 18, 0xFFFF);
+    }
+    memcpy(zone, common, sizeof(zone));
+    ev.data = common; ev.size = sizeof(common); ev.record_count = 1; ev.first_record = 8;
+    uf.data = funcs; uf.size = sizeof(funcs); uf.count = 1;
+    check_eq_i(q2_laserwalls_build(&bounded.set, &ev, &uf, NULL), 0,
+               "COMMON has no resident wall objects");
+    check_eq_i(bounded.set.declined, 9, "negative slots are all declined");
+    for (i = 0; i < 9; i++) q2_wr_u16(zone + 12 + 24*i + 18, 0);
+    for (i = 0; i < 4; i++) bounded.guard[i] = 0xABCDEF12u;
+    check_eq_i(q2_laserwalls_build(&bounded.set, &ev, &uf, &ops), 8,
+               "resident operands raise at most eight walls");
+    for (i = 0; i < 4; i++) check_eq_i(bounded.guard[i], 0xABCDEF12u,
+                                     "a ninth wall cannot overwrite the set");
+    wall = &bounded.set.wall[0];
+    check_eq_i(wall->raiser, 8, "the COMMON record owns the off switch");
+    scene.nodes = node; scene.node_count = 1;
+    q2_wr_u32(node + 16, (u32)-5); q2_wr_u32(node + 20, (u32)-7);
+    q2_wr_u32(node + 24, (u32)-9);
+    check(q2_laserwall_segment(wall, &scene, 0, from, to), "first row resolves");
+    check(from[0] == 38 && from[1] == -243 && from[2] == -9 &&
+          to[0] == 5008 && to[1] == -243 && to[2] == -9,
+          "negative odd centers truncate toward zero and Y subtracts its offset");
+    check(q2_laserwall_segment(wall, &scene, 2, from, to), "third row resolves");
+    check(from[0] == 118 && to[0] == 4928 && from[1] == 757 && to[1] == 757,
+          "signed spread contracts X while negative rise moves down");
+    wall->axis = 2; wall->length = -1000; wall->spread = 15; wall->rise = 100;
+    check(q2_laserwall_segment(wall, &scene, 1, from, to), "Z wall resolves");
+    check(from[0] == 38 && to[0] == 38 && from[2] == -24 && to[2] == -994 &&
+          from[1] == -343 && to[1] == -343, "Z spreads with signed length");
+    wall->axis = 1;
+    check(q2_laserwall_segment(wall, &scene, 1, from, to), "vertical wall resolves");
+    check(from[2] == -24 && to[2] == 6 && from[1] == -343 && to[1] == -1343,
+          "non-X walls spread along Z, including vertical ones");
+    q2_wr_u32(node + 16, 95); q2_wr_u32(node + 28, 100);
+    check(q2_laserwall_segment(wall, &scene, 0, from, to) && from[0] == 137,
+          "moving Scene bounds are read again, not cached");
+    check(!q2_laserwall_segment(wall, &scene, 3, from, to), "row limit is exclusive");
+    wall->scene_node = 1;
+    check(!q2_laserwall_segment(wall, &scene, 0, from, to), "absent node cannot draw");
+    for (i = 0; i < 9; i++) zone[12 + 24*i + 4] = 3;
+    check_eq_i(q2_laserwalls_build(&bounded.set, &ev, &uf, &ops), 0,
+               "invalid axes cannot write outside the endpoint vectors");
+    check_eq_i(bounded.set.declined, 9, "invalid axes are declined");
+}
+
+static void test_scripted_effect_runtime(void)
+{
+    static const u8 funcs[16] = {
+        1, 0, 0, 0, 'L','A','S','E','R','B','E','A','M',0,0,0
+    };
+    u8 raw[12 + 33 * 36] = {0};
+    u8 nodes[72] = {0};
+    q2_collision coll = {0};
+    q2_userfuncs uf = {0};
+    q2_events ev = {0};
+    struct { q2_laserbeam_set set; u32 guard[16]; } bounded;
+    q2_rng rng;
+    q2_fx_world w;
+    u32 i;
+    printf("scripted effects: laser areas, pool bounds and glint ownership\n");
+    /* A 33-beam record used to write beam[32] before checking its capacity. */
+    raw[8] = (u8)((4 + 33 * 36) & 0xFF);
+    raw[9] = (u8)((4 + 33 * 36) >> 8);
+    raw[10] = 33;
+    for (i = 0; i < 33; i++) {
+        u8 *p = raw + 12 + i * 36;
+        p[0] = Q2_EVOP_CALL;
+        p[1] = 36;
+        put32(p + 4, 1); /* enabled X, inside collision cell 0 */
+        put32(p + 20, 2001);
+    }
+    for (i = 0; i < 3; i++) {
+        put32(nodes + i * 4, (u32)-10000);
+        put32(nodes + 12 + i * 4, 10000);
+    }
+    nodes[32] = 23; /* cell zero belongs to render area 23, not area zero */
+    coll.nodes = nodes;
+    coll.node_count = 1;
+    uf.data = funcs; uf.size = sizeof(funcs); uf.count = 1;
+    ev.data = raw; ev.size = sizeof(raw); ev.record_count = 1; ev.first_record = 8;
+    for (i = 0; i < 16; i++) bounded.guard[i] = 0xCAFEBABEu;
+    check_eq_i(q2_laserbeams_build(&bounded.set, &ev, &uf, NULL, &coll), 32,
+               "only 32 beams fit");
+    for (i = 0; i < 16; i++)
+        check_eq_i(bounded.guard[i], 0xCAFEBABEu, "the thirty-third beam writes nothing");
+    check_eq_i(bounded.set.beam[0].area, 23, "laser uses the cell's render area");
+    q2_fx_world_init(&w, &g_tab);
+    q2_rng_seed(&rng, 1);
+    check_eq_i(q2_laserbeams_draw(&bounded.set, NULL, &w, &rng), 32,
+               "all accepted beams reach the effect queue");
+    check_eq_i(w.beam[0].area, 23, "the render area survives submission");
+
+    {
+        q2_sim *sim = calloc(1, sizeof(*sim));
+        q2_entity e[3] = {0};
+        q2_fx_glint *g;
+        q2_rng expected;
+        u32 rgb = 0;
+        int k;
+        if (!sim) { check(false, "allocate glint fixture"); return; }
+        g = &sim->glint;
+        sim->entities.ent = e;
+        sim->entities.count = 3;
+        g->ready = g->scripted = true;
+        g->zone_active = true;
+        g->power_left = 3600;
+        g->band_count = 1;
+        for (i = 0; i < 3; i++) {
+            e[i].in_use = true;
+            e[i].kind = Q2_ENT_KIND_ITEM;
+            e[i].place_id = 20;
+            e[i].surface = 23;
+        }
+        e[0].hidden = true;
+        e[1].place_id = 19;
+        e[2].origin[0] = 321;
+        e[2].angles[0] = 200;
+        e[2].angles[1] = -300;
+        e[2].angles[2] = 500;
+        g->base_angle[0][0] = 1024;
+        q2_rng_seed(&g->script_rng, 0);
+        q2_rng_seed(&expected, 0);
+        (void)q2_rng_next(&expected); /* owner turn speed */
+        (void)q2_rng_next(&expected); /* owner turn duration */
+        q2_sim_glint_tick(sim);
+        check(g->raised, "only the visible item 20 owns the glint");
+        check_eq_i(g->origin[0], 321, "glint uses its entity origin");
+        check_eq_i(g->area, 23, "glint uses its entity area");
+        check(e[2].angles[1] != -300, "the generator turns before refreshing its bands");
+        for (k = 0; k < 3; k++)
+            check_eq_i(g->band[0].angle[k], (s16)(g->base_angle[0][k] -
+                        e[2].angles[k] + (q2_rng_next(&expected) - 16384) / 256),
+                       "authored angle minus owner rotation plus jitter");
+        for (k = 0; k < 3; k++)
+            rgb |= (u32)(u8)q2_rng_next(&expected) << (k * 8);
+        check_eq_i(g->band[0].colour, rgb, "script generates each colour channel");
+        for (i = 0; i < 300; i++) {
+            q2_fx_glint_advance(g);
+            q2_sim_glint_tick(sim);
+        }
+        check_eq_i(g->band[0].phase, 4, "the script refreshes past the old 256-tick blackout");
+        e[2].in_use = false;
+        q2_sim_glint_tick(sim);
+        check(!g->raised, "removing the owner removes its effect");
+        free(sim);
+    }
+}
+
+static void test_authored_pool_and_shared_budget(void)
+{
+    q2_fx_world w;
+    q2_camera cam;
+    psx_ot ot;
+    gte_state gte;
+    s32 at[3] = {0, 0, 1024};
+    s16 velocity[Q2_FX_GROUP_QUADS][3] = {{0}};
+    u32 i, views;
+    printf("group: authored 80-slot pool and one packet budget across views\n");
+    q2_fx_world_init(&w, &g_tab);
+    q2_fx_world_resize(&w, 80, 1);
+    check_eq_i(w.group_count, 80, "JAIL4/ZONE0 and JAIL5/ZONE2 request 80 groups");
+    for (i = 0; i < 80; i++)
+        check_eq_i(q2_fx_group_spawn(&w, at, velocity, 1, &g_tab.ramp[0], NULL, 32, 16384, 0),
+                   i, "every authored pool slot is available");
+    check_eq_i(q2_fx_group_spawn(&w, at, velocity, 1, &g_tab.ramp[0], NULL, 32, 16384, 0),
+               -1, "full authored pool refuses the next group");
+    q2_fx_world_resize(&w, -1, 1);
+    check_eq_i(w.group_count, 0, "negative argument disables particles (80030C74)");
+    q2_fx_world_clear(&w);
+    check_eq_i(w.group_count, 0, "clear preserves a disabled pool");
+    check_eq_i(q2_fx_group_spawn(&w, at, velocity, 1, &g_tab.ramp[0], NULL, 32, 16384, 0),
+               -1, "disabled pool refuses a particle");
+    check(psx_ot_init(&ot, 256, 4096) == Q2_OK, "allocate particle test packets");
+    q2_camera_default(&cam, 512, 248);
+    memset(cam.pos, 0, sizeof(cam.pos));
+    cam.yaw = cam.pitch = cam.roll = 0;
+    cam.projection = 256;
+    gte_init(&gte);
+    gte_set_projection(&gte, 256, 256, 124);
+    for (views = 2; views <= 4; views += 2) {
+        q2_fx_world_clear(&w);
+        q2_fx_world_resize(&w, 4, views);
+        for (i = 0; i < 4; i++)
+            check(q2_fx_group_spawn(&w, at, velocity, 15, &g_tab.ramp[0], NULL, 32, 16384, 0) >= 0,
+                  "fill a small pool with complete groups");
+        for (i = 0; i < views; i++) {
+            psx_ot_clear(&ot);
+            check_eq_i(q2_fx_build_ot(&w, &cam, i, &ot, &gte), i < views / 2 ? 60 : 0,
+                       "800304EC initializes once, 80030AE8 loops views without resetting");
+        }
+        psx_ot_clear(&ot);
+        check_eq_i(q2_fx_build_ot(&w, &cam, 0, &ot, &gte), 60, "next frame restores the packet allowance");
+        for (i = 0; i < 4; i++) w.group[i].view_mask = 0x10;
+        psx_ot_clear(&ot);
+        check_eq_i(q2_fx_build_ot(&w, &cam, 0, &ot, &gte), 0, "hidden first view consumes no packets");
+        psx_ot_clear(&ot);
+        check_eq_i(q2_fx_build_ot(&w, &cam, 1, &ot, &gte), 60, "next view retains the unspent allowance");
+    }
+    psx_ot_free(&ot);
+}
+
+static void test_resource_lookup(void)
+{
+    q2_common_file common = {0};
+    dat_chunk chunk = {0};
+    q2_zone_resources result = {17, 18, 19};
+    u8 raw[76] = {0};
+    memcpy(raw, "Zone2", 6);
+    q2_wr_u32(raw + 12, (u32)-3000);
+    q2_wr_u32(raw + 24, 80);
+    q2_wr_u32(raw + 28, 48);
+    memcpy(raw + 32, "abcdefghijkl", 12);
+    q2_wr_u32(raw + 32 + 24, 64);
+    chunk.data = raw; chunk.size = sizeof(raw);
+    common.chunk[Q2_COMMON_RESOURCES] = &chunk;
+    check(q2_common_resources(&common, "JAIL5/zone2", &result), "resource lookup accepts a zone path and mixed case");
+    check(result.packet_control == -3000 && result.particle_groups == 80 && result.subdiv_meshes == 48,
+          "resource counts retain their signed authored values");
+    check(!q2_common_resources(&common, "Zone2extra", &result), "zone prefix is not a complete resource name");
+    check_eq_i(result.particle_groups, 80, "failed lookup preserves output");
+    check(q2_common_resources(&common, "ABCDEFGHIJKL", &result) && result.particle_groups == 64,
+          "full twelve-byte resource name needs no NUL on disc");
+    check(!q2_common_resources(&common, "ABCDEFGHIJKLM", &result), "overlong resource name is not truncated");
+    chunk.size = 31;
+    check(!q2_common_resources(&common, "Zone2", &result), "truncated record cannot supply counts");
+    check(!q2_common_resources(NULL, "Zone2", &result), "missing common archive is rejected");
+    check(!q2_common_resources(&common, NULL, &result), "missing resource name is rejected");
+}
+
 int main(void)
 {
     printf("effect system\n\n");
@@ -3136,6 +3660,8 @@ int main(void)
     test_integrator_order();
     test_life_zero_frees_the_slot();
     test_pool_fills_and_refuses();
+    test_authored_pool_and_shared_budget();
+    test_resource_lookup();
     test_ramp_is_indexed_by_age();
     test_one_ramp_defaults_to_both();
     test_budget();
@@ -3170,6 +3696,10 @@ int main(void)
     test_spawn_tick_is_drawable();
     test_glint_script_scan();
     test_glint_two_paths();
+    test_glint_attachment();
+    test_scripted_effect_runtime();
+    test_laserwall_geometry();
+    test_glint_lightning();
     test_debris_gravity();
     test_glint_phase();
     test_glintmod_decode();

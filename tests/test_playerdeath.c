@@ -13,6 +13,8 @@
 #include "monster.h"   /* q2_corpse_dissolve: the gate 0x8005B2A8 */
 #include "pad.h"       /* Q2_PAD_FULL */
 #include "sim.h"
+#include "random.h"
+#include "fixtures/player_animation_reference.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -31,6 +33,29 @@ static int g_fail;
 
 /* The frame step the sim runs at, in the 300-to-the-second clock. */
 #define DT 10
+
+static void test_native_animation(void)
+{
+    size_t i;
+    for (i = 0; i < sizeof(native_player_animation) / sizeof(native_player_animation[0]); i++) {
+        q2_player_anim_state state;
+        state.move = (q2_player_move)native_player_animation[i].move;
+        state.position = (s16)native_player_animation[i].position;
+        state.flags = (u16)native_player_animation[i].flags;
+        q2_random_seed(native_player_animation[i].seed);
+        q2_player_anim_step(&state, native_player_ranges,
+                           (q2_player_anim)native_player_animation[i].want,
+                           native_player_animation[i].contact, native_player_animation[i].dt);
+        CHECK(state.move == native_player_animation[i].result_move &&
+              state.position == native_player_animation[i].result_position &&
+              state.flags == native_player_animation[i].result_flags &&
+              q2_random_state() == native_player_animation[i].result_seed,
+              "native animation case %zu: got %d/%d/%u/%u expected %d/%d/%d/%u", i,
+              state.move, state.position, state.flags, q2_random_state(),
+              native_player_animation[i].result_move, native_player_animation[i].result_position,
+              native_player_animation[i].result_flags, native_player_animation[i].result_seed);
+    }
+}
 
 /* ------------------------------------------------------------------------- */
 /* The moves                                                                  */
@@ -710,13 +735,14 @@ static void test_the_corpse_slows_down(void)
 
     q2_player_death_init(&d);
     q2_player_die(&d, 1, 18, 0, true, false, NULL);
-    d.velocity[0] = 300;
+    d.velocity[0] = 1200;
     d.velocity[1] = -20;
     d.velocity[2] = 0;
 
-    /* 0x800395A0: dt * 5 toward zero, clamped rather than overshot. */
+    /* 0x800395A0..0x800395B8: dt * 40 toward zero, clamped at zero. */
     q2_player_death_tick(&d, -10, DT, true, 0);
-    CHECK(d.velocity[0] == 300 - DT * Q2_PDEATH_FRICTION, "vx is %d",
+    CHECK(Q2_PDEATH_FRICTION == 40, "corpse braking omits the final shift");
+    CHECK(d.velocity[0] == 1200 - DT * 40, "vx is %d",
           (int)d.velocity[0]);
     CHECK(d.velocity[1] == 0, "vy overshot zero to %d", (int)d.velocity[1]);
     CHECK(d.velocity[2] == 0, "vz moved off zero to %d", (int)d.velocity[2]);
@@ -765,7 +791,7 @@ static void test_resupply_is_spent(void)
 /* ------------------------------------------------------------------------- */
 /*
  * The two things a corpse must not do, and both of them come out of ONE fact:
- * `player_die` overwrites `entity+0x3C` with the corpse think (0x80039818), so
+ * `player_die` installs corpse_think (0x80039550) at 0x80039834, so
  * the player think at 0x8003A1C8 is not installed any more.
  *
  * 0x8003A4A4 is the pad read's only call site and 0x8003AD98 is the view
@@ -924,6 +950,7 @@ static void test_the_death_camera_rolls_over(void)
 
 int main(void)
 {
+    test_native_animation();
     test_move_names();
     test_anim_choice();
     test_a_death_move_is_never_replaced();

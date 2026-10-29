@@ -142,6 +142,21 @@ q2_result q2_zone_move(q2_zone_file *dst, q2_zone_file *src);
 void q2_common_close(q2_common_file *f);
 void q2_zone_close(q2_zone_file *f);
 
+/* Per-zone Resources record. packet_control is the loader's raw signed
+ * setting: negative forces its magnitude, nonnegative selects automatic
+ * sizing from the retail heap. Particle and mesh counts feed their allocators.
+ * A zero allocator count selects its default; a negative count disables it. */
+typedef struct q2_zone_resources {
+    s32 packet_control;
+    s32 particle_groups;
+    s32 subdiv_meshes;
+} q2_zone_resources;
+
+/* Accept a zone name or MAP/ZONE path, case-insensitively. A failed lookup
+ * leaves out unchanged. Names occupy at most twelve bytes on disc. */
+bool q2_common_resources(const q2_common_file *f, const char *zone_name,
+                         q2_zone_resources *out);
+
 /* Name -> enum. Returns -1 for a name not in the known set, which is how an
  * unrecognised build announces itself. */
 int q2_common_chunk_index(const char *name);

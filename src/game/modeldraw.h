@@ -43,6 +43,8 @@ typedef struct q2_model_draw_stats {
     u32 ot_overflow;
     u32 faces_semi;            /* blend selector 1..4: drawn with ABE         */
     u32 shadows_emitted;       /* 0x800784CC floor-shadow POLY_FT4            */
+    u32 glint_emitted;
+    u32 glint_draws;  /* includes wholly black bands, whose phases still age */
 } q2_model_draw_stats;
 
 /* The packet template built at 0x800783B8. It samples the lower-right 16x16
@@ -115,6 +117,7 @@ Q2PSX_INLINE bool q2_model_quad_faces_camera(gte_state *g, const gte_sxy screen[
  * to when its animation has not been selected yet.
  */
 typedef struct q2_model_instance {
+    const struct q2_fx_glint *glint; /* optional entity+0x04000000 overlay */
     const q2_model      *model;
     const q2_model_pose *pose;        /* num_parts entries, or NULL */
     s32                  origin[3];
@@ -268,6 +271,21 @@ typedef struct q2_model_instance {
 
 /* Zero the instance and set the fields whose neutral value is not zero. */
 void q2_model_instance_init(q2_model_instance *inst);
+
+/* Link a moving body's blob to the floor (0x80078978). `origin` is the
+ * collision centre, 286 above its feet. Grounded bodies use their contact
+ * height, including lifts; airborne bodies trace down 3 * entity+0x90 (128).
+ * SecondaryColl is eroded by 286; PrimaryColl is the fallback for bodies
+ * outside it. Query copies keep rendering from changing collision scratch.
+ * Missing hulls/floors disable the blob instead of leaving one in mid-air.
+ * Solid mover tops are also queried so raised platforms can receive blobs.
+ * Call after setting shadow_radius; pose vertices remain optional. */
+struct q2_move_world;
+void q2_model_shadow_ground(q2_model_instance *inst,
+                            const q2_collision *primary,
+                            const q2_collision *secondary,
+                            const struct q2_move_world *movers,
+                            const s32 origin[3], bool grounded);
 
 /*
  * Transform one model instance and append its primitives to `ot`.

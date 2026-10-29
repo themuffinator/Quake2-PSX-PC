@@ -60,6 +60,37 @@ static void put_u32(u8 *p, u32 v)
 }
 
 /* ------------------------------------------------------------------------- */
+static void test_frame_name_table(void)
+{
+    q2_creature c = { 0 };
+    u8 image[200] = { 0 };
+    q2_cre_frame_name names[4];
+    c.base = 0x80100000u;
+    /* Plausible strings before the export must not become an animation table. */
+    memcpy(image + 24, "Bogus", 6); memcpy(image + 44, "Wrong", 6);
+    put_u32(image + 12, c.base + 80);
+    put_u16(image + 80, 0); put_u16(image + 82, 20);
+    memcpy(image + 84, "Stand", 6);
+    put_u16(image + 100, 21); put_u16(image + 102, 0);
+    memcpy(image + 104, "Stand2", 7);
+    put_u16(image + 120, 50); put_u16(image + 122, 69);
+    memcpy(image + 124, "Walk", 5);
+    put_u16(image + 140, 0xFFFF);
+    put_u16(image + 160, 70); put_u16(image + 162, 78);
+    memcpy(image + 164, "After end", 10);
+    check(q2_creature_frame_names(&c, image, sizeof(image), names, 4) == 2 &&
+          names[0].first == 0 && names[0].last == 20 &&
+          !strcmp(names[0].name, "Stand") && names[1].first == 50 &&
+          !strcmp(names[1].name, "Walk"),
+          "frame names follow export 3, skip reversed ranges and stop at the sentinel");
+    put_u32(image + 12, 0);
+    check(q2_creature_frame_names(&c, image, sizeof(image), names, 4) == 0,
+          "an absent name export does not search arbitrary module strings");
+    put_u32(image + 12, c.base + sizeof(image) - 4);
+    check(q2_creature_frame_names(&c, image, sizeof(image), names, 4) == 0,
+          "a truncated exported record cannot be read past its image");
+}
+
 static int g_batch_stands;
 
 static void batch_stand(q2_monster *m)
@@ -88,6 +119,7 @@ static void test_summoned_batch_is_started(void)
     monster.group = 0;
     monster.health = 20;
     monster.in_use = false;       /* held by q2_creature_world_hold_batches */
+    monster.spawn_pending = true;
     monster.spawnflags |= Q2_SVFLAG_INUSE;
     monster.stand = batch_stand;
     w.set.monsters = &monster;
@@ -106,6 +138,57 @@ static void test_summoned_batch_is_started(void)
                "with a live next-think deadline");
     check_eq_i(q2_creature_world_summon(&w, "LiftRoom"), 0,
                "a second selection does not restart an active creature");
+    monster.in_use = false;
+    check_eq_i(q2_creature_world_summon(&w, "LiftRoom"), 0,
+               "a freed creature cannot be mistaken for an unspawned batch");
+    check(!monster.in_use && !monster.spawn_pending,
+          "summoning is one-shot even after the record becomes inactive");
+}
+
+static void test_batch_zone_eligibility(void)
+{
+    q2_creature_world w;
+    q2_monster monsters[5];
+    u8 population[5 * Q2_POP_GROUP_SIZE + 4] = {0};
+    const char *names[] = { "Zone0", "Zone0Room2", "Zone1", "Zone1Key", "Ambush" };
+    u32 i;
+
+    memset(&w, 0, sizeof(w));
+    for (i = 0; i < 5; i++) {
+        memcpy(population + i * Q2_POP_GROUP_SIZE, names[i], strlen(names[i]));
+        q2_monster_init(&monsters[i]);
+        monsters[i].group = (u16)i;
+        monsters[i].in_use = true;
+        monsters[i].health = 20;
+        monsters[i].stand = batch_stand;
+    }
+    w.pop.data = population;
+    w.pop.size = sizeof(population);
+    w.pop.group_count = 5;
+    w.pop_ready = true;
+    w.set.monsters = monsters;
+    w.set.count = 5;
+
+    /* The client already rejected this unzoned record against the hull. */
+    monsters[4].in_use = false;
+    q2_level_reset();
+    check_eq_i(q2_creature_world_hold_batches(&w, 0, NULL, 0), 3,
+               "only the exact resident zone group starts");
+    check(monsters[0].in_use && !monsters[0].spawn_pending,
+          "ordinary zone population stays live");
+    check(!monsters[1].in_use && monsters[1].spawn_pending,
+          "a resident suffixed group waits for its script");
+    check(monsters[2].spawn_pending && monsters[3].spawn_pending &&
+          !monsters[4].spawn_pending,
+          "only records accepted by the resident hull become pending");
+    check_eq_i(q2_creature_world_summon(&w, "Zone1"), 1,
+               "an explicit batch may select a group overlapping the resident zone");
+    check_eq_i(q2_creature_world_summon(&w, "Ambush"), 0,
+               "CREBATCH cannot bypass the client's hull exclusion");
+    check_eq_i(q2_creature_world_summon(&w, "Zone0Room2"), 1,
+               "the resident ambush is still reachable");
+    check(monsters[1].think == q2_M_MoveFrame &&
+          !monsters[1].spawn_pending, "the ambush starts and consumes its latch");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -283,7 +366,7 @@ static void test_population_spawn_flags(void)
 
     memset(&set, 0, sizeof(set));
     q2_monster_set_register(&set, 34);
-    check_eq_i(q2_spawn_from_population(&set, &pop, NULL, NULL), Q2_OK,
+    check_eq_i(q2_spawn_from_population(&set, &pop, NULL, NULL, NULL), Q2_OK,
                "one hand-built record spawns");
     check_eq_i(set.count, 1, "the record produced one monster");
 
@@ -409,7 +492,7 @@ static void test_spawn_loop_honours_difficulty(void)
     memset(&set, 0, sizeof(set));
     memset(&st, 0, sizeof(st));
     q2_monster_set_register(&set, 18);
-    check_eq_i(q2_spawn_from_population(&set, &pop, NULL, &st), Q2_OK,
+    check_eq_i(q2_spawn_from_population(&set, &pop, NULL, NULL, &st), Q2_OK,
                "the population spawns on medium");
     check_eq_i(st.records, 2, "both records were seen");
     check_eq_i(st.skill_filtered, 1,
@@ -424,7 +507,7 @@ static void test_spawn_loop_honours_difficulty(void)
     memset(&set, 0, sizeof(set));
     memset(&st, 0, sizeof(st));
     q2_monster_set_register(&set, 18);
-    check_eq_i(q2_spawn_from_population(&set, &pop, NULL, &st), Q2_OK,
+    check_eq_i(q2_spawn_from_population(&set, &pop, NULL, NULL, &st), Q2_OK,
                "and on easy");
     check_eq_i(st.skill_filtered, 0, "nothing is removed on easy");
     check_eq_i(set.count, 2, "both creatures exist");
@@ -781,6 +864,7 @@ static void test_soldier_present(void)
 /* ------------------------------------------------------------------------- */
 static int g_snd_calls; static int g_snd_last;
 static int g_mel_calls; static s32 g_mel_dmg, g_mel_kick, g_mel_aim0;
+static s32 g_mel_aim[3];
 
 static void spy_sound(q2_monster *m, int which, void *u)
 {
@@ -792,6 +876,7 @@ static void spy_melee(q2_monster *m, const s32 aim[3], s32 dmg, s32 kick,
 {
     (void)m; (void)u;
     g_mel_calls++; g_mel_dmg = dmg; g_mel_kick = kick; g_mel_aim0 = aim[0];
+    memcpy(g_mel_aim, aim, sizeof(g_mel_aim));
 }
 
 static void test_actions(void)
@@ -1000,8 +1085,8 @@ static void test_sound_fallback(void)
 
     printf("module sound fallbacks\n");
 
-    check(q2_creature_sound_fallbacks(&nfb) != NULL && nfb == 7,
-          "seven fallback slots: the Soldier's two trios and the Tank's one");
+    check(q2_creature_sound_fallbacks(&nfb) != NULL && nfb == 23,
+          "fallback slots cover native conditional sound registrations");
 
     /*
      * soldier_pain plays +0x32B4 and sol_pain3 is in NO bank on the disc, so
@@ -1515,6 +1600,163 @@ static void spy_last_shot(q2_monster *m, const q2_cre_shot *shot, void *user)
     g_shot_calls++;
 }
 
+static s16 g_muzzle_a, g_muzzle_b;
+
+static bool spy_muzzle(const q2_monster *m, s16 a, s16 b, s32 out[3], void *u)
+{
+    (void)m; (void)u;
+    g_muzzle_a = a;
+    g_muzzle_b = b;
+    out[0] = a == 239 ? -100 : 100;
+    out[1] = -200;
+    out[2] = 300;
+    return true;
+}
+
+static void test_melee_geometry(void)
+{
+    q2_monster m, foe;
+    s32 aim[3] = { 1020, 0, 0 }, point[3];
+    s16 impulse[3];
+    q2_monster_init(&m); q2_monster_init(&foe);
+    m.enemy = &foe; foe.pos[2] = 1000;
+    check(q2_cre_melee_contact(&m, aim, point) && point[0] == 0 &&
+          point[1] == 0 && point[2] == 714,
+          "central melee subtracts the target hull radius before projecting");
+    q2_cre_melee_impulse(&foe, point, 400, impulse);
+    check(foe.velocity[2] == 400 && impulse[2] == 6400,
+          "the kick sets AI velocity and adds a separately scaled mover impulse");
+    aim[1] = -48; aim[2] = -286;
+    check(q2_cre_melee_contact(&m, aim, point) && point[0] == -286 &&
+          point[1] == -48 && point[2] == 1000,
+          "a hull-edge swing uses the target's side and the native vertical sign");
+    point[0] = 0; point[1] = 500; point[2] = 1000;
+    foe.on_ground = true;
+    q2_cre_melee_impulse(&foe, point, 400, impulse);
+    check(foe.velocity[1] == -3072 && impulse[1] == -3072 && !foe.on_ground,
+          "vertical kick scales in place, caps upward lift and ungrounds the target");
+    foe.pos[2] = 1021;
+    check(!q2_cre_melee_contact(&m, aim, point), "an out-of-reach swing has no contact");
+}
+
+static void test_flyer_aim(void)
+{
+    const q2_cre_impl *impl = q2_cre_impl_find("Flyer");
+    q2_monster m, foe;
+    int frame;
+    puts("Flyer alternating muzzles, raw eye aim, hyper flags and slash bounds");
+    check(impl != &q2_cre_generic, "the Flyer has a native implementation");
+    if (impl == &q2_cre_generic) return;
+    q2_monster_init(&m);
+    q2_monster_init(&foe);
+    m.enemy = &foe;
+    foe.pos[0] = 101; foe.pos[1] = -223; foe.pos[2] = 800;
+    foe.view_height = -41;
+    foe.velocity[2] = 10000;
+    q2_cre_set_muzzle_hook(spy_muzzle, NULL);
+    q2_cre_set_shot_hook(spy_last_shot, NULL);
+    for (frame = 82; frame <= 89; frame++) {
+        m.frame = (s16)frame;
+        impl->method[(frame & 1) ? 9 : 8](&m);
+        check(g_last_shot.slot == Q2_IMP_FIRE_BLASTER && g_last_shot.aimed &&
+              g_last_shot.damage == 1 && g_last_shot.speed == 1000,
+              "each Flyer round carries its native figures");
+        check(g_last_shot.dir[0] == 1 && g_last_shot.dir[1] == -64 &&
+              g_last_shot.dir[2] == 500,
+              "the raw target-eye delta survives without velocity lead");
+        check(g_last_shot.effects ==
+                  (u32)((frame == 82 || frame == 85 || frame == 88) ? 64 : 0),
+              "only frames 82, 85 and 88 request hyper flags");
+        check(g_muzzle_a == ((frame & 1) ? 121 : 112) &&
+              g_muzzle_b == ((frame & 1) ? 128 : 115),
+              "the two posed muzzles alternate in native order");
+    }
+    q2_cre_set_sound_hook(spy_sound, NULL);
+    q2_cre_set_melee_hook(spy_melee, NULL);
+    m.mins[0] = -123; m.maxs[0] = 456;
+    g_mel_calls = 0;
+    impl->method[11](&m);
+    check(g_mel_calls == 1 && g_mel_dmg == 5 && g_mel_kick == 0 &&
+          g_mel_aim[0] == 1020 && g_mel_aim[1] == 0 && g_mel_aim[2] == -123,
+          "the left slash uses the live left hull bound");
+    impl->method[12](&m);
+    check(g_mel_calls == 2 && g_mel_aim[2] == 456,
+          "the right slash uses the live right hull bound");
+    foe.pos[2] = 5000;
+    impl->method[11](&m);
+    check(g_mel_calls == 2 && (u32)g_snd_last == 0x80101778u,
+          "a missed slash still plays its aliased swing sound");
+    m.next_think = 100;
+    ((void (*)(q2_monster *, s16))(void *)impl->callback[12])(&m, 100);
+    check(m.dead && m.deadflag == Q2_DEAD_DEAD && m.next_think == 0 &&
+          m.movetype == Q2_MOVETYPE_TOSS && m.takedamage == Q2_DAMAGE_YES &&
+          (m.svflags & Q2_SVF_DEADMONSTER),
+          "Flyer death immediately installs the native corpse state");
+    q2_cre_set_sound_hook(NULL, NULL);
+    q2_cre_set_melee_hook(NULL, NULL);
+    q2_cre_set_muzzle_hook(NULL, NULL);
+    q2_cre_set_shot_hook(NULL, NULL);
+}
+
+static void test_gunner_and_arachner_aim(void)
+{
+    const q2_cre_impl *gunner = q2_cre_impl_find("Gunner");
+    const q2_cre_impl *arachner = q2_cre_impl_find("Arachner");
+    q2_monster m, foe;
+
+    printf("Gunner muzzle/lead and Arachner barrel target snapshots\n");
+    q2_monster_init(&m);
+    q2_monster_init(&foe);
+    q2_cre_set_muzzle_hook(spy_muzzle, NULL);
+    q2_cre_set_shot_hook(spy_last_shot, NULL);
+    m.enemy = &foe;
+    foe.pos[0] = 1100; foe.pos[1] = -100; foe.pos[2] = 300;
+    foe.view_height = -100;
+    foe.velocity[2] = 1000;
+
+    gunner->method[2](&m);
+    check(g_muzzle_a == 227 && g_muzzle_b == 231,
+          "the chain gun uses its blended muzzle");
+    check(g_last_shot.aimed && g_last_shot.start[0] == 100 &&
+          g_last_shot.start[1] == -200 && g_last_shot.start[2] == 300,
+          "the posed muzzle reaches the shot hook");
+    check(g_last_shot.dir[0] > 3900 && g_last_shot.dir[1] == 0 &&
+          g_last_shot.dir[2] < -700,
+          "the shot includes the enemy's eye and negative velocity lead");
+
+    m.enemy = NULL;
+    gunner->method[1](&m);
+    check(g_muzzle_a == 273 && g_muzzle_b == 273 && g_last_shot.aimed,
+          "the grenade uses vertex 273 alone, even without an enemy");
+    check(g_last_shot.dir[0] == 0 && g_last_shot.dir[1] == 0 &&
+          g_last_shot.dir[2] == 4096 && g_last_shot.speed == 600,
+          "grenades leave along body forward, with the module's speed");
+
+    m.enemy = &foe;
+    m.blind_target[0] = 100; m.blind_target[1] = -200;
+    m.blind_target[2] = 2300;
+    foe.pos[0] = 2100;
+    arachner->method[3](&m);
+    check(g_muzzle_a == 290 && g_muzzle_b == 307 && g_last_shot.aimed,
+          "the right rail uses its own muzzle and initialized aim");
+    check(g_last_shot.dir[0] == 0 && g_last_shot.dir[1] == 0 &&
+          g_last_shot.dir[2] == 4096,
+          "the first barrel fires at the earlier target, not its new position");
+    check(m.blind_target[0] == 2100 && m.blind_target[1] == -200 &&
+          m.blind_target[2] == 300,
+          "the right barrel samples the enemy again only after firing");
+
+    m.enemy = NULL;
+    arachner->method[4](&m);
+    check(g_muzzle_a == 239 && g_muzzle_b == 253 && g_last_shot.aimed,
+          "the left rail uses its own muzzle after the enemy disappears");
+    check(g_last_shot.dir[0] == 4096 && g_last_shot.dir[1] == 0 &&
+          g_last_shot.dir[2] == 0,
+          "the second barrel retains the right barrel's target snapshot");
+    q2_cre_set_muzzle_hook(NULL, NULL);
+    q2_cre_set_shot_hook(NULL, NULL);
+}
+
 static void test_soldier_burst_and_death_aim(void)
 {
     const q2_cre_impl *impl = q2_cre_impl_find("Soldier");
@@ -1900,12 +2142,1286 @@ static void test_insane_start_draws(void)
     q2_class_table_reset();
 }
 
-/* ------------------------------------------------------------------------- */
-int main(void)
+/* Optional real-disc integration: bind every supported population class on
+ * every difficulty, drive its decoded attack and death moves, and verify
+ * every frame method is reachable. Assets stay on the user's disc. */
+static void roster_shot(q2_monster *m, const q2_cre_shot *shot, void *user)
 {
+    (void)m; (void)user;
+    g_shot_calls++;
+    check(shot->aimed && shot->damage > 0,
+          "every disc-driven shot has a muzzle, direction and damage");
+}
+
+static void test_disc_flyer(q2_cre_bind *bind)
+{
+    q2_monster m, foe;
+    const q2_cre_impl *impl = bind->impl;
+    const s32 pains[3] = { 134, 143, 147 };
+    int i, seed, first, next;
+    q2_level_reset();
+    q2_monster_init(&m);
+    q2_monster_init(&foe);
+    m.health = m.max_health = 50;
+    q2_creature_spawn(bind, &m, 0);
+    q2_monster_start_go(&m);
+    check((m.flags & Q2_FL_FLY) && m.mass == 50 && m.view_height == -250,
+          "the disc Flyer starts through flymonster_start");
+    m.walk(&m);
+    check(m.currentmove == q2_cre_find_move_at(&m, 0x80101484u),
+          "Walk selects the walking copy of frames 13..57");
+    m.aiflags &= ~Q2_AI_STAND_GROUND;
+    m.run(&m);
+    check(m.currentmove == q2_cre_find_move_at(&m, 0x8010151Cu),
+          "Run selects the running copy of the same frames");
+    m.aiflags |= Q2_AI_STAND_GROUND;
+    m.run(&m);
+    check(m.currentmove == q2_cre_find_move_at(&m, 0x801013ECu),
+          "stand-ground Run selects the stationary copy");
+    m.aiflags = 0;
+    m.enemy = m.goalentity = &foe;
+    foe.health = 10000;
+    foe.in_use = foe.client = true;
+    foe.spawnflags |= Q2_SVFLAG_INUSE;
+    foe.pos[2] = 5000;
+    m.attack(&m);
+    m.frame = 78;
+    g_shot_calls = 0;
+    for (i = 0; i < 17; i++) q2_M_MoveFrame(&m);
+    check(g_shot_calls == 8 && m.frame == 95,
+          "the real disc attack frames fire exactly eight shots");
+    check(m.currentmove->endfunc != NULL, "Attack2 binds its native run endfunc");
+    m.currentmove->endfunc(&m);
+    check(m.currentmove == q2_cre_find_move_at(&m, 0x8010151Cu),
+          "Attack2 ends by running, not the decoder's first possible branch");
+    m.melee(&m);
+    check(m.currentmove->endfunc != NULL, "melee start binds its loop installer");
+    m.currentmove->endfunc(&m);
+    check(m.currentmove->first_frame == 64 && m.currentmove->endfunc != NULL,
+          "melee chains into its native loop with a decision endfunc");
+    q2_random_seed(987);
+    first = q2_random_next();
+    q2_random_seed(987);
+    impl->method[1](&m);
+    check(m.currentmove->first_frame == 76 && q2_random_next() == first,
+          "a distant enemy ends melee without drawing the repeat chance");
+    foe.pos[0] = m.pos[0]; foe.pos[1] = m.pos[1]; foe.pos[2] = m.pos[2];
+    for (seed = 0; seed < 100; seed++) {
+        q2_random_seed((u32)seed);
+        first = q2_random_next(); next = q2_random_next();
+        q2_random_seed((u32)seed);
+        impl->method[1](&m);
+        check(m.currentmove->first_frame == (first < 26214 ? 64 : 76) &&
+              q2_random_next() == next,
+              "near melee repeats at the native threshold with one draw");
+    }
+    for (i = 0; i < 3; i++) {
+        for (seed = 0; ; seed++) {
+            q2_random_seed((u32)seed);
+            if (q2_random_next() % 3 == i) break;
+        }
+        q2_cre_set_skill(1);
+        q2_level_state.time = 100;
+        m.pain_debounce = 0;
+        m.health = 24;
+        q2_random_seed((u32)seed);
+        m.pain(&m, 1);
+        check(m.currentmove->first_frame == pains[i] && m.skinnum == 1 &&
+              m.pain_debounce == 130, "each native pain branch and deadline works");
+    }
+    m.attack(&m);
+    m.skinnum = 0;
+    m.pain_debounce = 0;
+    q2_cre_set_skill(3);
+    q2_random_seed(987);
+    first = q2_random_next();
+    q2_random_seed(987);
+    m.pain(&m, 40);
+    check(m.currentmove->first_frame == 79 && m.skinnum == 1 &&
+          m.pain_debounce == 130 && q2_random_next() == first,
+          "nightmare changes skin/debounce without interrupting or drawing RNG");
+    impl->method[4](&m);
+    check(m.currentmove->first_frame == 0 && bind->flyer_transition == 3,
+          "registered start writes the shared module transition selector");
+    impl->method[6](&m);
+    check(m.currentmove == q2_cre_find_move_at(&m, 0x8010151Cu),
+          "Start's final frame dispatches to Run");
+    q2_cre_set_skill(1);
+}
+
+static void test_disc_gladiator(q2_creature_module *mod)
+{
+    q2_cre_bind *bind = &mod->bind;
+    const q2_cre_impl *impl = bind->impl;
+    q2_monster m, foe;
+    q2_cre_sound_bind sounds[48];
+    u32 count, i;
+    int first, second;
+    static const q2_cre_sound_bind expected[] = {
+        { 0x801013D0u, "gld_pain2" }, { 0x801013D4u, "gld_pain2" },
+        { 0x801013D8u, "gld_death" }, { 0x801013DCu, "wep_railgf1a" },
+        { 0x801013E0u, "gld_melee3" }, { 0x801013ECu, "gld_idle1" },
+        { 0x801013F0u, "gld_srch1" }, { 0x801013F4u, "gld_sight" },
+        { 0x801013F8u, "msc_udeath" }
+    };
+    count = q2_creature_sound_bindings(mod->image, mod->size, Q2_CREWORLD_BASE,
+                                        sounds, 48);
+    check(count <= 48, "Gladiator sound registrations fit the binding table");
+    for (i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+        const char *name = q2_creature_sound_for_addr(sounds, count,
+                                                      expected[i].addr);
+        check(name && !strcmp(name, expected[i].name),
+              "every Gladiator handle resolves, including both scheduled pain calls");
+    }
+    q2_level_reset();
+    q2_monster_init(&m); q2_monster_init(&foe);
+    m.health = m.max_health = 400; m.gib_health = -175;
+    q2_creature_spawn(bind, &m, 0);
+    q2_monster_start_go(&m);
+    check(m.mass == 400 && m.speed_scale == 10 && !m.dodge &&
+          m.movetype == Q2_MOVETYPE_STEP && m.solid == Q2_SOLID_BBOX,
+          "Gladiator spawn installs the native physical state");
+    m.enemy = m.goalentity = &foe;
+    foe.health = 1000; foe.in_use = true;
+    m.blind_target[0] = 123;
+    foe.pos[2] = 1052;
+    m.attack(&m);
+    check(m.currentmove->first_frame == 0 && m.blind_target[0] == 123,
+          "the exact rail range boundary preserves the previous move and target");
+    foe.pos[2] = 1053; foe.view_height = -200;
+    m.attack(&m);
+    check(m.currentmove->first_frame == 46 && m.blind_target[0] == 0 &&
+          m.blind_target[1] == -200 && m.blind_target[2] == 1053,
+          "a farther target starts the rail move and snapshots its eye");
+    q2_cre_set_shot_hook(spy_last_shot, NULL);
+    q2_cre_set_muzzle_hook(spy_muzzle, NULL);
+    q2_cre_set_sound_hook(spy_sound, NULL);
+    m.enemy = NULL; foe.pos[0] = 10000;
+    impl->method[4](&m);
+    check(g_muzzle_a == 158 && g_muzzle_b == 169 &&
+          g_last_shot.slot == Q2_IMP_FIRE_RAILGUN &&
+          g_last_shot.damage == 50 && g_last_shot.kick == 100 &&
+          g_last_shot.flash == 0 && g_last_shot.aimed,
+          "the rail uses the posed barrel and native weapon parameters");
+    check(g_last_shot.dir[0] < 0 && g_last_shot.dir[1] == 0 &&
+          g_last_shot.dir[2] > 4000 && (u32)g_snd_last == 0x801013DCu,
+          "the shot uses its saved eye after enemy loss and plays the rail sound");
+    m.enemy = &foe; foe.pos[0] = foe.pos[2] = 0; m.mins[0] = -99;
+    q2_random_seed(123); first = q2_random_next(); second = q2_random_next();
+    q2_random_seed(123); g_mel_calls = 0;
+    impl->method[2](&m);
+    check(g_mel_calls == 1 && g_mel_dmg == 20 + first % 5 &&
+          g_mel_kick == 150 && g_mel_aim[0] == 1020 &&
+          g_mel_aim[1] == -48 && g_mel_aim[2] == -99 &&
+          q2_random_next() == second, "melee uses native damage, kick and hull aim");
+    foe.pos[2] = 3000; q2_random_seed(123);
+    impl->method[2](&m);
+    check(g_mel_calls == 1 && q2_random_next() == second,
+          "a missed melee still draws its damage roll");
+    q2_cre_set_skill(1); q2_level_state.time = 100;
+    m.health = 199; m.velocity[1] = 1200; g_snd_calls = 0;
+    q2_random_seed(123);
+    m.pain(&m, 1);
+    check(m.currentmove->first_frame == 55 && m.skinnum == 1 &&
+          m.pain_debounce == 130 && g_snd_calls == 1 &&
+          q2_random_next() == first, "ordinary pain at velocity 1200 consumes no RNG");
+    m.velocity[1] = 1201;
+    m.pain(&m, 1);
+    check(m.currentmove->first_frame == 83 && m.pain_debounce == 130 &&
+          g_snd_calls == 1, "debounce allows only normal pain to become upward pain");
+    m.attack(&m); m.pain(&m, 1);
+    check(m.currentmove->first_frame == 46 && g_snd_calls == 1,
+          "debounce does not interrupt an attack with upward pain");
+    q2_level_state.time = 130; q2_cre_set_skill(3);
+    m.pain(&m, 1);
+    check(m.currentmove->first_frame == 46 && g_snd_calls == 2 &&
+          m.pain_debounce == 160, "nightmare pain plays sound and sets debounce");
+    q2_cre_set_skill(1); q2_level_state.time = 160;
+    m.pain(&m, 1);
+    check(m.currentmove->first_frame == 83, "fresh pain also honors vertical velocity");
+    m.health = 0; m.die(&m, 10);
+    check(m.currentmove->first_frame == 61 && m.dead &&
+          m.takedamage == Q2_DAMAGE_YES, "normal death starts the full animation");
+    first = g_snd_calls; m.die(&m, 10);
+    check(g_snd_calls == first, "repeated corpse damage does not replay death");
+    m.currentmove->endfunc(&m);
+    check(m.next_think == 0 && m.movetype == Q2_MOVETYPE_TOSS &&
+          (m.svflags & Q2_SVF_DEADMONSTER), "death ends in the native corpse state");
+    m.health = m.gib_health; m.takedamage = Q2_DAMAGE_AIM;
+    m.die(&m, 200);
+    check(g_snd_calls == first && m.takedamage == Q2_DAMAGE_AIM,
+          "gib threshold is silent and preserves the damage mode");
+    q2_cre_set_sound_hook(NULL, NULL);
+    q2_cre_set_muzzle_hook(NULL, NULL);
+    q2_cre_set_shot_hook(roster_shot, NULL);
+}
+
+static bool blocked_creature_sight(void *user, const s32 a[3], const s32 b[3])
+{
+    (void)user; (void)a; (void)b;
+    return false;
+}
+
+static void test_disc_hover(q2_creature_module *mod)
+{
+    q2_monster m, foe;
+    const q2_cre_impl *impl = mod->bind.impl;
+    q2_cre_sound_bind sounds[48];
+    q2_ai_world blocked = { 0 };
+    u32 count;
+    const char *name;
+    int seed, first, second, i;
+    count = q2_creature_sound_bindings(mod->image, mod->size, Q2_CREWORLD_BASE,
+                                        sounds, 48);
+    check(count == 8, "Hover registers five samples and copies three additional handle slots");
+    name = q2_creature_sound_for_addr(sounds, count, 0x8010147Cu);
+    check(name && !strcmp(name, "msc_udeath"), "Hover's gib sound resolves");
+    q2_level_reset(); q2_monster_init(&m); q2_monster_init(&foe);
+    m.health = m.max_health = 240; m.gib_health = -100;
+    q2_creature_spawn(&mod->bind, &m, 0); q2_monster_start_go(&m);
+    check((m.flags & Q2_FL_FLY) && m.mass == 150, "Hover starts through flymonster_start");
+    m.walk(&m);
+    check(m.currentmove == q2_cre_find_move_at(&m, 0x801012F4u),
+          "walk selects the walking copy of Forward");
+    m.run(&m);
+    check(m.currentmove == q2_cre_find_move_at(&m, 0x80101370u),
+          "run selects the running copy of Forward");
+    m.aiflags |= Q2_AI_STAND_GROUND; m.run(&m);
+    check(m.currentmove->first_frame == 0, "stand-ground run stands");
+    m.enemy = m.goalentity = &foe;
+    foe.health = 100; foe.in_use = foe.client = true;
+    foe.spawnflags |= Q2_SVFLAG_INUSE;
+    foe.pos[0] = 164; foe.pos[1] = -200; foe.pos[2] = 4000;
+    foe.view_height = -64;
+    q2_cre_set_shot_hook(spy_last_shot, NULL);
+    q2_cre_set_muzzle_hook(spy_muzzle, NULL);
+    m.attack(&m); m.frame = 196; g_shot_calls = 0;
+    for (i = 0; i < 5; i++) q2_M_MoveFrame(&m);
+    check(g_shot_calls == 2 && m.frame == 201,
+          "start attack chains into exactly two shot frames");
+    check(g_muzzle_a == 275 && g_muzzle_b == 277 && g_last_shot.effects == 0,
+          "odd attack frame uses the first muzzle and ordinary bolt");
+    m.frame = 200; impl->method[6](&m);
+    check(g_muzzle_a == 267 && g_muzzle_b == 269 && g_last_shot.effects == 64 &&
+          g_last_shot.dir[0] == 64 && g_last_shot.dir[1] == -64 &&
+          g_last_shot.dir[2] == 3700 && g_last_shot.damage == 1,
+          "frame 200 uses the second muzzle and raw eye delta for a hyper bolt");
+    for (seed = 0; seed < 100; seed++) {
+        q2_random_seed((u32)seed); first = q2_random_next(); second = q2_random_next();
+        q2_random_seed((u32)seed); impl->method[5](&m);
+        check(m.currentmove->first_frame == (first < 19661 ? 200 : 203) &&
+              q2_random_next() == second, "visible living target repeats at native 60% threshold");
+    }
+    foe.health = 0; q2_random_seed(123); first = q2_random_next();
+    q2_random_seed(123); impl->method[5](&m);
+    check(m.currentmove->first_frame == 203 && q2_random_next() == first,
+          "a dead target ends the burst before drawing RNG");
+    foe.health = 100; blocked.line_of_sight = blocked_creature_sight;
+    q2_ai_set_world(&blocked); q2_random_seed(123); impl->method[5](&m);
+    check(m.currentmove->first_frame == 203 && q2_random_next() == first,
+          "lost visibility also ends the burst without RNG");
+    q2_ai_set_world(NULL); q2_cre_set_sound_hook(spy_sound, NULL);
+    q2_cre_set_skill(1); m.health = 119;
+    for (seed = 0; seed < 32; seed++) {
+        q2_random_seed((u32)seed); first = q2_random_next(); second = q2_random_next();
+        q2_random_seed((u32)seed); m.pain_debounce = 0; m.pain(&m, 25);
+        check(m.currentmove->first_frame == (first < 16384 ? 153 : 141) &&
+              m.skinnum == 1 && q2_random_next() == second,
+              "damage 25 selects between the two short pain moves");
+    }
+    q2_random_seed(123); first = q2_random_next(); q2_random_seed(123);
+    m.pain_debounce = 0; m.pain(&m, 26);
+    check(m.currentmove->first_frame == 113 && q2_random_next() == first,
+          "damage 26 selects long pain without a random draw");
+    m.attack(&m); m.pain_debounce = 0; g_snd_calls = 0;
+    q2_cre_set_skill(3); q2_random_seed(123); m.pain(&m, 50);
+    check(m.currentmove->first_frame == 197 && !g_snd_calls &&
+          m.pain_debounce == 30 && q2_random_next() == first,
+          "nightmare sets debounce but has no pain sound or animation");
+    m.health = 0; m.die(&m, 10);
+    check(m.currentmove->first_frame == 162 && m.dead &&
+          m.takedamage == Q2_DAMAGE_YES, "ordinary Hover death plays its full move");
+    m.currentmove->endfunc(&m);
+    check(m.health == m.gib_health && m.takedamage == Q2_DAMAGE_NO &&
+          (m.svflags & Q2_SVF_DEADMONSTER) && m.next_think == 0,
+          "completed death sets gib health and disables damage for corpse dispatch");
+    m.health = -300; m.die(&m, 200);
+    check(m.health == m.gib_health && (u32)g_snd_last == 0x8010147Cu,
+          "immediate gib death clamps to gib health and plays its own sound");
+    q2_cre_set_skill(1); q2_cre_set_sound_hook(NULL, NULL);
+    q2_cre_set_muzzle_hook(NULL, NULL); q2_cre_set_shot_hook(roster_shot, NULL);
+}
+
+static q2_ai_world g_parasite_base;
+static q2_monster *g_parasite_target;
+static int g_parasite_hits, g_parasite_damage, g_parasite_mod, g_parasite_beams;
+static void parasite_trace(void *user, const s32 start[3], const s16 mins[3],
+                           const s16 maxs[3], const s32 end[3],
+                           const q2_monster *ignore, u32 mask, q2_ai_trace *out)
+{
+    (void)user;
+    g_parasite_base.trace(g_parasite_base.user, start, mins, maxs, end, ignore, mask, out);
+    if (!mins && !maxs) {
+        check(mask == 0x06000003u, "Parasite drain uses the native trace mask");
+        out->ent = g_parasite_target;
+    }
+}
+static void parasite_hurt(q2_monster *self, q2_monster *target, s16 damage,
+                          int mod, const s32 *point, void *user)
+{
+    (void)user;
+    check(target == self->enemy && point == NULL,
+          "drain damages the traced enemy with no damage point");
+    g_parasite_hits++; g_parasite_damage += damage; g_parasite_mod = mod;
+}
+static void parasite_beam(q2_monster *self, q2_monster *target, s16 vertex, void *user)
+{
+    (void)user;
+    check(target == self->enemy && vertex == 97, "drain beam uses posed vertex 97");
+    g_parasite_beams++;
+}
+static void parasite_test_world(q2_monster *target)
+{
+    q2_ai_world world;
+    q2_ai_set_world(NULL);
+    g_parasite_base = *q2_ai_get_world();
+    world = g_parasite_base; world.trace = parasite_trace;
+    g_parasite_target = target;
+    q2_ai_set_world(&world);
+    q2_cre_set_contact_hooks(parasite_hurt, parasite_beam, NULL);
+}
+
+static void test_disc_parasite(q2_cre_bind *bind)
+{
+    q2_monster m, foe;
+    int i, seed, draw, next;
+    q2_level_reset(); q2_cre_set_skill(1);
+    q2_monster_init(&m); q2_monster_init(&foe);
+    m.health = m.max_health = 175; m.gib_health = -50;
+    q2_creature_spawn(bind, &m, 0);
+    check(m.mass == 250 && m.start_kind == Q2_CRE_START_WALK,
+          "Parasite spawn enters the native walking state");
+    m.run(&m); check(m.currentmove == q2_cre_find_move_at(&m, 0x8010168Cu),
+                    "run starts with the run-specific duplicate frame range");
+    bind->impl->method[3](&m);
+    check(m.currentmove == q2_cre_find_move_at(&m, 0x80101674u), "run loops its own move");
+    m.walk(&m); check(m.currentmove == q2_cre_find_move_at(&m, 0x801016F0u),
+                     "walk starts with its distinct duplicate frame range");
+    bind->impl->method[4](&m);
+    check(m.currentmove == q2_cre_find_move_at(&m, 0x801016D8u), "walk loops its own move");
+    m.aiflags |= Q2_AI_STAND_GROUND;
+    m.run(&m); check(m.currentmove->first_frame == 83, "stand-ground keeps Parasite still");
+    m.enemy = m.goalentity = &foe; foe.health = 10000; foe.pos[2] = 1000;
+    parasite_test_world(&foe);
+    q2_cre_set_sound_hook(spy_sound, NULL);
+    g_parasite_hits = g_parasite_damage = g_parasite_beams = 0;
+    m.attack(&m); m.frame = 38;
+    for (i = 0; i < 18; i++) q2_M_MoveFrame(&m);
+    check(g_parasite_hits == 11 && g_parasite_damage == 25 && g_parasite_beams == 11,
+          "the native drain move delivers one five-point and ten two-point hits");
+    g_parasite_hits = g_parasite_damage = 0;
+    m.frame = 41; bind->impl->method[12](&m);
+    check(g_parasite_hits == 1 && g_parasite_mod == 21, "first contact carries MOD 21");
+    m.frame = 42; bind->impl->method[12](&m);
+    check(g_parasite_hits == 2 && g_parasite_mod == 0, "later contact carries MOD 0");
+    g_parasite_target = NULL;
+    bind->impl->method[12](&m);
+    check(g_parasite_hits == 2, "a world or other-body obstruction refuses drain damage");
+    g_parasite_target = &foe;
+    memcpy(foe.pos, m.pos, sizeof(m.pos)); foe.pos[2] += 3360;
+    bind->impl->method[12](&m);
+    check(g_parasite_hits == 3, "3072 from the projected start is still in reach");
+    foe.pos[2]++;
+    bind->impl->method[12](&m);
+    check(g_parasite_hits == 3, "3073 from the projected start is out of reach");
+    for (i = 0; i < 2; i++) {
+        for (seed = 0; ; seed++) {
+            q2_random_seed((u32)seed); draw = q2_random_next();
+            if ((draw < 26215) == i) break;
+        }
+        next = q2_random_next(); q2_random_seed((u32)seed);
+        bind->impl->method[8](&m);
+        check(m.currentmove->first_frame == (i ? 104 : 110) && q2_random_next() == next,
+              "fidget repetition uses one native 26215-threshold random draw");
+    }
+    q2_cre_set_skill(3); m.health = 10; m.pain_debounce = 0;
+    g_snd_calls = 0; m.pain(&m, 1);
+    check(m.skinnum == 1 && m.pain_debounce == 30 && g_snd_calls == 0,
+          "nightmare still updates skin/debounce but skips pain sound and move");
+    q2_cre_set_skill(1); q2_level_state.time = 30; m.pain(&m, 100);
+    check(m.currentmove->first_frame == 57 && g_snd_calls == 1,
+          "pain at the debounce boundary enters the native flinch");
+    m.health = -1; m.die(&m, 10);
+    check(m.dead && m.currentmove->first_frame == 32 && m.takedamage == Q2_DAMAGE_YES,
+          "ordinary death retains damage and the seven-frame move");
+    for (i = 0; i < 8; i++) q2_M_MoveFrame(&m);
+    check(m.next_think == 0 && m.movetype == Q2_MOVETYPE_TOSS &&
+          (m.svflags & Q2_SVF_DEADMONSTER), "Parasite death reaches its corpse state");
+    q2_cre_set_contact_hooks(NULL, NULL, NULL);
+    q2_cre_set_sound_hook(NULL, NULL); q2_ai_set_world(NULL);
+}
+
+static void test_disc_ironmaiden(q2_creature_module *mod)
+{
+    q2_monster m, foe;
+    const q2_cre_impl *impl = mod->bind.impl;
+    q2_cre_sound_bind sounds[48];
+    q2_ai_world blocked = { 0 };
+    u32 count, i;
+    int seed, first, next;
+    static const q2_cre_sound_bind expected[] = {
+        { 0x80101B60u, "chk_atck1" }, { 0x80101B64u, "wep_rocklf1a" },
+        { 0x80101B68u, "ara_melee1" }, { 0x80101B6Cu, "chk_atck4" },
+        { 0x80101B78u, "chk_deth2" }, { 0x80101B84u, "chk_idle2" },
+        { 0x80101B90u, "chk_pain3" }, { 0x80101B94u, "chk_sght1" },
+        { 0x80101B9Cu, "msc_udeath" }
+    };
+    count = q2_creature_sound_bindings(mod->image, mod->size, Q2_CREWORLD_BASE,
+                                        sounds, 48);
+    for (i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+        const char *name = q2_creature_sound_resolve("Ironmaiden", sounds, count,
+                             Q2_CREWORLD_BASE, expected[i].addr, NULL, NULL);
+        check(name && !strcmp(name, expected[i].name),
+              "Ironmaiden resolves scheduled stores and the overwritten sight handle");
+    }
+    q2_level_reset(); q2_monster_init(&m); q2_monster_init(&foe);
+    m.health = m.max_health = 175; m.gib_health = -70;
+    q2_creature_spawn(&mod->bind, &m, 0); q2_monster_start_go(&m);
+    check(m.mass == 200 && m.speed_scale == 10 && m.dodge &&
+          m.currentmove->first_frame == 121, "Ironmaiden starts with native physical state");
+    m.run(&m);
+    check(m.currentmove->first_frame == 181, "stand enters the run start move");
+    m.run(&m);
+    check(m.currentmove == q2_cre_find_move_at(&m, 0x80101790u),
+          "run start switches to the running copy of Walk");
+    m.run(&m);
+    check(m.currentmove->first_frame == 181, "calling run while running restarts the lead-in");
+    m.walk(&m); m.run(&m);
+    check(m.currentmove == q2_cre_find_move_at(&m, 0x80101790u),
+          "walking enters the run loop directly");
+    m.aiflags |= Q2_AI_STAND_GROUND; m.run(&m);
+    check(m.currentmove->first_frame == 121, "stand-ground run stands");
+    m.aiflags &= ~Q2_AI_STAND_GROUND;
+    m.enemy = m.goalentity = &foe;
+    foe.health = 100; foe.in_use = foe.client = true;
+    foe.spawnflags |= Q2_SVFLAG_INUSE; foe.pos[2] = 4000;
+    q2_cre_set_shot_hook(spy_last_shot, NULL);
+    q2_cre_set_muzzle_hook(spy_muzzle, NULL);
+    q2_cre_set_sound_hook(spy_sound, NULL);
+    m.attack(&m); m.frame = -1; g_shot_calls = 0;
+    for (i = 0; i < 14; i++) q2_M_MoveFrame(&m);
+    check(m.frame == 13 && g_shot_calls == 1 && g_muzzle_a == 233 &&
+          g_muzzle_b == 240 && g_last_shot.slot == Q2_IMP_FIRE_ROCKET &&
+          g_last_shot.damage == 50 && g_last_shot.speed == 500 &&
+          g_last_shot.aimed && g_last_shot.flash == 0,
+          "the real attack lead-in launches one native rocket at frame 13");
+    for (seed = 0; seed < 100; seed++) {
+        q2_random_seed((u32)seed); first = q2_random_next(); next = q2_random_next();
+        q2_random_seed((u32)seed); impl->method[4](&m);
+        check(m.currentmove->first_frame == (first < 19961 ? 13 : 27) &&
+              q2_random_next() == next, "rocket repeat uses the disc's 19961 threshold");
+        foe.pos[2] = 0;
+        q2_random_seed((u32)seed); impl->method[3](&m);
+        check(m.currentmove->first_frame == (first < 29491 ? 35 : 44) &&
+              q2_random_next() == next, "close melee repeats at the disc's 90% threshold");
+        foe.pos[2] = 4000;
+    }
+    q2_random_seed(123); first = q2_random_next(); q2_random_seed(123);
+    blocked.line_of_sight = blocked_creature_sight; q2_ai_set_world(&blocked);
+    impl->method[4](&m);
+    check(m.currentmove->first_frame == 27 && q2_random_next() == first,
+          "obstruction ends the rocket loop without consuming its random draw");
+    q2_ai_set_world(NULL);
+    foe.pos[2] = 0; m.mins[0] = -99; g_mel_calls = 0;
+    q2_random_seed(123); first = q2_random_next(); next = q2_random_next();
+    q2_random_seed(123); impl->method[16](&m);
+    check(g_mel_calls == 1 && g_mel_dmg == 10 + first % 6 &&
+          g_mel_kick == 100 && g_mel_aim[0] == 1020 &&
+          g_mel_aim[1] == -120 && g_mel_aim[2] == 99 &&
+          q2_random_next() == next && (u32)g_snd_last == 0x80101B68u,
+          "slash uses the negated hull extent, native damage and contact sound");
+    for (seed = 0; ; seed++) {
+        q2_random_seed((u32)seed);
+        if (q2_random_next() < 8192) break;
+    }
+    m.enemy = NULL; q2_random_seed((u32)seed); m.dodge(&m, &foe, 999);
+    check(m.currentmove->first_frame == 83 && m.enemy == &foe,
+          "accepted dodge adopts the attacker and starts Duck");
+    q2_level_state.time = 100; impl->method[9](&m);
+    check((m.aiflags & Q2_AI_DUCKED) && m.pausetime == 110 &&
+          m.takedamage == Q2_DAMAGE_YES, "duck starts its ten-tick hold");
+    q2_level_state.time = 109; impl->method[9](&m); impl->method[10](&m);
+    check(m.pausetime == 110 && (m.aiflags & Q2_AI_HOLD_FRAME),
+          "repeated duck-down does not extend the deadline");
+    q2_level_state.time = 110; impl->method[10](&m); impl->method[11](&m);
+    check(!(m.aiflags & (Q2_AI_DUCKED | Q2_AI_HOLD_FRAME)) &&
+          m.takedamage == Q2_DAMAGE_AIM, "duck releases exactly at its deadline");
+    q2_cre_set_skill(1); m.health = 80;
+    for (i = 0; i < 3; i++) {
+        static const s16 damage[] = { 10, 25, 26 };
+        static const s16 move[] = { 90, 95, 100 };
+        m.pain_debounce = 0; q2_random_seed(123); m.pain(&m, damage[i]);
+        check(m.currentmove->first_frame == move[i] && m.skinnum == 1 &&
+              m.pain_debounce == 140 && q2_random_next() == first,
+              "pain boundaries choose the three moves without random draws");
+    }
+    q2_cre_set_skill(3); m.attack(&m); m.pain_debounce = 0; g_snd_calls = 0;
+    m.pain(&m, 26);
+    check(m.currentmove->first_frame == 0 && g_snd_calls == 1 &&
+          m.pain_debounce == 140, "nightmare retains the pain sound and deadline");
+    m.health = 0; q2_random_seed(123); m.die(&m, 10);
+    check(m.currentmove->first_frame == ((first & 1) ? 60 : 48) &&
+          m.takedamage == Q2_DAMAGE_YES, "death picks one of the two native moves");
+    m.currentmove->endfunc(&m);
+    check(m.next_think == 0 && m.movetype == Q2_MOVETYPE_TOSS &&
+          (m.svflags & Q2_SVF_DEADMONSTER), "death ends as a tossed corpse");
+    m.health = m.gib_health; m.die(&m, 100);
+    check((u32)g_snd_last == 0x80101B9Cu, "gib death resolves its delayed init store");
+    q2_cre_set_skill(1); q2_cre_set_sound_hook(NULL, NULL);
+    q2_cre_set_muzzle_hook(NULL, NULL); q2_cre_set_shot_hook(roster_shot, NULL);
+}
+
+static int g_explosions;
+static s32 g_explosion_point[3];
+static void spy_cre_explosion(q2_monster *m, const s32 *point, s32 scale, void *user)
+{
+    (void)m; (void)user;
+    check(scale == 4096, "Strider death uses the native explosion scale");
+    memcpy(g_explosion_point, point, sizeof(g_explosion_point)); g_explosions++;
+}
+static void test_disc_strider(q2_creature_module *mod)
+{
+    q2_monster m, other, foe;
+    const q2_cre_impl *impl = mod->bind.impl;
+    q2_cre_sound_bind sounds[48];
+    q2_ai_world blocked = { 0 };
+    static const char *native_bank[] = { "str_deth", "str_step", "tnk_step", NULL };
+    static const char *fallback_bank[] = { "tnk_death", "tnk_step", NULL };
+    s32 expected[3];
+    u32 n;
+    int i, first, next;
+    for (i = 10; i <= 11; i++) {
+        u32 step; bool found = false;
+        for (step = 0; step < mod->think[i].step_count; step++)
+            if (mod->think[i].step[step].op == Q2_CRE_OP_MELEE) {
+                found = true;
+                check(mod->think[i].step[step].damage_rand == 50,
+                      "Strider's chained multiply-back decodes rand modulo 50");
+            }
+        check(found, "Strider's native melee instruction is decoded");
+    }
+    n = q2_creature_sound_bindings(mod->image, mod->size, Q2_CREWORLD_BASE, sounds, 48);
+    if (n > 48) n = 48;
+    check_name(q2_creature_sound_resolve("Strider", sounds, n, Q2_CREWORLD_BASE,
+                   0x80102BD0u, stub_bank_has, (void *)native_bank), "str_step",
+               "Strider's native step handle wins over its conditional Tank fallback");
+    check_name(q2_creature_sound_resolve("Strider", sounds, n, Q2_CREWORLD_BASE,
+                   0x80102BD0u, stub_bank_has, (void *)fallback_bank), "tnk_step",
+               "the step slot has its own fallback despite sharing the idle name");
+    check_name(q2_creature_sound_resolve("Strider", sounds, n, Q2_CREWORLD_BASE,
+                   0x80102BCCu, stub_bank_has, (void *)fallback_bank), "tnk_death",
+               "the death slot selects the death fallback");
+    q2_level_reset(); q2_monster_init(&m); q2_monster_init(&foe);
+    m.health = m.max_health = 1000; m.gib_health = -500;
+    q2_creature_spawn(&mod->bind, &m, 0); q2_monster_start_go(&m);
+    check(m.bigturn && m.bigturn_threshold == 1024 && m.mass == 500,
+          "Strider installs its native turn callback and threshold");
+    m.enemy = m.goalentity = &foe; foe.in_use = foe.client = true; foe.health = 100;
+    foe.pos[2] = 3000; foe.view_height = -500; m.yaw_speed = 200;
+    m.bigturn(&m, 200);
+    check(m.currentmove->first_frame == 170 && m.angles[2] == 0,
+          "visible positive big turn starts Right without snapping yaw");
+    for (i = 0; i < 11; i++) impl->method[17](&m);
+    check(m.angles[2] == 1023, "the eleven native right steps total 1023 units");
+    m.run(&m);
+    check(m.currentmove->first_frame == 216 && (m.aiflags & Q2_AI_BRUTAL),
+          "turn completion passes through Standendwalk and marks a player target brutal");
+    m.run(&m);
+    check(m.currentmove->first_frame == 70, "Standendwalk enters StartWalk");
+    m.run(&m);
+    check(m.currentmove == q2_cre_find_move_at(&m, 0x801027BCu),
+          "StartWalk completes into the running Walk record");
+    blocked.line_of_sight = blocked_creature_sight; q2_ai_set_world(&blocked);
+    m.bigturn(&m, -200);
+    check(m.angles[2] == 823, "an unseen target permits the ordinary clamped turn");
+    q2_ai_set_world(NULL); m.angles[2] = 0;
+    /* Native exact-yaw decisions depend on the caller's preserved s2.
+     * End-of-move repeat inherits zero; a running attack inherits the player
+     * pointer, while standing AI carries M_MoveFrame's local frame index. */
+    q2_cre_set_move(&m, 140); m.frame=144; memset(m.pos,0,sizeof(m.pos)); foe.pos[0]=0; foe.pos[2]=3000;
+    q2_M_MoveFrame(&m);
+    check(m.currentmove->first_frame==145,"exactly aligned blaster ends its burst");
+    q2_cre_set_move(&m, 195); m.frame=198; foe.pos[2]=9000;
+    q2_M_MoveFrame(&m);
+    check(m.currentmove->first_frame==199,"exactly aligned laser ends its burst");
+    q2_cre_set_move(&m, 140); m.frame=144; m.angles[2]=1; foe.pos[2]=3000;
+    q2_M_MoveFrame(&m);
+    check(m.currentmove->first_frame==140,"nonzero yaw inside the cone repeats");
+    m.angles[2]=0; q2_cre_set_move(&m,18); q2_ai_native_s2=0; m.attack(&m);
+    check(m.currentmove->first_frame==18,"zero inherited s2 refuses aligned attack");
+    q2_ai_native_s2=1; m.attack(&m);
+    check(m.currentmove->first_frame==137,"nonzero inherited s2 permits aligned attack");
+    impl->method[6](&m);
+    check(m.blind_target[1] == 0 && m.blind_target[2] == 3000,
+          "Strider snapshots the enemy centre, without eye offset");
+    q2_cre_set_shot_hook(spy_last_shot, NULL); q2_cre_set_muzzle_hook(spy_muzzle, NULL);
+    foe.pos[0] = 6000; m.enemy = NULL;
+    impl->method[7](&m);
+    for (i = 0; i < 3; i++) expected[i] = m.blind_target[i] - g_last_shot.start[i];
+    q2_vector_normalize(expected);
+    check(g_muzzle_a == 145 && g_muzzle_b == 158 && g_last_shot.damage == 25 &&
+          g_last_shot.effects == 64 && g_last_shot.dir[2] == expected[2] / 2 &&
+          g_last_shot.dir[0] == expected[0] / 2,
+          "Strider's blaster uses a half-speed normalized saved aim after enemy loss");
+    impl->method[8](&m);
+    check(g_muzzle_a == 456 && g_muzzle_b == 457 &&
+          g_last_shot.slot == Q2_IMP_FIRE_LASER && g_last_shot.damage == 50 &&
+          g_last_shot.kick == 25 && g_last_shot.dir[2] == expected[2],
+          "laser keeps the full normalized saved aim and the other barrel");
+    m.enemy = &foe; foe.pos[0] = foe.pos[2] = 0;
+    q2_random_seed(2); first = q2_random_next(); next = q2_random_next();
+    q2_random_seed(2); g_mel_calls = 0; impl->method[11](&m);
+    check(g_mel_calls == 1 && g_mel_dmg == 100 + first % 50 &&
+          g_mel_kick == 500 && g_mel_aim[0] == 2040 && q2_random_next() == next,
+          "stomp's native modulus is 50, with doubled reach and a 500 kick");
+    q2_cre_set_sound_hook(spy_sound, NULL); q2_cre_set_skill(2);
+    q2_level_state.time = 100; m.health = 400; m.frame = 147; m.pain_debounce = 0;
+    g_snd_calls = 0; m.pain(&m, 40);
+    check(m.skinnum == 1 && m.pain_debounce == 0 && !g_snd_calls,
+          "hard skill refuses pain during the last blaster end frame");
+    m.frame = 148; m.pain(&m, 40);
+    check(m.currentmove->first_frame == 103 && m.pain_debounce == 130 && g_snd_calls == 1,
+          "the next frame accepts pain and the thirty-tick deadline");
+    q2_cre_set_explosion_hook(spy_cre_explosion, NULL); g_explosions = 0;
+    q2_monster_init(&other); other.class_byte = m.class_byte;
+    mod->bind.strider_explosion_phase = 0;
+    q2_random_seed(123); expected[0] = (q2_random_next() - 16384) / 32;
+    expected[1] = (q2_random_next() - 16384) / 64 - 60;
+    expected[2] = (q2_random_next() - 16384) / 32;
+    q2_random_seed(123); impl->method[14](&m);
+    check(g_explosions == 0, "the first shared death phase emits no explosion");
+    impl->method[14](&other);
+    check(g_explosions == 1 && !memcmp(expected, g_explosion_point, sizeof(expected)),
+          "another Strider shares the alternating phase and exact three random offsets");
+    m.health = 0; m.die(&m, 1);
+    check(m.currentmove->first_frame == 111 && m.takedamage == Q2_DAMAGE_YES,
+          "normal death starts the explosion animation while remaining damageable");
+    m.currentmove->endfunc(&m);
+    check(m.health == m.gib_health && m.takedamage == Q2_DAMAGE_NO &&
+          (m.svflags & Q2_SVF_DEADMONSTER), "death completion queues shared corpse destruction");
+    q2_cre_set_explosion_hook(NULL, NULL); q2_cre_set_sound_hook(NULL, NULL);
+    q2_cre_set_muzzle_hook(NULL, NULL); q2_cre_set_shot_hook(roster_shot, NULL);
+    q2_cre_set_skill(1);
+}
+
+static bool boss1_test_blend(const q2_monster *m, s16 a, s16 b,
+                              q2_cre_attach *out, void *user)
+{
+    (void)m; (void)user;
+    check((a == 564 && b == 571) || (a == 570 && b == 572),
+          "Supertank rocket attachments use both native vertex pairs");
+    out->off[0] = a == 564 ? 100 : 109;
+    out->off[1] = a == 564 ? -101 : -109;
+    out->off[2] = a == 564 ? 12 : -2;
+    out->part = 7;
+    return true;
+}
+static bool boss1_test_place(const q2_monster *m, const q2_cre_attach *a,
+                              s32 out[3], void *user)
+{
+    int k;
+    (void)m; (void)user;
+    check(a && a->part == 7, "interpolated rocket tube retains the submodel");
+    if (!a) return false;
+    for (k = 0; k < 3; k++) out[k] = a->off[k];
+    return true;
+}
+static void test_disc_boss1(q2_cre_bind *b)
+{
+    static const s32 expected[3][3] = { {101,-102,10}, {104,-104,6}, {107,-107,1} };
+    q2_monster m, foe;
+    q2_ai_world blocked = { 0 };
+    int i, next;
+    q2_level_reset(); q2_monster_init(&m); q2_monster_init(&foe);
+    m.health = m.max_health = 1500; m.gib_health = -500;
+    q2_creature_spawn(b, &m, 0); q2_monster_start_go(&m);
+    m.enemy = m.goalentity = &foe; foe.in_use = foe.client = true; foe.health = 100;
+    foe.pos[2] = 1920;
+    check(m.mass == 800 && m.currentmove->first_frame == 194,
+          "Supertank starts in its native stand with mass 800");
+    m.walk(&m); check(m.currentmove == q2_cre_find_move_at(&m, 0x801014B8u),
+                      "Supertank walk selects the walking Forward record");
+    m.run(&m); check(m.currentmove == q2_cre_find_move_at(&m, 0x80101470u),
+                     "Supertank run selects the running Forward record");
+    q2_random_seed(2); next = q2_random_next(); q2_random_seed(2);
+    m.attack(&m);
+    check(m.currentmove->first_frame == 0 && q2_random_next() == next,
+          "the inclusive 1920-unit attack boundary selects bullets without RNG");
+    q2_cre_set_shot_hook(spy_last_shot, NULL); q2_cre_set_muzzle_hook(spy_muzzle, NULL);
+    m.frame = -1; g_shot_calls = 0;
+    for (i = 0; i < 6; i++) q2_M_MoveFrame(&m);
+    check(g_shot_calls == 6 && g_muzzle_a == 412 && g_muzzle_b == 419 &&
+          g_last_shot.damage == 6 && g_last_shot.kick == 4 &&
+          g_last_shot.hspread == 300 && g_last_shot.vspread == 500,
+          "each of six chaingun frames fires from the native attachment");
+    blocked.line_of_sight = blocked_creature_sight; q2_ai_set_world(&blocked);
+    q2_M_MoveFrame(&m);
+    check(m.currentmove->first_frame == 6 && g_shot_calls == 6,
+          "losing visibility exits the burst through Attack a");
+    q2_ai_set_world(NULL);
+    q2_cre_set_attach_hooks(boss1_test_blend, boss1_test_place, NULL);
+    for (i = 0; i < 3; i++) {
+        m.frame = (s16)(27 + 3 * i); b->impl->method[3](&m);
+        check(!memcmp(g_last_shot.start, expected[i], sizeof(expected[i])) &&
+              g_last_shot.slot == Q2_IMP_FIRE_ROCKET && g_last_shot.damage == 50 &&
+              g_last_shot.speed == 500,
+              "rocket tubes retain signed truncation at all three positions");
+    }
+    q2_cre_set_attach_hooks(NULL, NULL, NULL);
+    q2_cre_set_sound_hook(spy_sound, NULL); q2_cre_set_skill(2);
+    q2_level_state.time = 100; m.health = 500; m.frame = 33;
+    m.pain_debounce = 0; g_snd_calls = 0; m.pain(&m, 30);
+    check(m.skinnum == 1 && m.pain_debounce == 0 && g_snd_calls == 0,
+          "hard skill protects rocket frame 33 while still updating the skin");
+    m.frame = 34; m.pain(&m, 30);
+    check(m.currentmove->first_frame == 172 && m.pain_debounce == 130 && !g_snd_calls,
+          "the next frame accepts the silent native large pain move");
+    q2_cre_set_skill(3); q2_level_state.time = 140; m.stand(&m); m.pain(&m, 30);
+    check(m.currentmove->first_frame == 194 && m.pain_debounce == 170,
+          "nightmare updates the pain deadline without changing animation");
+    m.health = -999; m.die(&m, 1000);
+    check(m.currentmove->first_frame == 300 && m.dead && m.takedamage == Q2_DAMAGE_NO,
+          "even overkill starts Supertank's invulnerable death animation");
+    q2_cre_set_explosion_hook(spy_cre_explosion, NULL);
+    b->boss1_explosion_phase = 0; g_explosions = 0; m.frame = 299;
+    for (i = 0; i < 34; i++) q2_M_MoveFrame(&m);
+    check(g_explosions == 6, "the last twelve death frames emit six explosions");
+    q2_M_MoveFrame(&m);
+    check(m.health == m.gib_health && m.next_think == 0 &&
+          (m.svflags & Q2_SVF_DEADMONSTER), "death completion queues shared destruction");
+    q2_cre_set_explosion_hook(NULL, NULL); q2_cre_set_sound_hook(NULL, NULL);
+    q2_cre_set_muzzle_hook(NULL, NULL); q2_cre_set_shot_hook(roster_shot, NULL);
+    q2_cre_set_skill(1);
+}
+
+static void test_disc_jorg(q2_cre_bind *b)
+{
+    q2_monster m, foe;
+    int i, seed, r, counts[2] = {0};
+    q2_monster_init(&m); q2_monster_init(&foe); q2_level_reset();
+    m.health = m.max_health = 3000; m.gib_health = -2000;
+    q2_creature_spawn(b, &m, 0); q2_monster_start_go(&m);
+    m.enemy = &foe; foe.health = 100; foe.pos[2] = 3000; foe.view_height = -200;
+    check(b->cre->class_count == 2 && b->cre->class_method_table[0] !=
+          b->cre->class_method_table[1] && b->cre->move_count < 20,
+          "Jorg's two registered classes keep their distinct method tables");
+    m.walk(&m); check(m.currentmove->image_offset == 0x43DC, "Jorg walk binds its own native move");
+    m.run(&m); check(m.currentmove->image_offset == 0x4380, "Jorg run binds its own native move");
+    for (seed = 1; seed < 100; seed++) {
+        q2_random_seed(seed); r = q2_random_next(); q2_random_seed(seed); m.attack(&m);
+        check(m.currentmove->first_frame == (r < 24576 ? 0 : 18), "Jorg attack uses the native 24576 threshold");
+        counts[r >= 24576]++;
+    }
+    check(counts[0] && counts[1], "both Jorg attacks were exercised");
+    q2_cre_set_shot_hook(spy_last_shot, NULL); q2_cre_set_muzzle_hook(spy_muzzle, NULL);
+    g_shot_calls = 0; q2_cre_set_move(&m, 8); m.frame = 7;
+    for (i = 0; i < 6; i++) q2_M_MoveFrame(&m);
+    check(g_shot_calls == 12 && g_last_shot.damage == 6 && g_last_shot.kick == 4 &&
+          g_last_shot.hspread == 300 && g_last_shot.vspread == 500 &&
+          g_last_shot.flash == 0 && g_muzzle_a == 226 && g_muzzle_b == 228,
+          "Jorg's six native firing frames emit both guns, with no muzzle-flash ID");
+    b->impl->method[4](&m);
+    check(g_last_shot.slot == Q2_IMP_FIRE_BFG && g_last_shot.damage == 50 &&
+          g_last_shot.flash == 132 && g_muzzle_a == 165 && g_muzzle_b == 161,
+          "Jorg BFG retains its native origin and parameters");
+    q2_cre_set_skill(3); m.pain_debounce = 0; m.frame = 112;
+    m.pain(&m, 101); check(m.pain_debounce == 30, "nightmare still sets Jorg's pain deadline");
+    q2_cre_set_skill(1); q2_cre_set_shot_hook(roster_shot, NULL); q2_cre_set_muzzle_hook(NULL, NULL);
+}
+
+static void test_disc_rider(q2_cre_bind *b)
+{
+    q2_monster m, foe; s32 target[3]; int seed, r, i, seen[3] = {0};
+    q2_monster_init(&m); q2_monster_init(&foe); q2_level_reset();
+    m.health = m.max_health = 3000; m.gib_health = -2000;
+    q2_creature_spawn(b, &m, 0); q2_monster_start_go(&m);
+    m.enemy = &foe; foe.health = 100; foe.pos[0] = 100; foe.pos[2] = 3000;
+    foe.view_height = -200;
+    for (seed = 1; seed < 150; seed++) {
+        q2_random_seed(seed); r = q2_random_next(); q2_random_seed(seed); m.attack(&m);
+        i = r < 9831 ? 0 : r < 19961 ? 1 : 2; seen[i]++;
+        check(m.currentmove->first_frame == (i == 0 ? 201 : i == 1 ? 209 : 235),
+              "Rider attack probabilities match both native boundaries");
+    }
+    check(seen[0] && seen[1] && seen[2], "all three Rider attacks were exercised");
+    q2_cre_set_shot_hook(spy_last_shot, NULL); q2_cre_set_muzzle_hook(spy_muzzle, NULL);
+    g_shot_calls = 0; q2_cre_set_move(&m, 209); m.frame = 208;
+    for (i = 0; i < 26; i++) q2_M_MoveFrame(&m);
+    check(g_shot_calls == 17 && g_last_shot.damage == 15 && g_last_shot.speed == 1000 &&
+          g_muzzle_a == 419 && g_muzzle_b == 422,
+          "Rider's sweep fires all seventeen blaster frames from its native muzzle");
+    b->impl->method[2](&m); memcpy(target, m.blind_target, sizeof(target));
+    foe.pos[0] += 4000; b->impl->method[1](&m);
+    check(!memcmp(target, m.blind_target, sizeof(target)) &&
+          g_last_shot.slot == Q2_IMP_FIRE_RAILGUN && g_last_shot.damage == 50 &&
+          g_last_shot.kick == 100 && g_last_shot.dir[0] == 0 &&
+          g_muzzle_a == 225 && g_muzzle_b == 227,
+          "the railgun fires at the saved eye position after the target moves");
+    b->impl->method[6](&m);
+    check(g_last_shot.slot == Q2_IMP_FIRE_BFG && g_last_shot.flash == 101 &&
+          g_muzzle_a == 431 && g_muzzle_b == 434, "Rider BFG keeps its separate muzzle");
+    q2_level_state.sight_client = &foe; m.health = 0; m.die(&m, 1);
+    check(m.health == m.gib_health && m.takedamage == Q2_DAMAGE_NO &&
+          (m.svflags & Q2_SVF_DEADMONSTER) && !m.next_think &&
+          !memcmp(foe.blind_target, m.pos, sizeof(m.pos)),
+          "Rider death publishes its position and immediately queues destruction");
+    q2_level_state.sight_client = NULL;
+    q2_cre_set_shot_hook(roster_shot, NULL); q2_cre_set_muzzle_hook(NULL, NULL);
+}
+
+static q2_monster *g_medic_trace_target;
+static int g_medic_beams, g_medic_revives;
+static void medic_test_trace(void *u, const s32 from[3], const s16 lo[3],
+    const s16 hi[3], const s32 to[3], const q2_monster *ignore, u32 mask, q2_ai_trace *tr)
+{
+    (void)u; (void)from; (void)lo; (void)hi; (void)ignore;
+    check(mask == 0x06000003u, "Medic cable trace includes native dead-actor mask");
+    memset(tr, 0, sizeof(*tr)); memcpy(tr->endpos, to, sizeof(tr->endpos));
+    tr->fraction = 4096; tr->ent = g_medic_trace_target;
+}
+static void medic_test_beam(q2_monster *m, q2_monster *c, s16 vertex, void *u)
+{ (void)m; (void)c; (void)u; check(vertex == 308, "Medic cable uses model vertex 308"); g_medic_beams++; }
+static bool medic_test_revive(q2_monster *m, q2_monster *c, void *u)
+{ (void)m; (void)u; g_medic_revives++; c->health = c->max_health; c->corpse = c->dead = false; return true; }
+static void test_disc_medic(q2_cre_bind *b)
+{
+    q2_monster set[3], foe; q2_ai_world w = {0}; int i;
+    q2_monster *m = &set[0], *c = &set[2];
+    q2_level_reset(); q2_monster_init(&foe);
+    for (i = 0; i < 3; i++) q2_monster_init(&set[i]);
+    m->health = m->max_health = 300; m->gib_health = -130;
+    q2_creature_spawn(b, m, 0); q2_monster_start_go(m);
+    foe.health = 100; foe.in_use = foe.client = true; foe.spawnflags |= Q2_SVFLAG_INUSE;
+    for (i = 1; i < 3; i++) {
+        set[i].in_use = set[i].dead = set[i].corpse = true;
+        set[i].spawnflags |= Q2_SVFLAG_INUSE; set[i].class_id = Q2_CLASS_CORPSE;
+        set[i].gib_health = -100; set[i].max_health = (s16)(i * 100);
+        set[i].pos[2] = i * 1000; set[i].hit_height = 150;
+    }
+    q2_cre_set_lifecycle_hooks(set, 3, NULL, medic_test_revive, NULL);
+    q2_ai_set_world(NULL); m->enemy = &foe; m->idle(m);
+    check(m->enemy == c && m->oldenemy == &foe && (m->aiflags & Q2_AI_MEDIC),
+          "Medic prefers the highest max-health corpse and retains its player enemy");
+    check(m->checkattack(m) && m->currentmove->first_frame == 209,
+          "a corpse inside 3072 immediately starts the cable sequence");
+    w.trace = medic_test_trace; q2_ai_set_world(&w);
+    q2_cre_set_contact_hooks(NULL, medic_test_beam, NULL);
+    g_medic_beams = g_medic_revives = 0; g_medic_trace_target = NULL;
+    m->frame = 219; b->impl->method[10](m);
+    check(!g_medic_beams && !c->effect[5], "blocked cable does not heal or draw a beam");
+    g_medic_trace_target = c; b->impl->method[10](m);
+    check(g_medic_beams == 1 && c->effect[5] == 30 &&
+          (c->aiflags & Q2_AI_RESURRECTING), "cable hit arms native healing presentation");
+    m->frame = 226; b->impl->method[10](m);
+    check(!g_medic_revives && c->think == q2_cre_medic_revive &&
+          c->oldenemy == &foe && c->owner == m, "frame 226 defers revival to the actor handler");
+    q2_cre_medic_revive(c);
+    check(g_medic_revives == 1 && c->health == 200, "the deferred handler revives the selected body");
+    b->impl->method[11](m); check(!(c->aiflags & Q2_AI_RESURRECTING), "retraction clears the healing flag");
+    m->enemy = &foe; q2_cre_set_shot_hook(spy_last_shot, NULL); q2_cre_set_muzzle_hook(spy_muzzle, NULL);
+    m->frame = 185; b->impl->method[7](m);
+    check(g_last_shot.damage == 2 && g_last_shot.speed == 1000 && g_last_shot.flash == 0 &&
+          g_muzzle_a == 239 && g_muzzle_b == 246, "Medic blaster uses the recovered attachment and figures");
+    q2_cre_set_lifecycle_hooks(NULL, 0, NULL, NULL, NULL); q2_ai_set_world(NULL);
+    q2_cre_set_contact_hooks(NULL, NULL, NULL); q2_cre_set_muzzle_hook(NULL, NULL);
+    q2_cre_set_shot_hook(roster_shot, NULL);
+}
+
+static q2_monster *g_boss2_trace_target;
+static void boss2_test_trace(void *user, const s32 start[3], const s16 mins[3],
+                              const s16 maxs[3], const s32 end[3],
+                              const q2_monster *ignore, u32 mask, q2_ai_trace *out)
+{
+    (void)user; (void)start; (void)end; (void)ignore;
+    check(!mins && !maxs && mask == 0x02000019u,
+          "Boss2 uses its native point trace mask for the attack decision");
+    memset(out, 0, sizeof(*out)); out->fraction = 4096;
+    out->ent = g_boss2_trace_target;
+}
+static bool boss2_test_blend(const q2_monster *m, s16 a, s16 b,
+                              q2_cre_attach *out, void *user)
+{
+    (void)m; (void)user;
+    check((a == 237 && b == 239) || (a == 238 && b == 240),
+          "Boss2 uses the two native rocket-span attachments");
+    out->off[0] = a == 237 ? -8 : 8;
+    out->off[1] = out->off[2] = 0; out->part = 7; return true;
+}
+static q2_cre_shot g_boss2_shots[8];
+static void boss2_test_shot(q2_monster *m, const q2_cre_shot *s, void *user)
+{
+    (void)m; (void)user;
+    if (g_shot_calls < 8) g_boss2_shots[g_shot_calls] = *s;
+    g_shot_calls++;
+}
+static void test_disc_boss2(q2_cre_bind *b)
+{
+    q2_monster m, foe;
+    q2_ai_world w = { 0 };
+    int k, seed, first, second;
+    q2_level_reset(); q2_monster_init(&m); q2_monster_init(&foe);
+    m.health = m.max_health = 2000; m.gib_health = -500;
+    q2_creature_spawn(b, &m, 0); q2_monster_start_go(&m);
+    check((m.flags & (Q2_FL_FLY | Q2_FL_IMMUNE_LASER)) ==
+          (Q2_FL_FLY | Q2_FL_IMMUNE_LASER) && m.mass == 1000,
+          "Boss2 starts flying with its laser-immunity flag");
+    for (k = 0; k < (int)b->move_count; k++)
+        check(b->move_name[k] && b->move_name[k][0],
+              "every Boss2 move keeps its exported name past the reversed Stand2 entry");
+    m.enemy = m.goalentity = &foe; foe.in_use = foe.client = true; foe.health = 100;
+    foe.pos[0] = 3000; q2_level_state.sight_entity = &foe;
+    b->impl->method[11](&m);
+    check(m.pos[1] == -1536 && m.health == 1999 && m.angles[2] == 1024,
+          "native activation raises Boss2 once and faces the sight entity");
+    b->impl->method[11](&m);
+    check(m.pos[1] == -1536 && m.health == 1999, "the health latch prevents another rise");
+    q2_level_state.sight_entity = NULL;
+    m.pos[1] = 0; m.angles[2] = 0; foe.pos[0] = 0; foe.pos[2] = 1500;
+    q2_random_seed(2); first = q2_random_next(); q2_random_seed(2); m.attack(&m);
+    check(m.currentmove->first_frame == 70 && q2_random_next() == first,
+          "the inclusive 1500-unit boundary chooses chainguns without RNG");
+    q2_cre_set_shot_hook(boss2_test_shot, NULL); q2_cre_set_muzzle_hook(spy_muzzle, NULL);
+    g_shot_calls = 0; foe.velocity[0] = 4096; foe.view_height = -200;
+    b->impl->method[9](&m);
+    check(g_shot_calls == 2 && g_boss2_shots[0].flash == 73 &&
+          g_boss2_shots[1].flash == 133 && g_muzzle_a == 339 && g_muzzle_b == 344 &&
+          g_boss2_shots[0].damage == 6 && g_boss2_shots[0].kick == 4 &&
+          g_boss2_shots[0].dir[0] < 0 && g_boss2_shots[0].dir[1] == 0,
+          "both guns retain their flash IDs, eye aim and negative velocity lead");
+    q2_cre_set_attach_hooks(boss2_test_blend, boss1_test_place, NULL);
+    g_shot_calls = 0; b->impl->method[10](&m);
+    check(g_shot_calls == 4, "one Boss2 rocket method launches four projectiles");
+    for (k = 0; k < 4; k++)
+        check(g_boss2_shots[k].start[0] == -6 + 4 * k &&
+              g_boss2_shots[k].slot == Q2_IMP_FIRE_ROCKET &&
+              g_boss2_shots[k].damage == 50 && g_boss2_shots[k].speed == 500,
+              "the four native rocket tubes occupy the centres of four equal intervals");
+    q2_cre_set_attach_hooks(NULL, NULL, NULL);
+    w.trace = boss2_test_trace; q2_ai_set_world(&w); g_boss2_trace_target = NULL;
+    check(!m.checkattack(&m), "a clear-looking trace that did not hit the enemy cannot fire");
+    g_boss2_trace_target = &foe; foe.pos[2] = 100; q2_cre_set_skill(0);
+    q2_random_seed(2); m.checkattack(&m);
+    check(m.attack_state == Q2_AS_MISSILE && q2_random_next() == first,
+          "Boss2's easy melee-range decision consumes no probability roll");
+    foe.pos[2] = 2000;
+    for (seed = 1; seed < 1000; seed++) {
+        q2_random_seed(seed); first = q2_random_next();
+        if (first >= 13106 && first < 26213) break;
+    }
+    second = q2_random_next(); q2_level_state.time = 100; m.attack_finished = 0;
+    q2_random_seed(seed); m.aiflags = 0;
+    check(m.checkattack(&m) && m.attack_finished == 100 + 20 * second / 32767,
+          "mobile Boss2 uses its 26213 threshold and exact 0..20-tick cooldown");
+    m.attack_finished = 0; m.aiflags = Q2_AI_STAND_GROUND; q2_random_seed(seed);
+    check(!m.checkattack(&m), "stand-ground uses the lower 13106 threshold");
+    q2_ai_set_world(NULL); q2_cre_set_skill(3); m.health = 900;
+    m.pain_debounce = 0; m.pain(&m, 29);
+    check(m.currentmove->first_frame == 128 && m.skinnum == 1,
+          "Boss2 still takes its short pain animation on nightmare");
+    q2_level_state.time += 31; m.pain(&m, 30);
+    check(m.currentmove->first_frame == 110, "damage 30 selects the long pain move");
+    m.health = 0; m.die(&m, 1);
+    check(m.dead && m.health == m.gib_health && m.currentmove->first_frame == 132 &&
+          !m.next_think && m.takedamage == Q2_DAMAGE_NO &&
+          (m.svflags & Q2_SVF_DEADMONSTER),
+          "death immediately queues destruction rather than waiting for 48 frames");
+    q2_cre_set_skill(1); q2_cre_set_muzzle_hook(NULL, NULL);
+    q2_cre_set_shot_hook(roster_shot, NULL);
+}
+
+static int script_sound_count;
+static u32 script_sound_handle;
+static const q2_monster *script_sound_owner;
+static void script_sound(q2_monster *m, u32 handle, const q2_monster *owner, void *user)
+{
+    (void)m; (void)user;
+    script_sound_count++; script_sound_handle = handle;
+    script_sound_owner = owner;
+}
+
+static void test_disc_script(q2_creature_module *mod)
+{
+    q2_monster m, player;
+    q2_monster *players[1] = { &player };
+    q2_monster_set set = {0};
+    q2_cre_sound_bind sound[48];
+    u32 n;
+    int i, start;
+    const char *name = mod->name;
+    q2_level_reset(); q2_monster_init(&m); q2_monster_init(&player);
+    m.health = m.max_health = 3000; m.gib_health = -500;
+    m.class_id = m.class_byte = 99;
+    player.in_use = player.client = true;
+    player.spawnflags = Q2_SVFLAG_INUSE; player.health = 100;
+    player.pos[0] = 1234; player.pos[1] = -321; player.pos[2] = 567;
+    q2_ai_set_clients(players, 1); q2_level_state.sight_client = &player;
+    {
+        u32 before = q2_random_state(), expected = before;
+        if (!strcmp(name, "Rider2") || !strcmp(name, "Rider3")) {
+            q2_random_next(); expected = q2_random_state(); q2_random_seed(before);
+        }
+        q2_creature_prepare(&mod->bind, &m, 0);
+        check(q2_random_state() == before && !m.spawn_initialized,
+              "preparing a dormant script consumes no random draw");
+        q2_monster_start_go(&m);
+        check(m.spawn_initialized && q2_random_state() == expected,
+              "script initialization consumes its native draws only when activated");
+        q2_monster_start_go(&m);
+        check(q2_random_state() == expected, "a second wake does not repeat script initialization");
+    }
+    set.monsters = &m; set.count = 1;
+    check(m.start_kind == Q2_CRE_START_SCRIPT && m.think && !m.currentmove,
+          "scripted module retains its direct think through wake");
+    check(q2_level_state.total_monsters == 0 && !(m.svflags & Q2_SVF_MONSTER),
+          "scripted props never enter monster_start's counters or flags");
+    check(m.class_byte == 99 && q2_cre_bind_for(&m) == &mod->bind,
+          "classless modules preserve the descriptor byte and bind identity");
+    check(mod->frame_name_count > 0, "scripted pose names come from export 3");
+    q2_cre_set_sound_owner_hook(script_sound, NULL); script_sound_count = 0;
+    if (!strcmp(name, "RiderStand")) {
+        check(m.frame == 414 && m.next_think == 2 && m.use && m.pain && m.die,
+              "RiderStand installs its native 414-frame loop and activation callbacks");
+        q2_monster_set_tick(&set); check(m.frame == 414, "projection waits two ticks");
+        q2_monster_set_tick(&set); check(m.frame == 415, "projection starts on its deadline");
+        m.frame = 473; q2_monster_set_tick(&set);
+        check(m.frame == 414, "projection wraps at frame 474");
+        n = q2_creature_sound_bindings(mod->image, mod->size, mod->cre.base, sound, 48);
+        check(n == 2, "RiderStand's register-copied sound handles decode");
+        if (n == 2) {
+            check(!strcmp(q2_creature_sound_for_addr(sound,n,mod->cre.base+0x990), "msc_tele1"),
+                  "projection shrink uses the native teleport sound");
+            check(!strcmp(q2_creature_sound_for_addr(sound,n,mod->cre.base+0x99C), "mak_laf2"),
+                  "projection activation uses the native laugh");
+        }
+        m.pain(&m, 1); m.pain(&m, 1);
+        check(script_sound_count == 1 && m.script_pain_used && q2_cre_think_id(&m) == 3,
+              "only the first hit activates projection pain");
+        check(script_sound_owner == &player,
+              "projection sound remains owned by the player");
+        for (i = 0; i < 4; i++) q2_monster_set_tick(&set);
+        check(m.render_scale == 2048 && script_sound_count == 2 &&
+              script_sound_handle == mod->cre.base + 0x990,
+              "four shrink ticks halve scale and play the teleport sound");
+        for (i = 0; i < 4; i++) q2_monster_set_tick(&set);
+        check(m.render_scale == 0 && m.health == m.gib_health && m.dead &&
+              m.next_think == 0 && m.takedamage == Q2_DAMAGE_NO &&
+              (m.svflags & Q2_SVF_DEADMONSTER), "eight shrink ticks destroy the projection");
+    } else if (!strcmp(name, "Rider2")) {
+        check(m.frame == 251 && m.health == 5000 && m.next_think == 2,
+              "fresh Rider2 begins Deatha at 251 and sets health 5000");
+        for (i = 0; i < 95; i++) q2_monster_set_tick(&set);
+        check(m.frame == 345 && !m.next_think && !m.dead, "Rider2 holds final frame 345");
+        for (i = 0; i < 5; i++) q2_monster_set_tick(&set);
+        check(m.frame == 345, "a disabled living timer cannot keep advancing");
+        mod->bind.impl->spawn(&m);
+        check(m.frame == 344, "restored 5000-health Rider2 takes its one-frame tail");
+        q2_monster_set_tick(&set); q2_monster_set_tick(&set);
+        check(m.frame == 345 && !m.next_think, "Rider2 tail stops on its own deadline");
+    } else if (!strcmp(name, "Rider3")) {
+        check(m.frame == 0 && m.health == 3000 && m.next_think == 2,
+              "Rider3 preserves health and schedules Death2");
+        for (i = 0; i < 21; i++) q2_monster_set_tick(&set);
+        check(m.frame == 0 && m.next_think == q2_level_state.time + 1,
+              "Rider3 loops exactly twenty frames");
+    } else {
+        check(m.frame == 0 && m.next_think == 5 && m.use &&
+              m.flags == Q2_FL_GODMODE && m.takedamage == Q2_DAMAGE_NO,
+              "DeadComm starts invulnerable with its five-tick drop timer");
+        for (i = 0; i < 5; i++) q2_monster_set_tick(&set);
+        check(m.pos[1] == -24 && !m.next_think && m.movetype == Q2_MOVETYPE_TOSS,
+              "DeadComm's drop changes Y by -24 and does not rearm");
+        for (i = 0; i < 5; i++) q2_monster_set_tick(&set);
+        check(m.pos[1] == -24, "the drop is not called again");
+        m.use(&m); start = script_sound_count;
+        for (i = 0; i < 23; i++) q2_monster_set_tick(&set);
+        check(start == 1 && script_sound_count == 24 && m.frame == 23 && !m.next_think,
+              "DeadComm activates with sight sound then plays idle on all 23 frames");
+    }
+    check(q2_cre_think_valid(&m, q2_cre_think_id(&m)), "script callback has a stable save id");
+    check(!q2_cre_think_valid(&m, 255), "invalid callback ids are rejected");
+    q2_cre_set_sound_owner_hook(NULL, NULL); q2_ai_set_clients(NULL, 0);
+}
+
+static void test_disc_roster(const char *path, const char *map,
+                              const char *only_module, int zone_index,
+                              u32 expected_cases)
+{
+    disc *d = NULL;
+    q2_build_id id;
+    q2_common_file common;
+    q2_zone_file zone;
+    q2_buf buf;
+    char common_path[160];
+    q2_creature_world *w = calloc(1, sizeof(*w));
+    u32 i, j, cases = 0;
+    u32 load_rng;
+    int skill;
+
+    printf("disc-backed native creature roster (%s)\n", map);
+    if (!w) exit(2);
+    snprintf(common_path, sizeof(common_path), "Q2DATA/LEVELS/%s/COMMON.DAT", map);
+    if (disc_open(&d, path) != Q2_OK || q2_identify(d, &id) != Q2_OK ||
+        disc_read_file(d, common_path, &buf) != Q2_OK)
+        exit(2);
+    if (q2_common_open(&common, &buf) != Q2_OK) exit(2);
+    if (zone_index >= 0) {
+        snprintf(common_path, sizeof(common_path), "Q2DATA/LEVELS/%s/ZONE%d.DAT",
+                 map, zone_index);
+        if (disc_read_file(d, common_path, &buf) != Q2_OK ||
+            q2_zone_open(&zone, &buf) != Q2_OK) exit(2);
+    }
+    load_rng = q2_random_state();
+    if (q2_creature_world_load(w, d, &id, &common,
+                               zone_index >= 0 ? &zone : NULL, NULL, NULL) != Q2_OK)
+        exit(2);
+    check(q2_random_state() == load_rng,
+          "loading population metadata does not run dormant creatures' spawn RNG");
+    check(w->mod_count >= (zone_index < 0 ? 7u : 8u),
+               "COMMON donors and the zone's native module load together");
+    q2_ai_set_world(NULL);
+    q2_cre_set_shot_hook(roster_shot, NULL);
+    q2_cre_set_melee_hook(spy_melee, NULL);
+
+    for (i = 0; i < w->mod_count; i++) {
+        const q2_creature_module *mod = &w->mod[i];
+        if (only_module && strcmp(mod->name, only_module)) continue;
+        for (j = 0; j < mod->cre.move_count; j++) {
+            const q2_mmove *mv = &mod->bind.move[j];
+            s32 f;
+            if (mod->cre.move[j].clip_piece) continue;
+            check(mv->frames && mv->last_frame >= mv->first_frame,
+                  "every real move has a valid frame range");
+            for (f = 0; f <= mv->last_frame - mv->first_frame; f++) {
+                u32 think = mv->frames[f].think;
+                if (think)
+                    check(mod->bind.impl->method[think] != NULL,
+                          "every nonempty frame has a native think implementation");
+            }
+        }
+        if (!strcmp(mod->name, "Flyer")) {
+            check(mod->image[0x2F2] == (!strcmp(map, "MAGDEMO") ? 0x5F : 0x69),
+                  "the active zone's own module variant was loaded");
+            test_disc_flyer(&w->mod[i].bind);
+        }
+        if (!strcmp(mod->name, "Gladiator"))
+            test_disc_gladiator(&w->mod[i]);
+        if (!strcmp(mod->name, "Hover"))
+            test_disc_hover(&w->mod[i]);
+        if (!strcmp(mod->name, "Parasite"))
+            test_disc_parasite(&w->mod[i].bind);
+        if (!strcmp(mod->name, "Ironmaiden"))
+            test_disc_ironmaiden(&w->mod[i]);
+        if (!strcmp(mod->name, "Strider"))
+            test_disc_strider(&w->mod[i]);
+        if (!strcmp(mod->name, "Boss1"))
+            test_disc_boss1(&w->mod[i].bind);
+        if (!strcmp(mod->name, "Boss2"))
+            test_disc_boss2(&w->mod[i].bind);
+        if (!strcmp(mod->name, "Jorg")) test_disc_jorg(&w->mod[i].bind);
+        if (!strcmp(mod->name, "Rider")) test_disc_rider(&w->mod[i].bind);
+        if (!strcmp(mod->name, "Medic")) test_disc_medic(&w->mod[i].bind);
+        if (mod->bind.impl->scripted) test_disc_script(&w->mod[i]);
+    }
+
+    for (skill = 0; skill < 4; skill++) {
+        q2_cre_set_skill(skill);
+        for (i = 0; i < w->classes.count; i++) {
+            const q2_class_entry *entry = &w->classes.entries[i];
+            q2_monster m, foe;
+            q2_creature_module *mod;
+            int tick;
+            if (entry->is_player || entry->id >= Q2_MONSTER_CLASS_COUNT ||
+                w->class_module[entry->id] < 0) continue;
+            if (only_module && strcmp(entry->name, only_module)) continue;
+            mod = &w->mod[w->class_module[entry->id]];
+            if (mod->bind.impl->scripted) continue;
+            q2_level_reset();
+            q2_random_seed(1234);
+            q2_monster_init(&m);
+            q2_monster_init(&foe);
+            m.pop_class_id = (u8)entry->id;
+            m.health = m.max_health = entry->health;
+            m.gib_health = entry->gib_health;
+            q2_creature_spawn(&mod->bind, &m, w->class_variant[entry->id]);
+            q2_monster_start_go(&m);
+            check(m.currentmove && m.stand && m.walk && m.run,
+                  "every class starts with live locomotion callbacks");
+            foe.health = 10000;
+            foe.in_use = foe.client = true;
+            foe.spawnflags |= Q2_SVFLAG_INUSE;
+            foe.pos[2] = m.attack ? 3000 : 100;
+            m.enemy = m.goalentity = &foe;
+            if (!strcmp(mod->name, "Parasite")) parasite_test_world(&foe);
+            else q2_ai_set_world(NULL);
+            g_parasite_hits = 0;
+            g_shot_calls = g_mel_calls = 0;
+            if (m.attack) m.attack(&m);
+            else if (m.melee) m.melee(&m);
+            for (tick = 0; tick < 150; tick++) {
+                q2_level_state.time++;
+                q2_level_state.framenum++;
+                q2_M_MoveFrame(&m);
+                check(m.currentmove != NULL, "animation chains retain a move");
+            }
+            if (!strcmp(mod->name, "Parasite"))
+                check(g_parasite_hits > 0, "the Parasite's ranged attack drains");
+            else if (m.attack)
+                check(g_shot_calls > 0, "a ranged creature's attack fires");
+            else if (m.melee)
+                check(g_mel_calls > 0, "a melee creature's attack swings");
+            else
+                check(g_shot_calls == 0 && g_mel_calls == 0,
+                      "the Insane remains a non-combatant");
+
+            m.health = 0;
+            if (m.die) m.die(&m, 10);
+            check(m.dead && m.currentmove, "death retains a valid native pose");
+            for (tick = 0; tick < 200 && !(m.svflags & Q2_SVF_DEADMONSTER); tick++) {
+                q2_level_state.time++;
+                q2_level_state.framenum++;
+                q2_M_MoveFrame(&m);
+            }
+            check((m.svflags & Q2_SVF_DEADMONSTER) != 0,
+                  "the death animation reaches its corpse state");
+            printf("  skill %d class %u %-10s: %d shots, %d swings, corpse %d\n",
+                   skill, entry->id, entry->name, g_shot_calls, g_mel_calls,
+                   !!(m.svflags & Q2_SVF_DEADMONSTER));
+            cases++;
+        }
+    }
+    check_eq_i(cases, expected_cases,
+               "native population variants run at four difficulties");
+    q2_cre_set_shot_hook(NULL, NULL);
+    q2_cre_set_melee_hook(NULL, NULL);
+    q2_cre_set_contact_hooks(NULL, NULL, NULL);
+    q2_ai_set_world(NULL);
+    q2_cre_set_skill(1);
+    q2_creature_world_free(w);
+    if (zone_index >= 0) q2_zone_close(&zone);
+    q2_common_close(&common);
+    disc_close(d);
+    free(w);
+}
+
+/* ------------------------------------------------------------------------- */
+int main(int argc, char **argv)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
     printf("Q2PSX-PC creature tests\n\n");
 
+    test_frame_name_table();
     test_summoned_batch_is_started();
+    test_batch_zone_eligibility();
     test_player_noise_stamps_the_window();
     test_bind();
     test_population_spawn_flags();
@@ -1924,9 +3440,33 @@ int main(void)
     test_tank_burst_rule();
     test_soldier_burst_and_death_aim();
     test_infantry_death_sweep();
+    test_gunner_and_arachner_aim();
+    test_flyer_aim();
+    test_melee_geometry();
     test_tank_footstep_rumble();
     test_insane_prone_flies();
     test_insane_start_draws();
+    if (argc == 3 && strcmp(argv[1], "--disc") == 0)
+    {
+        test_disc_roster(argv[2], "BASE0", NULL, -1, 36);
+        test_disc_roster(argv[2], "MAGDEMO", "Soldier", -1, 12);
+        test_disc_roster(argv[2], "BASE2", "Flyer", 1, 4);
+        test_disc_roster(argv[2], "MAGDEMO", "Flyer", 1, 4);
+        test_disc_roster(argv[2], "BIGGUN", "Gladiator", 1, 4);
+        test_disc_roster(argv[2], "JAIL3", "Hover", 1, 4);
+        test_disc_roster(argv[2], "BASE3", "Parasite", 0, 4);
+        test_disc_roster(argv[2], "BOSS1", "Ironmaiden", 0, 4);
+        test_disc_roster(argv[2], "BIGGUN", "Strider", 3, 4);
+        test_disc_roster(argv[2], "SECURITY", "Boss1", 1, 4);
+        test_disc_roster(argv[2], "COMMAND", "Boss2", 4, 4);
+        test_disc_roster(argv[2], "BOSS2", "Jorg", 1, 4);
+        test_disc_roster(argv[2], "BOSS2", "Rider", 1, 4);
+        test_disc_roster(argv[2], "JAIL3", "Medic", 3, 4);
+        test_disc_roster(argv[2], "BOSS1", "RiderStand", 1, 0);
+        test_disc_roster(argv[2], "BOSS2", "Rider2", 1, 0);
+        test_disc_roster(argv[2], "BOSS2", "Rider3", 1, 0);
+        test_disc_roster(argv[2], "LAB", "DeadComm", 2, 0);
+    }
 
     q2_cre_bind_reset();
     q2_class_table_reset();

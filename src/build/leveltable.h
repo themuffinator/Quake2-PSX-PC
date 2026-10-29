@@ -8,13 +8,16 @@
  * ---------------------------------------------------------------------------
  * Layout
  * ---------------------------------------------------------------------------
- * 53 records of 56 bytes, at file offset 0x84EC8 in the PAL executable:
+ * 52 records (51 named entries and a sentinel) of 56 bytes, at file offset
+ * 0x84EC8 in the PAL executable:
  *
  *     +0x00  char[12]  display name    e.g. "Base0", "COLD STORAGE"
- *     +0x0C  char[12]  directory name  e.g. "BASE0" — the Q2DATA/LEVELS folder
- *     +0x18  s32       always 0
+ *     +0x0C  char[10]  directory name  e.g. "BASE0" — the Q2DATA/LEVELS folder
+ *     +0x16  s16       mission id: 0 none, 1..5 campaign, 6 Tribute
+ *     +0x18  u32       runtime pointer, initially 0
  *     +0x1C  s32       always 0x80050008 — a pointer, identical in every record
- *     +0x20  u16       always 1 on a real level
+ *     +0x20  u8        0 on screens, 1 on campaign maps, 2 or 4 on arenas
+ *     +0x21  u8        padding, 0
  *     +0x22  u8[7]     the music playlist — see below
  *     +0x29  s8        -7: the playlist's loop-back
  *     +0x2A  u8[2]     the terminating zero, never reached
@@ -49,11 +52,11 @@
  * 11..16; BASE2 is 19 then 6..11; JAIL2 is 2 then 5..10.
  *
  * ---------------------------------------------------------------------------
- * Two records that are not levels
+ * The table terminator
  * ---------------------------------------------------------------------------
- * "BADLEVEL" is an error placeholder. The final record pairs two names with an
- * all-zero body and is a terminator rather than a map. Both are reported so a
- * caller can skip them deliberately instead of trying to load them.
+ * The final record has an empty display name and "BADLEVEL" directory. Native
+ * lookup stops on that empty first word. The following bytes are neighboring
+ * data ("Base3" / "Jail2"), not a 53rd level record.
  */
 #ifndef Q2PSX_LEVELTABLE_H
 #define Q2PSX_LEVELTABLE_H
@@ -63,6 +66,7 @@
 
 #define Q2_LEVEL_RECORD_SIZE 56
 #define Q2_LEVEL_NAME_LEN    12
+#define Q2_LEVEL_DIRECTORY_LEN 10
 
 /*
  * The raw byte list the music cursor walks, +0x22 through +0x2B. It is not a
@@ -76,7 +80,7 @@
 /* Where the table sits in the catalogued PAL build. A different build moves it,
  * which is exactly why identification is per-build — see ident.h. */
 #define Q2_LEVELTABLE_OFFSET_SLES01534 0x84EC8
-#define Q2_LEVELTABLE_COUNT_SLES01534  53
+#define Q2_LEVELTABLE_COUNT_SLES01534  52
 
 typedef struct q2_level_entry {
     char display[Q2_LEVEL_NAME_LEN + 1];   /* shown to the player      */
@@ -87,6 +91,8 @@ typedef struct q2_level_entry {
     u8   playlist[Q2_LEVEL_PLAYLIST];
 
     bool is_placeholder;  /* BADLEVEL or the terminator                */
+    s16 mission_unit;     /* +0x16: native direct-level mission selector. */
+    u8 game_kind;         /* +0x20: nonzero selects single-player pools. */
 } q2_level_entry;
 
 typedef struct q2_level_table {

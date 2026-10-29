@@ -109,6 +109,8 @@ void q2_menu_reset_video_for(q2_menu_settings *s, int screen_h)
 {
     if (!s) return;
     s->v[Q2_SET_HORIZONTAL_SPLIT] = 1;
+    s->v[Q2_SET_CRT] = 0;
+    s->v[Q2_SET_BLOOM] = 0;
     s->v[Q2_SET_SCREEN_X]         = 0;
     s->v[Q2_SET_SCREEN_Y]         = (s16)q2_menu_screen_y_default(screen_h);
 }
@@ -121,8 +123,18 @@ void q2_menu_reset_sound(q2_menu_settings *s)          /* 0x8001FA50 */
     s->v[Q2_SET_SFX]    = 96;
 }
 
+q2_menu_setting q2_menu_player_setting(q2_menu_setting id, int player)
+{
+    if (id >= Q2_SET_PAD_STYLE && id <= Q2_SET_MOUSE_SPEED &&
+        player > 0 && player < Q2_MENU_MP_MAX_PLAYERS)
+        return (q2_menu_setting)(Q2_SET_EXTRA_PAD_FIRST + (player - 1) *
+            (Q2_SET_MOUSE_SPEED - Q2_SET_PAD_STYLE + 1) + id - Q2_SET_PAD_STYLE);
+    return id;
+}
+
 void q2_menu_reset_player(q2_menu_settings *s)         /* 0x8001BDA8 */
 {
+    int player;
     if (!s) return;
     s->v[Q2_SET_CROSSHAIR]   = 1;
     s->v[Q2_SET_AUTOCENTRE]  = 1;
@@ -134,6 +146,11 @@ void q2_menu_reset_player(q2_menu_settings *s)         /* 0x8001BDA8 */
     s->v[Q2_SET_VIBRATION]   = 0;
     s->v[Q2_SET_SWAP_Y]      = 0;
     s->v[Q2_SET_USE_MOUSE]   = 0;
+    for (player = 1; player < Q2_MENU_MP_MAX_PLAYERS; player++) {
+        int id;
+        for (id = Q2_SET_PAD_STYLE; id <= Q2_SET_MOUSE_SPEED; id++)
+            s->v[q2_menu_player_setting((q2_menu_setting)id, player)] = s->v[id];
+    }
 }
 
 void q2_menu_reset_variables(q2_menu_settings *s)      /* 0x8002048C */
@@ -264,7 +281,7 @@ const char *q2_menu_item_display(const q2_menu *m, int index,
     selected = (index == m->cursor) && q2_menu_item_selectable(m, index);
 
     if (m->set && it->setting > Q2_SET_NONE && it->setting < Q2_SET_COUNT)
-        value = m->set->v[it->setting];
+        value = m->set->v[q2_menu_player_setting(it->setting, m->pauser)];
 
     switch (it->widget) {
     case Q2_WIDGET_TOGGLE:
@@ -364,7 +381,7 @@ static const q2_menu_page *resolve(const q2_menu *m, int id)
      * one screen that can set it before a split-screen match starts.
      */
     if (id == Q2_PAGE_VIDEO)
-        return q2_menu_video_page(m->multiplayer || m->front_end);
+        return q2_menu_video_host_page(m->multiplayer || m->front_end);
     if (id == Q2_PAGE_CONTROLLER)
         return q2_menu_controller_page(m->front_end);
     if (id == Q2_PAGE_FRONT_DMSETUP)
@@ -418,6 +435,7 @@ static const q2_menu_page *resolve(const q2_menu *m, int id)
  */
 static bool cursor_restores(int page_id)
 {
+    if (page_id == Q2_PAGE_FRONT_UNLOCK) return false;
     switch (page_id) {
     case Q2_PAGE_SCREEN_POSITION:   /* 7  */
     case Q2_PAGE_OPTIONS:           /* 27 */
@@ -714,12 +732,15 @@ static void page_entered(q2_menu *m)
         bool shock  = (m->pauser >= 0 &&
                        m->pauser < Q2_MENU_MP_MAX_PLAYERS &&
                        m->pad_shockable[m->pauser] != 0);
-        bool sticks = (m->set && m->set->v[Q2_SET_PAD_CLASS] == 1);
+        int cls = m->set ? m->set->v[q2_menu_player_setting(Q2_SET_PAD_CLASS, m->pauser)] : 2;
+        bool sticks = cls == 1;
 
         if (!shock)
             grey_item(m, 1);        /* VIBRATION   — gate at 0x8001C9D8 */
-        if (!sticks) {
+        if (!sticks && cls != 0) {
             grey_item(m, 2);        /* SWAP Y AXIS — gate at 0x8001CA94 */
+        }
+        if (!sticks) {
             grey_item(m, 3);        /* USE MOUSE   — gate at 0x8001CB58 */
         }
         break;
@@ -727,6 +748,11 @@ static void page_entered(q2_menu *m)
 
     case Q2_PAGE_FRONT_DMSETUP:
         front_setup_refresh(m);
+        break;
+
+    case Q2_PAGE_FRONT_UNLOCK:
+        snprintf(m->text[3], Q2_MENU_TEXT_MAX, "FOR %s CHEATS?",
+                 q2_menu_cheat_level_name(m->cheat_level));
         break;
 
     case Q2_PAGE_RESTARTING:
@@ -747,8 +773,6 @@ static void page_entered(q2_menu *m)
 
 void q2_menu_init(q2_menu *m, q2_menu_settings *settings, int screen_h)
 {
-    int i;
-
     if (!m)
         return;
 
@@ -772,10 +796,7 @@ void q2_menu_init(q2_menu *m, q2_menu_settings *settings, int screen_h)
      * Everything else is memset to zero above, which is what the banner wants
      * in single player anyway.
      */
-    for (i = 0; i < Q2_MENU_MP_MAX_PLAYERS; i++) {
-        m->mp_colour[i] = (s16)i;
-        m->mp_team[i]   = (s16)(i & 1);
-    }
+    q2_menu_reset_identities(m);
     m->title_bar_colour = (u8)Q2_MENU_BAR_BLUE;
 }
 
@@ -821,7 +842,7 @@ void q2_menu_set_controller_count(q2_menu *m, int count)
     if (count < 2) count = 2;
     if (count > Q2_MENU_MP_MAX_PLAYERS) count = Q2_MENU_MP_MAX_PLAYERS;
     m->controller_count = count;
-    if (m->mp_setup.players > count)
+    if (m->page_id != Q2_PAGE_FRONT_PLAYERS && m->mp_setup.players > count)
         m->mp_setup.players = (s16)count;
 }
 void q2_menu_set_cheat_level(q2_menu *m, int level)
@@ -986,11 +1007,6 @@ static void run_action(q2_menu *m, int action)
         q2_menu_close(m);
         break;
 
-    /*
-     * The rest of the front end's leaves. Each is a page the port has not built
-     * yet, and each closes rather than pretending to be one — which is visible,
-     * where a page that silently did nothing would not be.
-     */
     /* Picking a mode opens the setup, which is the page the capture shows
      * next: a player count, a map, the two limits, the variables and PROCEED. */
     case Q2_ACT_DM_MODE:
@@ -1011,8 +1027,8 @@ static void run_action(q2_menu *m, int action)
         push(m, Q2_PAGE_FRONT_VARIABLES);
         break;
     case Q2_ACT_PROCEED:
-        m->request = Q2_MREQ_MP_PROCEED;
-        q2_menu_close(m);
+        push(m, Q2_PAGE_FRONT_PLAYERS);
+        q2_menu_players_begin(m);
         break;
     case Q2_ACT_MULTIPLAYER:
         push(m, Q2_PAGE_FRONT_MULTI);
@@ -1020,6 +1036,14 @@ static void run_action(q2_menu *m, int action)
     case Q2_ACT_CREDITS:
         m->request = Q2_MREQ_CREDITS;
         q2_menu_close(m);
+        break;
+    case Q2_ACT_UNLOCK_SAVE:
+        m->request = Q2_MREQ_UNLOCK_SAVE;
+        q2_menu_close(m);
+        break;
+    case Q2_ACT_PAGE_FRONT_TITLE:
+        m->depth = 0;
+        q2_menu_goto(m, Q2_PAGE_FRONT_TITLE);
         break;
 
     case Q2_ACT_ASK_RESTART:     push(m, Q2_PAGE_RESTART_CONFIRM);  break;
@@ -1072,13 +1096,13 @@ static s16 *binding(q2_menu *m, int index)
     id = m->page->items[index].setting;
     if (id <= Q2_SET_NONE || id >= Q2_SET_COUNT)
         return NULL;
-    return &m->set->v[id];
+    return &m->set->v[q2_menu_player_setting(id, m->pauser)];
 }
 
 /* The style list the connected controller class offers — 0x8001C8A8. */
 static void choice_range(const q2_menu *m, int *lo, int *hi)
 {
-    int cls = (m->set ? m->set->v[Q2_SET_PAD_CLASS] : 2);
+    int cls = m->set ? m->set->v[q2_menu_player_setting(Q2_SET_PAD_CLASS, m->pauser)] : 2;
 
     switch (cls) {
     case 0:  *lo = 0; *hi = 3; break;   /* a mouse            */
@@ -1293,6 +1317,8 @@ bool q2_menu_point_at(q2_menu *m, int index)
 {
     if (!m || !m->open || !m->page)
         return false;
+    if (m->page_id == Q2_PAGE_FRONT_PLAYERS)
+        return q2_menu_player_point_at(m, index);
     if (index == m->cursor)
         return false;
     if (!q2_menu_item_selectable(m, index))
@@ -1428,6 +1454,21 @@ static void update_position_page(q2_menu *m)
     }
 }
 
+void q2_menu_advance_players(q2_menu *m, const u16 pad[4], u32 connected)
+{
+    int result;
+    if (!m || !m->open || m->page_id != Q2_PAGE_FRONT_PLAYERS) return;
+    result = q2_menu_players_step(m, pad, connected);
+    if (result < 0) {
+        if (m->depth) pop(m);
+        else q2_menu_goto(m, Q2_PAGE_FRONT_DMSETUP);
+    }
+    else if (result > 0) {
+        m->request = Q2_MREQ_MP_PROCEED;
+        q2_menu_close(m);
+    }
+}
+
 void q2_menu_advance(q2_menu *m, u16 buttons)
 {
     const q2_menu_item *item;
@@ -1444,6 +1485,10 @@ void q2_menu_advance(q2_menu *m, u16 buttons)
     m->pad_prev = buttons;
 
     if (!m->open || !m->page)
+        return;
+
+    /* The client supplies four separate button words on this page. */
+    if (m->page_id == Q2_PAGE_FRONT_PLAYERS)
         return;
 
     if (m->settle) {

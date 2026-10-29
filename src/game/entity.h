@@ -74,7 +74,8 @@
  * spawner, the save restore and two others all reach it. Its tail lifts the
  * record's Y by 286 and then by a further 30 (`addiu v0, v0, -286` at
  * 0x80051068 and `addiu v0, v0, -30` at 0x800510A4, +Y being down), and then
- * runs a DOWNWARD SWEEP of up to `dist` units against SecondaryCol, writing
+ * runs a DOWNWARD SWEEP to authored Y - 286 + `dist` against SecondaryCol
+ * (a displacement of `dist` + 30 from the nudged start), writing
  * back the Y it stopped at — offset +4 and nothing else (0x800511C0) — and the
  * cell it ended in at +0x4E (0x80051228).
  *
@@ -95,7 +96,11 @@
  * original treats as a hard failure — it frees the item and error-loops on a
  * creature — so a caller must not carry on as if the entity were placed.
  */
-bool q2_entity_drop_to_floor(q2_collision *coll, s32 pos[3], s32 dist,
+/* `world` supplies solid platforms absent from SecondaryCol. NULL retains
+ * collision-mesh-only placement for asset readers and early item loading. */
+struct q2_move_world;
+bool q2_entity_drop_to_floor(q2_collision *coll, const struct q2_move_world *world,
+                             s32 pos[3], s32 dist,
                              s32 *out_node);
 
 /* The nudge above the record before the sweep, 0x800510A4. */
@@ -151,6 +156,8 @@ struct q2_entity_world;
 typedef void (*q2_think_fn)(struct q2_entity *self, struct q2_entity_world *w);
 
 typedef struct q2_entity {
+    u32 audio_generation; /* runtime incarnation; invalidated on slot reuse */
+    u32 sound_duration;   /* entity+0x110; zero means 9000 game units */
     bool in_use;
 
     q2_think_fn think;          /* +0x3C */
@@ -257,6 +264,7 @@ typedef struct q2_entity {
      */
     s32 population_group;
     u32 population_slot;
+    u32 zone_serial; /* map-local identity for a dynamic object; 0 until captured */
 } q2_entity;
 
 void q2_entity_init(q2_entity *e);
@@ -349,6 +357,7 @@ typedef enum q2_ent_sound {
     Q2_SND_WATER_OUT   = 25,  /* 0x800B293C — pla_watr_out                  */
     Q2_SND_WATER_UNDER = 26,  /* 0x800B2940 — pla_watr_un                   */
     Q2_SND_GASP         = 27, /* 0x800B28F8 — pla_gasp1                     */
+    Q2_SND_BURN         = 28, /* 0x800B28DC — burn1/burn2, acid and lava    */
 
     Q2_SND_COUNT
 } q2_ent_sound;
@@ -384,6 +393,8 @@ typedef enum q2_ent_event_kind {
 typedef struct q2_ent_event {
     u8  kind;           /* a q2_ent_event_kind                            */
     u8  sound;          /* a q2_ent_sound; only for Q2_ENT_EVENT_SOUND    */
+    s8 sound_player;    /* -1: fixed point; otherwise stable player slot */
+    u32 sound_entity;   /* entity incarnation, zero for other source types */
     s32 pos[3];
     u8  glow[3];        /* Q2_ENT_EVENT_LIGHT and _BURST                  */
 
@@ -396,6 +407,7 @@ typedef struct q2_ent_event {
      * no bank to count with; the client does.
      */
     s32 model_index;
+    const struct q2_model_bank *model_bank; /* index is local to this bank */
     s32 radius;         /* Q2_ENT_EVENT_LIGHT: the OUTER radius            */
     s32 inner_radius;   /* Q2_ENT_EVENT_LIGHT: the inner, 0 if unspecified  */
 
@@ -422,6 +434,9 @@ typedef struct q2_ent_events {
 
 void q2_ent_events_clear(q2_ent_events *ev);
 void q2_ent_sound_at(q2_ent_events *ev, q2_ent_sound which, const s32 pos[3]);
+void q2_ent_sound_player(q2_ent_events *ev, int player, q2_ent_sound which,
+                          const s32 pos[3]);
+void q2_ent_sound_entity(q2_ent_events *ev, q2_ent_sound which, const q2_entity *owner);
 /*
  * Raise a dynamic light.
  *
@@ -444,7 +459,7 @@ void q2_ent_light_timed_at(q2_ent_events *ev, const s32 pos[3],
                            const u8 glow[3], s32 inner_radius, s32 radius,
                            s32 ticks);
 void q2_ent_burst_at(q2_ent_events *ev, const s32 pos[3], const u8 glow[3],
-                     s32 model_index);
+                     s32 model_index, const struct q2_model_bank *bank);
 
 /* ------------------------------------------------------------------------- */
 /* The world a think runs in                                                  */

@@ -169,6 +169,22 @@ static void emit_select_bar(psx_ot *ot, u32 bucket, int colour,
 }
 
 /* ------------------------------------------------------------------------- */
+/* Runtime menu rows (match banners and results)                              */
+/* ------------------------------------------------------------------------- */
+void q2_menu_draw_text_row(psx_ot *ot, const q2_menu_draw_opts *opts,
+                           int size, int x, int y, bool highlight,
+                           int colour, const char *text)
+{
+    const q2_menu_face *face = q2_menu_face_get(size);
+    if (!ot || !opts || !opts->font || !face || !text) return;
+    q2_menu_font_print(opts->font, ot, opts->bucket, size, x, y, highlight,
+                       opts->origin_x, opts->origin_y, text);
+    if (highlight)
+        emit_select_bar(ot, opts->bucket, colour, opts->view_x, opts->view_w,
+                          y, face->cell_h, opts->origin_x, opts->origin_y);
+}
+
+/* ------------------------------------------------------------------------- */
 /* The slider — 0x8001BA14                                                    */
 /* ------------------------------------------------------------------------- */
 #define Q2_MENU_BAR_W 133
@@ -266,6 +282,28 @@ u32 q2_menu_build_ot(const q2_menu *m, psx_ot *ot,
     if (!opts->font)
         return 0;
 
+    if (m->page_id == Q2_PAGE_FRONT_PLAYERS) {
+        int p;
+        u32 before = ot->prim_count;
+        for (p = 0; p < m->mp_setup.players && p < 4; p++) {
+            q2_menu_player_row rows[7];
+            q2_menu_draw_opts panel = *opts;
+            int x, y;
+            int count = q2_menu_player_rows(m, p, rows);
+            int colour = m->mp_setup.mode == Q2_MENU_MP_TEAM_DEATHMATCH
+                           ? m->mp_team[p] : m->mp_colour[p];
+            q2_menu_player_origin(m, p, &x, &y);
+            panel.origin_x += x;
+            panel.origin_y += y;
+            panel.view_x = m->mp_setup.players == 2 ? -x : 0;
+            panel.view_w = m->mp_setup.players == 2 ? 512 : 256;
+            for (i = 0; i < count; i++)
+                q2_menu_draw_text_row(ot, &panel, rows[i].size, 128, rows[i].y,
+                    rows[i].selected && !rows[i].disabled, colour & 3, rows[i].text);
+        }
+        return ot->prim_count - before;
+    }
+
     item_face = q2_menu_face_get(Q2_MENU_FACE_ITEM);
 
     /*
@@ -323,7 +361,7 @@ u32 q2_menu_build_ot(const q2_menu *m, psx_ot *ot,
 
             if (m->set && it->setting > Q2_SET_NONE &&
                 it->setting < Q2_SET_COUNT)
-                value = m->set->v[it->setting];
+                value = m->set->v[q2_menu_player_setting(it->setting, m->pauser)];
 
             emit_slider(ot, opts->bucket, bar_x, bar_y, value, selected,
                         greyed, opts->origin_x, opts->origin_y);

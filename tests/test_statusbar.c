@@ -1380,7 +1380,8 @@ static void test_field_modulation(void)
  *
  * The sheet is synthetic: texture page 1 (the tpage the other tests pass) is
  * filled with texel index 1 everywhere and CLUT (0,0) — clut word 0, the
- * fallback every sprite takes with no palette bank — maps index 1 to grey 64.
+ * fallback every sprite takes with no palette bank — maps index 1 to grey 64
+ * with STP set, as the real blended-strip palette requires.
  * The backdrop is grey 96. Every value is a multiple of 8, so the 5-bit
  * framebuffer holds each exactly, and dithering is off so a pixel is a number.
  */
@@ -1526,7 +1527,7 @@ static void test_bar_on_screen(void)
     for (y = 0; y < 256; y++)
         for (x = 64; x < 128; x++)          /* page 1, 4bpp: 4 texels a word */
             vram->px[y][x] = 0x1111;
-    vram->px[0][1] = psx_rgb555(TEXEL_GREY, TEXEL_GREY, TEXEL_GREY);
+    vram->px[0][1] = psx_rgb555(TEXEL_GREY, TEXEL_GREY, TEXEL_GREY) | 0x8000u;
 
     psx_raster_opts_default(&opts);
     opts.dither = false;

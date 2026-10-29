@@ -303,10 +303,10 @@ typedef struct q2_viewweapon {
      * Seek then eases +0x46 toward it, which is what makes the barrel settle
      * back to level when the lock is lost instead of snapping.
      *
-     * This port has no client block yet, so the field lives here and a caller
-     * feeds it — `q2_vw_set_aim_assist`, or `q2_vw_seek_aim_assist` for a
-     * caller that has only the target. It is zero until something does, which
-     * is exactly the console's own value with no target in front of you.
+     * The player simulation owns acquisition and easing. The client copies
+     * its retained result here with `q2_vw_set_aim_assist`; display-only
+     * updates never advance it. `q2_vw_seek_aim_assist` also exposes the
+     * native easing for standalone view-weapon callers and focused tests.
      *
      * `q2_vw_init` clears it with the rest of the struct, and that is right
      * rather than incidental: the console clears client+0x46 at the same
@@ -479,6 +479,18 @@ typedef struct q2_viewweapon {
      * -1 when nothing is pending; the caller drains it.
      */
     s16         frame_sound;
+
+    /*
+     * THE DRIVER'S RETURN — the halfword at 0x800B2B7E. Each substep's state
+     * machine pass rewrites it (0x8004FC40: zero, or what the idle arm's fire
+     * function returned), and the machinegun, chaingun and hyperblaster arms
+     * overwrite it with their own shot (0x8004FFE8, 0x80050214, 0x800502E0).
+     * 0x8004F6D4 returns whatever the LAST substep left there, and the player
+     * think requests ATTACK for any nonzero value (0x8003ADA0..0x8003ADB4).
+     * So a dry click (2) poses the body as a shot does, and a shot taken in an
+     * earlier substep is erased by a quieter later one.
+     */
+    s16         result;
 } q2_viewweapon;
 
 /*
@@ -575,6 +587,20 @@ const char *q2_vw_model_name(const q2_viewweapon *vw);
 bool q2_vw_advance(q2_viewweapon *vw, s32 dt, bool fire_held,
                    q2_vw_fire_result fired);
 
+/* Resolve each frame-driven burst during its animation substep. This keeps
+ * the held weapon, burst size and dry result together even across multiple
+ * keys in one frame. Without a callback, advance queues individual rounds
+ * for q2_vw_take_frame_fires, as used by offline animation probes. */
+typedef q2_vw_fire_result (*q2_vw_fire_fn)(void *user, int weapon, int rounds);
+bool q2_vw_advance_firing(q2_viewweapon *vw, s32 dt, bool fire_held,
+                          q2_vw_fire_result fired, q2_vw_fire_fn fire,
+                          void *user);
+
+/* What the last advance returned on the console (0x8004F6D4): 0, or the fire
+ * result — 1 for a shot, 2 for a dry one — left by its final substep. An
+ * advance that runs no substep leaves the previous value, as the global does. */
+s16 q2_vw_result(const q2_viewweapon *vw);
+
 /*
  * Take the "the latch was released" signal — the pass on which the original
  * recomputes the player's next and previous weapons, and therefore the moment a
@@ -606,10 +632,8 @@ void q2_vw_set_aim_assist(q2_viewweapon *vw, s16 assist);
  * (0x8003A190). Returns true on the tick it arrives, which is Seek's own
  * return value.
  *
- * THIS IS THE PLAYER THINK'S EASING, not the weapon's, and it is offered here
- * only because nothing in this port owns a client block yet. A caller that
- * grows one should do the Seek there, next to FindPlayerTarget's own write,
- * and feed the result through `q2_vw_set_aim_assist` instead.
+ * Standalone callers can use this helper. The game runs the seek in player
+ * think next to acquisition and publishes it with q2_vw_set_aim_assist.
  */
 bool q2_vw_seek_aim_assist(q2_viewweapon *vw, s16 target, s32 frame_dt);
 

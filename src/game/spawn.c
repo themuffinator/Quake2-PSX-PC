@@ -42,8 +42,19 @@ static q2_monster *monster_push(q2_monster_set *set)
     }
 }
 
+bool q2_spawn_place(const q2_pop_spawn *record, q2_collision *coll,
+                     const q2_move_world *world, s32 origin[3])
+{
+    if (!record || !origin) return false;
+    origin[0] = record->x;
+    origin[1] = record->y - Q2_EYE_BASE - Q2_ENTITY_SPAWN_NUDGE;
+    origin[2] = record->z;
+    return q2_entity_drop_to_floor(coll, world, origin, Q2_ENTITY_DROP_DIST, NULL);
+}
+
 q2_result q2_spawn_from_population(q2_monster_set *out, const q2_population *pop,
-                                   q2_collision *coll, q2_spawn_stats *stats)
+                                   q2_collision *coll, const q2_move_world *world,
+                                   q2_spawn_stats *stats)
 {
     q2_spawn_stats local;
     u32 gi;
@@ -126,7 +137,7 @@ q2_result q2_spawn_from_population(q2_monster_set *out, const q2_population *pop
             }
 
             m->group  = (u16)gi;
-            m->pos[0] = rec.x;
+            m->population_slot = slot;
             /*
              * THE RECORD'S Y IS THE FEET. `m->pos` is the entity ORIGIN, which
              * is Q2_EYE_BASE above them.
@@ -164,11 +175,7 @@ q2_result q2_spawn_from_population(q2_monster_set *out, const q2_population *pop
              * never put on the floor in the first place: the authored Y is a
              * HINT and the engine settles it.
              */
-            m->pos[1] = rec.y - Q2_EYE_BASE - Q2_ENTITY_SPAWN_NUDGE;
-            m->pos[2] = rec.z;
-
-            if (coll && !q2_entity_drop_to_floor(coll, m->pos,
-                                                 Q2_ENTITY_DROP_DIST, NULL)) {
+            if (!q2_spawn_place(&rec, coll, world, m->pos)) {
                 /*
                  * 0x8003B624 error-loops here. The port cannot, and must not
                  * drop the record either: Population is per MAP and a session
@@ -269,7 +276,7 @@ void q2_monster_set_wake(q2_monster_set *set, q2_monster *player)
 
     for (i = 0; i < set->count; i++) {
         q2_monster *m = &set->monsters[i];
-        if (!m->in_use || m->dead)
+        if (!m->in_use || m->dead || m->resume_pending)
             continue;
         q2_monster_start_go(m);
     }
@@ -352,13 +359,21 @@ u32 q2_monster_set_tick(q2_monster_set *set)
                 q2_monster_corpse_detach(m);
 
             if (m->corpse) {
+                if (m->think == q2_cre_medic_revive &&
+                    m->next_think > 0 && m->next_think <= q2_level_state.time) {
+                    m->think(m);
+                    ran++;
+                    continue;
+                }
                 q2_monster_corpse_tick(m);
                 ran++;
                 continue;
             }
 
-            if (m->currentmove && m->next_think != 0) {
-                q2_M_MoveFrame(m);
+            if (m->think && m->next_think > 0 &&
+                m->next_think <= q2_level_state.time) {
+                m->next_think = 0;
+                m->think(m);
                 ran++;
             }
             continue;
@@ -366,9 +381,12 @@ u32 q2_monster_set_tick(q2_monster_set *set)
 
         if (!m->think)
             continue;
-        if (m->next_think > q2_level_state.time)
+        if (m->next_think <= 0 || m->next_think > q2_level_state.time)
             continue;
 
+        /* 0x8007EE88 / 0x8007EEB0: a timer is disarmed before calling it.
+         * DeadComm's one-shot drop deliberately does not write another. */
+        m->next_think = 0;
         m->think(m);
         ran++;
     }

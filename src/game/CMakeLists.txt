@@ -20,13 +20,26 @@ add_library(q2psx_game STATIC
     combat.c
     combat.h
     creature.c
+    creinit.c
     creature.h
     crebind.c
     crebind.h
     cre_actions.c
     cre_arachner.c
     cre_berserk.c
+    cre_flyer.c
+    cre_gladiator.c
     cre_gunner.c
+    cre_hover.c
+    cre_parasite.c
+    cre_ironmaiden.c
+    cre_strider.c
+    cre_boss1.c
+    cre_boss2.c
+    cre_jorg.c
+    cre_rider.c
+    cre_medic.c
+    cre_script.c
     cre_infantry.c
     cre_insane.c
     cre_soldier.c
@@ -34,6 +47,8 @@ add_library(q2psx_game STATIC
     cre_generic.c
     creworld.c
     creworld.h
+    cremotion.c
+    cremotion.h
     entity.c
     entity.h
     entitydraw.c
@@ -60,6 +75,10 @@ add_library(q2psx_game STATIC
     mission.h
     movie.c
     movie.h
+    nativeheap.c
+    nativeheap.h
+    levelmemory.c
+    levelmemory.h
     levelbin.c
     mover.c
     mover.h
@@ -79,6 +98,8 @@ add_library(q2psx_game STATIC
     spawn.h
     save.c
     save.h
+    zonestate.c
+    zonestate.h
     saveui.c
     shock.c
     shock.h

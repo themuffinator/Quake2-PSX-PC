@@ -1,8 +1,11 @@
 add_library(q2psx_render STATIC
+    crt.c
+    crt.h
     font.c
     font.h
     raster.c
     raster.h
+    raster_scan.inc
 )
 
 target_include_directories(q2psx_render PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

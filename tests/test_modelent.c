@@ -1460,7 +1460,9 @@ static void test_gib_door(void)
     check_eq(e->pos[0], 39,
              "the second meets the door at 100: pulled back the whole step "
              "(0x80046650) and one unit off its face");
-    check_eq(b->vel[0], -1800, "and thrown back at 2304/4096 of 3200");
+    /* SquareRoot0(3200^2) is 3197, not 3200 (0x8008A7E8); 3197 * 2304 >> 12
+     * is 1798, and VectorNormal of (-1, 0, 0) is exactly -4096. */
+    check_eq(b->vel[0], -1798, "and thrown back at 2304/4096 of the SDK root of 3200");
     check(!(b->move_flags & Q2_GIB_MOVE_REST), "too fast to settle there");
     fixture_close(&f);
 

@@ -1,12 +1,10 @@
 /*
  * main.c — the playable client.
  *
- * Opens a disc, loads a zone, and lets you fly through it in real time. The
- * internal framebuffer is the console's own — 512x248, read out of the display
- * init at 0x800764DC rather than assumed — and is upscaled to the window. That
- * is not a concession to performance; rendering at the original resolution is
- * part of looking right, because the dither pattern and the vertex snapping are
- * both defined in terms of real pixels.
+ * Opens a disc, loads a zone, and lets you fly through it in real time. Legacy
+ * display modes retain the console framebuffer (512x248 PAL, 512x240 NTSC).
+ * Automatic aspect mode expands the view to the host window, within the GTE's
+ * coordinate limits, while retaining the authored pixel shape and fitted UI.
  *
  * Upscaled, NOT stretched to fill. A framebuffer pixel is two thirds as wide as
  * it is tall on a PAL television — every one of the GPU's horizontal modes spans
@@ -37,7 +35,7 @@
  *                nothing the engine does turns one on — see effect.h)
  *   F7 / F8      the memory-card front end, saving and loading
  *   F9 / F10     quick save and quick load, slot 1
- *   F11          screenshot, of the 512x248 framebuffer rather than the window
+ *   F11          screenshot: framebuffer, or fitted bloom/CRT output when enabled
  *   P            toggle the view's own world position and angles along the
  *                top of the frame, in the units --at, --yaw and --pitch
  *                take. Not the console's: nothing on this disc puts a
@@ -102,6 +100,8 @@
  * four rows, the release rule and the state machine (memcard.h, saveui.h).
  */
 #include "random.h"
+#include "crt.h"
+#include "crt_gl.h"
 #include <SDL3/SDL.h>
 
 #include <stdio.h>
@@ -111,6 +111,7 @@
 
 #include "ai.h"
 #include "aiworld.h"
+#include "area.h"
 #include "crebind.h"
 #include "creworld.h"
 #include "levelbin.h"
@@ -125,6 +126,7 @@
 #define Q2_CLIENT_ITEM_SOUNDS 11
 
 #include "multiplayer.h"
+#include "levelmemory.h"
 #include "playerdeath.h"
 #include "userfuncs.h"
 #include "disc.h"
@@ -162,12 +164,15 @@
 #include "sortdata.h"
 #include "pad.h"
 #include "gamepad.h"
+#include "controller_ui.h"
 #include "shock.h"
 #include "sim.h"
 #include "statusbar.h"
 #include "trace.h"
 #include "trig.h"
 #include "vag.h"
+#include "spu.h"
+#include "spatial.h"
 #include "version.h"
 #include "viewweapon.h"
 #include "vmtables.h"
@@ -185,9 +190,12 @@
 /* has to be stopped before the bank it points into is freed.                  */
 /* ------------------------------------------------------------------------- */
 #define CLIENT_VOICES 24
+#define CLIENT_AUDIO_RATE Q2_SPU_OUTPUT_RATE
+/* PAL audio setup, traced through SpuSetCommonAttr to 1f801d80/82 and db0/b2.
+ * Main direct-volume words are Q14; the CD input words are signed Q15. */
+#define CLIENT_SPU_MAIN_VOLUME 0x3fc0
+#define CLIENT_SPU_CD_VOLUME   0x7fff
 
-/* Two blocks: enough that a compaction always leaves room for the next one. */
-#define CLIENT_VOICE_BUF (SPU_SAMPLES_PER_BLOCK * 2)
 
 /*
  * The constant-power pan table at 0x800A1F20 — 31 entries, one side of the
@@ -221,10 +229,10 @@ static const u8 k_pan[CLIENT_PAN_STEPS] = {
  * all along. The arithmetic itself lives beside the request's PITCH byte in
  * vag.h, which is the other byte of the same record.
  */
-#define CLIENT_SFX_REQ_VOL ((s32)Q2_SFX_VOLUME_DEFAULT)
-/* What a listener-local sound gets instead — the menu, the player's own weapon
- * and footsteps, the HUD. Never attenuated, never panned. */
-#define CLIENT_SFX_LOCAL  254
+typedef enum client_sound_source {
+    CLIENT_SOUND_UI, CLIENT_SOUND_POINT, CLIENT_SOUND_PLAYER, CLIENT_SOUND_CREATURE,
+    CLIENT_SOUND_ENTITY
+} client_sound_source;
 
 typedef struct client_voice {
     bool         active;
@@ -243,15 +251,12 @@ typedef struct client_voice {
      * a bare `client_voice *`: client_play_sound memsets the slot before
      * reusing it, so `active` alone would report an unrelated later sound as
      * the one the caller started. `serial` is this port's tag; it is assigned
-     * after the memset, never zero, and never repeats.
+     * after the memset; zero is reserved for an invalid handle.
      */
     u32          serial;
-    q2_spu_voice dec;
-    s16          buf[CLIENT_VOICE_BUF];  /* decoded, not yet stepped over */
-    u32          have;                   /* samples in `buf`              */
-    u32          pos;                    /* 16.16 read cursor into `buf`  */
-    u32          step;                   /* 16.16 advance per output frame */
-    s32          vol;                    /* 0..127, latched at the start  */
+    q2_spu_player spu;
+    s32          vol;                    /* live SFX slider, 0..127      */
+    u32          sample_rate;            /* VAG rate for request pitch changes */
 
     /*
      * WHERE IT IS, which nothing used to record — so a creature idling across
@@ -261,6 +266,10 @@ typedef struct client_voice {
      */
     bool         positional;
     s32          pos_world[3];
+    client_sound_source source;
+    u32 owner_index, owner_generation, deadline;
+    bool flat_mono; /* retail voice type 7, independent of the stereo slider */
+    bool force_stereo, mono;
 
     /* Recomputed every frame from the listener, because a source moves and so
      * does the listener; 0..255 each. */
@@ -270,47 +279,19 @@ typedef struct client_voice {
     /*
      * The REQUEST's volume byte this voice was started from — 0x800DFDE4's +2,
      * 63 unless something called SoundSetRelativeVolume on the request. The
-     * per-frame recompute above overwrites `level` from the distance every
-     * frame, so a request's own volume cannot live there; it is folded in as a
-     * ratio against the default instead.
+     * per-frame spatial calculation scales this byte by the distance. Flat
+     * entity modes instead use the explicit retail levels 84, 127 or 254.
      */
     u8           req_vol;
 } client_voice;
 
 /* One render-clock cursor per articulated world model. `frame_stamp` prevents
  * split-screen from advancing it once per viewport instead of once per frame. */
-typedef struct client_model_anim {
-    q2_model_cursor cursor;
-    const q2_mmove *move;
-    long             frame_stamp;
-    u8               source;
-    bool             stamped;
-} client_model_anim;
+typedef q2_zone_animation client_model_anim;
 
 typedef struct client_player_anim {
-    q2_model_cursor cursor;
-    q2_player_move  move;
-    long            frame_stamp;
-    u32             shot_serial;
-    bool            stamped;
-    bool            attack_latched;
-    /*
-     * The sim's flinch serial as this record last saw it, and the latch it
-     * raises. Same shape as `shot_serial`/`attack_latched` above and for the
-     * same reason: the pose runs on the display clock and several viewports
-     * may ask for it in one frame, so the request cannot be a flag the first
-     * asker clears. Dropped when the pain clip wraps.
-     */
-    u32             pain_serial;
-    bool            pain_latched;
-    /*
-     * Whether the move now playing has run past its end at least once --
-     * bit 0 of entity+0x102, raised by 0x8003DF90 and read by the chooser at
-     * 0x8003D008 and 0x8003D1D0. Without it `q2_player_anim_pick`'s rule that
-     * a pain move holds until it wraps degenerates and the next tick's
-     * RUN/STAND cuts the flinch off after a single frame.
-     */
-    bool            wrapped;
+    q2_player_anim_state state;
+    u32 damage_serial;
 } client_player_anim;
 
 /*
@@ -342,6 +323,9 @@ typedef struct client {
     q2_build_id      build;
     q2_world_zone    zone;
     q2_common_file   common;
+    q2_level_memory  level_memory;
+    bool             level_memory_checked, level_memory_ready, level_memory_current;
+    u32              level_memory_failures;
     char             map[64];
     /*
      * The same level under the name the level table shows it by, which is what
@@ -359,6 +343,7 @@ typedef struct client {
     q2_xa_decoder    music_dec;
     u32              music_cursor;
     bool             music_open;
+    bool             music_playing; /* countdown also runs during silent tracks */
 
     /*
      * WHICH music, which used to be "track A, because the mapping is not
@@ -376,6 +361,10 @@ typedef struct client {
     int              music_cursor_at;
     int              music_id;
     SDL_AudioStream *audio;
+    double           audio_clock;   /* fractional frames without an output device */
+    double           audio_retry;   /* seconds until the next missing-device attempt */
+    bool             audio_warned;  /* report once per outage, not once per retry */
+    u64              audio_frames;  /* frames actually mixed, including headless */
 
     /*
      * ---------------------------------------------------------------------
@@ -407,14 +396,18 @@ typedef struct client {
      * into the music bed. One push per chunk, mixed, at the stream's format.
      */
     client_voice     voice[CLIENT_VOICES];
+    q2_sfx_request bank_request[128];
+    q2_sfx_request chaingun_request;
+    bool requests_ready;
+    u32 player_audio_generation[Q2_MP_MAX_PLAYERS];
     u32              voice_started;
     u32              voice_dropped;   /* all 24 busy, as the SPU would be */
 
     /*
      * Weapon-fire sounds ASKED FOR, which is a different number from voices
-     * started: a headless run has no audio device and starts none, and the
-     * question "does the chaingun bang once per bullet" has to be answerable
-     * there. `chaingun_bangs` is the per-bullet clone alone.
+     * started: bank misses and the 24-voice limit can reject a request.
+     * Headless runs execute the mixer too. `chaingun_bangs` counts the
+     * per-bullet clone alone.
      */
     u32              weapon_sounds;
     u32              chaingun_bangs;
@@ -424,10 +417,8 @@ typedef struct client {
      * for one and how many of those 0x8004FBB0 would have thrown away because
      * the previous copy was still sounding.
      *
-     * `quad_gated` can only be non-zero when a voice actually started, so a
-     * headless run — which has no device and therefore no voice — reads it as
-     * zero however hard the trigger is held. That is a property of the counter,
-     * not of the gate; `quad_raises` is the reproducible half.
+     * Both counters work without a device: the software mixer advances on
+     * the fixed headless clock, so the gate observes real voice lifetimes.
      */
     u32              cocks_played;
     u32              quad_raises;
@@ -451,7 +442,8 @@ typedef struct client {
      * handed out in chunks smaller than a sector so the queue can sit close to
      * its target instead of overshooting by 53 ms at a time.
      */
-    s16              bed[XA_FRAMES_PER_SECTOR * XA_CHANNELS];
+    s16              bed[XA_OUTPUT_FRAMES_PER_SECTOR * XA_CHANNELS];
+    q2_xa_resampler  bed_resampler;
     u32              bed_frames;      /* frames decoded into it   */
     u32              bed_pos;         /* frames handed out so far */
 
@@ -473,6 +465,7 @@ typedef struct client {
     s32             mp_camera_angles[Q2_MP_MAX_PLAYERS][3];
     q2_gamepads     gamepads;
     bool            gamepad_player_one;
+    SDL_JoystickID  primary_pad_id;
     q2_mp_results   mp_results;
     double          mp_results_dt_frac;
     u32             mp_results_prev[Q2_MP_MAX_PLAYERS];
@@ -718,6 +711,7 @@ typedef struct client {
     bool              player_model_ok[Q2_MP_MAX_PLAYERS];
     bool              player_anim_base_ok;
     client_player_anim player_anim[Q2_MP_MAX_PLAYERS];
+    q2_player_anim_range player_moves[Q2_PMOVE_COUNT];
 
     /*
      * The things in the level that are trying to kill you.
@@ -869,6 +863,10 @@ typedef struct client {
      * any of them through. q2_fx_build_ot's return was discarded, so a whole
      * class of bursts could be culled in every frame with no counter moving. */
     u32               fx_prims;
+    u32               glint_prims;
+    bool              glint_drawn; /* age once after all viewports */
+    u32               lightning_prims;
+    u32               generator_flashes;
     /* Debris models this map's bank yielded (0..3) and faces the live pieces
      * put in the table. Both are zero on the 30 banks with no Debris model,
      * which is the console's own answer there. */
@@ -1007,6 +1005,11 @@ typedef struct client {
      * arrive with the script state it was left in.
      */
     q2_event_store    event_store;
+    q2_native_mission native_mission;
+    q2_fx_beam_style  reactor_beam;
+    bool              reactor_beam_ready;
+    q2_zone_history   zone_history;
+    bool              new_game_loading;
 
     /* Non-NULL only during a saved-game load. Its latches must reach the
      * constructor/replay pass before the old session can contribute any. */
@@ -1170,6 +1173,7 @@ typedef struct client {
      * pool is refilled from empty each frame (effect.h).
      */
     q2_laserbeam_set  lasers;
+    q2_laserwall_set  laserwalls;
     u32               laser_drawn;
 
     /*
@@ -1202,6 +1206,9 @@ typedef struct client {
     u8               *film_rgb;        /* the frame most recently decoded */
     bool              film_have_frame;
     u32               film_frames;
+    u64               film_audio_mixed, film_audio_submitted, film_audio_played;
+    u64               film_stop_at;    /* sample frame at which the four-field fade starts */
+    bool              film_stopping;
     const char       *film_arg;        /* --movie NAME: play it and stop */
 
     /*
@@ -1226,6 +1233,7 @@ typedef struct client {
     char              film_screen[16];
     char              film_next_map[64];
     bool              film_is_start;    /* the front end's own opening reel */
+    bool              film_is_extro;    /* campaign ending -> credits/reward */
     bool              film_to_front;    /* ...and the intro, which opens on
                                          * the title screen rather than a map */
 
@@ -1554,6 +1562,8 @@ typedef struct client {
      * and the only one a rocket, a grenade or a boss's gib arm makes. */
     u32               explosion_sounds;
     u32               explosion_sounds_missed;
+    u32               grenade_bounce_sounds;
+    u32               grenade_bounce_sounds_missed;
     /* Every append ProcessTimedLights made, and every world vertex
      * ProcessMobileLights repainted, over the whole run. */
     u32               timed_lights_emitted;
@@ -1644,17 +1654,9 @@ typedef struct client {
     u32               vw_events;
     s16               vw_last_event;
 
-    /*
-     * Player 0's shots, counted off the sim's serial rather than off its latch,
-     * so one pull is one count no matter how many frames pass before the next.
-     * `mp_shots[]` is the same figure for players 1..3 and its loop starts at 1;
-     * player 0 does not go through `q2_sim_advance_player` and so was never
-     * counted at all.
-     *
-     * The point of having them is the comparison in the shot report:
-     * `vw.fires_started` should equal `shots_fired`, and any other answer means
-     * the view model is being told about shots that did not happen.
-     */
+    /* One count per successful fire call, including frame-driven bursts.
+     * mp_shots carries the same count per owner; fires_started counts clips,
+     * so an automatic weapon can have many shots in one fire clip. */
     u32               shots_fired;
     u32               shots_dry;
 
@@ -1733,8 +1735,10 @@ typedef struct client {
     u32               cre_bodies;     /* deaths that found a death move        */
     u32               cre_drawn;      /* creatures with faces in the last view */
     u32               cre_faces;
+    u32               cre_shadows; /* cumulative, across all viewports */
     u32               player_drawn;
     u32               player_faces;
+    u32               player_shadows;
     s32              *cre_home;      /* where each creature spawned          */
     s32              *cre_cell;      /* link +0xA2: its last SecondaryCol cell */
     s16              *cre_area;      /* link +0x9E: the area it is drawn in   */
@@ -1752,8 +1756,17 @@ typedef struct client {
     SDL_Window      *window;
     SDL_Renderer    *renderer;
     SDL_Texture     *texture;
+    SDL_Texture     *crt_texture;
+    q2_crt           crt;
+    q2_gl_display   *gl_display;
+    bool             crt_cpu;
+    bool             crt_presented, crt_warned;
+    bool             bloom_warned;
+    int              capture_scale;
+    const char      *display_shot_path;
 
     int              width, height;
+    int              output_width, output_height;
 
     /*
      * How the 512x248 buffer is fitted into the window. The default is 4:3, the
@@ -1837,6 +1850,10 @@ typedef struct client {
     q2_light_list    lights;
     q2_spacelights   spacelights;
     q2_light_world   light_world;
+    /* Simulation-owned lights (projectiles, items) hold until the next logic
+     * tick. Weapon and creature flashes are appended afresh per display frame. */
+    q2_light         tick_lights[Q2_DYNLIGHT_MAX];
+    u32              tick_light_count;
     bool             lights_ready;
 
     /* The title screen's two wandering lights keep their x across frames, in
@@ -1846,14 +1863,12 @@ typedef struct client {
 
     bool             in_front_end;
 
-    /*
-     * VIEW CREDITS. The words are QFRONT's own roll (levelbin.h); the layout —
-     * a centred scroll — is this port's, and is marked so at the reader.
-     */
+    /* QFRONT's authored roll and its sixteen streaming text objects. */
     bool             credits_open;
-    const char      *credits[Q2_LB_CREDITS_MAX];
-    u32              credits_count;
-    s32              credits_scroll;
+    bool             credits_back;
+    bool             credits_campaign; /* QFRONT engine+4A8 == 1 */
+    q2_credit_row    credit_rows[Q2_CREDITS_MAX];
+    q2_credits       credits;
     char             first_map[64];
 
     bool             show_glint;
@@ -1912,6 +1927,7 @@ static void client_bind_player_models(client *c);
 static bool client_film_start(client *c, const char *name);
 static void client_film_stop(client *c);
 static void client_film_tick(client *c, float dt);
+static void client_film_request_stop(client *c);
 
 /* Defined with the rest of the sound path, and called from the tick. */
 /*
@@ -1937,7 +1953,8 @@ static void client_film_tick(client *c, float dt);
  * eight-byte part records (`num_verts` at +3) and the caller divides by fifteen.
  * A bigger item bursts bigger, in proportion to its own mesh.
  */
-static void client_pickup_burst(client *c, const s32 pos[3], s32 model_index)
+static void client_pickup_burst(client *c, const s32 pos[3], s32 model_index,
+                                const q2_model_bank *bank)
 {
     q2_model mdl;
     s16 vel[Q2_FX_GROUP_QUADS][3];
@@ -1948,9 +1965,9 @@ static void client_pickup_burst(client *c, const s32 pos[3], s32 model_index)
     if (!c->sim[0].fx_ready)      { c->burst_no_fx++;    return; }
     if (!c->fx_tables_ready)      { c->burst_no_table++; return; }
     if (model_index < 0)          { c->burst_no_model++; return; }
-    if (!c->model_bank_ready)     { c->burst_no_bank++;  return; }
+    if (!bank)                   { c->burst_no_bank++;  return; }
 
-    if (q2_model_get(&c->model_bank, (u32)model_index, &mdl) != Q2_OK) {
+    if (q2_model_get(bank, (u32)model_index, &mdl) != Q2_OK) {
         c->burst_bad_model++;
         return;
     }
@@ -2185,9 +2202,20 @@ static bool client_mover_blocked(u32 index, const s32 step[3], void *user)
 }
 
 static bool client_play_sound(client *c, const char *want);
-static void client_sound_set_relative_volume(client *c, s32 delta);
+
 static bool client_play_sound_at(client *c, const char *want, const s32 at[3]);
-static bool client_find_sound(client *c, const char *want, q2_vag *out);
+static bool client_play_request(client *c, const char *name, q2_sfx_request *request,
+    client_sound_source source, u32 owner, const s32 at[3]);
+static bool client_play_player_sound(client *c, const char *name,
+    q2_sfx_request *request, int player);
+static bool client_play_creature_sound(client *c, const char *name,
+    q2_sfx_request *request, const q2_monster *m);
+static void client_sound_requests_init(client *c);
+static q2_sfx_request *client_request_for_sound(const char *name, void *user);
+static const char *client_ent_sound_name(const client *c, u32 which);
+static bool client_find_sound(const client *c, const char *want, q2_vag *out);
+static void client_shock(client *c, int player, int id, s32 strength,
+                         const s32 pos[3], s16 near_r, s16 far_r);
 /* The console's 0x800739B8 / 0x8007398C, on a (slot, tag) handle. */
 static bool client_voice_playing(const client_voice *v, u32 serial);
 static void client_voice_stop(client_voice *v, u32 serial);
@@ -2207,9 +2235,31 @@ static void client_menu_fill_stats(client *c);
 /* The creature hooks, defined below with the AI clock they run on. */
 static void client_cre_melee(q2_monster *m, const s32 aim[3], s32 damage,
                              s32 kick, void *user);
+static void client_cre_hurt(q2_monster *m, q2_monster *target, s16 damage,
+                            int mod, const s32 *point, void *user);
+static void client_cre_beam(q2_monster *m, q2_monster *target,
+                            s16 vertex, void *user);
+static void client_cre_actor_effect(q2_monster *m, u32 index, u8 ticks, void *user);
+static void client_cre_actor_spawn(q2_monster *m, void *user);
+static void client_cre_explosion(q2_monster *m, const s32 *point, s32 scale,
+                                 void *user);
 static void client_cre_sound(q2_monster *m, int which, void *user);
+static void client_cre_sound_pitch(q2_monster *m, int which, u8 pitch, void *user);
+static void client_cre_sound_owner(q2_monster *m, u32 which, const q2_monster *owner, void *user);
+static void client_cre_request(q2_monster *m, int which, u8 pitch,
+                               const q2_monster *owner, void *user);
 static void client_cre_fire(q2_monster *m, int flash, void *user);
 static void client_cre_shot(q2_monster *m, const q2_cre_shot *shot, void *user);
+static void client_cre_named_sound(q2_monster *m, const char *name, void *user)
+{
+    client *c = user;
+    q2_vag vag;
+    /* Rider+0x1374 looks up its rail report at runtime, then +0x1388 uses
+     * the entity start import. There is no initializer/BSS binding to resolve. */
+    if (client_find_sound(c, name, &vag))
+        client_play_creature_sound(c, name, NULL, m);
+    else c->cre_sound_missing++;
+}
 static bool client_cre_muzzle(const q2_monster *m, s16 vert_a, s16 vert_b,
                               s32 out[3], void *user);
 static bool client_cre_attach_blend(const q2_monster *m, s16 vert_a,
@@ -2274,13 +2324,13 @@ static s32 client_cre_area(client *c, u32 i, s32 *cell_out)
     }
 
     if (c->sim[0].coll_ready) {
-        found = q2_coll_find_node(&c->sim[0].coll, m->pos, cell, true);
+        found = q2_coll_find_node(&c->sim[0].coll, q2_cre_origin(m), cell, true);
         if (found >= 0 &&
             q2_collision_get_node(&c->sim[0].coll, (u32)found, &node)) {
             cell = found;
             area = node.contents & 0x7F;
         } else if (cell < 0 && c->sim[0].coll_primary_ready) {
-            found = q2_coll_find_node(&c->sim[0].coll_primary, m->pos, -1,
+            found = q2_coll_find_node(&c->sim[0].coll_primary, q2_cre_origin(m), -1,
                                       true);
             if (found >= 0 &&
                 q2_collision_get_node(&c->sim[0].coll_primary, (u32)found,
@@ -2298,8 +2348,27 @@ static s32 client_cre_area(client *c, u32 i, s32 *cell_out)
     return area;
 }
 
-/* Every body has been put somewhere new — a save restored over the level —
- * so what each remembered of its cell is from before. */
+/* Resolve the spawn frame once the module's model is available. */
+static void client_cre_seed_animation(client *c, u32 i)
+{
+    q2_monster *m = &c->creatures.set.monsters[i];
+    q2_cre_motion *p = &m->motion;
+    const q2_cre_frame_name *rec;
+    u32 base;
+    if (!p->seed_pending || !c->cre_model_ok || !c->cre_model_ok[i]) return;
+    rec = q2_creature_world_frame_name(&c->creatures, m, p->seed_frame);
+    if (rec && q2_model_position_for_move(&c->cre_model[i], rec->name,
+                                         p->seed_frame, rec->first, &base)) {
+        /* 0x8007F474 does not alter edict+46 (anim_previous). */
+        p->anim_base = (u16)base & 0x7FFFu;
+        p->anim_position = (s16)base;
+        p->anim_flags = 0;
+        p->animation_ready = true;
+    }
+    p->seed_pending = false;
+}
+
+/* A restored population must find its cells again in the current hull. */
 static void client_cre_area_forget(client *c)
 {
     u32 i;
@@ -2322,6 +2391,10 @@ static void client_cre_area_forget(client *c)
  */
 static void client_free_creatures(client *c)
 {
+    q2_cre_set_contact_hooks(NULL, NULL, NULL);
+    q2_cre_set_named_sound_hook(NULL, NULL);
+    q2_cre_set_actor_hooks(NULL, NULL, NULL);
+    q2_cre_set_explosion_hook(NULL, NULL);
     free(c->cre_model);
     free(c->cre_model_ok);
     free(c->cre_anim);
@@ -2359,19 +2432,39 @@ static void client_load_creatures(client *c, const s32 eye[3])
 
     client_free_creatures(c);
 
+    c->zone_bank_ready =
+        (q2_model_bank_from_zone(&c->zone_bank, &c->zone.zone) == Q2_OK);
+    if (!c->mp_enabled && !c->restoring_save)
+        q2_zone_history_items(&c->zone_history, c->map, c->zone_index, &c->sim[0],
+                               c->zone_bank_ready ? &c->zone_bank : NULL);
+
     if (q2_creature_world_load(&c->creatures, c->disc, &c->build, &c->common,
+                               &c->zone.zone,
                                c->sim[0].coll_ready ? &c->sim[0].coll
-                                                    : NULL) != Q2_OK) {
+                                                    : NULL,
+                               &c->sim[0].move_world) != Q2_OK) {
         Q2_WARN("%s: creatures will not load", c->map);
         return;
     }
     c->creatures_ready = true;
+
+    /* Export 2 runs at module load: take clone snapshots before any gameplay
+     * changes shared bank request state, including player weapon pitch. */
+    client_sound_requests_init(c);
+    q2_creature_world_init_sound_requests(&c->creatures, client_cre_bank_has, c,
+                                          client_request_for_sound);
 
     /* The zone's own CastList as well as the map's: a creature's model is as
      * likely to be in one as the other, which is why the inspector's census
      * searches both. */
     c->zone_bank_ready =
         (q2_model_bank_from_zone(&c->zone_bank, &c->zone.zone) == Q2_OK);
+
+    /* Items, including BIGGUN's Blackhole P, can live in this CastList too.
+     * Resolve before their first tick so model bias and clip length are ready. */
+    if (c->zone_bank_ready)
+        for (i = 0; i < c->sim[0].entities.count; i++)
+            q2_entity_resolve_model(&c->sim[0].entities.ent[i], &c->zone_bank);
 
     if (c->creatures.set.count) {
         c->cre_model    = (q2_model *)calloc(c->creatures.set.count,
@@ -2391,10 +2484,9 @@ static void client_load_creatures(client *c, const s32 eye[3])
                                                  sizeof(*c->cre_body));
     }
 
-    if (!c->cre_model || !c->cre_model_ok || !c->cre_anim ||
-        !c->cre_actor || !c->cre_target || !c->cre_fx || !c->cre_body) {
-        if (c->creatures.set.count)
-            Q2_WARN("no memory for %u creatures", c->creatures.set.count);
+    if (c->creatures.set.count && (!c->cre_model || !c->cre_model_ok || !c->cre_anim ||
+        !c->cre_actor || !c->cre_target || !c->cre_fx || !c->cre_body)) {
+        Q2_WARN("no memory for %u creatures", c->creatures.set.count);
         client_free_creatures(c);
         return;
     }
@@ -2661,6 +2753,7 @@ static void client_load_creatures(client *c, const s32 eye[3])
                             c->creatures_ready ? c->creatures.set.monsters
                                                : NULL,
                             c->creatures_ready ? c->creatures.set.count : 0);
+    c->ai_world.player_owner = &c->creatures.sight;
 
     q2_ai_world_bind_install(&c->ai_world);
 
@@ -2683,9 +2776,15 @@ static void client_load_creatures(client *c, const s32 eye[3])
     q2_trail_init();
 
     q2_cre_set_melee_hook(client_cre_melee, c);
+    q2_cre_set_contact_hooks(client_cre_hurt, client_cre_beam, c);
+    q2_cre_set_explosion_hook(client_cre_explosion, c);
     q2_cre_set_sound_hook(client_cre_sound, c);
+    q2_cre_set_pitched_sound_hook(client_cre_sound_pitch, c);
+    q2_cre_set_sound_owner_hook(client_cre_sound_owner, c);
     q2_cre_set_fire_hook(client_cre_fire, c);
     q2_cre_set_shot_hook(client_cre_shot, c);
+    q2_cre_set_named_sound_hook(client_cre_named_sound, c);
+    q2_cre_set_actor_hooks(client_cre_actor_effect, client_cre_actor_spawn, c);
     q2_cre_set_muzzle_hook(client_cre_muzzle, c);
     q2_cre_set_attach_hooks(client_cre_attach_blend, client_cre_attach_place,
                             c);
@@ -2713,9 +2812,16 @@ static void client_load_creatures(client *c, const s32 eye[3])
      */
     {
         const dat_chunk *lb = c->common.chunk[Q2_COMMON_LEVEL_BIN];
-        u32 held = q2_creature_world_hold_batches(
-            &c->creatures, c->zone_index,
-            lb ? lb->data : NULL, lb ? lb->size : 0);
+        u32 held;
+        if (c->sim[0].item_population_ready && c->sim[0].item_group_run &&
+            c->sim[0].item_population.group_count == c->creatures.pop.group_count)
+            held = q2_creature_world_hold_selected(
+                &c->creatures, c->zone_index, c->sim[0].item_group_run,
+                c->sim[0].item_population.group_count);
+        else
+            held = q2_creature_world_hold_batches(
+                &c->creatures, c->zone_index,
+                lb ? lb->data : NULL, lb ? lb->size : 0);
         if (held)
             Q2_INFO("creatures: %u held back, waiting for a CREBATCH", held);
     }
@@ -2725,13 +2831,32 @@ static void client_load_creatures(client *c, const s32 eye[3])
     {
         s32 player_origin[3];
 
+        if (!c->mp_enabled && !c->restoring_save)
+            q2_zone_history_creatures(&c->zone_history, c->map, c->zone_index,
+                                       &c->sim[0], &c->creatures);
+        else
+            for (i = 0; i < c->creatures.set.count; i++)
+                c->creatures.set.monsters[i].population_active =
+                    c->creatures.set.monsters[i].in_use;
+        client_cre_area_forget(c);
+        for (i = 0; i < c->creatures.set.count; i++)
+            q2_actor_from_monster(&c->cre_actor[i], &c->creatures.set.monsters[i]);
+
         player_origin[0] = eye[0];
         player_origin[1] = q2_sim_origin_y(c->sim[0].player[0].pos[1]);
         player_origin[2] = eye[2];
         q2_creature_world_wake(&c->creatures, player_origin,
                                c->sim[0].combat.inv.health);
     }
+    for (i = 0; i < c->creatures.set.count; i++) client_cre_seed_animation(c, i);
     c->ai_accum = 0.0;
+
+    if (!c->mp_enabled && !c->restoring_save) {
+        u32 phase_us = 0;
+        q2_zone_history_resume(&c->zone_history, c->map, c->zone_index, &c->sim[0],
+                                &c->creatures, c->cre_actor, c->cre_anim, &phase_us);
+        c->ai_accum = (double)phase_us / 1000000.0;
+    }
 
     {
         u32 live = 0, droppers = 0;
@@ -2780,7 +2905,7 @@ static void client_load_creatures(client *c, const s32 eye[3])
                 c->creatures.stats.skill_filtered, (int)q2_cre_skill(),
                 resolved,
                 c->creatures.stats.no_module
-                    ? ", some classes have no module" : "");
+                    ? ", some records require another zone's creature modules" : "");
 
         /*
          * WHICH GUARDS, by the class-table row the Soldier's spawn dispatches
@@ -2894,32 +3019,55 @@ static void client_load_creatures(client *c, const s32 eye[3])
  */
 static q2_actor *client_cre_actor(client *c, const q2_monster *m)
 {
-    size_t idx;
+    u32 i;
 
-    if (!c || !c->cre_actor || !m || m < c->creatures.set.monsters)
+    if (!c || !c->cre_actor || !m)
         return NULL;
-    idx = (size_t)(m - c->creatures.set.monsters);
-    return idx < c->creatures.set.count ? &c->cre_actor[idx] : NULL;
+    for (i = 0; i < c->creatures.set.count; i++)
+        if (m == &c->creatures.set.monsters[i])
+            return &c->cre_actor[i];
+    return NULL;
 }
+
+static void client_cre_actor_effect(q2_monster *m, u32 index, u8 ticks, void *user)
+{
+    q2_actor *a = client_cre_actor((client *)user, m);
+    if (a && index < sizeof(a->effect)) a->effect[index] = ticks;
+}
+
+static void client_cre_actor_spawn(q2_monster *m, void *user)
+{
+    client *c = (client *)user;
+    q2_actor *a = client_cre_actor(c, m);
+    if (a) {
+        u32 index = (u32)(a - c->cre_actor);
+        q2_actor_init(a);
+        q2_actor_from_monster(a, m);
+        if (c->cre_anim) memset(&c->cre_anim[index], 0, sizeof(c->cre_anim[index]));
+    }
+}
+
+static void client_cre_drain_one(client *c, u32 i);
 
 static void client_cre_melee(q2_monster *m, const s32 aim[3], s32 damage,
                              s32 kick, void *user)
 {
     client *c = (client *)user;
-
-    (void)aim; (void)kick;
+    q2_actor *victim;
+    q2_monster *enemy;
+    s32 point[3];
+    s16 impulse[3];
+    int k;
 
     if (!c || !c->creatures_ready || damage <= 0)
         return;
 
-    /*
-     * Only a creature that has actually acquired the player. A module's melee
-     * runs off its own animation frame and does not check who is in front of
-     * it, which is the engine's job — here that check is "is the player the
-     * thing it is hunting", because the port has one player and the AI's
-     * `enemy` is the sight client whenever it has one.
-     */
-    if (m->enemy != &c->creatures.sight)
+    if (!m || !m->enemy)
+        return;
+    enemy = m->enemy;
+    if (!q2_cre_melee_contact(m, aim, point)) return;
+    victim = client_cre_actor(c, m->enemy);
+    if (m->enemy != &c->creatures.sight && !victim)
         return;
 
     /*
@@ -2928,26 +3076,35 @@ static void client_cre_melee(q2_monster *m, const s32 aim[3], s32 damage,
      */
     c->cre_swings++;
 
-    /*
-     * WHICH creature is swinging, as an actor.
-     *
-     * This used to pass NULL, and a NULL attacker costs three things at once:
-     * the damage point defaults to the player's own position, so the blood and
-     * the flinch's roll both lose their direction (see q2_sim_hurt_player); the
-     * knockback has no source to push away from; and `last_attacker` is never
-     * recorded, so a player clawed to death by a Berserk died with no killer —
-     * which is precisely the attribution the scoring rule was built to honour.
-     *
-     * The monster and its actor are parallel arrays, so the index is the
-     * pointer difference. The actors are re-synced from the monsters at the top
-     * of every frame, before the tick this runs inside, so the origin here is
-     * where the creature is now.
-     *
-     * MOD 7 is `0x800612F0`, a creature's contact hit (combat.h) — armour
-     * applies, which is what makes it different from the environment's.
-     */
+    if (victim) {
+        q2_combat_damage(client_cre_actor(c, m), victim, (s16)damage,
+                          Q2_MOD_MELEE, point, &c->sim[0].combat.rules);
+        client_cre_drain_one(c, (u32)(victim - c->cre_actor));
+        q2_cre_melee_impulse(enemy, point, kick, impulse);
+        for (k = 0; k < 3; k++)
+            victim->knockback[k] = (s16)(victim->knockback[k] + impulse[k]);
+        victim->knocked = true;
+        memset(enemy->motion.velocity, 0, sizeof(enemy->motion.velocity));
+        enemy->motion.ent.flags &= ~0xA0u;
+        q2_actor_to_monster(victim, enemy);
+        return;
+    }
+
+    /* Preserve the swinging actor for killer attribution and the computed
+     * contact for blood/view kick. MOD 7 applies armour; fire_hit's separate
+     * kick then accumulates in object+0x2F8 and clears object+0x60 velocity. */
     q2_sim_hurt_player(&c->sim[0], client_cre_actor(c, m), (s16)damage,
-                       Q2_MOD_MELEE, c->creatures.sight.pos);
+                       Q2_MOD_MELEE, point);
+    q2_cre_melee_impulse(enemy, point, kick, impulse);
+    {
+        q2_player *p = &c->sim[0].player[0];
+        memset(p->vel, 0, sizeof(p->vel));
+        p->ent.flags &= ~0xA0u; /* object+0x98, 0x80061400/408 */
+        for (k = 0; k < 3; k++) p->impulse[k] = (s16)(p->impulse[k] + impulse[k]);
+        p->impulse_armed = true;
+        p->ent2_flags |= 0x4000u;
+        p->on_ground = (p->ent.flags & Q2_ENT_GROUNDED_MASK) != 0;
+    }
 }
 
 /*
@@ -3041,8 +3198,22 @@ static void client_cre_fire(q2_monster *m, int flash, void *user)
 static void client_cre_drain_one(client *c, u32 i)
 {
     q2_monster *m    = &c->creatures.set.monsters[i];
+    q2_actor   *source = c->cre_actor[i].damage_source;
+    q2_monster *attacker = NULL;
     bool        was  = m->dead;
     s16         hp   = m->health;
+    u32 j;
+
+    /* Actor identities survive projectile flight and identify a creature
+     * struck by friendly fire. Do not substitute the player for its shooter. */
+    if (source == &c->sim[0].combat.self)
+        attacker = &c->creatures.sight;
+    else if (source)
+        for (j = 0; j < c->creatures.set.count; j++)
+            if (source == &c->cre_actor[j]) {
+                attacker = &c->creatures.set.monsters[j];
+                break;
+            }
 
     q2_actor_to_monster(&c->cre_actor[i], m);
 
@@ -3062,32 +3233,37 @@ static void client_cre_drain_one(client *c, u32 i)
      * transcribed in monster.c. What is left here is deciding WHEN to
      * call it and with what.
      *
-     * The attacker is the sight client, which is where the player is;
-     * the port has no inflictor entity to hand over. For a creature struck
-     * by another creature's round that is an approximation, stated: the
-     * console's M_ReactToDamage sees the shooter.
+     * The combat actor records the damage source; resolve it to the live
+     * monster (or the player stand-in) before running M_ReactToDamage.
      *
-     * One honest approximation, stated: the original calls the tail on
-     * every hit, INCLUDING one that armour or godmode reduced to zero —
-     * and still reacts to it, because being shot at and unhurt is still
-     * being shot at. The actor sync reports health, not the shot, so a
-     * hit that took nothing is indistinguishable here from no hit at
-     * all. The gate is therefore "the health moved", which is a subset
-     * of the original's occasions and never a superset.
+     * The actor marks entry to T_Damage's tail separately from health loss.
+     * Armour or godmode can absorb a hit while M_ReactToDamage still acquires
+     * its attacker. A takedamage refusal never arms that mark.
      */
-    if (m->health != hp || (!was && m->health <= 0)) {
+    if (c->cre_actor[i].damage_reaction_pending ||
+        m->health != hp || (!was && m->health <= 0)) {
         s16 took = (s16)(hp - m->health);
 
-        if (took < 0)
+        /* A signed T_Damage call can restore health and still calls pain.
+         * Ordinary healing outside that path is not a damage reaction. */
+        if (took < 0 && !c->cre_actor[i].damage_reaction_pending)
             took = 0;
 
-        q2_monster_damage_reaction(m, &c->creatures.sight, took);
+        /* T_Damage's zero arm goes straight to M_ReactToDamage even on a
+         * corpse; it does not re-enter the death branch without subtraction. */
+        if (took == 0 && m->health <= 0) {
+            if (m->svflags & Q2_SVF_MONSTER) q2_m_react_to_damage(m, attacker);
+        } else {
+            q2_monster_damage_reaction(m, attacker, took);
+        }
 
         if (!was && m->dead)
             c->cre_die_calls++;
-        else if (!m->dead && took > 0)
+        else if (!m->dead && took != 0)
             c->cre_pain_calls++;
     }
+    c->cre_actor[i].damage_source = NULL;
+    c->cre_actor[i].damage_reaction_pending = false;
 
     /*
      * The frame it died on. What can be reconstructed from the module's
@@ -3125,7 +3301,106 @@ static const q2_model_instance *client_cre_pose(client *c, const q2_monster *m)
     if (idx >= c->creatures.set.count || !c->cre_model_ok[idx] ||
         !c->cre_fx[idx].valid)
         return NULL;
+    {
+        q2_model_instance *inst = &c->cre_fx[idx].inst;
+        s32 low = inst->model->hdr.ext2;
+        if (m->dead && inst->pose) {
+            s32 pose_low;
+            if (q2_model_pose_low_y(inst->model, inst->pose, CLIENT_FX_POSE_MAX, &pose_low))
+                low = pose_low;
+        }
+        inst->origin[0] = q2_cre_origin(m)[0];
+        inst->origin[1] = q2_cre_origin(m)[1] + Q2_EYE_BASE - low;
+        inst->origin[2] = q2_cre_origin(m)[2];
+        inst->yaw = q2_cre_yaw(m);
+    }
     return &c->cre_fx[idx].inst;
+}
+
+static void client_cre_hurt(q2_monster *m, q2_monster *target, s16 damage,
+                            int mod, const s32 *point, void *user)
+{
+    client *c = (client *)user;
+    q2_actor *victim;
+    if (!c || !c->creatures_ready || !target) return;
+    if (target == &c->creatures.sight) {
+        q2_sim_hurt_player(&c->sim[0], client_cre_actor(c, m), damage,
+                           (s16)mod, point);
+        target->health = c->sim[0].combat.inv.health;
+    } else if ((victim = client_cre_actor(c, target)) != NULL) {
+        q2_combat_damage(client_cre_actor(c, m), victim, damage,
+                          (s16)mod, point, &c->sim[0].combat.rules);
+        client_cre_drain_one(c, (u32)(victim - c->cre_actor));
+    }
+}
+
+static void client_cre_explosion(q2_monster *m, const s32 *point, s32 scale,
+                                 void *user)
+{
+    client *c = (client *)user;
+    q2_sim *sim = &c->sim[0];
+    u8 area = q2_sim_fx_area(sim, 0, point);
+    (void)m;
+    if (!q2_model_ent_spawn(&sim->entities, &c->model_bank, Q2_MODEL_ENT_EXPLOSION,
+                            point, area, scale, &sim->explosion_sounds))
+        q2_model_ent_spawn(&sim->entities, &c->zone_bank, Q2_MODEL_ENT_EXPLOSION,
+                            point, area, scale, &sim->explosion_sounds);
+}
+
+/* 0x80048D0C..0x80048D74: pose the owner's vertex each display frame,
+ * clip it from its origin, then aim at the target's cylinder centre. */
+static bool client_cre_beam_points(client *c, q2_monster *m, q2_monster *target,
+                                   s16 vertex, s32 from[3], s32 to[3], u8 *area)
+{
+    const q2_model_instance *inst = client_cre_pose(c, m);
+    s32 node = -1, clipped[3];
+    if (!inst || !q2_model_world_vertex(inst, vertex, from)) return false;
+    if (c->sim[0].coll_ready &&
+        (q2_coll_move(&c->sim[0].coll, m->pos, from, -1, clipped, &node) || node >= 0))
+        memcpy(from, clipped, sizeof(clipped));
+    memcpy(to, target->pos, sizeof(target->pos));
+    to[1] += (572 - target->hit_height) / 2;
+    *area = q2_sim_fx_area(&c->sim[0], 0, from);
+    return true;
+}
+
+static void client_cre_beam(q2_monster *m, q2_monster *target,
+                            s16 vertex, void *user)
+{
+    client *c = (client *)user;
+    const q2_ai_world *w = q2_ai_get_world();
+    q2_actor *owner, *victim;
+    s32 from[3], to[3], target_id;
+    u8 area;
+    if (!c || !c->creatures_ready || !c->sim[0].fx_ready || !m || !target) return;
+    owner = client_cre_actor(c, m);
+    victim = client_cre_actor(c, target);
+    if (!owner || (!victim && target != &c->creatures.sight)) return;
+    if (!w->line_of_sight(w->user, m->pos, target->pos)) return;
+    if (!client_cre_beam_points(c, m, target, vertex, from, to, &area)) return;
+    target_id = target == &c->creatures.sight ? -2 : (s32)(victim - c->cre_actor);
+    q2_fx_beam_attached(&c->sim[0].fx, (s32)(owner - c->cre_actor), target_id,
+                         vertex, from, to, area);
+}
+
+static void client_cre_beams_update(client *c)
+{
+    u32 i;
+    if (!c->creatures_ready) return;
+    for (i = 0; i < Q2_FX_TIMED_BEAMS_MAX; i++) {
+        q2_fx_timed_beam *beam = &c->sim[0].fx.timed[i];
+        q2_monster *owner, *target;
+        u8 area;
+        if (!beam->present || beam->attachment < 0) continue;
+        if (beam->owner < 0 || (u32)beam->owner >= c->creatures.set.count) continue;
+        owner = &c->creatures.set.monsters[beam->owner];
+        target = beam->target == -2 ? &c->creatures.sight :
+                 (beam->target >= 0 && (u32)beam->target < c->creatures.set.count)
+                    ? &c->creatures.set.monsters[beam->target] : NULL;
+        if (!target) continue;
+        if (client_cre_beam_points(c, owner, target, beam->attachment,
+                                    beam->from, beam->to, &area)) beam->area = area;
+    }
 }
 
 /* THE MUZZLE HOOK — q2_cre_muzzle (crebind.h): the posed attachment, placed. */
@@ -3179,7 +3454,7 @@ static bool client_cre_attach_place(const q2_monster *m,
 }
 
 /*
- * THE SWING TRAILS — the blur ribbons three creature modules lay from their
+ * THE SWING TRAILS — the blur ribbons creature modules lay from their
  * export 1, the per-object handler the engine calls once a frame.
  *
  * Each export compares the object's animation position (+0x100) against a
@@ -3195,6 +3470,8 @@ static bool client_cre_attach_place(const q2_monster *m,
  *                              (+0x1F8, +0x204, +0x20C; the inits at
  *                              module+0x370, +0x454, +0x538)
  *     Infantry  module+0xDC0   "Attack2" [start, end]  {200, 201}  (+0x2B8)
+ *     Flyer     module+0x908   "Attack1" [start, end]
+ *                              {92, 87} and {77, 74} (+0x2E0, +0x2EC)
  *
  * THE WINDOWS ARE IN POSITION UNITS, block D's halfwords times five. The
  * init stores the record's +12/+14 with no scale of its own and the handler
@@ -3223,7 +3500,10 @@ static const client_blur_rule k_cre_blurs[] = {
     { "Berserk",  "Attack1", 60, 140, { { 280, 281, 286 }, { -1, -1, -1 } } },
     { "Berserk",  "Attack2", 130, 190, { { 275, 263, -1 }, { -1, -1, -1 } } },
     { "Berserk",  "Attack3", 100, 240, { { 274, 265, -1 }, { -1, -1, -1 } } },
-    { "Infantry", "Attack2", 0,  -1, { { 200, 201, -1 }, { -1, -1, -1 } } }
+    { "Infantry", "Attack2", 0,  -1, { { 200, 201, -1 }, { -1, -1, -1 } } },
+    /* Flyer export 1 (+0x908): both lists throughout Attack1. */
+    { "Flyer", "Attack1", 0, -1, { { 92, 87, -1 }, { 77, 74, -1 } } },
+    { "Ironmaiden", "Slash", 0, -1, { { 337, 351, -1 }, { -1, -1, -1 } } }
 };
 
 static void client_cre_blurs(client *c)
@@ -3289,19 +3569,20 @@ static void client_cre_blurs(client *c)
 }
 
 /*
- * Which modules draw a muzzle flash, and from which cache: the three whose
+ * Which modules draw a muzzle flash, and from which cache: the modules whose
  * export 1 calls import +0xA0 while object+0x10C is negative, each reading
  * the attachment its own init blended (crebind.h, q2_cre_muzzle).
  *
  *     Soldier   0x80102120  module+0x32D8  vertices 228, 234
  *     Infantry  0x80100DC0  module+0x1D80  vertices 200, 205
  *     Gunner    0x801014BC  module+0x1D28  vertices 227, 231
+ *     Boss1     0x80100F54  module+0x17D8  vertices 412, 419
  *
  * The Tank Commander's module has no export 1 at all, and the Arachner's and
  * the Berserk's draw blur trails, so none of the three flashes whatever it
  * fires.
  */
-static bool client_cre_flash_verts(const q2_monster *m, s16 *a, s16 *b)
+static s32 client_cre_flash_verts(const q2_monster *m, s16 *a, s16 *b)
 {
     const q2_cre_bind *bind = q2_cre_bind_for(m);
     const char *name = NULL;
@@ -3313,9 +3594,11 @@ static bool client_cre_flash_verts(const q2_monster *m, s16 *a, s16 *b)
     if (!name)
         return false;
 
-    if (strcmp(name, "Soldier") == 0)  { *a = 228; *b = 234; return true; }
-    if (strcmp(name, "Infantry") == 0) { *a = 200; *b = 205; return true; }
-    if (strcmp(name, "Gunner") == 0)   { *a = 227; *b = 231; return true; }
+    if (strcmp(name, "Soldier") == 0)  { *a = 228; *b = 234; return 120; }
+    if (strcmp(name, "Infantry") == 0) { *a = 200; *b = 205; return 120; }
+    if (strcmp(name, "Gunner") == 0)   { *a = 227; *b = 231; return 120; }
+    /* Boss1 export 1's a3 at module+0xFA0 is 240, twice the other guns. */
+    if (strcmp(name, "Boss1") == 0)    { *a = 412; *b = 419; return 240; }
     return false;
 }
 
@@ -3325,7 +3608,7 @@ static bool client_cre_flash_verts(const q2_monster *m, s16 *a, s16 *b)
  * machinegun light — 250..349 and 700..899 — at every creature's origin on
  * every shot of every weapon. The console raises the creature's own,
  * 850..1049 and 1200..1599 from two rand()s, and only for a bullet or a
- * shotgun round from one of the three modules above: a blaster guard's bolt,
+ * shotgun round from one of the modules above: a blaster guard's bolt,
  * the Tank Commander's guns and the Arachner's rail flash nothing.
  *
  * WHERE THE LIGHT GOES is a quirk, and it is kept. 0x80031178..0x800311AC adds
@@ -3343,9 +3626,10 @@ static void client_cre_flash(client *c, const q2_monster *m)
     const q2_model_instance *inst;
     s32 local[3], world[3];
     s16 va, vb;
+    s32 size = client_cre_flash_verts(m, &va, &vb);
     int k;
 
-    if (!client_cre_flash_verts(m, &va, &vb))
+    if (!size)
         return;
     inst = client_cre_pose(c, m);
     if (!inst || !q2_model_blend_local(inst, va, vb, local))
@@ -3371,7 +3655,7 @@ static void client_cre_flash(client *c, const q2_monster *m)
         q2_model_local_to_world(inst, local, world);
         q2_fx_flash_corners(local, q2_fx_flash_angle(c->flash_spin,
                                                      (u32)c->frame_index),
-                            corner_local);
+                            size, corner_local);
         for (k = 0; k < 4; k++)
             q2_model_local_to_world(inst, corner_local[k], corner[k]);
         q2_fx_flash_add(&c->sim[0].fx, (const s32 (*)[3])corner, world,
@@ -3427,16 +3711,14 @@ static void client_cre_round(client *c, q2_monster *m, const s32 start[3],
  * and q2_sim_creature_launch launches the same one the player's gun does —
  * the Soldier's blaster bolt, the Tank Commander's bolts and rockets.
  *
- * An UNAIMED shot — a creature whose muzzle and aim are not transcribed (the
- * Gunner, the Arachner) — is resolved as before: at the player, when the
- * player is its enemy and in sight. Nothing more is known.
+ * The Gunner supplies its own muzzle and aim too, including a forward toss
+ * for grenades. The Arachner's rail uses the saved target for each barrel,
+ * passes through actors and draws a trail up to the world trace endpoint.
  */
 static void client_cre_shot(q2_monster *m, const q2_cre_shot *shot, void *user)
 {
     client *c = (client *)user;
-    s32 shots;
     int mod;
-    q2_actor *attacker;
     bool hitscan;
 
     if (!c || !c->creatures_ready || !m || !shot)
@@ -3455,7 +3737,7 @@ static void client_cre_shot(q2_monster *m, const q2_cre_shot *shot, void *user)
      * A shot with no damage read is declined rather than guessed — the same
      * rule the sound hook follows for a name the module does not carry.
      */
-    if (shot->damage <= 0) {
+    if (shot->damage <= 0 || !shot->aimed) {
         c->cre_fire_no_figures++;
         return;
     }
@@ -3484,12 +3766,9 @@ static void client_cre_shot(q2_monster *m, const q2_cre_shot *shot, void *user)
                            ? Q2_CRE_SND_SHOTGUN : Q2_CRE_SND_BULLET;
         q2_vag vag;
 
-        /*
-         * Counted on the BANK, not on a voice starting: client_play_sound_at
-         * returns false with no audio device, which is every headless run.
-         */
+        /* A full voice pool does not make this a missing bank entry. */
         if (client_find_sound(c, report, &vag))
-            client_play_sound_at(c, report, m->pos);
+            client_play_creature_sound(c, report, NULL, m);
         else
             c->cre_sound_missing++;
         c->cre_fire_sounds++;
@@ -3507,27 +3786,82 @@ static void client_cre_shot(q2_monster *m, const q2_cre_shot *shot, void *user)
      * 0x800B2B34 that the player's blaster plays too), the rocket spawner its
      * launch (0x8004B26C, 0x800B2B4C).
      */
-    if (shot->aimed && (shot->slot == Q2_IMP_FIRE_BLASTER ||
-                        shot->slot == Q2_IMP_FIRE_ROCKET)) {
+    if (shot->slot == Q2_IMP_FIRE_BFG) {
+        s32 aim[3];
+        s16 angles[3] = { m->angles[0], m->angles[1], q2_cre_yaw(m) };
+        /* monster_fire_bfg (0x800621BC) ignores the module's aim/speed and
+         * stores the muzzle at entity+0x5C. AnyoneFireBFG uses the actor's
+         * rotation and the shared BFG mover, beams and explosion. */
+        memcpy(m->blind_target, shot->start, sizeof(m->blind_target));
+        q2_angle_vectors(angles, aim, NULL, NULL);
+        if (q2_sim_creature_launch(&c->sim[0], client_cre_actor(c, m), Q2_FK_BFG,
+                shot->start, aim, (s16)shot->damage, q2_cre_yaw(m), 0, 0) >= 0)
+            c->cre_launched++;
+        return;
+    }
+    if (shot->slot == Q2_IMP_FIRE_BLASTER ||
+        shot->slot == Q2_IMP_FIRE_ROCKET ||
+        shot->slot == Q2_IMP_FIRE_GRENADE) {
         bool bolt = shot->slot == Q2_IMP_FIRE_BLASTER;
-        const char *report = bolt ? "wep_blastf1a" : "wep_rocklf1a";
+        bool grenade = shot->slot == Q2_IMP_FIRE_GRENADE;
+        const char *report = bolt ? "wep_blastf1a"
+                           : grenade ? "wep_grenlf1a" : "wep_rocklf1a";
+        q2_fire_kind kind = bolt ? Q2_FK_BOLT
+                         : grenade ? Q2_FK_GRENADE : Q2_FK_ROCKET;
         q2_vag vag;
 
         if (client_find_sound(c, report, &vag))
-            client_play_sound_at(c, report, shot->start);
+            client_play_creature_sound(c, report, NULL, m);
         else
             c->cre_sound_missing++;
         c->cre_fire_sounds++;
 
         if (q2_sim_creature_launch(&c->sim[0], client_cre_actor(c, m),
-                                   bolt ? Q2_FK_BOLT : Q2_FK_ROCKET,
+                                   kind,
                                    shot->start, shot->dir,
-                                   (s16)shot->damage, m->angles[2]) >= 0)
+                                   (s16)shot->damage, m->angles[2],
+                                   shot->speed, shot->effects) >= 0)
             c->cre_launched++;
         return;
     }
 
-    if (shot->aimed && hitscan) {
+    if (shot->slot == Q2_IMP_FIRE_LASER) {
+        q2_cre_rail_result hit = q2_sim_creature_laser(&c->sim[0], client_cre_actor(c, m),
+                                   shot->start, shot->dir, (s16)shot->damage);
+        u32 i;
+        c->cre_rounds++;
+        c->cre_rounds_player += hit.player_hit ? 1u : 0u;
+        c->cre_rounds_creature += hit.creatures_hit;
+        if (!hit.player_hit && !hit.creatures_hit) c->cre_rounds_world++;
+        for (i = 0; c->cre_actor && i < c->creatures.set.count; i++)
+            client_cre_drain_one(c, i);
+        return;
+    }
+
+    if (shot->slot == Q2_IMP_FIRE_RAILGUN) {
+        q2_cre_rail_result hit;
+        s32 dir[3];
+        u32 i;
+        int k;
+
+        /* 0x80062184 stores each aim halfword; 0x80049224 shifts it by 2. */
+        for (k = 0; k < 3; k++)
+            dir[k] = (s16)shot->dir[k] * 4;
+        hit = q2_sim_creature_rail(&c->sim[0], client_cre_actor(c, m),
+                                    shot->start, dir, (s16)shot->damage);
+        c->cre_rounds++;
+        c->cre_rounds_player += hit.player_hit ? 1u : 0u;
+        c->cre_rounds_creature += hit.creatures_hit;
+        if (!hit.player_hit && !hit.creatures_hit)
+            c->cre_rounds_world++;
+        for (i = 0; c->cre_actor && i < c->creatures.set.count; i++)
+            client_cre_drain_one(c, i);
+        q2_sim_rail_trail(&c->sim[0], shot->start, hit.end,
+                           m->angles[2], m->angles[0], m->angles[1]);
+        return;
+    }
+
+    if (hitscan) {
         s32 dir[3];
         int k;
 
@@ -3554,89 +3888,39 @@ static void client_cre_shot(q2_monster *m, const q2_cre_shot *shot, void *user)
         return;
     }
 
-    /*
-     * The pellet count is the ENGINE's, not the module's: 0x80061FD4 loops
-     * five times whatever the module passed (Q2_CRE_SHOTGUN_PELLETS above).
-     * Every other slot fires once — the module's `count` is carried because it
-     * is what the module passes, and it is read here only to keep a figure of
-     * zero from firing nothing.
-     */
-    shots    = shot->slot == Q2_IMP_FIRE_SHOTGUN ? Q2_CRE_SHOTGUN_PELLETS
-             : shot->count > 0                   ? shot->count
-                                                 : 1;
-    attacker = client_cre_actor(c, m);   /* 0x800582C8: the skill-0 halving */
-
-    if (m->enemy != &c->creatures.sight)
-        return;                          /* fired, but not at the player */
-
-    while (shots-- > 0) {
-        if (!q2_visible(m, &c->creatures.sight))
-            break;
-        q2_sim_hurt_player(&c->sim[0], attacker, (s16)shot->damage, (s16)mod,
-                           c->creatures.sight.pos);
-    }
 }
 
 static void client_cre_sound(q2_monster *m, int which, void *user)
 {
+    client_cre_sound_pitch(m, which, 0, user);
+}
+
+static void client_cre_sound_pitch(q2_monster *m, int which, u8 pitch, void *user)
+{
+    client_cre_request(m, which, pitch, m, user);
+}
+
+static void client_cre_sound_owner(q2_monster *m, u32 which, const q2_monster *owner, void *user)
+{
+    client_cre_request(m, (int)which, 0, owner, user);
+}
+
+static void client_cre_request(q2_monster *m, int which, u8 pitch,
+                               const q2_monster *owner, void *user)
+{
     client *c = (client *)user;
     const char *name = NULL;
 
-    (void)m;
     if (!c)
         return;
 
-    /*
-     * The module names a sound by an index into its OWN table, and that table
-     * is not resolved yet (#6). This used to map indices 0 and 1 to
-     * `cre_pain1` and `cre_die1`, which was an invention twice over: the bank
-     * has no such names, so it silently played nothing, and the index-to-name
-     * mapping was never read.
-     *
-     * The bank's real convention is `<creature>_<action><n>`, the same shape as
-     * `wep_` and `itm_`: BASE0 carries `sol_atck1`, `sol_atck2`, `sol_atck3`,
-     * `sol_deth1..3`, `sol_idle1`, `sol_pain1`, `sol_pain2` and `sol_srch1` —
-     * exactly the five families id's soldier has. So the names are there to be
-     * matched once the module's table says which index is which; until then
-     * this stays silent rather than guessing, and the index is recorded so a
-     * caller can see what was asked for.
-     */
     c->cre_sounds++;
     c->cre_last_sound = which;
+    client_sound_requests_init(c);
 
-    /*
-     * The Soldier's names are read out of its module and every one of them is
-     * in the map's bank, so it can actually be played. Another creature's
-     * table has not been read, so it stays silent rather than borrowing these.
-     */
-    /*
-     * The Soldier's names are transcribed; every other module carries its own
-     * table and it is read the same way. The transcription is preferred where it
-     * exists because it was read out of code rather than inferred from slot
-     * order.
-     *
-     * NOT "all seven creatures make their own sounds", which this comment used
-     * to claim. `q2psx-inspect creatures` prints each table, and two of the
-     * seven come back EMPTY:
-     *
-     *     Soldier  8   Insane 3   Arachner 6   Gunner 6   Infantry 4
-     *     Tankcomm 0   Berserk 0
-     *
-     * The finder locates the module's own name string and then takes the first
-     * run of three consecutive 12-byte name slots after it; those two modules do
-     * not carry the anchor where it looks, so it falls back to scanning from
-     * zero. Both results were checked against the modules' own code and are
-     * correct: the Berserk's thirteen run from module+0x144 to +0x1D4 and the
-     * Tank Commander's eight likewise. See openquestions #60 and #61.
-     */
-    /*
-     * `which` is the module ADDRESS of the sound handle, not an index —
-     * `cre_actions.c` passes `q2_cre_action.addr` straight through. This used
-     * to hand it to `q2_creature_world_sound_name`, which indexes a name list,
-     * so every decoded creature was asking for name 0x80101758 of eight and
-     * getting nothing. Resolving the address against the module's own
-     * registrations is what the module itself does (creature.h).
-     */
+    /* Native callbacks carry the module's handle address. Older indexed
+     * callbacks first recover their registration name, then resolve the same
+     * initialized slot, preserving the module's fallback and clone identity. */
     name = q2_creature_world_sound_for_addr(&c->creatures, m, (u32)which);
 
     /*
@@ -3648,30 +3932,16 @@ static void client_cre_sound(q2_monster *m, int which, void *user)
         name = q2_cre_soldier_sound_name(which);
     if (!name)
         name = q2_creature_world_sound_name(&c->creatures, m, (u32)which);
-    /*
-     * Counted on whether the BANK HAS IT, not on whether it played.
-     *
-     * `client_play_sound` returns false when `c->audio` is NULL, which is every
-     * headless run — so `%u not in bank` was reporting the absence of an audio
-     * device and read as "this map does not carry the creature's sounds". JAIL4
-     * carries `sol_idle1`, `sol_sght1`, `sol_pain1`, `sol_deth2` and the rest;
-     * they were found every time and the counter said otherwise.
-     */
+    /* Bank misses are separate from voice-allocation failures. Headless runs
+     * use the same voice allocator and mixer as device playback. */
     if (name) {
         q2_vag vag;
 
-        /*
-         * WHAT THE SLOT ACTUALLY HOLDS, which is not always what it was
-         * registered with. Two modules overwrite a handle their map's bank
-         * cannot fill with one it can, in their own spawn code: the Soldier's
-         * pain and death trios (module+0xE50..+0xF28) and the Tank Commander's
-         * idle, which becomes its footstep (module+0x808..+0x820). Every fill
-         * store is guarded by a `bne` on the destination, so a handle that
-         * resolved is never replaced. q2_cre_sound_resolve is that whole rule
-         * (crebind.h); a name in no group comes back as it went in.
-         */
-        const char *plays = q2_cre_sound_resolve(m, name, client_cre_bank_has,
-                                                 c);
+        /* Read the module's initialized request, including shared bank state. */
+        const char *plays = NULL;
+        q2_sfx_request *request = q2_creature_world_sound_request(&c->creatures,
+            m, (u32)which, name, client_cre_bank_has, c, client_request_for_sound, &plays);
+        if (request && pitch) q2_sfx_pitch_set(&request->pitch, pitch);
 
         /*
          * A slot that resolves to nothing — no fallback the bank carries — is
@@ -3688,8 +3958,10 @@ static void client_cre_sound(q2_monster *m, int which, void *user)
          */
         if (!plays || !client_find_sound(c, plays, &vag))
             c->cre_sound_missing++;
+        else if (owner == &c->creatures.sight)
+            client_play_player_sound(c, plays, request, 0);
         else
-            client_play_sound_at(c, plays, m->pos);
+            client_play_creature_sound(c, plays, request, owner);
     } else {
         c->cre_sound_unnamed++;
     }
@@ -3942,17 +4214,86 @@ static void client_gib_describe(void *user, q2_gib_victim kind,
  */
 static void client_creatures_tick(client *c, float dt, const s32 eye[3])
 {
-    int guard = 0;
+    s32 ticks = (s32)((double)dt * 300.0 + 0.5);
+    s32 phase, old_clock;
+    u32 i, j;
+    u32 active_areas[3];
+    q2_area_graph graph;
+    bool activity_ready;
 
     if (!c->creatures_ready)
         return;
 
-    c->ai_accum += (double)dt;
-    while (c->ai_accum >= 0.1 && guard++ < 8) {
-        c->ai_accum -= 0.1;
-        c->ai_thoughts += q2_creature_world_tick(&c->creatures, eye,
-                                                 c->sim[0].combat.inv.health);
+    q2_creature_world_actor_tick(&c->creatures);
+    activity_ready = c->sim[0].coll_primary_ready &&
+        q2_area_parse(&graph, &c->zone.zone) == Q2_OK;
+    if (activity_ready) {
+        q2_coll_node node;
+        s32 cell = q2_coll_find_node(&c->sim[0].coll_primary, c->cam.pos, -1, true);
+        u8 area = cell >= 0 && q2_collision_get_node(&c->sim[0].coll_primary,
+            (u32)cell, &node) ? node.contents & 0x7Fu : 0;
+        q2_cre_active_areas(&graph, &c->zone.scene, c->node_hidden,
+            c->node_hidden_count, area, c->frame_index <= 1 ||
+            c->sim[0].multiplayer, active_areas);
+    }
 
+    /* Aiming reads the same eye and velocity as visibility. Keep the sight
+     * entity current while crouching or moving, not frozen at its spawn. */
+    memcpy(c->creatures.sight.velocity, c->sim[0].player[0].vel,
+           sizeof(c->creatures.sight.velocity));
+    c->creatures.sight.view_height =
+        (s16)(Q2_EYE_BASE - c->sim[0].player[0].view_height);
+
+    memcpy(c->creatures.sight.pos, eye, sizeof(c->creatures.sight.pos));
+    c->creatures.sight.health = c->sim[0].combat.inv.health;
+    old_clock = q2_level_state.time;
+    phase = (s32)(c->ai_accum * 300.0 + 0.5) + ticks;
+    while (phase >= 30) {
+        phase -= 30;
+        q2_level_state.time++;
+        q2_level_state.framenum++;
+        q2_ai_set_sight_client();
+    }
+    c->ai_accum = (double)phase / 300.0;
+    for (i = 0; i < c->creatures.set.count; i++) {
+        q2_monster *m = &c->creatures.set.monsters[i];
+        q2_cre_motion_world world = {0};
+        world.coll = c->sim[0].coll_ready ? &c->sim[0].coll : NULL;
+        world.world = &c->sim[0].move_world;
+        world.bodies = &c->sim[0].body_world;
+        world.self_id = (s32)i;
+        world.gravity = c->sim[0].gravity;
+        world.multiplayer = c->sim[0].multiplayer;
+        client_cre_seed_animation(c, i);
+        if (activity_ready && m->in_use && !m->corpse) {
+            s32 area = client_cre_area(c, i, NULL);
+            world.suspended = q2_cre_motion_suspend(m, active_areas, area,
+                area >= 0 && psx_ot_area_bucket(&c->ot, (u32)area, NULL), c->cam.pos);
+        }
+        c->ai_thoughts += q2_cre_motion_tick(m, ticks, &world);
+        if (m->in_use && !m->corpse && !world.suspended &&
+            c->cre_model_ok && c->cre_model_ok[i]) {
+            const q2_cre_frame_name *rec = q2_creature_world_frame_name(
+                &c->creatures, m, m->frame);
+            u32 base;
+            if (rec && q2_model_position_for_move(&c->cre_model[i], rec->name,
+                                                   rec->first, rec->first, &base))
+                q2_cre_motion_animate(m, (s16)rec->first, (s16)rec->last, (s16)base);
+            else if (m->motion.animation_ready)
+                q2_cre_motion_animate(m, -1, -1, 0);
+        }
+        if (c->cre_actor) q2_actor_from_monster(&c->cre_actor[i], m);
+        if (c->cre_body) {
+            q2_move_body *body = &c->cre_body[i];
+            memcpy(body->pos, q2_cre_origin(m), sizeof(body->pos));
+            body->solid = m->in_use && !(m->motion.flags & 0x8000u);
+            body->sweep_radius = m->hit_radius;
+            body->height = m->hit_height;
+            for (j = 0; j < c->sim[0].body_count; j++)
+                if (c->sim[0].bodies[j].id == (s32)i) c->sim[0].bodies[j] = *body;
+        }
+    }
+    if (old_clock != q2_level_state.time) {
         /*
          * One creature, one line per AI tick: the move it is playing, the frame
          * it is on, and its attack state. Counters say what happened across a
@@ -4019,8 +4360,6 @@ static void client_creatures_tick(client *c, float dt, const s32 eye[3])
             c->trace_ticks++;
         }
     }
-    if (c->ai_accum > 0.5)
-        c->ai_accum = 0.0;
 }
 
 /*
@@ -4058,146 +4397,64 @@ static s32 client_model_anim_sample(client_model_anim *a,
     return a->cursor.position;
 }
 
-static q2_player_move client_player_visual_move(client *c, int pi)
+static void client_player_anim_reset(client *c, int pi)
+{
+    client_player_anim *a = &c->player_anim[pi];
+    bool local = pi == c->sim[0].cur_player;
+    memset(a, 0, sizeof(*a));
+    a->state.move = Q2_PMOVE_STAND;
+    a->state.position = (s16)c->player_moves[Q2_PMOVE_STAND].start;
+    a->damage_serial = local ? c->sim[0].combat.self.damage_serial :
+                              c->sim[0].pcombat[pi].self.damage_serial;
+}
+
+static void client_player_anim_tick(client *c, int pi, s32 dt, bool death)
 {
     client_player_anim *a = &c->player_anim[pi];
     const q2_player *p = &c->sim[0].player[pi];
-    const q2_player_death *d = &c->death[pi];
-    u32 serial = pi == 0 ? c->sim[0].combat.shot_serial
-                         : c->sim[0].pcombat[pi].shot_serial;
-    u32 pain = c->sim[0].player[pi].pain_serial;
+    bool local = pi == c->sim[0].cur_player;
+    const q2_actor *body = local ? &c->sim[0].combat.self : &c->sim[0].pcombat[pi].self;
     q2_player_anim want;
-    q2_player_move pick;
 
-    if (d->stage != Q2_PDEATH_ALIVE)
-        return d->move != Q2_PMOVE_NONE ? d->move : Q2_PMOVE_DEATH1;
-
-    if (serial != a->shot_serial) {
-        a->shot_serial    = serial;
-        a->attack_latched = true;
+    if (dt <= 0 || (!c->mp_enabled && !death)) return;
+    /* 0x8003A930/AB5C/ADAC/AE08: successful jump, then horizontal wish,
+     * attack only over stand, and the nonzero damage byte over all three.
+     * The killing branch returns before consuming that byte. */
+    if (death) want = Q2_PANIM_DEATH;
+    else if (body->damage_serial != a->damage_serial && (u8)body->last_mod)
+        want = Q2_PANIM_PAIN;
+    else if (p->jumped_this_tick) want = Q2_PANIM_JUMP;
+    else if (p->wish[0] || p->wish[2]) want = Q2_PANIM_RUN;
+    /* 0x8003ADA0: the view-weapon driver's return, which is its last
+     * substep's fire result (0x8004F6D4) — dry result 2 included, and a shot
+     * erased by a later quiet substep excluded. The driver ran this tick,
+     * just before here, as the console's player think calls it. */
+    else if (q2_vw_result(&c->vw[pi]) != 0) want = Q2_PANIM_ATTACK;
+    else want = Q2_PANIM_STAND;
+    if (!death) a->damage_serial = body->damage_serial;
+    q2_player_anim_step(&a->state, c->player_moves, want, p->ent.flags, dt);
+    if (death) {
+        c->death[pi].move = a->state.move;
+        c->death[pi].animflags = a->state.flags;
     }
-    if (pain != a->pain_serial) {
-        a->pain_serial  = pain;
-        a->pain_latched = true;
-    }
-
-    /*
-     * WHICH ANIMATION IS WANTED, as one id, exactly as 0x8003A1C8 builds one
-     * in s5 before handing it to `player_anim` at 0x8003AFC8. PAIN outranks
-     * everything: 0x8003AE08 `addiu s5, zero, 3` is unconditional once the
-     * damage byte is set, where every other request is a branch.
-     *
-     * The three below it keep the order this function already had.
-     * DEVIATION, called out rather than quietly fixed: the console lets
-     * ATTACK replace only STAND (0x8003ADAC `bne s5, zero`), so a console
-     * player who fires while running keeps running; this latch puts ATTAK
-     * ahead of JUMP and RUN. Changing that is a separate reading of
-     * 0x8003A930/0x8003AB5C and is not made here.
-     */
-    if (a->pain_latched)          want = Q2_PANIM_PAIN;
-    else if (a->attack_latched)   want = Q2_PANIM_ATTACK;
-    else if (!p->on_ground)       want = Q2_PANIM_JUMP;
-    else if (abs(p->vel[0]) + abs(p->vel[2]) > 8)
-                                  want = Q2_PANIM_RUN;
-    else                          want = Q2_PANIM_STAND;
-
-    /*
-     * And 0x8003CE14 itself decides what that becomes. This used to be four
-     * `return`s of the port's own, so `q2_player_anim_pick` was reconstructed
-     * -- the PAIN arm at 0x8003CF74, the hold rule at 0x8003D188 -- and asked
-     * for nothing but DEATH, and Male2's Pain 1/2/3 were never played.
-     *
-     * THE ROLL IS THE PORT'S. 0x8003CF74 picks the clip with `rand() % 3`
-     * inside the game think; this call is on the DISPLAY path, where drawing
-     * from the sim's generator would move a stream the shot spread and the
-     * creature AI share. The flinch serial is used instead, so consecutive
-     * hits still walk the three clips and a headless run stays reproducible.
-     */
-    pick = q2_player_anim_pick(want, a->move,
-                               a->wrapped ? Q2_PDEATH_ANIM_WRAPPED : 0u,
-                               a->pain_serial);
-    if (pick != Q2_PMOVE_NONE)
-        return pick;
-
-    /* 0x8003D1F8 returns without installing anything: the move already
-     * playing keeps playing. */
-    return a->move != Q2_PMOVE_NONE ? a->move : Q2_PMOVE_STAND;
 }
 
-/* Build a player pose from Male2's ten named retail moves. The coloured body
- * models have the same eighteen-part geometry but only a rest clip; they use
- * this pose exactly so colour selection does not throw animation away. */
+static q2_player_move client_player_visual_move(const client *c, int pi)
+{
+    return c->player_anim[pi].state.move;
+}
+
+/* Sampling a body never advances gameplay, chooses a move, consumes random
+ * numbers or finishes a death. All viewports read the same game-tick state. */
 static bool client_player_pose(client *c, int pi, q2_model_pose *pose)
 {
-    client_player_anim *a = &c->player_anim[pi];
-    q2_player_death *d = &c->death[pi];
-    q2_player_move move = client_player_visual_move(c, pi);
-    q2_model_move mv;
+    const q2_player_anim_state *a = &c->player_anim[pi].state;
     q2_model_anim clip;
-    s32 first, limit;
     u32 within;
-    bool rebased = false;
-
-    if (!c->player_anim_base_ok || !pose || move == Q2_PMOVE_NONE ||
-        !q2_model_move_by_name(&c->player_model[0],
-                               q2_player_move_name(move), &mv))
+    if (!c->player_anim_base_ok || !pose || client_player_visual_move(c, pi) == Q2_PMOVE_NONE ||
+        a->position < 0 ||
+        !q2_model_anim_at_position(&c->player_model[0], (u32)a->position, &clip, &within))
         return false;
-
-    first = (s32)mv.start * 5;
-    limit = first + (s32)q2_model_move_frames(&mv) *
-                          Q2_MODEL_TICKS_PER_FRAME;
-    if (limit <= first)
-        return false;
-
-    if (!a->cursor.ready || a->move != move) {
-        q2_model_cursor_reset(&a->cursor, first);
-        a->move    = move;
-        rebased    = true;
-        a->wrapped = false;   /* a freshly installed move has not wrapped */
-    }
-
-    /* Installing a retail runtime move exposes its first key for one display
-     * frame. Advancing in the same call skipped that key entirely at 30 Hz. */
-    if (rebased) {
-        a->frame_stamp = c->frame_index;
-        a->stamped     = true;
-    } else if (!a->stamped || a->frame_stamp != c->frame_index) {
-        s32 next = a->cursor.position + c->screen.dt;
-        bool terminal = q2_player_move_is_death(move);
-
-        if (next >= limit) {
-            if (terminal) {
-                /* The final key starts ten position units before the end. */
-                a->cursor.position = limit - Q2_MODEL_TICKS_PER_FRAME;
-                a->cursor.target   = a->cursor.position;
-                q2_player_death_anim_ended(d);
-            } else {
-                s32 span = limit - first;
-                a->cursor.position = first + (next - first) % span;
-                a->cursor.target   = a->cursor.position;
-                if (move == Q2_PMOVE_ATTAK)
-                    a->attack_latched = false;
-                /* 0x8003DF90 raises bit 0 of entity+0x102 when a move runs
-                 * past its end; the chooser reads it to know a pain clip
-                 * has played out and may now be replaced. */
-                if (q2_player_move_is_pain(move))
-                    a->pain_latched = false;
-                a->wrapped = true;
-            }
-        } else {
-            a->cursor.position = next;
-            a->cursor.target   = next;
-        }
-        a->frame_stamp = c->frame_index;
-        a->stamped     = true;
-    }
-
-    if (a->cursor.position < 0 ||
-        !q2_model_anim_at_position(&c->player_model[0],
-                                   (u32)a->cursor.position,
-                                   &clip, &within))
-        return false;
-
     return q2_model_pose_at(&c->player_model[0], &clip, within, pose) == Q2_OK;
 }
 
@@ -4397,12 +4654,14 @@ static void client_mp_tick(client *c, s32 ticks)
     {
         int w = q2_mp_find_winner(&c->mp);
         char buf[64];
+        const char *names[4] = { c->menu.mp_name[0], c->menu.mp_name[1],
+                                c->menu.mp_name[2], c->menu.mp_name[3] };
 
         Q2_INFO("multiplayer: request %d (%s); winner %d — %s",
                 (int)c->mp_last_request,
                 c->mp_last_request == Q2_MP_REQ_RESULTS ? "load MPResults"
                                                         : "restart the round",
-                w, q2_mp_winner_text(&c->mp, w, NULL, buf, sizeof(buf)));
+                w, q2_mp_winner_text(&c->mp, w, names, buf, sizeof(buf)));
         Q2_INFO("multiplayer: %s — %s, HUD set %s",
                 q2_mp_score_title(c->mp.mode), q2_mp_mode_name(c->mp.mode),
                 q2_mp_hud_image(true, c->mp.player_count));
@@ -4589,8 +4848,10 @@ static void client_score_deaths(client *c)
  * marks, and those three can leave none — the same weapon, the same owned set,
  * no pool higher — so the writer is called here, for player `pi`'s own bar
  * with that player's inventory and weapon, the way the draw picks them.
+ * ALL WEAPONS calls the same writer after its explicit grant below.
  */
 enum { CLIENT_SLOTS_SELECT, CLIENT_SLOTS_AUTOSELECT, CLIENT_SLOTS_SPAWN };
+static void client_install_game_variables(client *c);
 
 static void client_sbar_write_slots(client *c, int pi, int why)
 {
@@ -4610,6 +4871,28 @@ static void client_sbar_write_slots(client *c, int pi, int why)
     q2_statusbar_weapon_slots(&c->sbar[pi], inv, weapon);
     if (why >= 0 && why < 3)
         c->slots_written[why]++;
+}
+
+/* 0x8003B040, called by Config_InstallGameVariables and player respawn.
+ * Only grant models in this map's CastList, fill the current ammo tier, and
+ * retain the held weapon. This is an event, never a per-frame ammo refill. */
+static void client_grant_all_weapons(client *c, int pi)
+{
+    const q2_weapon_tables *tables = q2_weapon_tables_builtin();
+    q2_inventory *inv;
+    int w, a;
+    if (!(c->sim[0].cheats & Q2_CHEAT_ALL_WEAPONS) ||
+        pi < 0 || pi >= Q2_MP_MAX_PLAYERS) return;
+    inv = pi == c->sim[0].cur_player ? &c->sim[0].combat.inv
+                                     : &c->sim[0].pcombat[pi].inv;
+    if (c->model_bank_ready) {
+        for (w = 1; w <= Q2_WID_COUNT; w++)
+            if (q2_model_bank_find(&c->model_bank, tables->name[w]) >= 0)
+                inv->weapons |= (u16)tables->owned_bit[w];
+    }
+    for (a = 0; a < Q2_AMMO_COUNT; a++)
+        inv->ammo[a] = q2_inventory_ammo_max(inv, (q2_ammo)a);
+    client_sbar_write_slots(c, pi, -1);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -4646,7 +4929,12 @@ static bool client_mp_respawn(client *c, int pi)
     if (players < 1)
         players = 1;
     for (i = 0; i < players && i < Q2_MP_MAX_PLAYERS; i++) {
-        if (i == pi || c->death[i].stage != Q2_PDEATH_ALIVE)
+        const q2_inventory *inv = i == c->sim[0].cur_player
+                                      ? &c->sim[0].combat.inv
+                                      : &c->sim[0].pcombat[i].inv;
+        /* 0x80071004 reads entity presence and health, not the later
+         * corpse-animation state. Another death in this tick is not alive. */
+        if (i == pi || (i > 0 && !c->sim_ready[i]) || inv->health <= 0)
             continue;
         pv[i].alive  = true;
         pv[i].pos[0] = c->sim[0].player[i].pos[0];
@@ -4673,9 +4961,11 @@ static bool client_mp_respawn(client *c, int pi)
         int saved = c->sim[0].cur_player;
         q2_sim_select_player(&c->sim[0], pi);
         c->sim[0].combat.inv = c->mp_start_inv;
+        if (++c->player_audio_generation[pi] == 0) ++c->player_audio_generation[pi];
         q2_sim_spawn(&c->sim[0], feet, c->mp_view_yaw[pi]);
         q2_sim_player_loadout(&c->sim[0], pi, &c->mp_start_inv,
                               c->mp_start_weapon);
+        client_grant_all_weapons(c, pi);
         q2_sim_select_player(&c->sim[0], saved);
         if (pi == 0) c->cam.roll = 0;
     }
@@ -4685,6 +4975,7 @@ static bool client_mp_respawn(client *c, int pi)
     client_sbar_write_slots(c, pi, CLIENT_SLOTS_SPAWN);
 
     q2_player_death_init(&c->death[pi]);
+    client_player_anim_reset(c, pi);
     client_reset_view_model(c, pi);
     c->mp_dead[pi] = false;
     c->death_respawns++;
@@ -4806,15 +5097,10 @@ static u32 client_zone_dead(const client *c)
  * real level, and folding a stray zone into somebody else's slot would be a
  * wrong number rather than a missing one.
  *
- * THE SLOT ONLY EVER RISES. Walking back through a gate into a zone already
- * visited reloads that zone's creature set from COMMON.DAT with every `dead`
- * flag cleared — the port carries a zone's script latches across a gate
- * (`carry_events`) and not its casualties — so a plain assignment here would
- * hand the level's kill count back to zero the second time the player stood
- * in the room they cleared first. The console's counter cannot do that:
- * `0x8007CD84` only ever adds one to `0x800B29E8`, and nothing inside a level
- * subtracts from it. Keeping the larger of the two is how a port that rebuilds
- * the set reproduces that, and it is a deviation only in mechanism.
+ * The slot only rises, matching the console's counter at 0x8007CD84. Zone
+ * population history now restores casualties as well as script latches, but
+ * a legacy save can lack that history, and a body can move into overlapping
+ * geometry. Neither should subtract a kill already recorded for this zone.
  */
 static void client_zone_stash(client *c)
 {
@@ -4872,10 +5158,8 @@ static void client_level_tally(const client *c, u32 *dead, u32 *placed)
         p += c->zone_placed[i];
     }
 
-    /* The resident zone's own slot is not stale — it is what was stashed the
-     * last time the player left this zone, and on a return visit the reloaded
-     * set is alive again. The larger of the two is the one that does not
-     * un-kill anything; see `client_zone_stash`. */
+    /* Preserve the recorded tally even when restoring a legacy save without
+     * population history; see `client_zone_stash`. */
     if (z >= 0 && z < Q2_SAVE_LEVEL_ZONES) {
         if (c->zone_dead[z] > res_dead)
             res_dead = c->zone_dead[z];
@@ -5304,6 +5588,63 @@ static void client_apply_node_vis(client *c, const q2_explosive_result *vis)
     }
 }
 
+static void client_glint_scene(client *c, bool initial)
+{
+    /* BIGGUN +0x2700 hides Crack1..22; +0x1F30 reveals them as the
+     * generator's 1600-tick break-up clock crosses each threshold. */
+    static const s16 threshold[22] = {
+        1300, 1000, 1000, 1000, 850, 800, 800, 700, 600, 640, 600,
+        630, 600, 600, 620, 600, 600, 600, 600, 600, 620, 600
+    };
+    q2_fx_glint *g = &c->sim[0].glint;
+    q2_map_name_table names;
+    u32 i;
+    g->sparks_visible = false;
+    if (!g->scripted || !g->zone_active)
+        return;
+    /* The completed driver only removes a recreated owner; it advances no
+     * clock. Do this before the first draw, which may precede a logic tick. */
+    if (initial && g->finished)
+        q2_sim_glint_tick(&c->sim[0]);
+    if (initial)
+        q2_event_rt_disable_named(&c->sim[0].event_rt, "GravTeleport",
+                                   !g->burst_done);
+    if (!c->node_hidden || q2_map_names_parse(&names, &c->zone.zone) != Q2_OK)
+        return;
+    for (i = 0; i < names.count; i++) {
+        q2_map_name name;
+        if (!q2_map_name_get(&names, i, &name) || name.id >= c->node_hidden_count)
+            continue;
+        if (!strncmp(name.name, "Crack", 5)) {
+            char *end;
+            long n = strtol(name.name + 5, &end, 10);
+            if (*end || n < 1 || n > 22) continue;
+            if (initial) c->node_hidden[name.id] = 1;
+            if (g->dying && g->crack_time <= threshold[n - 1])
+                c->node_hidden[name.id] = 0;
+        } else if (!strcmp(name.name, "Power Source")) {
+            q2_scene_node node;
+            g->sparks_visible = !c->node_hidden[name.id] &&
+                q2_scene_get_node(&c->zone.scene, name.id, &node) &&
+                !(node.flags & 0x8000u);
+        }
+    }
+}
+
+static void client_glint_burst(client *c)
+{
+    q2_fx_glint *g = &c->sim[0].glint;
+    static const u8 white[3] = {255, 255, 255};
+    if (!g->burst_pending) return;
+    g->burst_pending = false;
+    /* +0x1468..+0x1570: break the glass, flash viewport zero for ten
+     * drawn frames, and enable the escape teleporter without firing it. */
+    q2_event_rt_trigger_named(&c->sim[0].event_rt, "DestroyGlass");
+    q2_screen_flash_set(&c->screen, 0, white, 10, 2);
+    q2_event_rt_disable_named(&c->sim[0].event_rt, "GravTeleport", false);
+    c->generator_flashes++;
+}
+
 /*
  * A script reaching a `func_explosive`. The console destroys it on the spot —
  * the dispatch arm passes damage zero and the handler's first branch falls
@@ -5392,6 +5733,1142 @@ static void client_centre_line(client *c, const char *text)
     q2_hud_ctx_default(&ctx, Q2_HUD_SPACE_W, Q2_HUD_SPACE_H);
     q2_hud_centre(&c->hud[0], &c->hud_tables, &ctx, text);
     c->centre_lines++;
+}
+
+static bool client_mission_seen(const client *c, const char *name)
+{
+    const q2_sim *sim = &c->sim[0];
+    q2_event_record rec, prev;
+    bool more;
+    if (!sim->event_rt.object_flags) return false;
+    for (more = q2_events_first_record(&sim->events, &rec); more;
+         more = q2_events_next_record(&sim->events, &prev, &rec)) {
+        u32 i;
+        prev = rec;
+        for (i = 0; i < rec.n_items; i++) {
+            q2_event_item item;
+            q2_uf_call call;
+            char key[13];
+            if (q2_events_get_item(&sim->events, &rec, i, &item) &&
+                item.offset < sim->event_rt.item_flags_size &&
+                sim->event_rt.object_flags[item.offset] &&
+                q2_uf_decode_call(&call, &sim->userfuncs, &item) == Q2_OK &&
+                call.prim == Q2_UF_MISEVENT &&
+                q2_uf_operand_name(&call, 0, key) && !strcmp(key, name)) return true;
+        }
+    }
+    return false;
+}
+
+static s32 client_named_node(const client *c, const char *key)
+{
+    q2_map_name_table names;
+    q2_map_name name;
+    u32 i;
+    if (q2_map_names_parse(&names, &c->zone.zone) != Q2_OK) return -1;
+    for (i = 0; i < names.count; i++)
+        if (q2_map_name_get(&names, i, &name) && !strcmp(name.name, key) &&
+            name.id < c->zone.scene.node_count) return (s32)name.id;
+    return -1;
+}
+
+static bool client_jail3_bridge(client *c)
+{
+    /* JAIL3 +0xFF0 allocates an entity box through import +128, then copies
+     * it into DrawBridge's 52-byte SCENE record through import +228. These
+     * are culling bounds and solid floor geometry, not TrigBounds. */
+    static const s32 min[3] = { -10878, -7039, 6639 };
+    static const s32 max[3] = { -7839, -6839, 7919 };
+    s32 node = client_named_node(c, "DrawBridge");
+    return node >= 0 && q2_sim_scene_solid_set(&c->sim[0], node, min, max) &&
+           q2_scene_set_bounds(&c->zone.zone, (u32)node, min, max);
+}
+
+static void client_native_popup(client *c, const char *orders,
+                                  const char *objective, s32 delay)
+{
+    if (c->sim[0].event_rt.initial_pass || c->restoring_save) return;
+    q2_briefing_popup_set(&c->popup, orders,
+        c->leveltext_ready ? q2_leveltext_find(&c->leveltext, orders) : NULL,
+        objective,
+        c->leveltext_ready ? q2_leveltext_find(&c->leveltext, objective) : NULL);
+    q2_briefing_popup_raise(&c->popup, delay, Q2_BRIEFING_SECONDS,
+                            c->sim[0].level_time, c->sim[0].cur_dt);
+    c->popup_raises++;
+    client_play_sound(c, "msc_comp_up");
+}
+
+static void client_stop_platform(client *c)
+{
+    q2_event_record rec;
+    q2_event_dir_entry entry = {0};
+    u32 i, j;
+    for (i = 0; i < c->sim[0].events.dir_count; i++)
+        if (q2_events_get_dir_entry(&c->sim[0].events, i, &entry) &&
+            !strcmp(entry.name, "PLATFORM")) break;
+    if (i == c->sim[0].events.dir_count ||
+        !q2_events_record_at(&c->sim[0].events, entry.offset, &rec)) return;
+    /* BIGGUN +0x2F20 writes 0xFFFF to the PLATFORM object's wait timer.
+     * It finishes its travel and then holds; it does not freeze in midair. */
+    for (i = 0; i < rec.n_items; i++) {
+        q2_event_item item;
+        if (!q2_events_get_item(&c->sim[0].events, &rec, i, &item)) break;
+        for (j = 0; j < c->movers.count; j++)
+            if (c->movers.movers[j].item_offset == item.offset)
+                c->movers.movers[j].wait_timer = Q2_MOVER_WAIT_NEVER;
+    }
+}
+
+static const struct {
+    const char *map, *key;
+    u32 bit;
+} client_native_keys[] = {
+    { "JAIL3", "Bridge", Q2_NATIVE_BRIDGE },
+    { "COMMAND", "Comp1", Q2_NATIVE_COMP1 },
+    { "COMMAND", "Comp2", Q2_NATIVE_COMP2 },
+    { "BOSS1", "Stairs0", Q2_NATIVE_STAIRS0 },
+    { "BOSS1", "Stairs1", Q2_NATIVE_STAIRS1 },
+    { "BOSS1", "LaserButton0", Q2_NATIVE_LASER0_OFF },
+    { "BOSS1", "LaserButton1", Q2_NATIVE_LASER1_OFF },
+    { "SECURITY", "OrbActive", Q2_NATIVE_ORB_ACTIVE },
+    { "SECURITY", "LOCKLIFTS", Q2_NATIVE_LOCK_LIFTS },
+    { "BIGGUN", "STOPPLATFORM", Q2_NATIVE_STOP_PLATFORM },
+    { NULL, "Pump1On", Q2_NATIVE_PUMP1 },
+    { NULL, "Pump2On", Q2_NATIVE_PUMP2 }
+};
+
+static void client_native_mission_call(client *c, const char *key,
+                                         const q2_event_item *item)
+{
+    q2_event_rt *rt = &c->sim[0].event_rt;
+    u32 i, bit = 0, before = c->native_mission.flags;
+    const u32 computers = Q2_NATIVE_COMP1 | Q2_NATIVE_COMP2;
+    const u32 stairs = Q2_NATIVE_STAIRS0 | Q2_NATIVE_STAIRS1;
+    const u32 pumps = Q2_NATIVE_PUMP1 | Q2_NATIVE_PUMP2;
+    for (i = 0; i < sizeof(client_native_keys) / sizeof(client_native_keys[0]); i++) {
+        if ((!client_native_keys[i].map || client_name_eq(c->map, client_native_keys[i].map)) &&
+            !strcmp(key, client_native_keys[i].key)) {
+            bit = client_native_keys[i].bit;
+            break;
+        }
+    }
+    if (bit == Q2_NATIVE_BRIDGE && !client_jail3_bridge(c)) return;
+    if (bit) {
+        c->native_mission.flags |= bit;
+        if (bit == Q2_NATIVE_ORB_ACTIVE && !rt->initial_pass && !c->restoring_save)
+            c->native_mission.flags &= ~Q2_NATIVE_ORB_DONE;
+        if (rt->object_flags && item->offset < rt->item_flags_size)
+            rt->object_flags[item->offset] = 1;
+    }
+    if ((bit & computers) && (c->native_mission.flags & computers) == computers) {
+        q2_event_rt_disable_named(rt, "LasersOff", false);
+        q2_event_rt_disable_named(rt, "TheLasers", true);
+        client_native_popup(c, "Unit4Curr2", "Unit4Miss1", 50);
+    } else if (bit & stairs) {
+        bool complete = (c->native_mission.flags & stairs) == stairs;
+        if (!rt->initial_pass && !c->restoring_save)
+            client_centre_line(c, complete ? "Sequence complete" : "One more to go...");
+        if (complete) q2_event_rt_trigger_named(rt, "Steps");
+    } else if (bit & pumps) {
+        if (!(before & bit))
+            client_native_popup(c, (c->native_mission.flags & pumps) == pumps
+                                     ? "Unit3Curr4" : "Unit3Curr3", "Unit3Miss1", 50);
+        if ((c->native_mission.flags & pumps) == pumps)
+            q2_event_rt_trigger_named(rt, "WasteFill");
+    } else if (!strcmp(key, "CheckPumps")) {
+        if ((c->native_mission.flags & pumps) == pumps)
+            q2_event_rt_trigger_named(rt, "WasteFill");
+    } else if (bit == Q2_NATIVE_STOP_PLATFORM) {
+        client_stop_platform(c);
+    } else if (client_name_eq(c->map, "LAB") &&
+               (!strcmp(key, "Laser0") || !strcmp(key, "Laser1"))) {
+        i = (u32)(key[5] - '0');
+        /* These are retriggerable sweeps, not permanent on/off switches.
+         * Save reconstruction must not restart an active or completed sweep. */
+        if (!rt->initial_pass && !c->restoring_save && c->native_mission.lab_phase[i] <= 0)
+            c->native_mission.lab_phase[i] = 8192;
+    }
+    /* JAIL5 BUTPRESSED is intentionally jr ra / nop (+0x7C8). */
+}
+
+static q2_mover *client_native_lift(client *c, u32 index, u32 *volume)
+{
+    static const struct { const char *map, *name; } lifts[Q2_NATIVE_LIFT_COUNT] = {
+        {"LAB", "Lift A"}, {"LAB", "Lift C"},
+        {"SECURITY", "Lift A"}, {"SECURITY", "Lift B"},
+        {"BOSS1", "Lift A"},
+        {"BOSS2", "LiftStemA"}, {"BOSS2", "LiftStemB"}
+    };
+    s32 node;
+    u32 i, p, out = 0;
+    if (index >= Q2_NATIVE_LIFT_COUNT || !client_name_eq(c->map, lifts[index].map)) return NULL;
+    node = client_named_node(c, lifts[index].name);
+    for (i = 0; node >= 0 && i < c->movers.count; i++) {
+        q2_mover *m = &c->movers.movers[i];
+        if (!m->blocks_player) continue;
+        for (p = 0; p < m->part_count; p++, out++)
+            if (m->node[p] == node && out < c->sim[0].mover_count) {
+                *volume = out;
+                return m;
+            }
+    }
+    return NULL;
+}
+
+static void client_native_lifts_capture(client *c)
+{
+    u32 i, volume;
+    if (c->mp_enabled || c->restoring_save || c->sim[0].event_rt.initial_pass) return;
+    /* LAB +0x3D0, SECURITY +0x460, BOSS1 +0x424 and BOSS2 +0x414 snapshot
+     * only resident lifts. Unit memory retains the absent lifts' last state. */
+    for (i = 0; i < Q2_NATIVE_LIFT_COUNT; i++) {
+        q2_mover *m = client_native_lift(c, i, &volume);
+        q2_native_lift *saved = &c->native_mission.lift[i];
+        const q2_move_target *box;
+        if (!m) continue;
+        box = &c->sim[0].volumes[volume];
+        saved->valid = 1; saved->state = m->state;
+        saved->wait = m->wait_timer; saved->offset = m->offset;
+        memcpy(saved->min, box->min, sizeof(saved->min));
+        memcpy(saved->max, box->max, sizeof(saved->max));
+        memcpy(saved->env_min, box->env_min, sizeof(saved->env_min));
+        memcpy(saved->env_max, box->env_max, sizeof(saved->env_max));
+        saved->dy = box->dy;
+    }
+}
+
+static void client_native_lifts_restore(client *c)
+{
+    u32 i, volume, v, k;
+    if (c->mp_enabled) return;
+    /* Zone callbacks call LAB +0xD8, SECURITY +0x168, BOSS1 +0x130 or
+     * BOSS2 +0x11C after event replay. Scene indices change across zones. */
+    for (i = 0; i < Q2_NATIVE_LIFT_COUNT; i++) {
+        const q2_native_lift *saved = &c->native_mission.lift[i];
+        q2_mover *m = client_native_lift(c, i, &volume);
+        const s32 *primary;
+        if (!saved->valid || !m) continue;
+        m->state = saved->state; m->wait_timer = saved->wait; m->offset = saved->offset;
+        primary = &c->sim[0].mover_base[volume * 6u];
+        /* BOSS2 also restores its object's +0x30 partner displacement. The
+         * port stores both parts in one mover, with a box per part; translate
+         * each box's bounds/envelope relative to the saved named part. */
+        for (v = 0; v < c->sim[0].mover_count; v++) {
+            q2_move_target *box = &c->sim[0].volumes[v];
+            const s32 *base = &c->sim[0].mover_base[v * 6u];
+            if (box->id != (s32)(m - c->movers.movers)) continue;
+            for (k = 0; k < 3; k++) {
+                box->min[k] = saved->min[k] + base[k] - primary[k];
+                box->max[k] = saved->max[k] + base[k+3] - primary[k+3];
+                box->env_min[k] = saved->env_min[k] + base[k] - primary[k];
+                box->env_max[k] = saved->env_max[k] + base[k+3] - primary[k+3];
+            }
+            box->dy = (s16)saved->dy;
+            c->sim[0].mover_last_off[v] = saved->offset;
+        }
+    }
+}
+
+static void client_native_security_lift(client *c, bool tick)
+{
+    q2_mover *lift = NULL;
+    s32 node, ring;
+    u32 i, part;
+    bool at_top;
+    if (c->mp_enabled || !client_name_eq(c->map, "SECURITY") || c->zone_index != 2) return;
+    node = client_named_node(c, "HexLift");
+    for (i = 0; node >= 0 && !lift && i < c->movers.count; i++)
+        for (part = 0; part < c->movers.movers[i].part_count; part++)
+            if (c->movers.movers[i].node[part] == node) { lift = &c->movers.movers[i]; break; }
+    if (!lift) return;
+    /* SECURITY+0x15C8 runs independently of OrbActive. It hides the named
+     * ring at full travel, then latches the lift when player 0's entity
+     * origin is strictly above -8899. PAL has no "LiftRing1" name: do not
+     * substitute its different "ring" node or write outside the Scene. */
+    at_top = lift->offset == lift->target;
+    ring = client_named_node(c, "LiftRing1");
+    if (ring >= 0 && c->node_hidden && (u32)ring < c->node_hidden_count)
+        c->node_hidden[ring] = at_top;
+    if (tick && !c->restoring_save && !c->sim[0].event_rt.initial_pass && at_top &&
+        c->sim[0].player_count > 0 && q2_sim_origin_y(c->sim[0].player[0].pos[1]) < -8899)
+        c->native_mission.flags |= Q2_NATIVE_SECURITY_LIFT_HELD;
+    if (c->native_mission.flags & Q2_NATIVE_SECURITY_LIFT_HELD) {
+        /* +0x169C clears the object's think pointer and pins its Y offset.
+         * Rebind that ownership on zone/card loads before a generic tick. */
+        lift->external = Q2_MV_EXTERNAL_HELD;
+        if (lift->offset != lift->target) {
+            lift->offset = lift->target;
+            q2_sim_movers_update(&c->sim[0], &c->movers);
+        }
+    }
+}
+
+static void client_native_mission_restore(client *c)
+{
+    u32 i;
+    const u32 computers = Q2_NATIVE_COMP1 | Q2_NATIVE_COMP2;
+    for (i = 0; i < sizeof(client_native_keys) / sizeof(client_native_keys[0]); i++)
+        if ((!client_native_keys[i].map || client_name_eq(c->map, client_native_keys[i].map)) &&
+            client_mission_seen(c, client_native_keys[i].key))
+            c->native_mission.flags |= client_native_keys[i].bit;
+    if (client_name_eq(c->map, "JAIL3") && c->zone_index == 1 &&
+        (c->native_mission.flags & Q2_NATIVE_BRIDGE)) client_jail3_bridge(c);
+    if (client_name_eq(c->map, "COMMAND") &&
+        (c->native_mission.flags & computers) == computers) {
+        q2_event_rt_disable_named(&c->sim[0].event_rt, "LasersOff", false);
+        q2_event_rt_disable_named(&c->sim[0].event_rt, "TheLasers", true);
+    }
+    if (client_name_eq(c->map, "BIGGUN") &&
+        (c->native_mission.flags & Q2_NATIVE_STOP_PLATFORM)) client_stop_platform(c);
+    if ((client_name_eq(c->map, "BASE3") || client_name_eq(c->map, "MAGDEMO")) &&
+        (c->native_mission.flags & Q2_NATIVE_BASE3_WALL_OFF))
+        q2_event_rt_disable_named(&c->sim[0].event_rt, "LASERWALL1", true);
+    if (client_name_eq(c->map, "BOSS2") &&
+        (c->native_mission.flags & Q2_NATIVE_TRAIN_OPEN)) {
+        q2_event_rt_disable_named(&c->sim[0].event_rt, "DoorToTrain", false);
+        q2_event_rt_disable_named(&c->sim[0].event_rt, "DoorString", true);
+    }
+    /* POWER1's three zone callbacks clear +0xC98, but leave +0xC68 alone.
+     * A cold save restores both clocks instead of restarting the hazard. */
+    if (client_name_eq(c->map, "POWER1") && !c->restoring_save)
+        c->native_mission.power1_next_blast = 0;
+    /* SECURITY's zone-2 callback clears all five arc lifetimes (+0x1A98).
+     * Card loads retain the recorded trajectories instead. */
+    if (client_name_eq(c->map, "SECURITY") && c->zone_index == 2 && !c->restoring_save)
+        for (i = 0; i < 5; i++) c->native_mission.orb_arc[i].life = 0;
+    c->reactor_beam_ready = false;
+    if (client_name_eq(c->map, "POWER2")) {
+        q2_native_mission *s = &c->native_mission;
+        const dat_chunk *lb = c->common.chunk[Q2_COMMON_LEVEL_BIN];
+        if (s->flags & Q2_NATIVE_ROCK_LASER_OFF)
+            q2_event_rt_disable_named(&c->sim[0].event_rt, "RockLaser", true);
+        if (c->zone_index == 0) {
+            /* +0x148: a completed reactor is reconstructed at zone entry.
+             * A card load instead retains its exact in-flight callback state. */
+            if (!c->restoring_save) {
+                s->flags &= ~Q2_NATIVE_REACTOR_ACTIVE;
+                if (s->flags & Q2_NATIVE_REACTOR_DONE) {
+                    q2_event_rt *rt = &c->sim[0].event_rt;
+                    bool initial = rt->initial_pass;
+                    s->flags |= Q2_NATIVE_REACTOR_BEAM_OFF;
+                    s->reactor_glass = 63;
+                    rt->initial_pass = true;
+                    q2_event_rt_trigger_named(rt, "DrainCool");
+                    q2_event_rt_trigger_named(rt, "ExploDoor");
+                    q2_event_rt_update(rt);
+                    rt->initial_pass = initial;
+                }
+            }
+            for (i = 0; i < 6; i++) if ((!c->restoring_save && (s->flags & Q2_NATIVE_REACTOR_DONE)) ||
+                                         (s->reactor_glass & (1u << i))) {
+                char name[7];
+                s32 node;
+                snprintf(name, sizeof(name), "Glass%u", i + 1);
+                node = client_named_node(c, name);
+                if (c->node_hidden && node >= 0 && (u32)node < c->node_hidden_count)
+                    c->node_hidden[node] = 1;
+            }
+            /* +0x1B1C..+0x1BE4 is this module's red core, not a global
+             * laser style. Keep decoded faces alive through the render pass. */
+            if (lb && lb->size == 0x1C18) {
+                u32 face, k;
+                for (face = 0; face < 10; face++) {
+                    const u8 *p = lb->data + 0x1B1C + face * 20;
+                    q2_fx_face *f = face < 6 ? &c->reactor_beam.tube[face] :
+                        face < 8 ? &c->reactor_beam.cap_near[face - 6] :
+                                   &c->reactor_beam.cap_far[face - 8];
+                    memcpy(f->v, p, 4);
+                    for (k = 0; k < 4; k++) f->colour[k] = q2_rd_u32(p + 4 + 4*k);
+                }
+                c->reactor_beam_ready = true;
+            }
+        } else if (!c->restoring_save && (s->flags & Q2_NATIVE_REACTOR_ACTIVE)) {
+            /* +0x52C/+0x604/+0x6DC/+0x7B4 finish a sequence left behind. */
+            s->flags |= Q2_NATIVE_REACTOR_DONE;
+        }
+    }
+}
+
+static void client_activate_batch(client *c, const char *group)
+{
+    u32 woke = c->creatures_ready
+             ? q2_creature_world_summon(&c->creatures, group) : 0;
+    u32 placed = q2_sim_activate_item_group(&c->sim[0], group);
+    c->script_summoned += woke;
+    if (woke || placed)
+        Q2_INFO("CREBATCH '%s' woke %u, placed %u", group, woke, placed);
+}
+
+/* RegisterKill (0x8007CD24) consumes Population.flags & 0x600 at corpse
+ * detachment (0x8007F098), including the dead-actor departure sweep at
+ * 0x8007F698. Health crossing zero is too early. The current roster and its
+ * authored-identity history supply the same completed deaths without counting
+ * one body again on every visit. A dormant actor is not a casualty. */
+static bool client_population_death_complete(const client *c, u32 group, u32 slot)
+{
+    u32 i, j;
+    for (i = 0; i < c->creatures.set.count; i++) {
+        const q2_monster *m = &c->creatures.set.monsters[i];
+        if (m->group == group && m->population_slot == slot && m->population_active)
+            return m->dead && (m->corpse || m->gibbed || !m->in_use);
+    }
+    for (i = 0; i < c->zone_history.count; i++) {
+        const q2_zone_population *p = &c->zone_history.map[i];
+        if (!client_name_eq(p->map, c->map)) continue;
+        for (j = 0; j < p->count; j++) {
+            const q2_zone_object *o = &p->object[j];
+            if (o->kind == Q2_ZONE_CREATURE && o->group == group && o->slot == slot)
+                return o->dead != 0;
+        }
+    }
+    return false;
+}
+
+static u32 client_population_tag_deaths(const client *c, u16 tag)
+{
+    const q2_population *pop = &c->sim[0].item_population;
+    u32 gi, slot, count = 0;
+    for (gi = 0; gi < pop->group_count; gi++) {
+        q2_pop_group g;
+        q2_pop_spawn spawn;
+        if (!q2_pop_get_group(pop, gi, &g)) continue;
+        for (slot = 0; q2_pop_get_spawn(pop, &g, slot, &spawn); slot++)
+            if ((spawn.flags & 0x600) == tag &&
+                client_population_death_complete(c, gi, slot)) count++;
+    }
+    return count;
+}
+
+static bool client_rider_death_complete(const client *c)
+{
+    const q2_population *pop = &c->sim[0].item_population;
+    u32 gi, slot;
+    /* Jorg+0x31E8 creates class 14 with flags 0x400, independently of its
+     * parent's 0x200. The reserved child uses a separate stable namespace. */
+    for (gi = 0; gi < pop->group_count; gi++) {
+        q2_pop_group g;
+        q2_pop_spawn spawn;
+        if (!q2_pop_get_group(pop, gi, &g)) continue;
+        for (slot = 0; q2_pop_get_spawn(pop, &g, slot, &spawn); slot++)
+            if (spawn.class_id == 13 && client_population_death_complete(c,
+                    gi + pop->group_count, slot)) return true;
+    }
+    return false;
+}
+
+static void client_native_population_frame(client *c)
+{
+    q2_native_mission *s = &c->native_mission;
+    q2_event_rt *rt = &c->sim[0].event_rt;
+    if (!c->sim[0].item_population_ready || c->restoring_save || rt->initial_pass) return;
+    if (client_name_eq(c->map, "BASE3") || client_name_eq(c->map, "MAGDEMO")) {
+        /* +0x3F4: unit 1 seeds one first-counter kill (0x80022A38).
+         * Zone3/1's Gunner consumes it at completed death. Unit save word +32
+         * keeps the wall off thereafter, even if its record is re-enabled. */
+        if ((s->flags & Q2_NATIVE_BASE3_WALL_OFF) ||
+            client_population_tag_deaths(c, 0x200) >= 1) {
+            s->flags |= Q2_NATIVE_BASE3_WALL_OFF;
+            q2_event_rt_disable_named(rt, "LASERWALL1", true);
+        }
+    } else if (client_name_eq(c->map, "SECURITY") && c->zone_index == 1) {
+        u32 i;
+        /* Unit 2 seeds two 0x200 kills and one 0x400 kill (0x80023280).
+         * SECURITY+0x1FB0 waits for the two Tank Commanders, then selects
+         * Boss1 and schedules ExplodeWall1..4 at 600 + 450*i ticks. */
+        if (!(s->flags & Q2_NATIVE_SECURITY_BOSS) &&
+            client_population_tag_deaths(c, 0x200) >= 2) {
+            s->flags |= Q2_NATIVE_SECURITY_BOSS;
+            client_activate_batch(c, "Boss1");
+            for (i = 0; i < 4; i++) s->security_wall[i] = 600 + 450 * (s32)i;
+        }
+        if (!(s->flags & Q2_NATIVE_SECURITY_HATCH) &&
+            client_population_tag_deaths(c, 0x400) >= 1) {
+            s->flags |= Q2_NATIVE_SECURITY_HATCH;
+            q2_event_rt_trigger_named(rt, "ExplodeHatch");
+        }
+        /* +0x142C decrements these only while zone 1 is resident. */
+        for (i = 0; i < 4; i++) if (s->security_wall[i] > 0) {
+            s->security_wall[i] -= c->sim[0].cur_dt;
+            if (s->security_wall[i] <= 0) {
+                char event[13];
+                s->security_wall[i] = 0;
+                snprintf(event, sizeof(event), "ExplodeWall%u", i + 1);
+                q2_event_rt_trigger_named(rt, event);
+            }
+        }
+    } else if (client_name_eq(c->map, "BOSS2") &&
+               !(s->flags & Q2_NATIVE_TRAIN_OPEN) && client_rider_death_complete(c)) {
+        /* +0xD30 tests unit save word +28 and the SECOND kill counter. Jorg's
+         * first-stage death cannot open this route. +0xE04 selects Zone4 even
+         * while the boss arena (zone 1) is resident. */
+        s->flags |= Q2_NATIVE_TRAIN_OPEN;
+        client_activate_batch(c, "Zone4");
+        q2_event_rt_disable_named(rt, "DoorToTrain", false);
+        q2_event_rt_disable_named(rt, "DoorString", true);
+        client_native_popup(c, "Unit5Curr4", "Unit5Miss2", 50);
+        s->boss2_quake_time = 0; /* +0x1048, after this frame's quake pass. */
+    } else if (client_name_eq(c->map, "POWER2") &&
+               !(s->flags & Q2_NATIVE_ROCK_LASER_OFF) &&
+               client_population_tag_deaths(c, 0x200) >= 1) {
+        /* +0x11A0: unit 3's first kill counter is Zone3/2's Infantry. */
+        s->flags |= Q2_NATIVE_ROCK_LASER_OFF;
+        q2_event_rt_disable_named(rt, "RockLaser", true);
+    }
+}
+
+static void client_native_mission_queue(client *c)
+{
+    if (!c->mp_enabled && client_name_eq(c->map, "SECURITY") &&
+        (c->native_mission.flags & Q2_NATIVE_LOCK_LIFTS)) {
+        /* +0x1DF8 calls both named records on every game frame. */
+        q2_event_rt_trigger_named(&c->sim[0].event_rt, "LIFTA");
+        q2_event_rt_trigger_named(&c->sim[0].event_rt, "LIFTB");
+    }
+}
+
+/* LevelBin's import +64 is the damaging beam at 0x80048DC8. The effect
+ * emitter alone only builds packets: native mission beams also need its hit
+ * test. Damage belongs to the shared logic tick, never to a viewport draw.
+ * Native draws resolve the submitted cell; the port's effect API instead
+ * expects its draw-area byte, not the collision-array index. */
+static s32 client_beam_in_cell(client *c, u32 kind, const s32 from[3],
+                              const s32 to[3], s32 cell, bool tick, bool *hit)
+{
+    q2_sim *sim = &c->sim[0];
+    const q2_fx_laser_kind *laser = q2_fx_laser_kind_at(&c->fx_tables, kind);
+    q2_coll_node cell_data;
+    s32 victim = -1;
+    if (hit) *hit = false;
+    if (!laser || !sim->coll_primary_ready) return -1;
+    if (cell < 0 || !q2_collision_get_node(&sim->coll_primary, (u32)cell, &cell_data)) return -1;
+    if (!c->no_lasers)
+        q2_fx_laser(&sim->fx, &sim->fx_rng, kind, from, to, cell_data.contents, 0, NULL);
+    if (tick && laser->damage) {
+        victim = q2_sim_mission_laser(sim, from, to, laser->damage, laser->mod);
+        if (victim >= 0) client_cre_drain_one(c, (u32)victim);
+        if (hit) *hit = victim != -1;
+    }
+    return cell;
+}
+
+static s32 client_native_beam(client *c, u32 kind, const s32 from[3],
+                             const s32 to[3], bool tick, bool *hit)
+{
+    s32 cell = c->sim[0].coll_primary_ready
+             ? q2_coll_find_node(&c->sim[0].coll_primary, from, -1, true) : -1;
+    return client_beam_in_cell(c, kind, from, to, cell, tick, hit);
+}
+
+static void client_laserwalls_frame(client *c, bool tick)
+{
+    u32 i, row;
+    for (i = 0; i < c->laserwalls.count; i++) {
+        const q2_laserwall *wall = &c->laserwalls.wall[i];
+        s32 from[3], to[3], cell;
+        if (q2_event_rt_flags(&c->sim[0].event_rt, wall->raiser) & Q2_EVREC_DISABLED)
+            continue;
+        if (!q2_laserwall_segment(wall, &c->zone.scene, 0, from, to)) continue;
+        /* DrawLaserWalls resolves the first origin once, then submits every
+         * row with that cell. Kind 0 deals 512 laser damage; the wall's
+         * separate trigger volume uses its authored +20 damage instead. */
+        cell = client_native_beam(c, 0, from, to, tick, NULL);
+        for (row = 1; row < wall->rows; row++)
+            if (q2_laserwall_segment(wall, &c->zone.scene, row, from, to))
+                client_beam_in_cell(c, 0, from, to, cell, tick, NULL);
+    }
+}
+
+static void client_laserbeams_frame(client *c, bool tick)
+{
+    u32 i;
+    c->laser_drawn = 0;
+    /* DrawLaserBeams calls 0x80048DC8, not just its packet emitter. Its
+     * actor-only sweep runs even if the visual pool is full or hidden.
+     * Submit and resolve each beam before advancing to the next record. */
+    for (i = 0; i < c->lasers.count; i++) {
+        const q2_laserbeam *beam = &c->lasers.beam[i];
+        const q2_fx_laser_kind *kind = q2_fx_laser_kind_at(&c->fx_tables, (u32)beam->kind);
+        q2_fx_laser_result result;
+        s32 victim;
+        if (q2_event_rt_flags(&c->sim[0].event_rt, beam->raiser) & Q2_EVREC_DISABLED)
+            continue;
+        if (!c->no_lasers && q2_fx_laser(&c->sim[0].fx, &c->sim[0].fx_rng,
+                (u32)beam->kind, beam->from, beam->to, beam->area, 0, &result) && result.queued)
+            c->laser_drawn++;
+        if (!tick || !kind || !kind->damage) continue;
+        victim = q2_sim_mission_laser(&c->sim[0], beam->from, beam->to, kind->damage, kind->mod);
+        if (victim >= 0) client_cre_drain_one(c, (u32)victim);
+    }
+}
+
+static const s32 client_reactor_top[3] = {-21760,-296,-10242};
+static const s32 client_reactor_bottom[3] = {-21760,856,-10242};
+static const s32 client_reactor_center[3] = {-21760,280,-10242};
+
+static void client_native_explosion(client *c, const s32 at[3], u8 area, s32 size)
+{
+    q2_sim *sim = &c->sim[0];
+    if (!q2_model_ent_spawn(&sim->entities, &c->model_bank,
+            Q2_MODEL_ENT_EXPLOSION, at, area, size, &sim->explosion_sounds))
+        q2_model_ent_spawn(&sim->entities, &c->zone_bank,
+            Q2_MODEL_ENT_EXPLOSION, at, area, size, &sim->explosion_sounds);
+}
+
+static u8 client_power1_blast_area(client *c, const s32 at[3])
+{
+    q2_collision *coll = &c->sim[0].coll_primary;
+    q2_coll_node node;
+    s32 cell = q2_coll_find_node(coll, at, -1, true);
+    if (cell >= 0 && q2_collision_get_node(coll, (u32)cell, &node)) return node.contents;
+    /* The two entrance origins are outside retail's hull. +0x1AC/+0x1E4
+     * still index node -1: (chunk+4) - 36 + 32 lands on the header's low
+     * node-count byte. Preserve that result without an out-of-bounds read;
+     * rejecting the spawn here would also suppress its sound and shock. */
+    return (u8)coll->node_count;
+}
+
+/* POWER1 +0x5F0 and +0x414. The entrance repeats two blasts every 900
+ * ticks; the shaft advances one phase every 100. Both use next < now, so
+ * equality is silent and a late frame never catches up multiple phases.
+ * The frame's other call enables MakeBlitzes when unit 3's second counter
+ * reaches zero. No POWER1 Events directory contains that name on retail. */
+static void client_native_power1(client *c, bool tick)
+{
+    static const s32 entrance[2][3] = {{1975,-6500,9653}, {-1880,-6500,9653}};
+    static const s32 shaft[8][3] = {
+        {-600,5200,-13120}, {-600,4600,-13120}, {-600,4000,-13120}, {-600,3400,-13120},
+        {-600,2800,-13120}, {-600,2200,-13120}, {-600,1600,-13120}, {-600,1000,-13120}
+    };
+    q2_sim *sim = &c->sim[0];
+    q2_native_mission *s = &c->native_mission;
+    u32 i, phase;
+    s32 origin[3];
+    const s32 *at;
+    if (!tick || sim->cur_dt <= 0 || c->restoring_save || sim->event_rt.initial_pass ||
+        !(s->power1_next_blast < (u32)sim->level_time)) return;
+    if (c->zone_index == 0) {
+        s->power1_next_blast = (u32)sim->level_time + 900u;
+        for (i = 0; i < 2; i++) {
+            s32 size = 5000 + (q2_rng_next(&sim->fx_rng) & 2047);
+            client_native_explosion(c, entrance[i], client_power1_blast_area(c, entrance[i]), size);
+        }
+    } else if (c->zone_index == 1) {
+        s->power1_next_blast = (u32)sim->level_time + 100u;
+        phase = s->power1_blast_phase = (s->power1_blast_phase + 1u) & 15u;
+        /* Index zero is never emitted. A player below the shaft sees only
+         * its first two blasts; the upper seven run while climbing it. */
+        memcpy(origin, sim->player[0].pos, sizeof(origin));
+        origin[1] = q2_sim_origin_y(origin[1]);
+        if (!phase || phase >= 8 || (origin[1] >= 5200 && phase >= 3)) return;
+        at = shaft[phase];
+        {
+            s32 size = 4000 + (q2_rng_next(&sim->fx_rng) & 511);
+            client_native_explosion(c, at, client_power1_blast_area(c, at), size);
+        }
+        /* Retail T_Damage(player0, player0, 30, 10, blast). Use entity
+         * origin Y and strict bounds, through ordinary lava/armour rules. */
+        if (origin[0] > at[0] - 500 && origin[0] < at[0] + 500 &&
+            origin[1] > at[1] - 1500 && origin[1] < at[1] + 1500 &&
+            origin[2] > at[2] - 500 && origin[2] < at[2] + 500)
+            q2_sim_hurt_player(sim, &sim->combat.self, 30, Q2_MOD_LAVA, at);
+    }
+}
+
+static void client_reactor_core(client *c, s32 cell, u8 area, bool tick)
+{
+    q2_sim *sim = &c->sim[0];
+    s16 velocity[Q2_FX_GROUP_QUADS][3];
+    s32 at[3], sign;
+    u32 i, life, size;
+    if (c->no_lasers || !c->reactor_beam_ready || cell < 0) return;
+    /* Retail submits a PrimaryColl index and resolves it in 0x80063650's
+     * 0x80044C44 walk. The port's effect API takes the resolved draw area. */
+    q2_fx_beam_add(&sim->fx, client_reactor_top, client_reactor_bottom,
+        256, area, c->reactor_beam.tube,
+        c->reactor_beam.cap_near, c->reactor_beam.cap_far);
+    /* POWER2+0xF20: the non-damaging core emits fifteen sparks during
+     * 48 of each 64 ticks, alternating its origin and vertical direction. */
+    if (!tick || ((u32)sim->level_time & 63u) < 16) return;
+    sign = ((u32)sim->level_time & 127u) < 63 ? -1 : 1;
+    memcpy(at, sign < 0 ? client_reactor_bottom : client_reactor_top, sizeof(at));
+    for (i = 0; i < Q2_FX_GROUP_QUADS; i++) {
+        velocity[i][0] = (s16)((q2_rng_next(&sim->fx_rng) - 16384) >> 13);
+        velocity[i][1] = (s16)((q2_rng_next(&sim->fx_rng) >> 8) * sign);
+        velocity[i][2] = (s16)((q2_rng_next(&sim->fx_rng) - 16384) >> 13);
+    }
+    at[0] += (q2_rng_next(&sim->fx_rng) & 255) - 127;
+    at[2] += (q2_rng_next(&sim->fx_rng) & 255) - 127;
+    /* Preserve the retail addition-before-mask operands at +0x1120/1144. */
+    life = (q2_rng_next(&sim->fx_rng) + 16) & 15;
+    size = (q2_rng_next(&sim->fx_rng) + 4000) & 4095;
+    q2_fx_group_spawn(&sim->fx, at, velocity, Q2_FX_GROUP_QUADS,
+        q2_fx_ramp_by_id(&c->fx_tables, 2), q2_fx_ramp_by_id(&c->fx_tables, 0),
+        life, (s32)size, area);
+}
+
+static void client_reactor_collapse(client *c, s32 cell, u8 area)
+{
+    static const u32 deadline[6] = {4100,4200,4700,4750,4800,5100};
+    q2_sim *sim = &c->sim[0];
+    q2_native_mission *s = &c->native_mission;
+    u32 elapsed = (u32)sim->level_time - s->reactor_start, i, k;
+    q2_scene_node scene;
+    char name[7];
+    s32 node, from[3], to[3];
+    s16 delta[3], direction[3];
+    if (!(s->flags & Q2_NATIVE_REACTOR_DRAINED)) {
+        q2_event_rt_trigger_named(&sim->event_rt, "DrainCool");
+        s->flags |= Q2_NATIVE_REACTOR_DRAINED;
+    }
+    if (elapsed >= 10000) {
+        q2_event_rt_trigger_named(&sim->event_rt, "ExploDoor");
+        s->flags |= Q2_NATIVE_REACTOR_DONE;
+    }
+    /* +0x88C consumes at most one glass deadline each frame, even if the
+     * clock crossed several. A missing node still consumes its deadline. */
+    for (i = 0; i < 6 && (s->reactor_glass & (1u << i)); i++) {}
+    if (i == 6) {
+        if ((q2_rng_next(&sim->fx_rng) & 3) == 0) {
+            for (k = 0; k < 3; k++)
+                from[k] = client_reactor_center[k] + (q2_rng_next(&sim->fx_rng) & 511) - 255;
+            client_native_explosion(c, from, area, 4000 + (q2_rng_next(&sim->fx_rng) & 511));
+        }
+        return;
+    }
+    if (elapsed < deadline[i]) return;
+    s->reactor_glass |= 1u << i;
+    snprintf(name, sizeof(name), "Glass%u", i + 1);
+    node = client_named_node(c, name);
+    if (node < 0 || !q2_scene_get_node(&c->zone.scene, (u32)node, &scene)) return;
+    s->flags |= Q2_NATIVE_REACTOR_BEAM_OFF;
+    for (k = 0; k < 3; k++) {
+        from[k] = (scene.bbox_min[k] + scene.bbox_max[k]) >> 1;
+        delta[k] = (s16)(from[k] - client_reactor_center[k]);
+    }
+    delta[1] = (s16)(delta[1] + (q2_rng_next(&sim->fx_rng) & 255) - 127);
+    q2_vector_normal(delta, direction);
+    for (k = 0; k < 3; k++) to[k] = from[k] + (s16)(direction[k] * 8);
+    if (cell >= 0) {
+        const q2_fx_laser_kind *laser = q2_fx_laser_kind_at(&c->fx_tables, 2);
+        s32 victim;
+        if (!c->no_lasers)
+            q2_fx_laser(&sim->fx, &sim->fx_rng, 2, from, to, area, 0, NULL);
+        if (laser && laser->damage) {
+            victim = q2_sim_mission_laser(sim, from, to, laser->damage, laser->mod);
+            if (victim >= 0) client_cre_drain_one(c, (u32)victim);
+        }
+    }
+    client_native_explosion(c, from, area, 4000 + (q2_rng_next(&sim->fx_rng) & 511));
+    q2_sim_debris_burst(sim, scene.bbox_min, scene.bbox_max, NULL, 10, 0);
+    if (c->node_hidden && (u32)node < c->node_hidden_count) c->node_hidden[node] = 1;
+}
+
+static void client_native_power2(client *c, bool tick)
+{
+    q2_sim *sim = &c->sim[0];
+    q2_native_mission *s = &c->native_mission;
+    const u32 pumps = Q2_NATIVE_PUMP1 | Q2_NATIVE_PUMP2;
+    if (c->restoring_save || sim->event_rt.initial_pass) return;
+    if (c->zone_index == 0) {
+        q2_coll_node cell_data;
+        s32 cell = q2_coll_find_node(&sim->coll_primary, client_reactor_top, -1, true);
+        u8 area = cell >= 0 && q2_collision_get_node(&sim->coll_primary, (u32)cell, &cell_data)
+                    ? (u8)cell_data.contents : 0;
+        bool advance = tick && sim->cur_dt > 0;
+        if (advance) {
+            if (!(s->flags & Q2_NATIVE_REACTOR_ACTIVE)) {
+                if ((s->flags & pumps) == pumps && !(s->flags & Q2_NATIVE_REACTOR_DONE)) {
+                    s->flags |= Q2_NATIVE_REACTOR_ACTIVE;
+                    s->flags &= ~Q2_NATIVE_REACTOR_BEAM_OFF;
+                    s->reactor_start = (u32)sim->level_time;
+                    client_native_popup(c, "Unit3Curr5", "Unit3Miss2", 50);
+                }
+            } else {
+                s->reactor_alarm += sim->cur_dt;
+                if (s->reactor_alarm > 300) {
+                    s->reactor_alarm -= 300;
+                    client_play_sound_at(c, "amb_klax2n", client_reactor_center);
+                }
+            }
+        }
+        if (!(s->flags & Q2_NATIVE_REACTOR_BEAM_OFF))
+            client_reactor_core(c, cell, area, advance);
+        if (advance && (s->flags & (Q2_NATIVE_REACTOR_ACTIVE | Q2_NATIVE_REACTOR_DONE)) ==
+                                       Q2_NATIVE_REACTOR_ACTIVE)
+            client_reactor_collapse(c, cell, area);
+    } else if (c->zone_index == 4) {
+        /* +0x1584: each bank is dark for its first 47 ticks; the 209-tick
+         * active windows alternate over the 512-tick cycle. */
+        u32 phase = (u32)sim->level_time & 511u;
+        bool gap = (phase & 255u) < 47;
+        q2_event_rt_disable_named(&sim->event_rt, "Laser1", gap || phase >= 256);
+        q2_event_rt_disable_named(&sim->event_rt, "Laser2", gap || phase < 256);
+    }
+}
+
+static void client_native_light(client *c, const s32 at[3], const u8 rgb[3],
+                                  s32 inner, s32 inner_span, s32 outer, s32 outer_span)
+{
+    /* Module lights use BIOS rand()/32768, style 1, size shift 3. */
+    inner += q2_rng_next(&c->sim[0].fx_rng) * inner_span / 32768;
+    outer += q2_rng_next(&c->sim[0].fx_rng) * outer_span / 32768;
+    if (c->lights_ready)
+        q2_light_add_dynamic(&c->light_world, at, rgb, inner, outer, 1, 3);
+}
+
+static void client_native_sweep_effects(client *c, const s32 from[3],
+                                         const s32 to[3], u8 area, u32 life, bool burst,
+                                         const s16 velocity[Q2_FX_GROUP_QUADS][3])
+{
+    static const u8 colour[3] = { 0x40, 0x20, 0xFF };
+    s32 at[3] = { to[0], to[1] - 50, to[2] };
+    if (burst && !c->no_lasers) {
+        /* Import +220 points at the first ramp, 0x8009BA60. Both sweeps
+         * share the fifteen velocities generated at module-frame entry.
+         * Their area is cached from an emitter, not resolved at the moving
+         * endpoint: LAB's endpoints are outside the PrimaryColl hull. */
+        const q2_fx_ramp *ramp = q2_fx_ramp_at(&c->fx_tables, 0);
+        q2_fx_group_spawn(&c->sim[0].fx, to, velocity, Q2_FX_GROUP_QUADS,
+                            ramp, ramp, life, 10000, area);
+    }
+    client_native_light(c, at, colour, 250, 100, 400, 200);
+    client_native_light(c, from, colour, 350, 200, 600, 200);
+}
+
+static s32 client_native_orb_shift(client *c)
+{
+    /* +0x978..+0xA30: integer reciprocal expressions used by retail. */
+    u32 clock = (u32)c->sim[0].level_time << 12;
+    u32 a = (u32)(((u64)clock * 0x6FCFF4A5u) >> 43) & 0x3FFCu;
+    u32 b = (u32)(((u64)clock * 0x1B4E81B5u) >> 37) & 0x3FFCu;
+    s32 bob = q2_sin12((s32)b / 4) * (q2_sin12((s32)a / 4) + 8192) / 409600 - 100;
+    s32 node = client_named_node(c, "Orb");
+    u32 i;
+    for (i = 0; i < c->rotators.count; i++)
+        if (node >= 0 && c->rotators.rotators[i].node == node)
+            c->rotators.rotators[i].offset[1] = (s16)bob;
+    return bob;
+}
+
+static void client_native_orb(client *c, bool tick)
+{
+    static const s32 origin[3] = { -1918, -10178, -23996 };
+    static const s32 top[3] = { -1918, -10519, -23996 };
+    static const s32 bottom[3] = { -1918, -9259, -23996 };
+    static const u8 colour[3] = {0, 0, 255};
+    q2_sim *sim = &c->sim[0];
+    q2_native_mission *s = &c->native_mission;
+    q2_scene_node scene;
+    s32 node = client_named_node(c, "Orb"), high[3], low[3], middle[3], bob, beam_cell;
+    u32 i, k;
+    if (c->restoring_save || sim->event_rt.initial_pass) return;
+    if (node >= 0 && q2_scene_get_node(&c->zone.scene, (u32)node, &scene) &&
+        ((scene.flags & 0x8000u) ||
+         (c->node_hidden && (u32)node < c->node_hidden_count && c->node_hidden[node]))) {
+        if (tick) {
+            q2_coll_node cell;
+            s32 ci = q2_coll_find_node(&sim->coll_primary, origin, -1, true);
+            if (ci >= 0 && q2_collision_get_node(&sim->coll_primary, (u32)ci, &cell)) {
+                q2_entity *e = q2_model_ent_spawn(&sim->entities, &c->model_bank,
+                    Q2_MODEL_ENT_EXPLOSION, origin, cell.contents, 4096, &sim->explosion_sounds);
+                if (!e) q2_model_ent_spawn(&sim->entities, &c->zone_bank,
+                    Q2_MODEL_ENT_EXPLOSION, origin, cell.contents, 4096, &sim->explosion_sounds);
+            }
+            s->flags |= Q2_NATIVE_ORB_DONE;
+            client_native_popup(c, "Unit2Curr9", "Unit2Miss2", 140);
+        }
+        return;
+    }
+    bob = client_native_orb_shift(c);
+    memcpy(high, origin, sizeof(high)); high[1] += bob;
+    memcpy(middle, high, sizeof(middle)); middle[1] += 281;
+    memcpy(low, high, sizeof(low)); low[1] += 562;
+    /* All seven calls use the zone-entry cell at the fixed origin, not
+     * whichever cell the bobbing endpoints happen to occupy this frame. */
+    beam_cell = q2_coll_find_node(&sim->coll_primary, origin, -1, true);
+    client_beam_in_cell(c, 3, high, top, beam_cell, tick, NULL);
+    client_beam_in_cell(c, 3, low, bottom, beam_cell, tick, NULL);
+    for (i = 0; i < 5; i++) {
+        if (tick) {
+            if (s->orb_arc[i].life <= 0) {
+                s32 angle;
+                s->orb_arc[i].life = (s16)(300 + q2_rng_next(&sim->fx_rng) * 1500 / 32768);
+                angle = q2_rng_next(&sim->fx_rng) & 4095;
+                s->orb_arc[i].to[0] = middle[0] + 2 * q2_sin12(angle);
+                s->orb_arc[i].to[2] = middle[2] + 2 * q2_cos12(angle);
+                s->orb_arc[i].to[1] = middle[1] + 3072 + (q2_rng_next(&sim->fx_rng) - 16384) / 8;
+                for (k = 0; k < 3; k++)
+                    s->orb_arc[i].velocity[k] = (s16)((q2_rng_next(&sim->fx_rng) - 16384) / (k == 1 ? 512 : 256));
+            }
+            for (k = 0; k < 3; k++) s->orb_arc[i].to[k] += s->orb_arc[i].velocity[k];
+            s->orb_arc[i].life = (s16)(s->orb_arc[i].life - sim->cur_dt);
+        }
+    }
+    /* +0xD0C submits all five AFTER updating every trajectory, including
+     * the frame its timer expires. Damage/pain RNG must not change a later
+     * arc's renewal draws. A fresh render-only load has no endpoints yet. */
+    for (i = 0; i < 5; i++)
+        if (tick || s->orb_arc[i].life || s->orb_arc[i].to[0] ||
+            s->orb_arc[i].to[1] || s->orb_arc[i].to[2])
+            client_beam_in_cell(c, 1, middle, s->orb_arc[i].to, beam_cell, tick, NULL);
+    client_native_light(c, middle, colour, 850, 200, 1100, 200);
+}
+
+/* EventDisabled (0x80027BF0) returns -1 when the name is absent. Its
+ * LevelBin callers test nonzero, so a missing name also counts as disabled. */
+static bool client_native_event_disabled(const client *c, const char *name)
+{
+    const q2_event_rt *rt = &c->sim[0].event_rt;
+    u32 i;
+    for (i = 0; i < rt->events.dir_count; i++) {
+        q2_event_dir_entry e;
+        if (q2_events_get_dir_entry(&rt->events, i, &e) && !strcmp(e.name, name))
+            return (q2_event_rt_flags(rt, e.offset) & Q2_EVREC_DISABLED) != 0;
+    }
+    return true;
+}
+
+/* BOSS1+0xD3C selects +0x1708 for ZONE0. These five kind-4 beams turn ON
+ * when their named records are disabled, and DoorBlown disables the bank.
+ * The module passes cell -1; 0x80044C44 resolves each origin before drawing.
+ * No sweep velocities, phases or projection callback run on this branch. */
+static void client_native_boss_entrance(client *c, bool tick)
+{
+    static const char *const names[5] = {"LaserNW", "LaserNE", "LaserSW", "LaserSE", "LaserMid"};
+    static const s32 from[5][3] = {
+        {650,-10848,1042}, {650,-10646,283}, {650,-10047,910},
+        {650,-9885,380}, {650,-10342,638}
+    };
+    static const s32 to[5][3] = {
+        {-3000,-10848,1042}, {-3000,-10646,283}, {-3000,-10047,910},
+        {-3000,-9885,380}, {-3000,-10342,638}
+    };
+    u32 i;
+    if (client_native_event_disabled(c, "DoorBlown")) return;
+    for (i = 0; i < Q2PSX_ARRAY_COUNT(names); i++)
+        if (client_native_event_disabled(c, names[i]))
+            client_native_beam(c, 4, from[i], to[i], tick, NULL);
+}
+
+/* SECURITY+0xE90: the zone-0 obstacle course. Its named LASERBEAM gates
+ * take effect on the next shared beam walk; the two moving kind-1 beams
+ * are submitted here. All phases come from the saved level/frame clocks. */
+static void client_native_security_lasers(client *c, bool tick)
+{
+    static const char *const groups[] = {"LaserBank", "LaserRing", "LaserGrid"};
+    static const u32 counts[] = {6,4,2};
+    static const s32 origins[4][3] = {
+        {79,-5921,-15040}, {79,-5921,-11840},
+        {-3920,-5921,-15040}, {-3920,-5921,-11840}
+    };
+    q2_sim *sim = &c->sim[0];
+    u32 now = (u32)sim->level_time, odd = sim->tick_count & 1u;
+    u32 phase = (now % 600u) / 30u, mask = 0, bit = 0, group, side, row;
+    s32 sweep = (s32)((now % 1800u) * 8000u / 1800u);
+    if (c->restoring_save || sim->event_rt.initial_pass) return;
+    if (phase & 1u) {
+        phase /= 2;
+        if (phase >= 6) phase = 10 - phase;
+        mask |= 1u << (phase + (odd ? 0 : 6));
+    }
+    mask |= 1u << ((now % 200u) / 50u + (odd ? 12 : 16));
+    mask |= 1u << ((now % 300u) / 150u + (odd ? 20 : 22));
+    for (group = 0; group < Q2PSX_ARRAY_COUNT(groups); group++)
+        for (side = 0; side < 2; side++) for (row = 0; row < counts[group]; row++, bit++) {
+            char name[13];
+            snprintf(name, sizeof(name), "%s %c%c", groups[group], side ? 'R' : 'L', (int)('A' + row));
+            q2_event_rt_disable_named(&sim->event_rt, name, (mask & (1u << bit)) == 0);
+        }
+    if (sweep > 4000) sweep = 8000 - sweep;
+    for (row = 0; row < 2; row++) {
+        s32 to[3] = {odd ? -5120 : 1276, -5921, row ? -11840 : -15040};
+        if (sweep < 800) to[1] = -5121 - sweep;
+        else to[2] = row ? -11040 - sweep : sweep - 15840;
+        client_native_beam(c, 1, origins[odd * 2 + row], to, tick, NULL);
+    }
+}
+
+/* BOSS1+0xB2C and LAB+0x988 poll EventDisabled (import+0xA4), then
+ * invoke the first matching actor's use callback once. The original marks
+ * the attempt done even when no actor/edict exists. */
+static void client_native_creature_use(client *c)
+{
+    const char *event, *model;
+    u32 bit, i, live = 0;
+    if (c->mp_enabled || !c->creatures_ready) return;
+    if (client_name_eq(c->map, "BOSS1")) {
+        event = "E_NearMakron"; model = "RiderStand";
+        bit = Q2_NATIVE_PROJECTION_USED;
+    } else if (client_name_eq(c->map, "LAB")) {
+        event = "E_GotHead"; model = "DeadComm";
+        bit = Q2_NATIVE_COMMANDER_USED;
+    } else return;
+    if (c->native_mission.flags & bit) return;
+    if (!client_native_event_disabled(c, event)) return;
+    c->native_mission.flags |= bit;
+    for (i = 0; i < c->creatures.set.count && live < 48; i++) {
+        q2_monster *m = &c->creatures.set.monsters[i];
+        const char *name;
+        if (!m->in_use) continue;
+        live++;
+        name = q2_creature_world_model_name(&c->creatures, m);
+        if (name && !strcmp(name, model)) {
+            if (m->use) m->use(m);
+            break;
+        }
+    }
+}
+
+/* SECURITY+0x590 and BOSS2+0xADC add to the player's physical impulse
+ * halfwords, not the camera kick. Signed division truncates toward zero;
+ * the additions wrap just like the native lhu/addu/sh sequence. */
+static void client_native_quake_pulses(client *c, s32 *phase, s32 horizontal_divisor)
+{
+    q2_sim *sim = &c->sim[0];
+    q2_player *p = &sim->player[0];
+    *phase += sim->cur_dt;
+    while (*phase > 0) {
+        s32 origin[3] = { p->pos[0], q2_sim_origin_y(p->pos[1]), p->pos[2] };
+        s32 strength;
+        int k;
+        for (k = 0; k < 3; k++)
+            p->impulse[k] = (s16)(p->impulse[k] +
+                (q2_rng_next(&sim->fx_rng) - 16384) / (k == 1 ? 16 : horizontal_divisor));
+        p->impulse_armed = true;
+        p->ent2_flags |= 0x4000;
+        strength = (q2_rng_next(&sim->fx_rng) & 4095) + 1024;
+        client_shock(c, Q2_SHOCK_ALL_PLAYERS, Q2_SHOCK_EXPLOSION, strength, NULL, 2048, 4096);
+        if (q2_rng_next(&sim->fx_rng) < 8192)
+            client_play_sound_at(c, "wep_grenlx1a", origin);
+        *phase -= 30;
+    }
+}
+
+static void client_native_quakes(client *c)
+{
+    q2_native_mission *s = &c->native_mission;
+    q2_sim *sim = &c->sim[0];
+    if (c->restoring_save || sim->event_rt.initial_pass || sim->player_count < 1) return;
+    if (client_name_eq(c->map, "SECURITY")) {
+        /* +0x2654 is set with the four wall timers, cleared by wall 4.
+         * Quakes precede that countdown and continue outside zone 1. */
+        if (s->security_wall[3] > 0)
+            client_native_quake_pulses(c, &s->security_quake_phase, 6);
+    } else if (client_name_eq(c->map, "BOSS2")) {
+        if (s->boss2_quake_time != Q2_NATIVE_QUAKE_INACTIVE)
+            s->boss2_quake_time += sim->cur_dt;
+        if (s->boss2_quake_time > 300) {
+            client_native_quake_pulses(c, &s->boss2_quake_phase, 12);
+            if (s->boss2_quake_time > 3000) s->boss2_quake_time = -3000;
+        }
+    }
+}
+
+static void client_native_mission_frame(client *c, bool tick)
+{
+    q2_native_mission *s = &c->native_mission;
+    s32 dt = tick ? c->sim[0].cur_dt : 0;
+    u32 i;
+    s16 velocity[Q2_FX_GROUP_QUADS][3];
+    if (c->mp_enabled) return;
+    if (tick && (client_name_eq(c->map, "SECURITY") || client_name_eq(c->map, "BOSS2")))
+        client_native_lifts_capture(c); /* +0x1E08 / +0xAB4: callback entry */
+    if (client_name_eq(c->map, "BOSS1") && c->zone_index == 0) {
+        client_native_boss_entrance(c, tick);
+        if (tick) client_native_lifts_capture(c);
+        return;
+    }
+    if (tick) {
+        client_native_quakes(c);
+        client_native_population_frame(c);
+    }
+    if (client_name_eq(c->map, "POWER1")) client_native_power1(c, tick);
+    if (client_name_eq(c->map, "POWER2")) client_native_power2(c, tick);
+    if (client_name_eq(c->map, "SECURITY") && c->zone_index == 0)
+        client_native_security_lasers(c, tick);
+    if (client_name_eq(c->map, "LAB") || client_name_eq(c->map, "BOSS1"))
+        for (i = 0; i < Q2_FX_GROUP_QUADS; i++) {
+            velocity[i][0] = (s16)((q2_rng_next(&c->sim[0].fx_rng) - 16384) >> 8);
+            velocity[i][2] = (s16)((q2_rng_next(&c->sim[0].fx_rng) - 16384) >> 8);
+            velocity[i][1] = (s16)(-q2_rng_next(&c->sim[0].fx_rng) >> 13);
+        }
+    if (client_name_eq(c->map, "LAB")) {
+        static const s32 from[2][3] = {{-1521,-1665,4062}, {2382,-1670,5041}};
+        static const s32 target[2][3] = {{-1511,-619,3441}, {1765,-639,5022}};
+        for (i = 0; i < 2; i++) if (s->lab_phase[i] > 0) {
+            q2_coll_node source;
+            s32 cell, to[3], phase = s->lab_phase[i] - 2 * dt;
+            bool hit;
+            /* +0xC6C/+0xF98 retain the signed final decrement, down to -59. */
+            s->lab_phase[i] = phase;
+            memcpy(to, target[i], sizeof(to));
+            to[i ? 2 : 0] += q2_sin12(phase) * 400 / 4096;
+            to[i ? 0 : 2] += q2_sin12(phase * 8) * 100 / 4096;
+            cell = client_native_beam(c, 1, from[i], to, tick, &hit);
+            if (cell >= 0 && q2_collision_get_node(&c->sim[0].coll_primary, (u32)cell, &source))
+                client_native_sweep_effects(c, from[i], to, source.contents, 10, tick && !hit, velocity);
+        }
+        if (tick) {
+            client_native_creature_use(c); /* +0x129C, after both sweeps */
+            client_native_lifts_capture(c);
+        }
+    } else if (client_name_eq(c->map, "BOSS1")) {
+        static const s32 from[2][3] = {{16107,-19700,3520}, {16107,-19700,-2239}};
+        static const s32 to[2][3] = {{20600,-16477,2239}, {20600,-16477,-961}};
+        static const s32 sweep[2][3] = {{16323,-17156,-961}, {16323,-17156,2246}};
+        static const s32 target[2][3] = {{16328,-16000,-803}, {16328,-16000,2076}};
+        static const u8 colour[3] = {0x40,0x20,0xFF};
+        q2_coll_node spark_cell;
+        s32 cell = q2_coll_find_node(&c->sim[0].coll_primary, sweep[1], -1, true);
+        /* +0x8C8 caches the second emitter's area in +0x1E5C; BOTH spark
+         * calls (+0x10A4/+0x1500) read that same halfword. */
+        u8 spark_area = cell >= 0 && q2_collision_get_node(&c->sim[0].coll_primary, (u32)cell, &spark_cell)
+                            ? spark_cell.contents : 255;
+        for (i = 0; i < 2; i++) if (!(s->flags & (i ? Q2_NATIVE_LASER1_OFF : Q2_NATIVE_LASER0_OFF))) {
+            s32 end[3];
+            if (client_native_beam(c, 3, from[i], to[i], tick, NULL) >= 0)
+                client_native_light(c, to[i], colour, 150, 400, 800, 400);
+            if (q2_coll_find_node(&c->sim[0].coll_primary, sweep[i], -1, true) < 0) continue;
+            s->boss_phase[i] = (s->boss_phase[i] + (i ? 12 : 15) * dt) & 4095;
+            memcpy(end, target[i], sizeof(end));
+            end[0] += q2_sin12(s->boss_phase[i]) * 250 / 4096;
+            end[2] += q2_cos12(s->boss_phase[i]) * 250 / 4096;
+            client_native_beam(c, 1, sweep[i], end, tick, NULL);
+            client_native_sweep_effects(c, sweep[i], end, spark_area, 5, tick, velocity);
+        }
+        if (tick) {
+            client_native_creature_use(c); /* +0x16C8, before the lift recorder */
+            client_native_lifts_capture(c);
+        }
+    } else if (client_name_eq(c->map, "SECURITY") && c->zone_index == 2) {
+        if ((s->flags & (Q2_NATIVE_ORB_ACTIVE | Q2_NATIVE_ORB_DONE)) == Q2_NATIVE_ORB_ACTIVE)
+            client_native_orb(c, tick);
+        client_native_security_lift(c, tick);
+    }
+}
+
+static void client_level_effects_frame(client *c, bool tick)
+{
+    q2_teleport_frame tp;
+    u32 k;
+    /* QuakeLoop 0x80038FA4..0x80038FD4: teleport columns, laser walls,
+     * static lasers, then import +100's mission callback. Teleports consume
+     * 45 random values even without pads. A callback's shutdown affects the
+     * next frame's shared beam walk, not one that has already happened. */
+    c->teleport_drawn = q2_teleports_draw(&c->teleports, &c->sim[0].triggers,
+        &c->sim[0].fx, &c->sim[0].fx_rng, c->sim[0].level_time, &tp);
+    if (c->lights_ready)
+        for (k = 0; k < tp.light_count; k++)
+            if (q2_light_add_dynamic(&c->light_world, tp.light[k].pos,
+                    tp.light[k].rgb, tp.light[k].inner, tp.light[k].outer,
+                    Q2_FX_TELEPORT_LIGHT_STYLE, Q2_FX_TELEPORT_LIGHT_SIZE))
+                c->teleport_lights++;
+    client_laserwalls_frame(c, tick);
+    client_laserbeams_frame(c, tick);
+    client_native_mission_frame(c, tick);
+    /* Drain hazard sounds before the next simulation tick clears them. The
+     * light world was reset before this stage, so these lights also survive. */
+    client_entity_events(c);
 }
 
 static void client_event_call(void *user, const q2_event_item *item,
@@ -5797,15 +7274,7 @@ static void client_event_call(void *user, const q2_event_item *item,
         if (q2_uf_decode_call(&call, &c->sim[0].userfuncs, item) == Q2_OK &&
             call.prim == Q2_UF_CREBATCH &&
             q2_uf_operand_name(&call, 0, group) && group[0]) {
-            u32 woke = c->creatures_ready
-                     ? q2_creature_world_summon(&c->creatures, group) : 0;
-            u32 placed = q2_sim_activate_item_group(&c->sim[0], group);
-
-            if (woke)
-                c->script_summoned += woke;
-            if (woke || placed)
-                Q2_INFO("CREBATCH '%s' woke %u, placed %u",
-                        group, woke, placed);
+            client_activate_batch(c, group);
         }
     }
 
@@ -5879,9 +7348,8 @@ static void client_event_call(void *user, const q2_event_item *item,
      * 165 of 363 uses resolve disc-wide — so a key with no text is silence and
      * not a warning.
      *
-     * SIMPLESOUND carries an ABSOLUTE world position and a bank name. The
-     * position is not used: this port's mixer has no positional path, so the
-     * sound plays flat. That is a stated shortfall rather than a silent one.
+     * SIMPLESOUND carries an absolute world position and a bank name; both
+     * are passed to the positional mixer below.
      */
     {
         q2_uf_call call;
@@ -5928,10 +7396,9 @@ static void client_event_call(void *user, const q2_event_item *item,
      * and the map's own, recovered from its LevelBin (levelbin.h) — and 20 of
      * the disc's 20 keys resolve in one or the other.
      *
-     * Most handlers are still MIPS in the module and are named/countable rather
-     * than executable here. BASE0's DOCRATES is reconstructed below: it is the
-     * crate conveyor, not a generic train, and its four runtime-object writes
-     * now have an exact native counterpart in mover.c.
+     * Native switch/clock handlers run through client_native_mission_call;
+     * their frame consumers live beside it. The population/key callbacks and
+     * BASE0's crate conveyor keep their existing subsystem hooks below.
      */
     {
         q2_uf_call call;
@@ -5945,6 +7412,64 @@ static void client_event_call(void *user, const q2_event_item *item,
 
             c->misevents++;
             snprintf(c->misevent_last, sizeof(c->misevent_last), "%s", key);
+            client_native_mission_call(c, key, item);
+
+            /* BASE3 +0x8A0 writes 1 to mission+24. Its zone-1 callback
+             * chooses Zone1a instead of Zone1 when that word is set. Keep
+             * the executed item in the persistent event shadow, including
+             * when its author supplied no one-shot latch. The next load can
+             * resolve the population before constructing entities. */
+            if (!strcmp(key, "DoneDish") &&
+                (client_name_eq(c->map, "BASE3") ||
+                 client_name_eq(c->map, "MAGDEMO")) &&
+                c->sim[0].event_rt.object_flags &&
+                item->offset < c->sim[0].event_rt.item_flags_size)
+                c->sim[0].event_rt.object_flags[item->offset] = 1;
+
+            /* JAIL3 +0xC34: BothKeys updates the help text and the disabled
+             * bit of PyramidOpen through import +160 (0x80027B04). The
+             * argument at +0xF30 is keys == 0, not keys != 0x60: the named
+             * script supplies the remaining individual key checks. */
+            if (client_name_eq(c->map, "JAIL3") && !strcmp(key, "BothKeys")) {
+                q2_event_rt *rt = &c->sim[0].event_rt;
+                u32 flags = rt->initial_pass && (c->carry_player || c->restoring_save)
+                              ? c->carry_inv.flags : c->sim[0].combat.inv.flags;
+                u32 keys = flags & (Q2_KEY_PYRAMID_RED | Q2_KEY_PYRAMID_PURPLE);
+                bool seen = rt->object_flags && item->offset < rt->item_flags_size &&
+                            rt->object_flags[item->offset];
+                const char *orders = keys == Q2_KEY_PYRAMID_PURPLE ? "Unit2Curr6"
+                                   : keys == (Q2_KEY_PYRAMID_RED | Q2_KEY_PYRAMID_PURPLE)
+                                       ? "Unit2CurrA" : "Unit2Curr3";
+                q2_event_rt_disable_named(rt, "PyramidOpen", keys == 0);
+                if (!rt->initial_pass) {
+                    if (!keys)
+                        client_centre_line(c, "You need both Pyramid Keys");
+                    if (keys || !seen) {
+                        q2_briefing_popup_set(&c->popup, orders,
+                            c->leveltext_ready ? q2_leveltext_find(&c->leveltext, orders) : NULL,
+                            "Unit2Miss1",
+                            c->leveltext_ready ? q2_leveltext_find(&c->leveltext, "Unit2Miss1") : NULL);
+                        q2_briefing_popup_raise(&c->popup, 100, Q2_BRIEFING_SECONDS,
+                                                c->sim[0].level_time, c->sim[0].cur_dt);
+                        c->popup_raises++;
+                    }
+                }
+                if (rt->object_flags && item->offset < rt->item_flags_size)
+                    rt->object_flags[item->offset] = 1;
+            }
+
+            if (c->sim[0].glint.scripted && !strcmp(key, "Destroy Grav")) {
+                /* +0x12B0 writes mission+24 before HelpComputer. */
+                c->sim[0].glint.shutting_down = true;
+                q2_briefing_popup_set(&c->popup, "Unit4Curr8",
+                    c->leveltext_ready ? q2_leveltext_find(&c->leveltext, "Unit4Curr8") : NULL,
+                    "Unit4Miss2",
+                    c->leveltext_ready ? q2_leveltext_find(&c->leveltext, "Unit4Miss2") : NULL);
+                q2_briefing_popup_raise(&c->popup, 150, Q2_BRIEFING_SECONDS,
+                                        c->sim[0].level_time, c->sim[0].cur_dt);
+                c->popup_raises++;
+                client_play_sound(c, "msc_comp_up");
+            }
 
             if (exe) {
                 c->misevent_exe++;
@@ -6005,16 +7530,19 @@ static void client_event_call(void *user, const q2_event_item *item,
                  * `FoundASecret` key does not resolve gets neither. Only the
                  * counter is past the join, which is why it stays outside.
                  *
-                 * POSITION. 0x80028FA0 passes `s2 + 84`, the handler entity's
-                 * feet. The port's on_call hook carries no entity, so the
-                 * player's feet are used — not the eye, which sits 576 above
-                 * them. Both are within a body's width of the volume that
-                 * fired, so the pan and attenuation come out the same.
+                 * POSITION. 0x80028FA0 passes `s2 + 84`, the entity that
+                 * entered the volume, and SoundAtLocation_Vol copies its
+                 * +0x54..+0x5C (0x80072AAC..0x80072AD4). For the player that
+                 * is the ORIGIN, 286 above the feet — QuakeCamera builds the
+                 * view from the same +0x58 (0x80038630). The port's on_call
+                 * hook carries no entity, so the player's origin is formed
+                 * here; the feet used to stand in for it, 286 too low.
                  *
-                 * INHERITED DEVIATION: the dedup above is the port's, not the
-                 * console's. Re-entering a secret volume chimes again on the
-                 * disc; here it will stay silent, for the same reason the
-                 * counter stays put.
+                 * The dedup above is the port's, but it changes nothing the
+                 * shipped maps can reach: all 33 volume-fired INSECRETs sit in
+                 * one-shot records (flags 0x48 or 0x50) that the latch at
+                 * 0x800279A8 disables after their first call and nothing
+                 * re-enables, and BASE0's crate record 0x1FC fires once.
                  *
                  * COUNTED ON BANK PRESENCE, not on a voice starting, because
                  * client_play_sound_at returns false whenever `c->audio` is
@@ -6024,15 +7552,19 @@ static void client_event_call(void *user, const q2_event_item *item,
                  */
                 if (c->secret_message[0]) {
                     q2_vag vag;
+                    const s32 *feet = c->sim[0].player[0].pos;
+                    s32 at[3];
 
                     /* 0x80028F90 is `jal 0x80043570` with the same player-0
                      * context PSXSTRING passes: the centre line, not the ring. */
                     client_centre_line(c, c->secret_message);
 
+                    at[0] = feet[0];
+                    at[1] = q2_sim_origin_y(feet[1]);
+                    at[2] = feet[2];
                     if (client_find_sound(c, Q2_SECRET_SOUND, &vag))
                         c->secret_sounds++;
-                    client_play_sound_at(c, Q2_SECRET_SOUND,
-                                         c->sim[0].player[0].pos);
+                    client_play_sound_at(c, Q2_SECRET_SOUND, at);
                 }
 
                 Q2_INFO("secret found: %u of %u — \"%s\" (%u chimed)",
@@ -6234,13 +7766,211 @@ static void client_event_call(void *user, const q2_event_item *item,
 
 
 /* ------------------------------------------------------------------------- */
+/* BASE3's zone-1 callback (+0x194, also shipped in MAGDEMO) selects one of
+ * two populations. A static scan only sees the last arm, Zone1. Resolve the
+ * DoneDish state from the restored event shadow before spawning either kind
+ * of entity. The event replay later reconstructs the same latch. */
+static bool client_saved_group_at(const client *c, u32 index, const char *name)
+{
+    const q2_save *s = c->restoring_save;
+    q2_population pop;
+    q2_pop_group g;
+    return s && s->item_state_present && s->item_group_order_count > index &&
+        s->item_group_order &&
+        q2_population_parse(&pop, &c->common) == Q2_OK &&
+        s->item_population_group_count == pop.group_count &&
+        q2_pop_get_group(&pop, s->item_group_order[index], &g) &&
+        !strcmp(g.name, name);
+}
+
+static const char *client_dish_batch(const client *c, int zone)
+{
+    const q2_sim *sim = &c->sim[0];
+    const q2_event_rt *rt = &sim->event_rt;
+    q2_event_record rec;
+
+    if (c->mp_enabled || zone != 1 ||
+        (!client_name_eq(c->map, "BASE3") &&
+         !client_name_eq(c->map, "MAGDEMO")))
+        return NULL;
+
+    /* A save made after DoneDish but before leaving zone 1 still owns the
+     * original population. Restore its recorded startup choice, then apply
+     * the saved live/dead states; only the next zone load selects anew. */
+    if (c->restoring_save) {
+        if (client_saved_group_at(c, 0, "Zone1a"))
+            return "Zone1a";
+        return "Zone1";
+    }
+
+    if (!sim->events_ready || !sim->userfuncs_ready ||
+        !q2_events_first_record(&sim->events, &rec))
+        return "Zone1";
+    do {
+        u32 i;
+        bool spent_record =
+            (q2_event_rt_flags(rt, rec.offset) &
+             (Q2_EVREC_DISABLED | Q2_EVREC_HASRUN)) ==
+                (Q2_EVREC_DISABLED | Q2_EVREC_HASRUN);
+        for (i = 0; i < rec.n_items; i++) {
+            q2_event_item item;
+            q2_uf_call call;
+            char name[13];
+            if (!q2_events_get_item(&sim->events, &rec, i, &item) ||
+                q2_uf_decode_call(&call, &sim->userfuncs, &item) != Q2_OK ||
+                call.prim != Q2_UF_MISEVENT ||
+                !q2_uf_operand_name(&call, 0, name) || strcmp(name, "DoneDish"))
+                continue;
+            if (spent_record ||
+                ((item.op & Q2_EVOP_ONESHOT) &&
+                 (q2_event_rt_item_flags(rt, item.offset) & Q2_EVOP_DISABLED)) ||
+                (rt->object_flags && item.offset < rt->item_flags_size &&
+                 rt->object_flags[item.offset]))
+                return "Zone1a";
+        }
+    } while (q2_events_next_record(&sim->events, &rec, &rec));
+    return "Zone1";
+}
+
+static bool client_mission_batches(const client *c, int zone,
+                                     const char **batch, u32 *count)
+{
+    const char *dish = client_dish_batch(c, zone);
+    if (dish) {
+        batch[0] = dish;
+        *count = 1;
+        return true;
+    }
+    if (!c->mp_enabled && client_name_eq(c->map, "COMMAND") && zone == 4) {
+        const u32 keys = c->carry_player ? c->carry_inv.flags
+                                        : c->sim[0].combat.inv.flags;
+        /* Zone callback +0x694 skips Zone4 when the white key is held.
+         * A resident save must retain its original population prefix even
+         * when that key was acquired after entering the zone. */
+        bool selected = c->restoring_save && c->restoring_save->item_state_present
+                      ? client_saved_group_at(c, 0, "Zone4")
+                      : !(keys & Q2_KEY_WHITE);
+        *count = selected ? 1 : 0;
+        if (selected) batch[0] = "Zone4";
+        return true;
+    }
+    if (!c->mp_enabled && client_name_eq(c->map, "JAIL3") &&
+        zone >= 0 && zone < 6) {
+        static const char *const zones[] = {
+            "Zone0", "Zone1", "Zone2", "Zone3", "Zone4", "Zone5"
+        };
+        const u32 keys = c->carry_player ? c->carry_inv.flags
+                                        : c->sim[0].combat.inv.flags;
+        q2_population pop;
+        u32 i;
+        *count = 0;
+        if (q2_population_parse(&pop, &c->common) != Q2_OK)
+            return false;
+        for (i = 0; i < pop.group_count; i++) {
+            q2_pop_group g;
+            if (q2_pop_get_group(&pop, i, &g) && !strcmp(g.name, zones[zone])) {
+                batch[(*count)++] = zones[zone];
+                break;
+            }
+        }
+        if (c->restoring_save) {
+            /* Preserve the saved roster even if keys were acquired since its
+             * startup, or an older port selected both return groups early. */
+            for (i = 0; i < 2; i++) {
+                if (client_saved_group_at(c, *count, "Jail4Return"))
+                    batch[(*count)++] = "Jail4Return";
+                else if (client_saved_group_at(c, *count, "Jail5Return"))
+                    batch[(*count)++] = "Jail5Return";
+                else break;
+            }
+        } else {
+            /* Zone callback table +0x1200: entry 4 (+0x290) tests keys bit
+             * 0x20, entry 5 (+0x614) tests 0x40. The import at +252 points
+             * at 0x800B29D0, the player's key flags. */
+            if (zone == 4 && (keys & Q2_KEY_PYRAMID_RED))
+                batch[(*count)++] = "Jail5Return";
+            if (zone == 5 && (keys & Q2_KEY_PYRAMID_PURPLE))
+                batch[(*count)++] = "Jail4Return";
+        }
+        return true; /* An empty selection is meaningful in zones 3 and 5. */
+    }
+    return false;
+}
+
+static void client_world_resources(client *c, bool stream)
+{
+    q2_level_memory_files files;
+    q2_zone_resources resources;
+    const q2_level_entry *entry;
+    unsigned unit=0, views=c->mp_enabled ? (unsigned)c->mp.player_count : 1;
+    bool game_level;
+    if (!c->level_memory_checked) {
+        q2_exe exe;
+        c->level_memory_checked=true;
+        if (q2_exe_load(&exe,c->disc,c->build.exe_name)==Q2_OK) {
+            c->level_memory_ready=q2_level_memory_init(&c->level_memory,&exe);
+            q2_exe_free(&exe);
+        }
+        if (!c->level_table_ready)
+            c->level_table_ready=q2_level_table_load(&c->level_table,c->disc,&c->build)==Q2_OK;
+    }
+    if (!c->level_memory_ready) {
+        q2_world_subdiv_resources(&c->render,&c->common,c->zone.name);
+        return;
+    }
+    entry=c->level_table_ready ? q2_level_find(&c->level_table,c->map) : NULL;
+    game_level=entry ? entry->game_kind!=0 : !c->in_front_end;
+    /* Direct-level selection reads the signed id at level-table +0x16.
+     * Multiplayer uses InitMissionNull; id 6 is the unshipped Tribute unit. */
+    if (!c->mp_enabled && entry) {
+        if (entry->mission_unit>=1 && entry->mission_unit<=6)
+            unit=(unsigned)entry->mission_unit;
+    } else if (!c->mp_enabled && c->leveltext_ready) {
+        unsigned candidate;
+        for (candidate=1;candidate<=5;++candidate) {
+            char key[Q2_LEVELTEXT_NAME_LEN+1];
+            q2_leveltext_key_objective(key,(int)candidate);
+            if (q2_leveltext_find(&c->leveltext,key)) { unit=candidate; break; }
+        }
+    }
+    /* Screens without Strings can retain the departing campaign allocation.
+     * Use the actual loaded session: mission.unit defaults to 1 even for a
+     * fresh movie launch or a boot sequence that has never entered a game. */
+    if (!c->mp_enabled && !unit && (client_name_eq(c->map,"QFMV") ||
+                  !strncmp(c->map,"QENDMIS",7)) &&
+        c->level_memory_current && c->level_memory.mission_unit>=1 &&
+        c->level_memory.mission_unit<=5) unit=c->level_memory.mission_unit;
+    if (q2_common_resources(&c->common,c->zone.name,&resources) &&
+        q2_level_memory_files_read(&files,&c->common,&c->zone.zone,&c->sfx.buf) &&
+        q2_level_memory_load(&c->level_memory,&files,&resources,unit,views,
+            c->mp_enabled,game_level,stream && c->level_memory_current) &&
+        q2_world_subdiv_resources_heap(&c->render,&c->common,c->zone.name,
+                                       c->level_memory.largest_payload)) {
+        c->level_memory_current=true;
+        return;
+    }
+    c->level_memory_current=false;
+    ++c->level_memory_failures;
+    Q2_WARN("%s: native heap accounting failed; using resource fallback",c->zone.name);
+    q2_world_subdiv_resources(&c->render,&c->common,c->zone.name);
+}
+
 static bool client_load_zone(client *c, const char *map, int index)
 {
-    q2_world_zone loaded;
+    /* Most callers pass c->map itself. Keep the requested name independent of
+     * the destination buffer before publishing the new map below. */
+    char requested_map[sizeof(c->map)];
+    q2_world_zone loaded = {0};
+    q2_common_file prepared_common = {0};
     s32 wmin[3], wmax[3];
     bool placed = false;
     bool same_map_transition = c->carry_player && c->carry_same_map &&
                                c->map[0] && client_name_eq(c->map, map);
+    q2_fx_glint carry_glint = c->sim[0].glint;
+    u32 carry_ticks = c->sim[0].tick_count;
+    u32 carry_lava_burn_calls = c->sim[0].lava_burn_calls;
+    s32 carry_accum = c->sim[0].dt_accum;
+    double carry_fraction = c->sim[0].dt_frac;
     /*
      * IS THE DIRECTORY ABOUT TO BE READ A DIFFERENT ONE?
      *
@@ -6254,11 +7984,64 @@ static bool client_load_zone(client *c, const char *map, int index)
      */
     bool map_change  = !(c->map[0] && client_name_eq(c->map, map));
 
+    snprintf(requested_map, sizeof(requested_map), "%s", map);
+    map = requested_map;
+
+    /* Resolve both archives before changing any live state. A refused load
+     * must leave the current world, mission row, loading screen and shocks
+     * intact. The target may be a missing zone or a damaged COMMON archive. */
+    {
+        char path[256];
+        q2_buf buf;
+        q2_result result = q2_world_load_zone(&loaded, c->disc, map, index);
+        if (result == Q2_OK) {
+            snprintf(path, sizeof(path), "Q2DATA/LEVELS/%s/COMMON.DAT", map);
+            result = disc_read_file(c->disc, path, &buf);
+            if (result == Q2_OK) {
+                result = q2_common_open(&prepared_common, &buf);
+                if (result != Q2_OK) q2_buf_free(&buf);
+            }
+        }
+        if (result != Q2_OK) {
+            q2_world_free_zone(&loaded);
+            c->carry_player = c->carry_same_map = false;
+            c->carry_pos_valid = false;
+            c->gate_name[0] = '\0';
+            c->loads_failed++;
+            Q2_WARN("cannot load %s zone %d: %s", map, index, q2_result_str(result));
+            return false;
+        }
+    }
+
+    if (!c->restoring_save && !c->new_game_loading && !c->mp_enabled && c->map[0] &&
+        q2_zone_history_capture(&c->zone_history, c->map, c->zone_index,
+                                  &c->sim[0], c->creatures_ready ? &c->creatures : NULL,
+                                  c->cre_actor, c->cre_anim, (u32)(c->ai_accum * 1000000.0 + 0.5)) != Q2_OK) {
+        q2_world_free_zone(&loaded);
+        q2_common_close(&prepared_common);
+        c->carry_player = c->carry_same_map = false;
+        c->carry_pos_valid = false;
+        c->gate_name[0] = '\0';
+        c->loads_failed++;
+        Q2_ERROR("cannot retain the outgoing zone's population");
+        return false;
+    }
+
     /*
      * The outgoing zone's kill tally, before anything below frees the set that
-     * holds it. First statement of the load for that reason.
+     * holds it, after the incoming archives have passed preflight.
      */
     client_zone_stash(c);
+    if (!c->new_game_loading) client_native_lifts_capture(c);
+
+    /* ReloadLevelData also calls killallsounds (0x800793D8), even when the
+     * same map's bank stays resident. Otherwise a freed rotator loses the
+     * only handle capable of stopping its motor. Do this after preflight. */
+    client_voices_stop(c);
+    c->bed_frames = c->bed_pos = 0;
+    q2_xa_resampler_reset(&c->bed_resampler);
+    if (c->audio)
+        SDL_ClearAudioStream(c->audio);
 
     /* KillDualShocks (0x800411F0), which OnLeavingZone calls at 0x80078D24:
      * every pattern slot freed, the little motor's accumulator left. */
@@ -6379,50 +8162,6 @@ static bool client_load_zone(client *c, const char *map, int index)
     if (!same_map_transition)
         c->mission_row = -1;
 
-    if (q2_world_load_zone(&loaded, c->disc, map, index) != Q2_OK) {
-        /* The client counts a map's zones by probing until one is absent, so
-         * "no zone N" is how the count ENDS, not a fault. It is a warning only
-         * when the caller asked for a specific zone. */
-        if (index == 0)
-            Q2_WARN("no zone 0 in %s", map);
-        else
-            Q2_INFO("%s has %d zone%s", map, index, index == 1 ? "" : "s");
-
-        /*
-         * A load that never touched the sim must not leave a transition
-         * ARMED. `carry_player` is only cleared by the successful restore, so
-         * a failed zone gate left it up and the next load — a restart, a new
-         * game — took the carry path and imported whatever the sim happened to
-         * hold. client_change_map already does this on its own failure.
-         */
-        c->carry_player   = false;
-        c->carry_same_map = false;
-        c->gate_name[0]   = '\0';
-
-        /*
-         * AND THE SCREEN COMES BACK DOWN, because nothing loaded.
-         *
-         * The raise above is unconditional and happens before the read, which
-         * is right — it is the console's order. What was missing is the other
-         * half: `0x80079178` only reaches `0x80079364`, the `jal 0x8001A384`
-         * that enters page 46, AFTER its two refusals, so a transition the
-         * console declines never puts a screen up at all. Here the decline is
-         * later — it is the read failing rather than a name compare — so the
-         * screen is already up and has to be taken down again.
-         *
-         * Without this, a request for a zone the map does not have is half a
-         * second of LOADING over a level that never went anywhere, which is
-         * indistinguishable, from the player's chair, from the game hanging.
-         */
-        if (c->running) {
-            q2_loading_hide(&c->loading);
-            if (c->loading_raises)
-                c->loading_raises--;
-        }
-        c->loads_failed++;
-        return false;
-    }
-
     /*
      * Take the player's own state off the sim FIRST, while the outgoing zone's
      * sim is still standing. Before the placement block, not after it: the
@@ -6489,7 +8228,7 @@ static bool client_load_zone(client *c, const char *map, int index)
      * OnLeavingZone runs only on a real level (+0x20 of the level record,
      * 0x80078D44) — so an arena neither writes nor reads one.
      */
-    if (!c->restoring_save && !c->mp_enabled && c->map[0] &&
+    if (!c->restoring_save && !c->new_game_loading && !c->mp_enabled && c->map[0] &&
         c->sim[0].events_ready) {
         q2_event_carry *slot = q2_event_store_open(&c->event_store, c->map);
 
@@ -6553,6 +8292,7 @@ static bool client_load_zone(client *c, const char *map, int index)
      * --zone-probe) intermittent use-after-return accesses. */
     if (q2_world_move_zone(&c->zone, &loaded) != Q2_OK) {
         Q2_ERROR("cannot take ownership of %s zone %d", map, index);
+        q2_common_close(&prepared_common);
         c->carry_player   = false;
         c->carry_same_map = false;
         c->gate_name[0]   = '\0';
@@ -6572,6 +8312,30 @@ static bool client_load_zone(client *c, const char *map, int index)
         Q2_INFO("sort order: %u bytes, %u streams",
                 c->sortdata.size, q2_sortdata_enumerate(&c->sortdata, NULL, 0));
     c->zone_index = index;
+    memset(&c->lasers, 0, sizeof(c->lasers));
+    memset(&c->laserwalls, 0, sizeof(c->laserwalls));
+    /* Full loads re-read COMMON and call LevelBin export 0 (0x80070F64),
+     * even when Restart/Resupply keeps the same directory. Ordinary zone
+     * gates (0x8007901C) retain the module and run only the zone callback.
+     * Card loads restore the recorded module state instead. */
+    if (!same_map_transition && !c->restoring_save) {
+        c->native_mission.flags &= ~(Q2_NATIVE_PROJECTION_USED | Q2_NATIVE_COMMANDER_USED);
+        memset(c->native_mission.lab_phase, 0, sizeof(c->native_mission.lab_phase));
+        c->native_mission.boss_phase[0] = 1000;
+        c->native_mission.boss_phase[1] = 0;
+        memset(c->native_mission.orb_arc, 0, sizeof(c->native_mission.orb_arc));
+        memset(c->native_mission.security_wall, 0, sizeof(c->native_mission.security_wall));
+        c->native_mission.security_quake_phase = 0;
+        c->native_mission.boss2_quake_time = Q2_NATIVE_QUAKE_INACTIVE;
+        c->native_mission.boss2_quake_phase = 0;
+        c->native_mission.flags &= ~(Q2_NATIVE_REACTOR_ACTIVE | Q2_NATIVE_REACTOR_DRAINED |
+                                     Q2_NATIVE_REACTOR_BEAM_OFF);
+        c->native_mission.reactor_start = 0;
+        c->native_mission.reactor_alarm = 0;
+        c->native_mission.reactor_glass = 0;
+        c->native_mission.power1_next_blast = 0;
+        c->native_mission.power1_blast_phase = 0;
+    }
     snprintf(c->map, sizeof(c->map), "%s", map);
 
     /* And the name the table shows it by — 0x800E46B4's copy. A directory with
@@ -6591,15 +8355,10 @@ static bool client_load_zone(client *c, const char *map, int index)
      * a wall somewhere else.
      */
     {
-        char path[256];
-        q2_buf buf;
+        {
+            q2_common_file common = {0};
 
-        snprintf(path, sizeof(path), "Q2DATA/LEVELS/%s/COMMON.DAT", map);
-
-        if (disc_read_file(c->disc, path, &buf) == Q2_OK) {
-            q2_common_file common;
-
-            if (q2_common_open(&common, &buf) == Q2_OK) {
+            if (q2_common_move(&common, &prepared_common) == Q2_OK) {
                 q2_start_pos_list spawns;
 
                 if (q2_start_pos_parse(&spawns, &common) == Q2_OK) {
@@ -6966,8 +8725,6 @@ static bool client_load_zone(client *c, const char *map, int index)
                         }
                     }
                 }
-            } else {
-                q2_buf_free(&buf);
             }
         }
     }
@@ -6987,8 +8744,13 @@ static bool client_load_zone(client *c, const char *map, int index)
     if (!same_map_transition && c->vram) {
         q2_vram_section vs;
         memset(c->vram, 0, sizeof(*c->vram));
+        psx_draw_state_clear_cache(&c->screen.gpu);
         if (q2_vram_load(&vs, c->disc, map) == Q2_OK) {
             c->opts.textures = (q2_vram_upload(&vs, c->vram) == Q2_OK);
+            /* The level's lightning atlas is a standalone image. The texture
+             * page loop stops at page 11 in BIGGUN, leaving this slot empty. */
+            (void)q2_vram_upload_named(&vs, "Squiggle.lbm", 12, 159,
+                                       c->vram, NULL);
             Q2_INFO("textures: %u pages, %u palettes",
                     vs.texpage_count, vs.clut4_count);
             c->clut4_count_a = vs.clut4_count_a;
@@ -7103,11 +8865,13 @@ static bool client_load_zone(client *c, const char *map, int index)
         client_voices_stop(c);
         c->bed_frames = 0;
         c->bed_pos    = 0;
+        q2_xa_resampler_reset(&c->bed_resampler);
         if (c->sfx_ready) {
             q2_sound_bank_free(&c->sfx);
             c->sfx_ready = false;
         }
         c->sfx_ready = (q2_sound_bank_load(&c->sfx, c->disc, map) == Q2_OK);
+        c->requests_ready = false;
         if (c->sfx_ready)
             Q2_INFO("sound bank: %u effects", c->sfx.count);
 
@@ -7135,6 +8899,9 @@ static bool client_load_zone(client *c, const char *map, int index)
     q2_item_drop_reset();
     q2_monster_drop_reset();
     q2_sim_init(&c->sim[0], &c->zone, q2_build_tick_rate(&c->build));
+    /* 0x800AE898 is initialized once in the executable, with no level,
+     * respawn or card-load reset. Keep its cadence across every zone rebuild. */
+    c->sim[0].lava_burn_calls = carry_lava_burn_calls;
     /* The client owns a view-weapon machine, so the machine decides when a
      * shot happens — the tick must not also fire from the raw trigger. */
     c->sim[0].fire_from_input = false;
@@ -7241,11 +9008,12 @@ static bool client_load_zone(client *c, const char *map, int index)
             const char *batch[Q2_MP_MAX_BATCHES];
             u32 batch_count = c->mp_enabled
                                   ? q2_mp_batches(c->mp.mode, batch) : 0;
+            bool mission_batches = client_mission_batches(c, index, batch, &batch_count);
             q2_result ir = q2_sim_attach_item_batches(
                 &c->sim[0], &c->common, index,
                 c->item_table_ready ? &c->item_table : NULL,
                 c->model_bank_ready ? &c->model_bank : NULL,
-                batch_count ? batch : NULL, batch_count);
+                batch_count || mission_batches ? batch : NULL, batch_count);
 
             /*
              * BRACED, and it had to be: the `if (c->zone_trace)` below used to
@@ -7267,7 +9035,8 @@ static bool client_load_zone(client *c, const char *map, int index)
                                        "%s%s", bi ? " " : "", batch[bi]);
                     Q2_INFO("items: %u placed (%s batches: %s)",
                             c->sim[0].entities.count,
-                            q2_mp_mode_name(c->mp.mode), names);
+                            c->mp_enabled ? q2_mp_mode_name(c->mp.mode)
+                                          : "mission", names);
                 } else {
                     Q2_INFO("items: %u placed", c->sim[0].entities.count);
                 }
@@ -7344,8 +9113,14 @@ static bool client_load_zone(client *c, const char *map, int index)
         /* The zone number seeds the effect generator, so re-entering a zone
          * looks the same twice and two zones do not share a sequence. */
         if (c->fx_tables_ready) {
+            q2_zone_resources resources;
             q2_sim_attach_effects(&c->sim[0], &c->fx_tables,
                                   0x51A5E5u + (u32)index);
+            /* 0x80070E98 / 0x8007148C pass Resources+0x18 to the particle
+             * allocator. Its zero-argument default is not the authored pool. */
+            if (q2_common_resources(&c->common, c->zone.name, &resources))
+                q2_fx_world_resize(&c->sim[0].fx, resources.particle_groups,
+                                    (u32)c->screen.view_count);
 
             /*
              * The particle quads live on `chars.lbm`'s page, so the overlay's
@@ -7360,6 +9135,14 @@ static bool client_load_zone(client *c, const char *map, int index)
              * has one. A map without it simply has no glint.
              */
             q2_sim_attach_glint(&c->sim[0], &c->common);
+            if (same_map_transition && carry_glint.scripted) {
+                q2_fx_glint_mesh mesh = c->sim[0].glint.mesh;
+                c->sim[0].glint = carry_glint;
+                c->sim[0].glint.mesh = mesh;
+            }
+            c->sim[0].glint.zone_active = index == 1;
+            c->sim[0].glint.raised = false;
+            c->sim[0].glint.owner_active = false;
 
             /*
              * THE DEBRIS MODELS, which nothing has ever registered.
@@ -7463,6 +9246,7 @@ static bool client_load_zone(client *c, const char *map, int index)
          * it is opened against the hull the sim already has.
          */
         c->lights_ready = false;
+        c->tick_light_count = 0;
         /*
          * InitLights' whole treatment of the timed table, 0x80074194: zero the
          * sixteen counters and leave everything else. It runs here rather than
@@ -7561,6 +9345,7 @@ static bool client_load_zone(client *c, const char *map, int index)
                 c->ev_operands.base_a = ev.data;
                 c->ev_operands.base_b = have_zev ? zev.data : NULL;
                 c->ev_operands.b_size = have_zev ? zev.size : 0;
+                q2_sim_bind_hazards(&c->sim[0], &c->ev_operands);
 
                 /*
                  * The breakables, now that the rebase is in hand: each pane's
@@ -7689,7 +9474,6 @@ static bool client_load_zone(client *c, const char *map, int index)
                     c->zone.node_hidden       = c->node_hidden;
                     c->zone.node_hidden_count = c->node_hidden_count;
                 }
-
                 /*
                  * THE EXPLOSIVES' LOAD-TIME VISIBILITY, and it has to be here
                  * rather than where they are built: the constructor at
@@ -7782,6 +9566,7 @@ static bool client_load_zone(client *c, const char *map, int index)
                         c->endmis_open     = false;
                         c->briefing_open   = false;
                         c->leveltext_ready = false;
+                        c->film_is_extro = client_name_eq(want, "Extro FMV");
                         if (!client_film_start(c, film))
                             Q2_WARN("movie: QFMV could not play %s", film);
                         /* Consumed. A later entry with nobody setting it is an
@@ -7913,6 +9698,8 @@ static bool client_load_zone(client *c, const char *map, int index)
                     }
                 }
 
+                if (q2_laserwalls_build(&c->laserwalls, &ev, &uf, &c->ev_operands))
+                    Q2_INFO("laser walls: %u registered", c->laserwalls.count);
                 if (q2_laserbeams_build(&c->lasers, &ev, &uf,
                                         &c->ev_operands,
                                         c->sim[0].coll_primary.node_count
@@ -8092,8 +9879,8 @@ static bool client_load_zone(client *c, const char *map, int index)
          *
          * The 72 LASERBEAM and 2 LASERWALL calls are no-ops in
          * client_event_call, which implements neither: the beams are already
-         * raised by q2_laserbeams_build, which is where the console's own
-         * registration pass raises them (levelbin.h), and nothing here can
+         * raised by q2_laserbeams_build / q2_laserwalls_build, matching the
+         * console's registration pass (levelbin.h), and nothing here can
          * double-register one or deal LASERWALL damage at load.
          */
         c->sim[0].event_rt.initial_pass = true;          /* 0x8007C2AC */
@@ -8151,6 +9938,8 @@ static bool client_load_zone(client *c, const char *map, int index)
          * from 0x800B29D4 while 0x800B2E0C is up, and the zone loader sets
          * that word at 0x8007B588.
          */
+        client_native_mission_restore(c);
+
         if (c->carry_events.size && !c->mp_enabled) {
             const q2_event_rt *rt = &c->sim[0].event_rt;
             const u16 keys = (u16)(c->carry_inv.flags & 0x0FFFu);
@@ -8191,6 +9980,8 @@ static bool client_load_zone(client *c, const char *map, int index)
                     "seven passes", spent, rt->replayed_count, moved);
         }
         c->carry_events.size = 0;
+        client_native_lifts_restore(c);
+        client_native_security_lift(c, false);
         q2_sim_scene_solids_update(&c->sim[0], &c->rotators);
 
         q2_sim_spawn(&c->sim[0], feet, c->cam.yaw);
@@ -8316,6 +10107,10 @@ static bool client_load_zone(client *c, const char *map, int index)
             if (c->carry_same_map) {
                 /* One level, one clock: the deadlines stay absolute. */
                 c->sim[0].level_time = c->carry_level_time;
+                c->sim[0].tick_count = carry_ticks;
+                c->sim[0].dt_accum = carry_accum;
+                c->sim[0].dt_frac = carry_fraction;
+                c->sim[0].ent_world.level_time = c->carry_level_time;
             } else {
                 /* A new level restarts the clock, so a deadline expressed
                  * against the old one has to be re-expressed against this one
@@ -8410,6 +10205,10 @@ static bool client_load_zone(client *c, const char *map, int index)
             }
         }
 
+        /* Reconcile the generator after STARTLEV and spent-event replay:
+         * replay can enable GravTeleport while the carried fade is pending. */
+        client_glint_scene(c, true);
+
         /* Last, because it wakes the AI onto the player and therefore needs
          * the player to already be standing somewhere. */
         {
@@ -8430,8 +10229,10 @@ static bool client_load_zone(client *c, const char *map, int index)
     if (!same_map_transition) {
         int pi;
 
-        for (pi = 0; pi < Q2_MP_MAX_PLAYERS; pi++)
+        for (pi = 0; pi < Q2_MP_MAX_PLAYERS; pi++) {
             q2_player_death_init(&c->death[pi]);
+            client_player_anim_reset(c, pi);
+        }
         c->death_abandon   = 0;
         c->mp_start_inv    = c->sim[0].combat.inv;
         c->mp_start_weapon = c->sim[0].combat.weapon_id;
@@ -8452,6 +10253,10 @@ static bool client_load_zone(client *c, const char *map, int index)
             if (c->sim_ready[pi])
                 client_sbar_write_slots(c, pi, CLIENT_SLOTS_SPAWN);
     }
+
+    client_world_resources(c,same_map_transition);
+    if (!same_map_transition && c->mp_enabled && !c->in_front_end)
+        client_install_game_variables(c);
 
     Q2_INFO("%s: %u nodes, %u vertices",
             c->zone.name, c->zone.scene.node_count, c->zone.points.count);
@@ -8492,10 +10297,9 @@ static bool client_load_zone(client *c, const char *map, int index)
 /*
  * Music.
  *
- * The XA streams run at 37800 Hz, which no sound card wants. Rather than write
- * a resampler, hand SDL an audio stream declared as 37800 Hz stereo and let it
- * convert — the conversion is not part of the console's character, so there is
- * nothing to be gained by reproducing it by hand.
+ * XA sectors decode at 37800 Hz, then the CD controller interpolates them
+ * onto the SPU's 44100 Hz output clock. Voices and music meet at that rate.
+ * SDL only converts the completed console-rate mix for the selected device.
  *
  * Sectors are decoded on demand rather than up front: one .XAI channel is
  * several minutes of audio, and the original streamed it off the disc for
@@ -8503,6 +10307,9 @@ static bool client_load_zone(client *c, const char *map, int index)
  */
 static bool client_music_start(client *c, char letter, u8 channel)
 {
+    c->music_open = false;
+    c->bed_frames = c->bed_pos = 0;
+    q2_xa_resampler_reset(&c->bed_resampler);
     if (q2_xa_track_open(&c->music, c->disc, letter, channel) != Q2_OK) {
         Q2_WARN("no music track QUAKE_%c channel %u", letter, channel);
         return false;
@@ -8520,9 +10327,10 @@ static bool client_music_start(client *c, char letter, u8 channel)
 /*
  * Play a track id, which is the unit the game thinks in.
  *
- * An id below 2 is silence — the table's `file` is negative there and the
- * player's own `bltz` at 0x80071778 takes a different arm entirely — so this
- * stops rather than pretending.
+ * Negative-file entries take the native CD-DA arm at 0x80071778. The port
+ * keeps their timers but emits silence. On both supported original discs,
+ * ids 0/1 have zero duration and no named playlist selects them; PlayThisXA
+ * is also a no-op. CD-DA PCM for modified tables remains unimplemented.
  */
 /* The console's own numbers: the fallback duration and the fade's width. */
 #define Q2_MUSIC_FALLBACK_TENTHS 300   /* 0x80071878, 30.0 s   */
@@ -8532,9 +10340,11 @@ static bool client_music_play_id(client *c, int id)
 {
     const q2_music_entry *e = q2_music_get(&c->music_table, id);
 
-    if (!c->music_table_ready || !e || e->file < 0 ||
-        e->file >= Q2_MUSIC_FILES) {
-        c->music_open = false;
+    c->music_open = c->music_playing = false;
+    c->bed_frames = c->bed_pos = 0;
+    q2_xa_resampler_reset(&c->bed_resampler);
+    if (!c->music_table_ready || !e || e->file >= Q2_MUSIC_FILES) {
+        c->music_total = c->music_left = 0;
         return false;
     }
 
@@ -8544,10 +10354,11 @@ static bool client_music_play_id(client *c, int id)
      * `0x80071898` reads the table's `tenths`, `0x800718C0` multiplies it by
      * five into `0x800B2710` and `0x800718C8` copies the same value to
      * `0x800B2708` — tenths -> 50 Hz ticks, with a 300-tenths (30.0 s) fallback
-     * at `0x80071878` for an entry that names none. A is what remains, B is the
+     * at `0x80071878` when playback cannot start. A is what remains, B is the
      * total, and neither is a length the stream has to agree with: at
      * `0x80071A58` a countdown of zero ADVANCES THE PLAYLIST CURSOR, and an end
-     * of list restarts it at `0x80071B6C`.
+     * of list stops playback through `0x80071B6C`. Only an explicit negative
+     * playlist byte loops; a zero terminator must not restart the first track.
      *
      * That is what #14 was asking. The engine does not loop a track; it plays
      * each for its table duration and moves on, which is why the one entry that
@@ -8559,13 +10370,20 @@ static bool client_music_play_id(client *c, int id)
      * lasts the same seconds and its 64-tick fades are a fifth quicker.
      */
     c->music_id     = id;
-    c->music_total  = (e->tenths ? e->tenths : Q2_MUSIC_FALLBACK_TENTHS) *
-                      q2_video_fields_per_tenth(c->build.video);
+    c->music_total  = e->tenths * q2_video_fields_per_tenth(c->build.video);
     c->music_left   = c->music_total;
     c->music_clock  = 0.0;
+    c->music_playing = true;
 
-    return client_music_start(c, q2_music_files[e->file][6],
-                              (u8)e->channel);
+    if (e->file < 0)
+        return true;
+
+    /* An unreadable stream is silent for the retail retry interval, rather
+     * than permanently wedging the playlist. 0x80071860..0x80071878. */
+    if (!client_music_start(c, q2_music_files[e->file][6], (u8)e->channel))
+        c->music_left = c->music_total = Q2_MUSIC_FALLBACK_TENTHS *
+                                        q2_video_fields_per_tenth(c->build.video);
+    return true;
 }
 
 /*
@@ -8582,10 +10400,9 @@ static bool client_music_play_id(client *c, int id)
  * console's single call to the playlist-start entry point hangs off it, so this
  * belongs at the end of a successful zone load and nowhere else.
  *
- * A ZONE GATE IS NOT A LEVEL CHANGE. Both resolve to the same level record, so
- * the record is compared and an unchanged one does not go back to entry 0 of
- * the playlist. `force` is for the one caller that needs the restart anyway:
- * coming back off a film, where the drive was taken away.
+ * A same-record zone gate retains the playlist cursor; a full load resets it,
+ * including restart/resupply and save restore. `force` also resets it after a
+ * film or a boot music hold releases the drive.
  *
  * BUT AN UNCHANGED RECORD IS NOT "LEAVE THE STREAM ALONE" EITHER, which is what
  * this used to say and what it did. ReloadLevelData — the zone load — is
@@ -8621,12 +10438,14 @@ static void client_music_for_level(client *c, bool force, bool zone_gate)
      * so the forced call that lifts the hold still sees a change.
      */
     if (c->music_held) {
-        c->music_open = false;
+        c->music_open = c->music_playing = false;
+        c->bed_frames = c->bed_pos = 0;
+        q2_xa_resampler_reset(&c->bed_resampler);
         return;
     }
 
     lv = q2_level_find(&c->level_table, c->map);
-    if (lv == c->level && !force) {
+    if (lv == c->level && !force && zone_gate) {
         /*
          * Same level record. A ZONE GATE is ReloadLevelData, and 0x800794F8 is
          * the countdown to zero and nothing else — the advance itself belongs
@@ -8634,16 +10453,12 @@ static void client_music_for_level(client *c, bool force, bool zone_gate)
          * block, so the cursor steps there exactly as it does when a track runs
          * its duration out.
          *
-         * Everything ELSE that resolves the same record — a restart, a death,
-         * an arena round reset, a memory-card restore — is left playing as it
-         * was. Which of the console's two level loads those run is not traced
-         * (ReloadLevelData has one caller, LoadZone at 0x80079114, and
-         * LoadLevelData has one, 0x80070D44), and the difference decides
-         * whether the playlist advances or goes back to entry 0. Guessing
-         * would be inventing a behaviour, so they keep what they had.
+         * Full reloads, including restart/resupply and card restore, go through
+         * ProcessGame -> LoadLevel (0x80018C90) -> 0x80070D84 -> 0x80070C94
+         * -> LoadLevelData. Its 0x800796C8 resets the playlist even when the
+         * level record has not changed. Only an actual zone gate advances it.
          */
-        if (zone_gate)
-            c->music_left = 0;
+        c->music_left = 0;
         return;
     }
 
@@ -8658,46 +10473,58 @@ static void client_music_for_level(client *c, bool force, bool zone_gate)
          * the table, so they have no playlist to have.
          */
         Q2_INFO("%s is not in the level table, so it has no playlist", c->map);
-        c->music_open = false;
+        c->music_open = c->music_playing = false;
+        c->bed_frames = c->bed_pos = 0;
+        q2_xa_resampler_reset(&c->bed_resampler);
         return;
     }
 
     {
         int id = q2_level_playlist_next(lv, &c->music_cursor_at);
 
-        if (id < 0 || !client_music_play_id(c, id))
-            c->music_open = false;
+        client_music_play_id(c, id);
         Q2_INFO("music: %s plays %d first", c->map, id);
     }
 }
 
 /*
  * The next track in this level's playlist, by the engine's own walk. Called
- * when a stream runs out, which is the only thing that advances it.
+ * when the retail field countdown expires, including silent entries.
  */
 static void client_music_advance(client *c)
 {
     int id;
 
     if (!c->level || !c->music_table_ready) {
-        /* No playlist: loop what is playing, which is what the port did before
-         * any of this was decoded. */
-        c->music_cursor = 0;
-        q2_xa_decoder_reset(&c->music_dec);
+        c->music_open = c->music_playing = false;
+        c->bed_frames = c->bed_pos = 0;
+        q2_xa_resampler_reset(&c->bed_resampler);
         return;
     }
 
     id = q2_level_playlist_next(c->level, &c->music_cursor_at);
-    if (id < 0) {
-        /* A list that ends rather than looping: restart it. */
-        c->music_cursor_at = -1;
-        id = q2_level_playlist_next(c->level, &c->music_cursor_at);
-    }
-
     if (id < 0 || !client_music_play_id(c, id)) {
+        c->music_open = c->music_playing = false;
+        c->bed_frames = c->bed_pos = 0;
+        q2_xa_resampler_reset(&c->bed_resampler);
         c->music_cursor = 0;
         q2_xa_decoder_reset(&c->music_dec);
     }
+}
+
+/* The PAL/NTSC field countdown runs for XA, CD-DA silence and failed reads. */
+static void client_music_tick(client *c, double dt)
+{
+    if (!c->music_playing)
+        return;
+    c->music_clock += dt * (double)q2_build_tick_rate(&c->build);
+    while (c->music_clock >= 1.0) {
+        c->music_clock -= 1.0;
+        if (c->music_left > 0)
+            c->music_left--;
+    }
+    if (c->music_left <= 0)
+        client_music_advance(c);
 }
 
 /*
@@ -8839,6 +10666,38 @@ static s32 client_music_volume(const client *c)
     return vol;
 }
 
+/* QFMV +0x3294/+0x352C call SetCDVolume directly with the movie's argument
+ * (255), independent of MUSIC, targetcdvol and actcdvol. Stereo still applies.
+ * Gain is evaluated at the audio sample being queued, not a frame ahead. */
+static s32 client_film_volume(const client *c, u64 sample)
+{
+    if (sample >= c->film_stop_at) {
+        u64 field = (sample - c->film_stop_at) * q2_build_tick_rate(&c->build) / CLIENT_AUDIO_RATE;
+        return field < 4 ? (s32)(255 * (4 - field) / 4) : 0;
+    }
+    {
+        double fps = c->film.fps > 0.0 ? c->film.fps : Q2_MOVIE_FPS;
+        double frame = (double)sample * fps / CLIENT_AUDIO_RATE;
+        /* The loop increments before setting volume: 15,31,...,239,255. */
+        return frame >= 15.0 ? 255 : 255 * ((s32)frame + 1) / 16;
+    }
+}
+
+static u64 client_film_audio_end(const client *c)
+{
+    if (c->film_stop_at == ~(u64)0) return ~(u64)0;
+    return c->film_stop_at + 4u * CLIENT_AUDIO_RATE / q2_build_tick_rate(&c->build);
+}
+
+static u32 client_film_audio_frames(const client *c, u32 requested)
+{
+    u64 end, remaining;
+    if (!c->film_open) return requested;
+    end = client_film_audio_end(c);
+    remaining = end > c->film_audio_submitted ? end - c->film_audio_submitted : 0;
+    return remaining < requested ? (u32)remaining : requested;
+}
+
 /*
  * Decode one more sector of bed — the film's track if one is running, otherwise
  * the level's music. False means neither had anything, and the caller mixes the
@@ -8846,64 +10705,23 @@ static s32 client_music_volume(const client *c)
  */
 static bool client_bed_refill(client *c)
 {
-    const u32 cap = (u32)(sizeof(c->bed) / sizeof(c->bed[0]));
+    s16 raw[XA_FRAMES_PER_SECTOR * XA_CHANNELS];
+    const u32 cap = Q2PSX_ARRAY_COUNT(raw);
     u32 n = 0;
 
     c->bed_frames = 0;
     c->bed_pos    = 0;
-
     if (c->film_open) {
-        n = q2_movie_audio(&c->film, c->bed, cap);
+        n = q2_movie_audio(&c->film, raw, cap);
     } else if (c->music_open) {
-        n = q2_xa_track_read(&c->music, &c->music_dec, &c->music_cursor,
-                             c->bed, cap);
-        if (n == 0) {
-            /*
-             * End of stream: the playlist advances. The engine's walk is what
-             * decides what comes next, and for every real level it eventually
-             * jumps back and starts the seven again.
-             *
-             * This is the SECOND thing that advances it. The first is the
-             * countdown in the frame loop, which is the console's own trigger;
-             * a stream that runs out early still has to move on.
-             *
-             * One retry, so the new track starts in this call rather than a
-             * frame later — and only one, so a playlist of empty tracks cannot
-             * spin here.
-             */
-            client_music_advance(c);
-            if (c->music_open)
-                n = q2_xa_track_read(&c->music, &c->music_dec, &c->music_cursor,
-                                     c->bed, cap);
-        }
+        n = q2_xa_track_read(&c->music, &c->music_dec, &c->music_cursor, raw, cap);
+        /* EOF contributes silence until the retail countdown advances. */
     }
-
-    /* Less than one frame is not a bed. Guarding it here is what stops
-     * `client_bed_read` spinning on a refill that succeeds and yields nothing. */
-    if (n < XA_CHANNELS)
-        return false;
-
-    {
-        s32 vol = client_music_volume(c);
-
-        /*
-         * AND STEREO OFF FOLDS THE MUSIC TO MONO, which this used not to do at
-         * all: it scaled both channels independently and never consulted the
-         * setting. 0x800719EC branches on 0x800B333E and writes volume/2 into
-         * all four mix bytes when it is clear, so each output carries the sum
-         * of both XA channels at half level — see `q2_xa_cd_mix`.
-         *
-         * This is the CD half of the setting; the SPU half already worked. The
-         * same halfword is read at 0x80072C48 as a one-or-two channel count,
-         * which is `client_voices_update` collapsing an effect's panning to
-         * 0x80/0x80 — so turning STEREO off centred every sound effect and left
-         * the music alone in full stereo.
-         */
-        q2_xa_cd_mix(c->bed, n, vol, c->settings.v[Q2_SET_STEREO] != 0);
-    }
-
-    c->bed_frames = n / XA_CHANNELS;
-    return true;
+    if (n < XA_CHANNELS) return false;
+    if (n < cap) memset(raw + n, 0, (cap - n) * sizeof(*raw));
+    c->bed_frames = q2_xa_resample_sector(&c->bed_resampler, raw, c->bed,
+                                         XA_OUTPUT_FRAMES_PER_SECTOR);
+    return c->bed_frames != 0;
 }
 
 /* Hand out `frames` of bed, padding with silence when nothing is playing. */
@@ -8935,70 +10753,44 @@ static void client_bed_read(client *c, s16 *dst, u32 frames)
     if (done < frames)
         memset(dst + done * XA_CHANNELS, 0,
                (size_t)(frames - done) * XA_CHANNELS * sizeof(s16));
+
+    /* Keep the decoded sector dry. Volume/fold changes apply to the next
+     * chunk, including samples already decoded but not yet queued. */
+    if (c->film_open) {
+        u32 i;
+        for (i = 0; i < frames; i++)
+            q2_xa_cd_mix(dst + i * XA_CHANNELS, XA_CHANNELS,
+                client_film_volume(c, c->film_audio_mixed + i),
+                c->settings.v[Q2_SET_STEREO] != 0);
+        c->film_audio_mixed += frames;
+    } else
+        q2_xa_cd_mix(dst, frames * XA_CHANNELS, client_music_volume(c),
+                      c->settings.v[Q2_SET_STEREO] != 0);
 }
 
 /*
  * Sum one voice into `dst`.
  *
- * The sample's rate is 11025 or 22050 and the stream's is 37800, so the cursor
- * steps through the source by a fraction of a sample per output frame and the
- * pair either side of it are interpolated. That is not the SPU's own four-tap
- * gaussian, and it is not pretending to be: what matters here is that an effect
- * plays at its own pitch rather than at 1.7 to 3.4 times it, which is what
- * handing mono 11025 to a stereo 37800 stream did.
+ * The voice runs its pitch accumulator, Gaussian filter and ADSR on the SPU's
+ * 44100 Hz clock, which is also the mixer clock. No voice samples are
+ * discarded or linearly interpolated before summation.
  *
- * Mono goes to both channels. There is no panning: the events carry a world
- * position and the port has no listener basis wired to it (openquestions #60),
- * so centring is the honest reading rather than a guessed pan.
+ * Gain and pan are recomputed by client_voices_update. Accumulate all voices
+ * before saturation so cancellation does not depend on voice-slot order.
  */
-static void client_voice_mix(client_voice *v, s16 *dst, u32 frames)
+static void client_voice_mix(client_voice *v, s32 *dst, u32 frames)
 {
     u32 i;
-
+    s32 left = q2_sfx_volume_register((u16)v->level, (u8)v->pan_l, (u8)v->vol, v->mono);
+    s32 right = q2_sfx_volume_register((u16)v->level, (u8)v->pan_r, (u8)v->vol, v->mono);
     for (i = 0; i < frames; i++) {
-        u32 idx;
-        s32 a, b, s, l, r;
-
-        /* Keep two samples ahead of the cursor, so the pair to interpolate is
-         * always there. Compacting first means `have` is at most 1 when the
-         * next block lands, so the 2-block buffer cannot overflow. */
-        while ((v->pos >> 16) + 1 >= v->have) {
-            u32 shift = v->pos >> 16;
-            u32 n;
-
-            if (shift > 0) {
-                memmove(v->buf, v->buf + shift,
-                        (size_t)(v->have - shift) * sizeof(s16));
-                v->have -= shift;
-                v->pos  -= shift << 16;
-            }
-
-            n = q2_spu_voice_block(&v->dec, v->buf + v->have);
-            if (n == 0) {
-                v->active = false;
-                return;
-            }
-            v->have += n;
-        }
-
-        idx = v->pos >> 16;
-        a   = v->buf[idx];
-        b   = v->buf[idx + 1];
-        s   = a + (((b - a) * (s32)(v->pos & 0xFFFF)) >> 16);
-        s   = (s * v->vol) / 127;
-
-        /* Level and pan are the console's two per-voice bytes; both are 0..255
-         * so the pair is a 16-bit scale. */
-        l = dst[i * XA_CHANNELS]     + ((s * v->level * v->pan_l) >> 16);
-        r = dst[i * XA_CHANNELS + 1] + ((s * v->level * v->pan_r) >> 16);
-        if (l >  32767) l =  32767;
-        if (l < -32768) l = -32768;
-        if (r >  32767) r =  32767;
-        if (r < -32768) r = -32768;
-        dst[i * XA_CHANNELS]     = (s16)l;
-        dst[i * XA_CHANNELS + 1] = (s16)r;
-
-        v->pos += v->step;
+        s32 sample = q2_spu_player_sample(&v->spu, CLIENT_AUDIO_RATE);
+        /* A stopped logical channel is immediately reusable, while its SPU
+         * release can still contribute until a new key-on replaces it. */
+        if (!v->spu.active) v->active = false;
+        dst[i * XA_CHANNELS] += (s32)(((s64)sample * left) >> 14);
+        dst[i * XA_CHANNELS + 1] += (s32)(((s64)sample * right) >> 14);
+        if (!q2_spu_player_alive(&v->spu)) return;
     }
 }
 
@@ -9015,34 +10807,132 @@ static void client_voice_mix(client_voice *v, s16 *dst, u32 frames)
  * The chunk is much smaller than a sector for the same reason: topping up a
  * sector at a time would overshoot the target by up to 53 ms every time.
  */
-#define CLIENT_AUDIO_TARGET_FRAMES (XA_SAMPLE_RATE / 16)
+#define CLIENT_AUDIO_TARGET_FRAMES (CLIENT_AUDIO_RATE / 16)
 #define CLIENT_AUDIO_CHUNK_FRAMES  256
 
-static void client_audio_pump(client *c)
+static void client_audio_mix(client *c, s16 *dst, u32 frames)
+{
+    s32 sum[CLIENT_AUDIO_CHUNK_FRAMES * XA_CHANNELS];
+    u32 i;
+
+    while (frames) {
+        u32 n = frames > CLIENT_AUDIO_CHUNK_FRAMES ? CLIENT_AUDIO_CHUNK_FRAMES : frames;
+        client_bed_read(c, dst, n);
+        /* The CD controller has already applied and saturated its matrix.
+         * SPU CD-input gain applies to that signal, before adding voices. */
+        for (i = 0; i < n * XA_CHANNELS; i++)
+            sum[i] = ((s32)dst[i] * CLIENT_SPU_CD_VOLUME) >> 15;
+        for (i = 0; i < CLIENT_VOICES; i++)
+            if (c->voice[i].active || q2_spu_player_alive(&c->voice[i].spu))
+                client_voice_mix(&c->voice[i], sum, n);
+        for (i = 0; i < n * XA_CHANNELS; i++) {
+            s32 s = sum[i];
+            s = s > 32767 ? 32767 : s < -32768 ? -32768 : s;
+            /* The summed signal saturates before the SPU main gain. */
+            dst[i] = (s16)((s * CLIENT_SPU_MAIN_VOLUME) >> 14);
+        }
+        c->audio_frames += n;
+        frames -= n;
+        dst += n * XA_CHANNELS;
+    }
+}
+
+static void client_audio_failed(client *c, const char *operation)
+{
+    if (!c->audio_warned)
+        Q2_WARN("audio %s failed: %s; continuing silently and retrying",
+                operation, SDL_GetError());
+    c->audio_warned = true;
+    if (c->audio) SDL_DestroyAudioStream(c->audio);
+    c->audio = NULL;
+    c->audio_retry = 1.0;
+    /* Queued audio and a failed submission have already advanced the decoder.
+     * Account for those discarded samples on the silent movie clock, including
+     * a final fade chunk, so recovery cannot replay them or strand the movie. */
+    if (c->film_open) c->film_audio_submitted = c->film_audio_mixed;
+}
+
+static void client_audio_open(client *c)
+{
+    const SDL_AudioSpec spec = { SDL_AUDIO_S16LE, XA_CHANNELS, CLIENT_AUDIO_RATE };
+    if (c->headless || c->audio) return;
+    if (!(SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO) &&
+        !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        client_audio_failed(c, "initialization");
+        return;
+    }
+    /* SDL retains and migrates an open DEFAULT logical device when the physical
+     * output changes. Retry only a missing/failed stream; reopening on a device
+     * removal event would discard SDL's working migration and queued samples. */
+    c->audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+                                        &spec, NULL, NULL);
+    if (!c->audio) {
+        client_audio_failed(c, "open");
+        return;
+    }
+    if (!SDL_ResumeAudioStreamDevice(c->audio)) {
+        client_audio_failed(c, "resume");
+        return;
+    }
+    if (c->audio_warned) Q2_INFO("audio: playback recovered");
+    c->audio_warned = false;
+    c->audio_retry = c->audio_clock = 0.0;
+}
+
+static void client_audio_pump(client *c, double dt)
 {
     s16 mix[CLIENT_AUDIO_CHUNK_FRAMES * XA_CHANNELS];
     const int target = (int)(CLIENT_AUDIO_TARGET_FRAMES * XA_CHANNELS *
                              sizeof(s16));
-    const int chunk  = (int)(CLIENT_AUDIO_CHUNK_FRAMES * XA_CHANNELS *
-                             sizeof(s16));
-    int queued;
+    int queued = 0;
 
-    if (!c->audio)
+    if (!c->audio && !c->headless) {
+        c->audio_retry -= dt;
+        if (c->audio_retry <= 0.0) client_audio_open(c);
+    }
+    if (c->audio) {
+        queued = SDL_GetAudioStreamQueued(c->audio);
+        if (queued < 0) client_audio_failed(c, "queue query");
+    }
+
+    if (!c->audio) {
+        /* The same mixer runs without a device. Voice lifetimes, gates and
+         * playlist decoding continue through an outage, as well as in
+         * deterministic headless runs. */
+        u32 remaining;
+        c->audio_clock += dt * CLIENT_AUDIO_RATE;
+        remaining = (u32)c->audio_clock;
+        c->audio_clock -= remaining;
+        while (remaining) {
+            u32 n = remaining > CLIENT_AUDIO_CHUNK_FRAMES ? CLIENT_AUDIO_CHUNK_FRAMES : remaining;
+            n = client_film_audio_frames(c, n);
+            if (!n) break;
+            client_audio_mix(c, mix, n);
+            if (c->film_open) c->film_audio_submitted += n;
+            remaining -= n;
+        }
         return;
-
-    queued = SDL_GetAudioStreamQueued(c->audio);
+    }
 
     while (queued < target) {
-        u32 i;
-
-        client_bed_read(c, mix, CLIENT_AUDIO_CHUNK_FRAMES);
-
-        for (i = 0; i < CLIENT_VOICES; i++)
-            if (c->voice[i].active)
-                client_voice_mix(&c->voice[i], mix, CLIENT_AUDIO_CHUNK_FRAMES);
-
-        SDL_PutAudioStreamData(c->audio, mix, chunk);
-        queued += chunk;
+        u32 n = client_film_audio_frames(c, CLIENT_AUDIO_CHUNK_FRAMES);
+        int bytes;
+        if (!n) break;
+        bytes = (int)(n * XA_CHANNELS * sizeof(s16));
+        client_audio_mix(c, mix, n);
+        if (!SDL_PutAudioStreamData(c->audio, mix, bytes)) {
+            client_audio_failed(c, "submission");
+            return;
+        }
+        if (c->film_open) {
+            c->film_audio_submitted += n;
+            if (c->film_audio_submitted == client_film_audio_end(c) &&
+                !SDL_FlushAudioStream(c->audio)) { /* drain the final samples */
+                client_audio_failed(c, "flush");
+                return;
+            }
+        }
+        queued += bytes;
     }
 }
 
@@ -9052,8 +10942,12 @@ static void client_voices_stop(client *c)
 {
     u32 i;
 
-    for (i = 0; i < CLIENT_VOICES; i++)
+    for (i = 0; i < CLIENT_VOICES; i++) {
         c->voice[i].active = false;
+        /* Bank teardown also discards the at-most-two-clock release and any
+         * host resampler history, before the borrowed ADPCM is freed. */
+        memset(&c->voice[i].spu, 0, sizeof(c->voice[i].spu));
+    }
 
     /*
      * And drop every handle into those voices. The serial test would already
@@ -9365,8 +11259,9 @@ static void client_shock_sink(void *user, int player, int id, s32 strength,
 
 static void client_shock_send(client *c, int p)
 {
-    SDL_Gamepad *pad = (p >= 0 && p < Q2_SIM_MAX_PLAYERS)
-                     ? c->gamepads.device[p] : NULL;
+    int slot = p == 0 ? q2_gamepads_primary(&c->gamepads, c->mp_enabled) : p;
+    SDL_Gamepad *pad = (slot >= 0 && slot < Q2_SIM_MAX_PLAYERS)
+                     ? c->gamepads.device[slot] : NULL;
     u8 little = c->shock_out[p][0], big = c->shock_out[p][1];
 
     if (!pad)
@@ -9404,7 +11299,7 @@ static void client_shock_tick(client *c, s32 ticks)
         for (p = 0; p < n; p++) {
             u8 out[2] = { 0, 0 };
 
-            if (c->settings.v[Q2_SET_VIBRATION]) {
+            if (c->settings.v[q2_menu_player_setting(Q2_SET_VIBRATION, p)]) {
                 const bool local = (p == c->sim[0].cur_player);
                 const s16 health = local ? c->sim[0].combat.inv.health
                                          : c->sim[0].pcombat[p].inv.health;
@@ -9449,28 +11344,80 @@ static void client_shock_hold(client *c)
 
 /* Each view-weapon entity owns its animation, selection and shot cursors.
  * The caller selects the same owner's combat block before entering here. */
-static void client_advance_view_weapon(client *c, bool attack, float dt)
+/* Consume each fire result at its call site. last_shot is a diagnostic latch,
+ * not an event queue: a later dry attempt must not replace an earlier bang,
+ * nor may yesterday's burst restart an idle animation on trigger release. */
+static q2_vw_fire_result client_fire_view_weapon(void *user, int weapon, int rounds)
+{
+    client *c = user;
+    int pi = c->sim[0].cur_player;
+    const q2_weapon_tables *wt = q2_weapon_tables_builtin();
+    q2_fire_result_v2 shot = q2_sim_fire_weapon(&c->sim[0], weapon, rounds);
+    u32 b;
+
+    client_sound_requests_init(c);
+
+    c->shot_serial_shown[pi] = c->sim[0].combat.shot_serial;
+    c->shot_serial_heard[pi] = c->sim[0].combat.shot_serial;
+    if (!shot.fired && !shot.dry)
+        return Q2_VW_FIRE_NONE;
+
+    if (shot.fired) {
+        if (pi == 0) c->shots_fired++;
+        c->mp_shots[pi]++;
+        if (pi == 0 && c->creatures_ready)
+            q2_creature_world_player_noise(&c->creatures, true);
+        if (shot.shock)
+            client_shock(c, pi, shot.shock, Q2_SHOCK_FULL, NULL, 0, 0);
+        /* 0x8004CCB4: one quiet clone per bullet, then 0x8004CCD8's
+         * full-volume bang once per burst. */
+        if (weapon == Q2_WID_CHAINGUN) {
+            for (b = 0; b < shot.shot_count; b++) {
+                c->chaingun_bangs++;
+                client_play_request(c, wt->sound[Q2_WSND_MACHINEGUN],
+                    &c->chaingun_request, CLIENT_SOUND_POINT, 0, c->sim[0].player[pi].pos);
+            }
+        }
+        if (weapon == Q2_WID_SHOTGUN)
+            c->cock_pending[pi] = true;
+    } else {
+        if (pi == 0) c->shots_dry++;
+        c->mp_dry[pi]++;
+    }
+    if (shot.sound >= 0 && (u32)shot.sound < Q2_WT_SOUND_COUNT) {
+        c->weapon_sounds++;
+        if (client_play_player_sound(c, wt->sound[shot.sound],
+                client_request_for_sound(wt->sound[shot.sound], c), pi)) {
+            c->shot_voice[pi] = c->voice_last;
+            c->shot_voice_serial[pi] = c->voice_last_serial;
+        }
+    }
+    return shot.dry ? Q2_VW_FIRE_DENIED : Q2_VW_FIRED;
+}
+
+/*
+ * ONCE PER LOGIC TICK, with that tick's dt. The driver 0x8004EE0C has one
+ * caller, 0x8003AD98 inside the live player think, and it reads the frame's
+ * single dt global 0x800B2DB4 — so the shots it takes, the clip it advances
+ * and the result the body's ATTACK request reads all belong to the tick. This
+ * used to run on every DISPLAY frame with the display's dt, which at 60 Hz
+ * fired and animated between ticks and left the body to guess from a shot
+ * counter what the driver had returned.
+ */
+static void client_advance_view_weapon(client *c, bool attack, s32 ticks)
 {
     int pi = c->sim[0].cur_player;
+
+    client_sound_requests_init(c);
 
     if (!c->death[pi].linked_weapon || c->sim[0].combat.inv.health <= 0)
         return;
 
     if (c->vm_ready) {
-        s32 ticks = (s32)((double)dt * 300.0 + 0.5);
         bool swapped;
 
-        /*
-         * HOW MANY TIMES THE FIRE FUNCTION RAN THIS FRAME, AND HOW MANY BULLETS
-         * CAME OUT OF IT.
-         *
-         * The console raises its sounds INSIDE the fire function, so a frame
-         * that ran it twice made two bangs; this port raised one per change of
-         * `shot_serial`, which is one per frame however many calls there were.
-         * On a wound-up chaingun that is the difference between a rip and a
-         * tap: measured 573 fire calls against 95 sounds on a 300-frame run.
-         */
-        u32 fire_calls = 0, fire_bullets = 0;
+        /* PrimaryQuakePlayer acquired and eased this on the logic tick. */
+        q2_vw_set_aim_assist(&c->vw[pi], c->sim[0].player[pi].aim_assist);
 
         if (ticks < 1) ticks = 1;
         if (ticks > Q2_SCREEN_DT_MAX) ticks = Q2_SCREEN_DT_MAX;
@@ -9493,94 +11440,10 @@ static void client_advance_view_weapon(client *c, bool attack, float dt)
             c->vw_last_weapon[pi] = c->sim[0].combat.weapon_id;
         }
 
-        /*
-         * WHAT THE SIM'S SHOT ACTUALLY DID.
-         *
-         * This used to report Q2_VW_FIRED whenever the trigger was down and the
-         * weapon was not dry — which is every frame of a held trigger, refire
-         * gate or no refire gate. So the fire clip played for shots that never
-         * happened, and it played at RENDER rate: q2_vw_advance runs every
-         * frame while the sim ticks every second frame in the headless step.
-         *
-         * The three outcomes are distinct and only one of them is a shot:
-         *
-         *     dry     -> Q2_VW_FIRE_DENIED, the empty-gun pass that makes the
-         *                machine switch you off the weapon
-         *     fired   -> Q2_VW_FIRED
-         *     neither -> the refire gate said no; the machine must not be told
-         *                anything, or the clip restarts on a tick that did not
-         *                fire
-         *
-         * THE SERIAL IS WHAT MAKES IT AN EVENT, and this used to gate on `ticks`
-         * instead — which is clamped to a minimum of 1 fifty lines above and is
-         * therefore always true. It gated nothing. `last_shot` is a latch that
-         * holds the last ATTEMPT, so on the frames between ticks it still reads
-         * `fired`, and the third outcome above was unreachable from here: a held
-         * trigger re-reported one shot on every rendered frame, and the clip
-         * restarted as fast as the machine's latch could clear. That is the very
-         * defect the comment above claimed the gate was preventing, and it is
-         * the same one the sound below had.
-         *
-         * `shot_serial` is bumped once per fire attempt (sim.h), so a value this
-         * client has not seen means a NEW attempt and nothing else does. The
-         * trigger drops out of the condition with it: the sim only attempts a
-         * shot on a tick whose input had `attack` set, so a fresh serial already
-         * says the trigger was down when it mattered — which is not the same
-         * question as whether it is still down on this frame.
-         *
-         * `attack` is still passed to the machine, because that argument is
-         * the TRIGGER, not the report.
-         */
         {
             q2_vw_fire_result report = Q2_VW_FIRE_NONE;
-
-            /*
-             * THE MACHINE OWNS THE TRIGGER. `q2_vw_wants_fire` is this port's
-             * name for the console's own condition — IDLE with the dry latch
-             * clear — and it sat here with no caller anywhere for as long as
-             * the sim fired on its own tick.
-             *
-             * With the invented 30-tick gate gone (weapon.c), the rate of fire
-             * is the fire CLIP, which is what the console does: its IDLE arm
-             * calls the fire function and then enters FIRE. The three weapons
-             * that need to be faster get it from their own frame driver, which
-             * is drained just below.
-             */
-            if (ticks > 0 && attack && q2_vw_wants_fire(&c->vw[pi])) {
-                q2_fire_result_v2 r = q2_sim_fire(&c->sim[0]);
-
-                if (r.fired) {
-                    fire_calls++;
-                    fire_bullets += r.shot_count;
-                    /* The fire function's own SetShockData, at its end. */
-                    if (r.shock)
-                        client_shock(c, pi, r.shock, Q2_SHOCK_FULL,
-                                     NULL, 0, 0);
-                }
-            }
-
-            if (c->sim[0].combat.shot_serial != c->shot_serial_shown[pi]) {
-                c->shot_serial_shown[pi] = c->sim[0].combat.shot_serial;
-
-                if (c->sim[0].combat.last_shot.dry) {
-                    report = Q2_VW_FIRE_DENIED;
-                    if (pi == 0) c->shots_dry++;
-                    c->mp_dry[pi]++;
-                } else if (c->sim[0].combat.last_shot.fired) {
-                    report = Q2_VW_FIRED;
-                    if (pi == 0) c->shots_fired++;
-                    c->mp_shots[pi]++;
-                    /*
-                     * AND THE NOISE IT MADE. PlayerNoise (0x80062C74) is what
-                     * puts a gunshot on the level's `sound_entity`, and
-                     * FindTarget's second arm looks for exactly that. Without
-                     * it the player could empty a magazine in a corridor and
-                     * wake nobody — measured at 126 shots, 0 hunting.
-                     */
-                    if (pi == 0 && c->creatures_ready)
-                        q2_creature_world_player_noise(&c->creatures, true);
-                }
-            }
+            if (attack && q2_vw_wants_fire(&c->vw[pi]))
+                report = client_fire_view_weapon(c, c->vw[pi].weapon, 1);
 
             /*
              * Is the quad up? The four fire sites read the deadline out of the
@@ -9593,33 +11456,13 @@ static void client_advance_view_weapon(client *c, bool attack, float dt)
                 (c->sim[0].level_time <
                  c->sim[0].combat.inv.quad_until);
 
-            /*
-             * AND THE BARREL'S OWN PITCH, client+0x46. PrimaryQuakePlayer eases
-             * it toward client+0x44 once a tick at 0x8003A44C..0x8003A460 —
-             * `Seek(&client+0x46, client+0x44, [0x800B2DB4] * 4)` — and
-             * 0x8004F3F0 adds the result to the clip rotation's X before the
-             * weapon model's matrix is built, so the gun tips onto a target
-             * above or below you while the view stays level. `ticks` is the
-             * same 1/300 s frame delta the console passes, which is what
-             * q2_vw_advance is already given.
-             *
-             * THE TARGET IS ZERO AND THAT IS THE HALF THAT IS MISSING, said
-             * plainly rather than hidden behind a call that looks wired. The
-             * elevation comes from FindPlayerTarget (QPLAYER.C 0x80039DDC),
-             * which picks one of eleven candidates and writes the ratan2 of the
-             * offset into client+0x44 at 0x8003A138 — and writes ZERO at
-             * 0x8003A190 when it finds nobody. Nothing in this port searches
-             * for that target yet, so what runs here is the no-target arm: the
-             * console's own answer when there is nothing in front of you, and
-             * the reason `view.aim_assist` reads zero in every report today.
-             * When the search lands, only this argument changes.
-             */
-            q2_vw_seek_aim_assist(&c->vw[pi], 0, ticks);
-
-            swapped = q2_vw_advance(&c->vw[pi], ticks, attack, report);
+            swapped = q2_vw_advance_firing(&c->vw[pi], ticks, attack, report,
+                                            client_fire_view_weapon, c);
         }
-        if (swapped)
+        if (swapped) {
+            c->cock_pending[pi] = false;
             client_bind_view_model(c, pi);
+        }
 
         /* Grenade3 is a hidden entity attached to the view weapon until the
          * model timeline crosses 411. Retail copies viewmodel+0xA4 every think
@@ -9656,49 +11499,8 @@ static void client_advance_view_weapon(client *c, bool attack, float dt)
                              NULL, 0, 0);
         }
 
-        /*
-         * AND THE SHOTS THE FIRE-STATE DRIVER ASKED FOR.
-         *
-         * The four per-weapon arms of 0x8004FEE8 call the weapon's fire
-         * function themselves, once per animation frame or once per 30 units
-         * of accumulated step depending on the weapon — that is what makes a
-         * held chaingun a stream rather than one shot. They are drained here
-         * and turned into real shots against the sim.
-         *
-         * The sim's own refire gate still applies. For the four weapons that
-         * have an arm the console has no gate but the animation, so the two
-         * agree as long as the clip is slower than 30 ticks; where they do not,
-         * the gate wins and the shot is skipped, which is the conservative
-         * half. Weapon 6 raises no frame fire: its arm feeds the held entity
-         * above, and its model-timeline crossing at 411 performs the throw.
-         */
         {
-            u32 n = q2_vw_take_frame_fires(&c->vw[pi]);
             s16 snd;
-
-            while (n--) {
-                q2_fire_result_v2 r = q2_sim_fire(&c->sim[0]);
-
-                c->player_attacks++;
-                if (r.fired) {
-                    fire_calls++;
-                    fire_bullets += r.shot_count;
-                    if (r.shock)
-                        client_shock(c, pi, r.shock, Q2_SHOCK_FULL,
-                                     NULL, 0, 0);
-                }
-
-                /*
-                 * AND THE ARM HEARS HOW IT WENT. Each of 0x8004FEE8's arms
-                 * tests the fire function's return before anything else: a
-                 * dry machinegun drops to IDLE there and then, a dry chaingun
-                 * or hyperblaster raises the latch, and only a shot that
-                 * fired brings the quad's sound. A shot the port's own gate
-                 * refused is neither, and is not reported.
-                 */
-                if (r.fired || r.dry)
-                    q2_vw_frame_fire_result(&c->vw[pi], r.dry);
-            }
 
             /* And the clip's own sound at a band boundary — the chaingun's
              * spin-up, loop and spin-down, three of the eleven weapon sounds
@@ -9708,7 +11510,8 @@ static void client_advance_view_weapon(client *c, bool attack, float dt)
                 const q2_weapon_tables *wt = q2_weapon_tables_builtin();
 
                 if (wt->sound[snd][0])
-                    client_play_sound(c, wt->sound[snd]);
+                    client_play_player_sound(c, wt->sound[snd],
+                        client_request_for_sound(wt->sound[snd], c), pi);
             }
 
             /*
@@ -9744,7 +11547,9 @@ static void client_advance_view_weapon(client *c, bool attack, float dt)
                 c->quad_raises++;
                 if (client_voice_playing(c->quad_voice, c->quad_voice_serial)) {
                     c->quad_gated++;
-                } else if (client_play_sound(c, c->item_sound[Q2_SND_QUAD])) {
+                } else if (client_play_request(c, c->item_sound[Q2_SND_QUAD],
+                    client_request_for_sound(c->item_sound[Q2_SND_QUAD], c), CLIENT_SOUND_POINT, 0,
+                    c->sim[0].player[pi].pos)) {
                     c->quad_voice        = c->voice_last;
                     c->quad_voice_serial = c->voice_last_serial;
                 }
@@ -9783,16 +11588,10 @@ static void client_advance_view_weapon(client *c, bool attack, float dt)
                                     CLIENT_SLOTS_AUTOSELECT);
         }
 
-        /*
-         * The animation's own per-key event. Drained and RECORDED rather than
-         * acted on, and deliberately so: the original's consumer is 0x80050454,
-         * a multi-way dispatch on the id with an arm for 2 and a shared arm for
-         * {3,6,7,8,11}, reading state+0x114/+0x116 and calling 0x800739B8 and
-         * 0x8007270C. Nothing read so far says which id is a muzzle flash and
-         * which is a shell eject, and hanging an invented meaning on a decoded
-         * id is exactly the mistake this project keeps paying for. Counted so
-         * the ids that actually occur can be seen; see openquestions.
-         */
+        /* Diagnostic copy of the key event. 0x80050454 dispatches on WEAPON
+         * id, not effect id: q2_vw_advance already starts the named model move,
+         * and the deferred shotgun cock is handled below. These are not
+         * additional muzzle-flash or shell-ejection requests. */
         {
             s16 ev;
             if (q2_vw_take_event(&c->vw[pi], &ev)) {
@@ -9802,110 +11601,20 @@ static void client_advance_view_weapon(client *c, bool attack, float dt)
         }
 
         /*
-         * AND THE SHOT'S SOUND, which every one of the eleven fire functions
-         * computes into `res.sound` and nothing has ever played. Firing any
-         * weapon was silent, and a dry trigger did not click.
-         *
-         * IT IS CONSUMED, not sampled. `last_shot` is a latch that is written
-         * on a trigger pull and never cleared, so `fired` stays true after the
-         * trigger is released — and this read used to be gated on `ticks`,
-         * which is clamped to a minimum of 1 just above and is therefore
-         * always true. Every rendered frame replayed the same shot: one pull,
-         * and then that shot for as long as the player stood there. Between
-         * ticks it also fired several times per shot while the trigger WAS
-         * held, because a fire attempt happens on a tick and this runs on a
-         * frame.
-         *
-         * The serial is what makes it an event: it is bumped once per attempt
-         * (sim.h), so a shot is heard exactly once no matter how many frames
-         * pass before the next one.
-         */
-        if (c->sim[0].combat.shot_serial != c->shot_serial_heard[pi]) {
-            const q2_fire_result_v2 *shot = &c->sim[0].combat.last_shot;
-
-            c->shot_serial_heard[pi] = c->sim[0].combat.shot_serial;
-
-            /*
-             * THE CHAINGUN BANGS ONCE PER BULLET, AND QUIETLY.
-             *
-             * QPlayerFireChainGun's bullet loop runs `lhu s5, 44(s6)` times —
-             * one, two or three, written by the view-model arm at 0x800501C0
-             * and clamped to the ammo at 0x80050200 — and 0x8004CCB4/0x8004CCB8
-             * play `SoundChaingunFire` (gp+17700) at the player's origin INSIDE
-             * it, once per bullet. That handle is not the machinegun's: 0x8004E0F8
-             * CLONES the wep_machgf1b request with GetSoundClone and 0x8004E2CC
-             * takes the clone down by 40, so it sounds at 23 of 63 — a little
-             * over a third of a machinegun shot from the same sample.
-             *
-             * Then, after the loop, 0x8004CCD8 plays the SEPARATE full-volume
-             * request at gp+17744 (SoundMachinegunFire) once through
-             * SoundByCreature. So a three-bullet chaingun tick is three quiet
-             * bangs and one loud one, and this port made a single loud one.
-             */
-            if (fire_bullets &&
-                c->sim[0].combat.weapon_id == Q2_WID_CHAINGUN) {
-                const q2_weapon_tables *wt = q2_weapon_tables_builtin();
-                const char *key = wt->sound[Q2_WSND_MACHINEGUN];
-                u32 b;
-
-                for (b = 0; b < fire_bullets && key[0]; b++) {
-                    c->chaingun_bangs++;
-                    if (client_play_sound(c, key))
-                        client_sound_set_relative_volume(
-                            c, Q2_SFX_VOLUME_CHAINGUN_DELTA);
-                }
-            }
-
-            /*
-             * ONCE PER FIRE CALL, not once per frame. Every fire function plays
-             * its weapon's sound itself — the chaingun's trailing one is
-             * 0x8004CCD8 — so a frame in which the frame-fire driver ran the
-             * function three times made three of them, and this raised one.
-             *
-             * `fire_calls` counts only the calls that FIRED, which is also why
-             * it is preferred to `shot->fired`: that is the LAST attempt's
-             * outcome, and a frame can fire twice and then be refused.
-             * A dry trigger has no call to count and still clicks once.
-             */
-            {
-                u32 want = fire_calls ? fire_calls
-                                      : ((shot->fired || shot->dry) ? 1u : 0u);
-                u32 k;
-
-                for (k = 0; k < want && shot->sound >= 0; k++) {
-                    const q2_weapon_tables *wt = q2_weapon_tables_builtin();
-
-                    c->weapon_sounds++;
-                    if ((u32)shot->sound < Q2_WT_SOUND_COUNT &&
-                        wt->sound[shot->sound][0] &&
-                        client_play_sound(c, wt->sound[shot->sound])) {
-                        /* entity+276/278: the handle the cock waits on. */
-                        c->shot_voice[pi]        = c->voice_last;
-                        c->shot_voice_serial[pi] = c->voice_last_serial;
-                    }
-                }
-            }
-
-            /* 0x8004C460. The raise is the fire function's, so it is keyed on
-             * the shot having fired and on the weapon that fired it. */
-            if (shot->fired && c->sim[0].combat.weapon_id == Q2_WID_SHOTGUN)
-                c->cock_pending[pi] = true;
-        }
-
-        /*
          * 0x80050484..0x800504D0, the deferred half. The console asks on every
          * substep of the key loop and this asks once a frame, which moves the
          * cock by at most one frame and cannot move it before the bang ends —
          * the query is the same one.
          */
         if (c->cock_pending[pi] &&
-            c->sim[0].combat.weapon_id == Q2_WID_SHOTGUN &&
+            c->vw[pi].weapon == Q2_WID_SHOTGUN &&
             !client_voice_playing(c->shot_voice[pi],
                                   c->shot_voice_serial[pi])) {
             const q2_weapon_tables *wt = q2_weapon_tables_builtin();
 
             if (wt->sound[Q2_WSND_SHOTGUN_RELOAD][0])
-                client_play_sound(c, wt->sound[Q2_WSND_SHOTGUN_RELOAD]);
+                client_play_player_sound(c, wt->sound[Q2_WSND_SHOTGUN_RELOAD],
+                    client_request_for_sound(wt->sound[Q2_WSND_SHOTGUN_RELOAD], c), pi);
             c->cock_pending[pi] = false;
             c->cocks_played++;
         }
@@ -9928,7 +11637,8 @@ static void client_extra_input(client *c, int pi, s32 step, bool resumed,
     pad->lx = pad->ly = pad->rx = pad->ry = 0;
     q2_pad_config_default(&cfg);
     cfg.style = c->sim[0].player[pi].look_scheme;
-    cfg.swap_y = c->settings.v[Q2_SET_SWAP_Y];
+    cfg.swap_y = c->settings.v[q2_menu_player_setting(Q2_SET_SWAP_Y, pi)];
+    cfg.mouse_speed = c->settings.v[q2_menu_player_setting(Q2_SET_MOUSE_SPEED, pi)];
     raw = c->demo ? client_demo_pad((long)c->frame_index + (long)pi * 37)
                   : q2_gamepads_read(&c->gamepads, pi, cfg.style, pad);
     c->gamepads.pressed[pi] = 0;
@@ -10013,6 +11723,54 @@ static void client_extra_camera(client *c, int pi)
     }
 }
 
+/* Select the think function's movement before rebuilding the body list and
+ * before each extra player's tick, which may follow damage from another
+ * player's frame. The death state machine itself runs later; its first
+ * dissolve tick still moves. */
+static void client_player_motion(client *c)
+{
+    int pi;
+
+    for (pi = 0; pi < Q2_SIM_MAX_PLAYERS; pi++) {
+        const q2_player_death *d = &c->death[pi];
+        q2_player *p = &c->sim[0].player[pi];
+        const bool local = pi == c->sim[0].cur_player;
+        const s16 health = local ? c->sim[0].combat.inv.health
+                                 : c->sim[0].pcombat[pi].inv.health;
+        const q2_actor *actor = local ? &c->sim[0].combat.self
+                                      : &c->sim[0].pcombat[pi].self;
+
+        /* 0x8004597C tests the chain's DEAD bit, raised after the first
+         * single-player corpse move or when the deathmatch animation ends.
+         * The sim sets its own bit earlier to stop input and firing. */
+        p->corpse_separate = d->stage == Q2_PDEATH_DYING &&
+                             !(d->ent2 & Q2_PDEATH_DEAD_BIT);
+        if (d->stage == Q2_PDEATH_ALIVE) {
+            p->motion = Q2_PLAYER_MOTION_LIVE;
+        } else if (d->stage == Q2_PDEATH_DYING && health > d->gib_health) {
+            p->motion = Q2_PLAYER_MOTION_CORPSE;
+        } else if (d->stage == Q2_PDEATH_DOWN &&
+                   (health > d->gib_health ||
+                    q2_corpse_dissolve_pick(actor->effect) != Q2_CORPSE_DISSOLVE_NONE)) {
+            p->motion = Q2_PLAYER_MOTION_BODY;
+        } else {
+            p->motion = Q2_PLAYER_MOTION_NONE;
+        }
+    }
+}
+
+static void client_grenade_bounce_audio(client *c)
+{
+    s32 at[3];
+    const char *name = q2_weapon_tables_builtin()->sound[Q2_WSND_GRENADE_BOUNCE];
+    while (q2_model_ent_sound_next(&c->sim[0].grenade_bounce_sounds, at)) {
+        q2_vag vag;
+        if (client_find_sound(c, name, &vag)) c->grenade_bounce_sounds++;
+        else c->grenade_bounce_sounds_missed++;
+        client_play_sound_at(c, name, at);
+    }
+}
+
 static void client_input_simulated(client *c, float dt)
 {
     q2_input in;
@@ -10087,16 +11845,20 @@ static void client_input_simulated(client *c, float dt)
     step = q2_sim_next_dt(&c->sim[0], (double)dt);
 
     pad->lx = pad->ly = pad->rx = pad->ry = 0;
-    if (c->gamepads.changed[0]) {
-        *pend = 0;
-        memset(pad, 0, sizeof(*pad));
-        c->pad_resume = resumed = true;
-        c->gamepads.changed[0] = false;
+    {
+        int primary = q2_gamepads_primary(&c->gamepads, c->mp_enabled);
+        if (c->gamepads.changed[primary] || c->primary_pad_id != c->gamepads.id[primary]) {
+            *pend = 0;
+            memset(pad, 0, sizeof(*pad));
+            c->pad_resume = resumed = true;
+            c->gamepads.changed[primary] = false;
+            c->primary_pad_id = c->gamepads.id[primary];
+        }
+        raw = client_pad_mask(c, &bind);
+        if (!c->demo)
+            raw |= (u16)q2_gamepads_read(&c->gamepads, primary, style, pad);
+        c->gamepads.pressed[primary] = 0;
     }
-    raw = client_pad_mask(c, &bind);
-    if (!c->demo)
-        raw |= (u16)q2_gamepads_read(&c->gamepads, 0, style, pad);
-    c->gamepads.pressed[0] = 0;
 
     /* The wheel, onto the same two masks the weapon keys use, and into `raw`
      * so a notch is latched by the same accumulator as a key. */
@@ -10320,6 +12082,10 @@ static void client_input_simulated(client *c, float dt)
      * falling into it — bit 26 suppresses bit 27 on a frame that somehow
      * carries both, which the wheel's own gap flag makes possible.
      */
+    /* QMULTI enters page 45 while the end banner counts down. Keep the
+     * world clock running, but no player may move, turn or start a shot. */
+    if (c->mp_enabled && c->mp.end != Q2_MP_RUNNING)
+        memset(&in, 0, sizeof(in));
     if (step > 0)
         client_cycle_input(c, 0, &in);
 
@@ -10338,34 +12104,7 @@ static void client_input_simulated(client *c, float dt)
         u32 i;
         for (i = 0; i < c->creatures.set.count; i++) {
             const q2_monster *m = &c->creatures.set.monsters[i];
-            s32 push[3];
-
-            /*
-             * The damage-effect timers (entity+0x2F0..0x2F5) and the killer
-             * byte (+222) outlive this rebuild inside q2_actor_from_monster
-             * itself (combat.c), so this side no longer saves and restores
-             * effect[] around the call.
-             *
-             * A BODY'S KNOCKBACK outlives it too, and that one is this side's
-             * to keep, because q2_actor_init zeroes +0x2F8 and nothing on a
-             * corpse ever does. T_Damage accumulates the push into a living
-             * target and OVERWRITES a dead one's (0x80058188 `lh v0,264(s2)` /
-             * `blez` to the stores at 0x800581E0..0x80058200). `q2psx-inspect
-             * access 0x2F8` over the main executable (it does not scan the
-             * relocated creature modules) finds `sh zero,760` only at
-             * 0x80045F4C and 0x800461CC, inside the mover 0x8004583C, which
-             * the live creature think calls (0x8007EE00, 0x8007EFD0) and the
-             * corpse handler 0x8007F71C does not. So the gib dispatcher reads,
-             * at 0x8007D104 and its twins, the last hit's push. Zeroed here
-             * every frame it reached the throw only when the gibbing hit and
-             * the 10 Hz corpse tick fell in the same frame. A living
-             * creature's is still dropped: the port has no creature mover to
-             * spend it, and the rebuild stands in for the consume.
-             */
-            memcpy(push, c->cre_actor[i].knockback, sizeof(push));
             q2_actor_from_monster(&c->cre_actor[i], m);
-            if (m->health <= 0)
-                memcpy(c->cre_actor[i].knockback, push, sizeof(push));
             /*
              * A FREED body — gibbed, or dissolved by 0x8005B2A8's handler —
              * has no think once 0x8006D280 has released it, so 0x8005B880
@@ -10400,7 +12139,7 @@ static void client_input_simulated(client *c, float dt)
 
                 memset(b, 0, sizeof(*b));
                 for (k = 0; k < 3; k++) {
-                    b->pos[k]  = m->pos[k];
+                    b->pos[k]  = q2_cre_origin(m)[k];
                     b->mins[k] = m->mins[k];
                     b->maxs[k] = m->maxs[k];
                 }
@@ -10440,7 +12179,7 @@ static void client_input_simulated(client *c, float dt)
      * scoring path can be exercised rather than reasoned about, and it is a
      * harness, not gameplay.
      */
-    if (c->mp_stage && c->mp_enabled) {
+    if (c->mp_stage && c->mp_enabled && c->mp.end == Q2_MP_RUNNING) {
         int pi;
         s32 eye0[3];
 
@@ -10567,11 +12306,15 @@ static void client_input_simulated(client *c, float dt)
      * at higher render rates q2_sim_advance legitimately does nothing on the
      * intervening frames.
      */
-    if (q2_sim_next_dt(&c->sim[0], (double)dt) != 0)
+    if (q2_sim_next_dt(&c->sim[0], (double)dt) != 0) {
         q2_event_rt_trigger_named(&c->sim[0].event_rt, "ALWAYS");
+        client_native_mission_queue(c);
+    }
 
     c->mp_input[0] = in;
+    client_player_motion(c);
     ticked = (q2_sim_advance(&c->sim[0], &in, (double)dt) != 0);
+    if (ticked) client_glint_scene(c, false);
     q2_combat_scan_who = Q2_COMBAT_SCAN_OTHER;
     client_score_deaths(c);
 
@@ -10609,17 +12352,19 @@ static void client_input_simulated(client *c, float dt)
                 continue;
 
             client_extra_input(c, pi, step, resumed, &pin);
+            if (c->mp.end != Q2_MP_RUNNING)
+                memset(&pin, 0, sizeof(pin));
             c->mp_input[pi] = pin;
             if (ticked) client_cycle_input(c, pi, &pin);
 
-            view_attack[pi] = c->mp_stage || pin.attack;
+            view_attack[pi] = (c->mp_stage && c->mp.end == Q2_MP_RUNNING) || pin.attack;
             if (!ticked)
                 continue;
 
             {
                 s32 ticks = step_dt;      /* the step player 0 just took */
 
-                if (c->mp_stage) {
+                if (c->mp_stage && c->mp.end == Q2_MP_RUNNING) {
                     pin.attack   = true;
                     pin.buttons |= Q2_BTN_ATTACK_PRESS;
 
@@ -10635,7 +12380,15 @@ static void client_input_simulated(client *c, float dt)
                 }
                 client_targets_for(c, pi);
                 q2_combat_scan_who = pi;
-                q2_sim_advance_player(&c->sim[0], pi, &pin, ticks);
+                client_player_motion(c);
+                {
+                    bool primary_autocentre = c->sim[0].autocentre_setting;
+                    /* Player one's continuous host mouse must not disable
+                     * the other players' retail pad spring-centering. */
+                    c->sim[0].autocentre_setting = c->settings.v[Q2_SET_AUTOCENTRE] != 0;
+                    q2_sim_advance_player(&c->sim[0], pi, &pin, ticks);
+                    c->sim[0].autocentre_setting = primary_autocentre;
+                }
                 q2_combat_scan_who = Q2_COMBAT_SCAN_OTHER;
 
                 client_score_deaths(c);
@@ -10664,33 +12417,25 @@ static void client_input_simulated(client *c, float dt)
      * damage a creature. See client_drain_creature_damage.
      */
 
-    /*
-     * What the items did while that ran. Immediately after the tick, because
-     * the event list is cleared at the top of the next one.
-     *
-     * AND ONLY IF ONE RAN. The list is cleared at the top of a tick and this is
-     * the only thing that drains it, so a frame on which the sim did not tick
-     * finds the PREVIOUS tick's events still sitting there — and used to play
-     * every one of them again. At 90 fps against a 25 Hz tick that is every
-     * footstep, pain grunt and pickup heard three or four times, with the count
-     * wobbling as the frame rate did. It is also why the sixteen dynamic light
-     * slots were being refilled from the same events several times a frame.
-     */
-    /*
-     * AND AFTER THE WEAPON, NOT BEFORE IT. This drain used to sit above the
-     * view-weapon block, and the muzzle flash never reached the light world
-     * once: `q2_sim_fire` is called from inside `client_advance_view_weapon`,
-     * so the flash was appended to a list that had already been walked and was
-     * thrown away by the next tick's clear. The machinegun and the chaingun
-     * have carried a muzzle light for as long as `q2_weapon_has_muzzle_light`
-     * has existed and not one of them was ever seen — which is why the timed
-     * shotgun flashes looked dormant when they were merely last in a queue
-     * nobody read.
-     *
-     * Still immediately after the tick in the sense that matters — nothing
-     * between here and there clears the list, and the next tick's clear is a
-     * whole frame away.
-     */
+    /* Start a display frame with the simulation's current lights. A projectile
+     * still glows between logic ticks, but a one-frame gun flash must expire.
+     * Drain the simulation before the weapons, retaining only that batch as
+     * the lighting held until the next tick. The second drain below consumes
+     * shots even on frames on which q2_sim_advance returned zero. */
+    if (c->lights_ready) {
+        q2_light_world_begin_frame(&c->light_world);
+        if (!ticked) {
+            memcpy(c->light_world.dynamic_world, c->tick_lights,
+                   c->tick_light_count * sizeof(c->tick_lights[0]));
+            c->light_world.dynamic_world_count = c->tick_light_count;
+        }
+    }
+    client_entity_events(c);
+    if (ticked && c->lights_ready) {
+        c->tick_light_count = c->light_world.dynamic_world_count;
+        memcpy(c->tick_lights, c->light_world.dynamic_world,
+               c->tick_light_count * sizeof(c->tick_lights[0]));
+    }
     /*
      * The weapon in the hands, advanced on the same clock. The selection comes
      * from the simulation, but the SWAP does not happen when the selection
@@ -10724,8 +12469,11 @@ static void client_input_simulated(client *c, float dt)
              * a dead player's gun went on animating in his hands and could
              * still change weapon under him.
              */
-            if (!(c->sim[0].player[pi].ent2_flags & Q2_ENT2_DEAD))
-                client_advance_view_weapon(c, view_attack[pi], dt);
+            if (ticked && !(c->sim[0].player[pi].ent2_flags & Q2_ENT2_DEAD))
+                client_advance_view_weapon(c, view_attack[pi], c->sim[0].cur_dt);
+            if (ticked && c->death[pi].stage == Q2_PDEATH_ALIVE &&
+                c->sim[0].combat.inv.health > 0)
+                client_player_anim_tick(c, pi, c->sim[0].cur_dt, false);
             client_score_deaths(c);
         }
         q2_sim_select_player(&c->sim[0], saved);
@@ -10734,8 +12482,7 @@ static void client_input_simulated(client *c, float dt)
         q2_combat_scan_who = Q2_COMBAT_SCAN_OTHER;
     }
 
-    if (ticked)
-        client_entity_events(c);
+    client_entity_events(c);
 
     /* Damage tracking is per player, like the viewport's flash tile
      * (0x8003AE10 writes the same view+672 that 0x80076764 draws). */
@@ -10858,6 +12605,8 @@ static void client_input_simulated(client *c, float dt)
         }
     }
 
+    client_glint_burst(c);
+
     /*
      * The camera is NOT the player's aim. 0x80038260 composes three decaying
      * kicks — firing over 30 ticks, damage over 150, landing over 90 — on top of
@@ -10904,50 +12653,7 @@ static void client_input_simulated(client *c, float dt)
     /* The multiplayer session's own frame, on the same clock. */
     if (ticked) client_mp_tick(c, c->sim[0].cur_dt);
 
-    /*
-     * The level's own beams, re-queued because the transient pool empties every
-     * frame — which is exactly what the console's walk at 0x8002EE38 does with
-     * its own list, every frame, for ever. Not on the rotators' clock and not
-     * gated on them: a zone with lasers and no rotating brush is ordinary.
-     */
-    c->laser_drawn = c->no_lasers
-                     ? 0
-                     : q2_laserbeams_draw(&c->lasers, &c->sim[0].event_rt,
-                                          &c->sim[0].fx, &c->sim[0].fx_rng);
-
-    /*
-     * AND THE TELEPORT PADS, which is the third of QuakeLoop's three per-frame
-     * walks — 0x80038FA4 calls DrawTelePorts immediately BEFORE DrawLaserWalls
-     * and DrawLaserBeams, so this goes above the beams in the console's order
-     * and the beams' own draws follow. Called unconditionally and on every map,
-     * because the console's is: the fifteen shared velocities come out of the
-     * generator before NumTelePorts is tested (levelbin.h).
-     *
-     * The light is added here rather than inside the walk because the light
-     * world is the client's and `client_entity_events` has already emptied it
-     * for this frame; sixteen dynamic slots is the engine's ceiling and
-     * q2_light_add_dynamic drops the seventeenth by itself.
-     */
-    {
-        q2_teleport_frame tp;
-        u32 k;
-
-        c->teleport_drawn =
-            q2_teleports_draw(&c->teleports, &c->sim[0].triggers,
-                              &c->sim[0].fx, &c->sim[0].fx_rng,
-                              c->sim[0].level_time, &tp);
-
-        if (c->lights_ready) {
-            for (k = 0; k < tp.light_count; k++) {
-                if (q2_light_add_dynamic(&c->light_world, tp.light[k].pos,
-                                         tp.light[k].rgb, tp.light[k].inner,
-                                         tp.light[k].outer,
-                                         Q2_FX_TELEPORT_LIGHT_STYLE,
-                                         Q2_FX_TELEPORT_LIGHT_SIZE))
-                    c->teleport_lights++;
-            }
-        }
-    }
+    client_level_effects_frame(c, ticked);
 
     /*
      * The 1/300 s clock three separate subsystems run on, and each is now
@@ -11063,6 +12769,10 @@ static void client_input_simulated(client *c, float dt)
                 }
             }
         }
+
+        /* Grenade contact precedes its fuse check, so a final rebound sounds
+         * before the explosion in that frame. */
+        client_grenade_bounce_audio(c);
 
         /*
          * THE EXPLOSION'S OWN BANG. Every spawn that bound the `Explosion`
@@ -11467,7 +13177,7 @@ static void client_input_simulated(client *c, float dt)
         player_origin[0] = c->sim[0].player[0].pos[0];
         player_origin[1] = q2_sim_origin_y(c->sim[0].player[0].pos[1]);
         player_origin[2] = c->sim[0].player[0].pos[2];
-        client_creatures_tick(c, dt, player_origin);
+        if (ticked) client_creatures_tick(c, (float)c->sim[0].cur_dt / 300.0f, player_origin);
     }
 
     /*
@@ -11510,8 +13220,8 @@ static void client_input_simulated(client *c, float dt)
      * death TWICE — once correctly and once with a hard-coded killer of -1,
      * which also charged the victim a suicide frag for being shot.
      */
-    {
-        const s32 tick = (step > 0) ? step : 0;
+    if (ticked) {
+        const s32 tick = c->sim[0].cur_dt;
         int       pi;
 
         for (pi = 0; pi < Q2_MP_MAX_PLAYERS; pi++) {
@@ -11567,9 +13277,9 @@ static void client_input_simulated(client *c, float dt)
                 if (ev.abandon_armed)
                     c->death_abandon = Q2_PDEATH_ABANDON_TICKS;
 
-                /* The rendered Male2 cursor raises ANIM_WRAPPED at the last
-                 * death key. A map with no player model still needs the old
-                 * fail-safe or a deathmatch corpse could never settle. */
+                /* The killing think installs DEATH even in single player. */
+                client_player_anim_tick(c, pi, tick, true);
+                /* A missing body model must not strand the corpse. */
                 if (c->mp_enabled && !c->player_anim_base_ok)
                     q2_player_death_anim_ended(d);
                 continue;          /* the killing tick is not a body tick */
@@ -11581,7 +13291,12 @@ static void client_input_simulated(client *c, float dt)
                 /* The body's effect bytes, for the dissolve gate respawn_think
                  * runs first (0x8003E244 jal 0x8005B2A8; playerdeath.h). */
                 q2_player_death_tick_fx(d, health, tick, c->mp_enabled,
-                                        client_mp_rng(c), a->effect);
+                                        0, a->effect);
+                /* corpse_think tests the previous flags before advancing.
+                 * A clip ending now settles on the next body tick. */
+                if (c->mp_enabled && was == Q2_PDEATH_DYING &&
+                    d->stage == Q2_PDEATH_DYING && d->animflags == 0)
+                    client_player_anim_tick(c, pi, tick, true);
 
                 /* The sim keeps its own copy for the movement and camera
                  * gates; this is the chain handing it the bit. */
@@ -11711,7 +13426,8 @@ static void client_input_simulated(client *c, float dt)
             s32 to[3];
             /* The framing below is measured from the creature's FEET, which is
              * where its model stands; `pos` is the entity origin. */
-            s32 feet_y = best->pos[1] + Q2_EYE_BASE;
+            const s32 *origin = q2_cre_origin(best);
+            s32 feet_y = origin[1] + Q2_EYE_BASE;
 
             /*
              * Stand in front of it, at head height, looking at it — the
@@ -11720,18 +13436,18 @@ static void client_input_simulated(client *c, float dt)
              * The camera moves and nothing else does; the player is still
              * where the simulation left them.
              */
-            c->cam.pos[0] = best->pos[0] +
-                            ((q2_sin12(best->angles[2]) * 700) >> Q2_FRAC_12);
+            c->cam.pos[0] = origin[0] +
+                            ((q2_sin12(q2_cre_yaw(best)) * 700) >> Q2_FRAC_12);
             c->cam.pos[1] = feet_y - 250;
-            c->cam.pos[2] = best->pos[2] +
-                            ((q2_cos12(best->angles[2]) * 700) >> Q2_FRAC_12);
+            c->cam.pos[2] = origin[2] +
+                            ((q2_cos12(q2_cre_yaw(best)) * 700) >> Q2_FRAC_12);
             eye[0] = c->cam.pos[0];
             eye[1] = c->cam.pos[1];
             eye[2] = c->cam.pos[2];
 
-            to[0] = best->pos[0] - eye[0];
+            to[0] = origin[0] - eye[0];
             to[1] = feet_y - eye[1] - 150;         /* look at the chest */
-            to[2] = best->pos[2] - eye[2];
+            to[2] = origin[2] - eye[2];
 
             double horiz = sqrt((double)to[0] * to[0] +
                                 (double)to[2] * to[2]);
@@ -11839,7 +13555,7 @@ static void client_input(client *c, float dt)
  * scancodes. That keeps the navigation rules — wrap, skip, press-versus-release
  * — exactly as they were read out of the executable.
  */
-static u16 client_menu_pad(const client *c)
+static u16 client_menu_pad(client *c)
 {
     const bool *k;
     u16 pad = 0;
@@ -11870,9 +13586,9 @@ static u16 client_menu_pad(const client *c)
     }
 
     if (c) {
-        int pi;
-        for (pi = 0; pi < Q2_MP_MAX_PLAYERS; pi++)
-            pad |= (u16)c->gamepads.held[pi];
+        if (c->menu.page_id != Q2_PAGE_FRONT_PLAYERS)
+            pad |= q2_gamepads_menu(&c->gamepads);
+        if (c->in_front_end && (pad & Q2_PAD_START)) pad |= Q2_PAD_CROSS;
         if (c->headless) return pad;
     }
     k = SDL_GetKeyboardState(NULL);
@@ -11887,6 +13603,7 @@ static u16 client_menu_pad(const client *c)
         k[SDL_SCANCODE_KP_ENTER] ||
         k[SDL_SCANCODE_SPACE])     pad |= Q2_PAD_CROSS;
     if (k[SDL_SCANCODE_BACKSPACE]) pad |= Q2_PAD_TRIANGLE;
+    if (k[SDL_SCANCODE_R])         pad |= Q2_PAD_SQUARE;
 
     /*
      * And the RIGHT BUTTON, which is TRIANGLE — the console's own back. It is
@@ -11925,6 +13642,38 @@ static void client_menu_origin(const client *c, int *ox, int *oy)
     if (oy) *oy = (c->height - Q2_MENU_SCREEN_H) / 2;
 }
 
+static bool client_ui_open(const client *c);
+
+static q2_screen_fit client_display_fit(const client *c)
+{
+    /* Raw-pixel debug fits must never distort a menu or its pointer targets. */
+    if ((c->fit == Q2_SCREEN_FIT_STRETCH || c->fit == Q2_SCREEN_FIT_SQUARE) &&
+        (c->in_front_end || client_ui_open(c) || c->loading.open ||
+         c->endmis_open || c->mp_scoreboard)) return Q2_SCREEN_FIT_AUTO;
+    return c->fit;
+}
+
+static void client_prompt_labels(const client *c, char labels[Q2_PROMPT_COUNT][32])
+{
+    SDL_Gamepad *pad = q2_gamepads_prompt(&c->gamepads);
+    snprintf(labels[Q2_PROMPT_SELECT], 32, "%s SELECT",
+             pad ? q2_ui_button(pad, SDL_GAMEPAD_BUTTON_SOUTH) : "ENTER");
+    snprintf(labels[Q2_PROMPT_BACK], 32, "%s BACK",
+             pad ? q2_ui_button(pad, SDL_GAMEPAD_BUTTON_EAST) : "ESC");
+    snprintf(labels[Q2_PROMPT_RULES], 32, "%s RULES",
+             pad ? q2_ui_button(pad, SDL_GAMEPAD_BUTTON_WEST) : "R");
+}
+
+static void client_prompt_build_ot(client *c, u32 bucket)
+{
+    char labels[Q2_PROMPT_COUNT][32];
+    const char *text[Q2_PROMPT_COUNT] = {labels[0], labels[1], labels[2]};
+    int ox, oy;
+    client_prompt_labels(c, labels);
+    client_menu_origin(c, &ox, &oy);
+    q2_prompt_build_labels(&c->prompts, &c->menu_font, &c->ot, bucket, ox, oy, text);
+}
+
 /*
  * The pointer in menu space, undoing the two transforms the frame applied on
  * the way out: the window fit (q2_screen_fit_rect plus SCREEN POSITION, exactly
@@ -11941,11 +13690,12 @@ static bool client_menu_pointer_pos(const client *c, int *mx, int *my)
     int ox = 0, oy = 0;
     double sx, sy, fx, fy;
 
-    if (c->headless || !c->renderer || !c->pointer_valid || c->mouse_grabbed)
+    if (c->headless || (!c->renderer && !c->gl_display) || !c->pointer_valid || c->mouse_grabbed)
         return false;
 
-    SDL_GetCurrentRenderOutputSize(c->renderer, &out_w, &out_h);
-    q2_screen_fit_rect(&c->screen, c->fit, out_w, out_h, &px, &py, &pw, &ph);
+    if (c->gl_display) SDL_GetWindowSizeInPixels(c->window, &out_w, &out_h);
+    else SDL_GetCurrentRenderOutputSize(c->renderer, &out_w, &out_h);
+    q2_screen_fit_rect(&c->screen, client_display_fit(c), out_w, out_h, &px, &py, &pw, &ph);
     if (pw <= 0 || ph <= 0)
         return false;
 
@@ -11953,12 +13703,34 @@ static bool client_menu_pointer_pos(const client *c, int *mx, int *my)
     sy = (double)(c->settings.v[Q2_SET_SCREEN_Y] -
                   q2_menu_screen_y_default(c->screen.disp.height));
 
-    fx = ((double)c->pointer_x -
+    /* SDL pointer events are in window units; the renderer may use HiDPI pixels. */
+    {
+        int ww = out_w, wh = out_h;
+        SDL_GetWindowSize(c->window, &ww, &wh);
+        fx = ww > 0 ? (double)c->pointer_x * out_w / ww : 0;
+        fy = wh > 0 ? (double)c->pointer_y * out_h / wh : 0;
+    }
+    fx = (fx -
           ((double)px + sx * (double)pw / (double)Q2_SCREEN_PAL_WIDTH)) *
-         (double)c->width / (double)pw;
-    fy = ((double)c->pointer_y -
+         (double)c->screen.buf[0].width / (double)pw;
+    fy = (fy -
           ((double)py + sy * (double)ph / (double)c->screen.disp.height)) *
-         (double)c->height / (double)ph;
+         (double)c->screen.buf[0].height / (double)ph;
+
+    if (c->crt_presented) {
+        double u = fx / c->screen.buf[0].width;
+        double v = fy / c->screen.buf[0].height;
+        q2_crt_source_uv(&u, &v);
+        fx = u * c->screen.buf[0].width;
+        fy = v * c->screen.buf[0].height;
+    }
+    if (c->screen.adaptive) {
+        int ux, uy, uw, uh;
+        q2_screen_ui_rect(&c->screen, -1, &ux, &uy, &uw, &uh);
+        if (!uw || !uh) return false;
+        fx = (fx - ux) * c->width / uw;
+        fy = (fy - uy) * c->height / uh;
+    }
 
     client_menu_origin(c, &ox, &oy);
 
@@ -12039,6 +13811,9 @@ static u16 client_menu_pointer(client *c, q2_menu *m)
         case Q2_MENU_HIT_OFF:
         case Q2_MENU_HIT_NEXT:
             pad |= Q2_PAD_RIGHT;
+            break;
+        case Q2_MENU_HIT_CHAR:
+            pad |= Q2_PAD_UP;
             break;
 
         /*
@@ -12132,6 +13907,15 @@ static void client_apply_settings(client *c)
         c->sim[0].dt_per_field = 1;
 }
 
+static void client_install_game_variables(client *c)
+{
+    int pi;
+    client_apply_settings(c);
+    if (!c->menu.multiplayer || c->in_front_end) return;
+    for (pi = 0; pi < c->sim[0].player_count && pi < Q2_MP_MAX_PLAYERS; pi++)
+        if (pi == 0 || c->sim_ready[pi]) client_grant_all_weapons(c, pi);
+}
+
 /*
  * The CONTROLLER page, applied — which until now it was not. Nothing anywhere
  * read Q2_SET_PAD_STYLE, so the page was five rows that remembered what you
@@ -12143,15 +13927,16 @@ static void client_apply_settings(client *c)
  * the CONTROLLER THAT IS CONNECTED. On a PC with USE MOUSE on, the mouse is the
  * connected controller — so the toggle drives the class, and the page offers
  * RIGHT MOUSE / RIGHT MOUSE 2 / HUNTER MOUSE. A gamepad assigned to player one
- * selects the analogue class and exposes styles 3..5. Extra controllers use
- * RIGHT STICK until the front end has per-player controller settings.
+ * selects the analogue class and exposes styles 3..5. Each extra controller
+ * has the same independent configuration as retail's 34-byte player records.
  *
  * Cheap enough to run every frame, which is what makes the toggle take effect
  * the moment it is flipped rather than at the next page change.
  */
 static void client_apply_input(client *c)
 {
-    bool have_pad = c->gamepads.id[0] != 0 && !c->demo;
+    bool have_pad = c->gamepads.id[q2_gamepads_primary(&c->gamepads,
+        c->mp_enabled || c->menu.page_id == Q2_PAGE_FRONT_PLAYERS)] != 0 && !c->demo;
     bool want_mouse = !have_pad && c->settings.v[Q2_SET_USE_MOUSE] != 0;
     int  style;
     int  i;
@@ -12174,9 +13959,17 @@ static void client_apply_input(client *c)
     }
 
     style = c->settings.v[Q2_SET_PAD_STYLE];
-    for (i = 0; i < Q2_SIM_MAX_PLAYERS; i++)
-        c->sim[0].player[i].look_scheme = i == 0 || c->demo ? style
-                                                       : Q2_PAD_STYLE_RIGHT_STICK;
+    c->sim[0].player[0].look_scheme = style;
+    for (i = 1; i < Q2_SIM_MAX_PLAYERS; i++) {
+        q2_menu_setting key = q2_menu_player_setting(Q2_SET_PAD_STYLE, i);
+        /* Extra host slots are gamepads. Preserve their chosen analogue
+         * style over disconnection, respawn, map changes and menu frames. */
+        c->settings.v[q2_menu_player_setting(Q2_SET_PAD_CLASS, i)] = 1;
+        if (c->settings.v[key] < Q2_PAD_STYLE_RIGHT_STICK ||
+            c->settings.v[key] > Q2_PAD_STYLE_BOTH_STICKS)
+            c->settings.v[key] = Q2_PAD_STYLE_RIGHT_STICK;
+        c->sim[0].player[i].look_scheme = c->demo ? style : c->settings.v[key];
+    }
 
     /* 0x800B3342. The AUTOCENTRE row has been on this page since the menu was
      * transcribed and had nothing on the other end of it; the sim reads it now.
@@ -12196,10 +13989,8 @@ static void client_apply_input(client *c)
     c->sim[0].autocentre_setting =
         !want_mouse && c->settings.v[Q2_SET_AUTOCENTRE] != 0;
     if (want_mouse) {
-        for (i = 0; i < Q2_SIM_MAX_PLAYERS; i++) {
-            c->sim[0].player[i].autocentre = 0;
-            c->sim[0].player[i].recentring = false;
-        }
+        c->sim[0].player[0].autocentre = 0;
+        c->sim[0].player[0].recentring = false;
     }
 
     /* A scripted run has no mouse to grab, and its pad script is STANDARD A's. */
@@ -12273,8 +14064,29 @@ static void client_update_grab(client *c)
  * cannot inherit SELECT, BACK or RULES from the last menu page. */
 static void client_menu_close(client *c)
 {
+    if (c->menu.open && !c->in_front_end && c->menu.multiplayer)
+        client_install_game_variables(c);
     q2_menu_close(&c->menu);
     q2_prompt_hide_all(&c->prompts);
+}
+
+static bool client_pause_open(client *c, int player)
+{
+    if (c->menu.open || c->save_prompt_open || c->in_front_end || c->mp_scoreboard ||
+        (c->mp_enabled && c->mp.end != Q2_MP_RUNNING) || c->film_open || c->boot_open ||
+        c->mcard_open || c->mission_open || c->briefing_open || c->endmis_open || c->credits_open)
+        return false;
+    /* Page 26 builds its statistics and player-coloured banner on entry. */
+    client_menu_fill_stats(c);
+    q2_menu_set_pauser(&c->menu, player);
+    /* InGame_GOTO_PAUSED (0x8001FD88) and pad removal (0x8003E860) both
+     * kill voices. Resume (0x80020140) restores only the CD target. The SAVE?
+     * page (0x800203C4) ducks CD without killing voices and is excluded above.
+     * ROTHATCH starts pt1__mid only on entering motion (0x8002B3DC), so an
+     * interrupted motor loop stays stopped until its next movement begins. */
+    client_voices_stop(c);
+    q2_menu_open(&c->menu);
+    return true;
 }
 
 /*
@@ -12300,10 +14112,12 @@ static void client_menu_bind_pads(client *c)
 
     for (p = 0; p < Q2_MENU_MP_MAX_PLAYERS; p++) {
         bool rumble = false;
+        int slot = p == 0 ? q2_gamepads_primary(&c->gamepads,
+            c->mp_enabled || c->menu.page_id == Q2_PAGE_FRONT_PLAYERS) : p;
 
-        if (p < Q2_SIM_MAX_PLAYERS && c->gamepads.device[p])
+        if (slot < Q2_SIM_MAX_PLAYERS && c->gamepads.device[slot])
             rumble = SDL_GetBooleanProperty(
-                         SDL_GetGamepadProperties(c->gamepads.device[p]),
+                         SDL_GetGamepadProperties(c->gamepads.device[slot]),
                          SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
 
         /* The card menu never reaches page 31, so only the one that can. */
@@ -12345,27 +14159,15 @@ static void client_mp_configure(client *c, q2_mp_mode mode, int players,
     q2_menu_set_multiplayer(&c->menu, true);
     q2_mp_session_init(&c->mp, mode, players);
     c->mp.frag_limit  = frag_limit;
-    c->mp.time_limit  = time_limit;
+    c->mp.time_limit  = mode == Q2_MP_VERSUS ? Q2_MP_NO_LIMIT : time_limit;
     c->mp.round_limit = round_limit;
 
-    /*
-     * And the session halfwords the pause banner is coloured from. 0x800B3354
-     * is the mode, and it is only ever asked one question — 0x8001CFF0 tests it
-     * against 1, so TEAM DEATHMATCH takes the TEAM halfword at config+2 and
-     * every other mode takes the player-colour halfword at config+4.
-     *
-     * The per-player pair is fed from the session's own `team[]`, which had no
-     * reader in this port before now, and from the player index for the colour.
-     * That index IS the colour: FrontEndResetMultiplayerDefaults writes
-     * `colour = p` at 0x8001BEDC and `team = p & 1` at 0x8001BF04, so a client
-     * that never got here still has the disc's defaults from q2_menu_init.
-     */
+    /* QFRONT's player panels own these choices. Initializing the match must
+     * preserve them, including across Versus rounds and a return to QFRONT. */
     q2_menu_set_mp_mode(&c->menu, (int)c->mp.mode);
     for (pi = 0; pi < Q2_MENU_MP_MAX_PLAYERS; pi++)
-        q2_menu_set_player_colour(&c->menu, pi,
-                                  pi < Q2_MP_MAX_PLAYERS ? (int)c->mp.team[pi]
-                                                         : (pi & 1),
-                                  pi);
+        if (c->menu.set)
+            c->mp.team[pi] = (s16)(c->menu.mp_team[pi] & 1);
 
     c->mp_spawn_count    = 0;
     c->mp_rng_state      = 0x13572468u;
@@ -12489,9 +14291,73 @@ static bool client_mp_restart_round(client *c)
     return true;
 }
 
-/* The scoreboard owns input and freezes the arena. QMRESULT +0x1580 reads
+/* State 11 loads MPResults at Default, independently of the arena's split
+ * layout. Load as a presentation map: it has no multiplayer spawns or HUD.
+ * Engine-owned scores and controller styles survive the module change. */
+static bool client_mp_load_results(client *c)
+{
+    q2_vram_section art;
+    u16 palette[Q2_VRAM_CLUT8_ENTRIES];
+    u32 image, i;
+    int style[Q2_MP_MAX_PLAYERS];
+    bool loaded;
+    int pi;
+    if (!c->mp_scoreboard || client_name_eq(c->map, "QMRESULT")) return true;
+    for (pi = 0; pi < Q2_MP_MAX_PLAYERS; pi++)
+        style[pi] = c->sim[0].player[pi].look_scheme;
+    c->carry_player = false;
+    c->carry_same_map = false;
+    c->mp_enabled = false;
+    loaded = client_load_zone(c, "QMRESULT", 0);
+    c->mp_enabled = true;
+    if (!loaded) return false;
+    /* QMRESULT only carries chars.lbm. Retail retains the common menu atlas;
+     * our map load clears VRAM, so recover that same atlas from QDUMMY. */
+    if (!c->menu_font.item_resident) {
+        q2_vram_section shared;
+        q2_result result = q2_vram_load(&shared, c->disc, "QDUMMY");
+        if (result != Q2_OK) return false;
+        result = q2_vram_upload_named(&shared, Q2_MENU_ATLAS_NAME,
+                    Q2_MENU_ATLAS_SLOT, Q2_MENU_ATLAS_V_OFS, c->vram, NULL);
+        q2_vram_free(&shared);
+        if (result != Q2_OK) return false;
+        c->menu_font.item_resident = true;
+    }
+    /* QMRESULT +0x1890/+0x2508 draws wipteam1, registered in slot 4,
+     * as two 256x240 8bpp sprites. +0x0D0C installs its palette at 0x3FC0
+     * and +0x3E9C gives every non-black entry the STP bit. */
+    if (q2_vram_load(&art, c->disc, "QMRESULT") != Q2_OK) return false;
+    loaded = q2_vram_find_by_name(&art, "wipteam1.lbm", &image) &&
+             image >= art.texpage_count &&
+             q2_vram_get_clut8(&art, image - art.texpage_count, palette) &&
+             q2_vram_upload_named(&art, "wipteam1.lbm", 4, 0,
+                                    c->vram, NULL) == Q2_OK;
+    q2_vram_free(&art);
+    if (!loaded) return false;
+    psx_vram_transfer(c->vram);
+    for (i = 0; i < Q2_VRAM_CLUT8_ENTRIES; i++) {
+        u16 colour = palette[i] & 0x7FFFu;
+        c->vram->px[255][i] = colour ? colour | Q2_VRAM_STP_BIT : 0;
+    }
+    memset(c->sim_ready, 0, sizeof(c->sim_ready));
+    for (pi = 0; pi < Q2_MP_MAX_PLAYERS; pi++)
+        c->sim[0].player[pi].look_scheme = style[pi];
+    q2_screen_set_layout(&c->screen, Q2_SCREEN_LAYOUT_ONE, 1);
+    /* The results presentation has one viewport and no arena camera. */
+    memset(c->cam.pos, 0, sizeof(c->cam.pos));
+    c->cam.yaw = c->cam.pitch = c->cam.roll = 0;
+    c->screen.view[0].far_z = 4000;
+    q2_loading_hide(&c->loading);
+    q2_mp_results_init(&c->mp_results);
+    c->mp_results_entered = false;
+    c->mp_results_dt_frac = 0;
+    Q2_INFO("multiplayer: QMRESULT loaded; one results viewport, scores preserved");
+    return true;
+}
+
+/* The scoreboard owns input. QMRESULT +0x1580 reads
  * every player's fire edge, latches READY and waits 150 ticks after all agree.
- * The port then returns to its multiplayer setup screen for the next match. */
+ * Request 18 selects QFRONT's MULTIPLAYER page (+0x3258 -> +0xCF68). */
 static bool client_mp_results_input(client *c, float dt)
 {
     u32 pressed = 0;
@@ -12513,7 +14379,9 @@ static bool client_mp_results_input(client *c, float dt)
             if (pi == 0) raw |= client_pad_mask(c, &bind);
         }
         if (c->mp_results_entered &&
-            (raw & ~c->mp_results_prev[pi] & bind.fire)) pressed |= 1u << pi;
+            ((raw & ~c->mp_results_prev[pi] & bind.fire) ||
+             (!c->demo && (c->gamepads.pressed[pi] & bind.fire))))
+            pressed |= 1u << pi;
         c->mp_results_prev[pi] = raw;
         c->gamepads.pressed[pi] = 0;
     }
@@ -12525,6 +14393,15 @@ static bool client_mp_results_input(client *c, float dt)
         Q2_INFO("multiplayer: results ready mask %X",
                 (unsigned)(c->mp_results.ready | pressed));
     return q2_mp_results_tick(&c->mp_results, c->mp.player_count, pressed, ticks);
+}
+
+static void client_mp_return_to_menu(client *c)
+{
+    /* Request 18 -> 0x8007CCE0(2); QFRONT +0x3258 calls +0xCF68,
+     * the MULTIPLAYER mode-menu builder, rather than the match setup. */
+    Q2_INFO("multiplayer: all players ready; returning to multiplayer menu");
+    client_enter_front_end(c);
+    q2_menu_goto(&c->menu, Q2_PAGE_FRONT_MULTI);
 }
 
 static bool client_mp_start_from_menu(client *c)
@@ -12572,10 +14449,81 @@ static bool client_mp_start_from_menu(client *c)
     return true;
 }
 
+static void client_play_menu_sound(client *c, q2_menu_sound which);
+
+static void client_credits_close(client *c)
+{
+    bool campaign = c->credits_campaign;
+    c->credits_open = false;
+    c->credits.active = false;
+    c->credits_campaign = false;
+    /* +3680 installs +CCA4 normally, +4454 after the extro. Both Back and
+     * natural completion run the same callback. +4454 awards the difficulty's
+     * tier immediately, even when the player declines to save it. */
+    if (campaign) {
+        int skill = q2_cre_skill();
+        if (skill < 0) skill = 0;
+        if (skill > 2) skill = 2;
+        q2_menu_set_cheat_level(&c->menu, skill + 1);
+        Q2_INFO("front end: campaign complete — %s cheats",
+                q2_menu_cheat_level_name(c->menu.cheat_level));
+    }
+    q2_menu_open(&c->menu);
+    q2_menu_goto(&c->menu, campaign ? Q2_PAGE_FRONT_UNLOCK : Q2_PAGE_FRONT_OPTIONS);
+    q2_sim_scene_page(&c->sim[0], false, true);
+    q2_prompt_sync_menu(&c->prompts, &c->menu, true);
+}
+
+static void client_credits_open(client *c, bool campaign)
+{
+    const dat_chunk *lb = c->common.chunk[Q2_COMMON_LEVEL_BIN];
+    u32 count = lb ? q2_levelbin_credits(lb->data, lb->size, 0,
+                                         c->credit_rows, Q2_CREDITS_MAX) : 0;
+    c->credits_campaign = campaign;
+    q2_credits_start(&c->credits, c->credit_rows, count);
+    c->credits_open = c->credits.active;
+    if (!c->credits_open) {
+        Q2_WARN("front end: this module carries no valid credit roll");
+        client_credits_close(c);
+        return;
+    }
+    client_menu_close(c);
+    c->credits_back = (client_menu_pad(c) & Q2_PAD_TRIANGLE) != 0;
+    c->menu_esc_back = false;
+    q2_sim_scene_page(&c->sim[0], false, true);
+    q2_prompt_show(&c->prompts, Q2_PROMPT_BACK, 216);
+    Q2_INFO("front end: credits, %u authored rows", count);
+}
+
+static void client_credits_frame(client *c, double dt)
+{
+    u16 pad = client_menu_pad(c);
+    bool back = (pad & Q2_PAD_TRIANGLE) != 0;
+    int rate = q2_build_tick_rate(&c->build);
+    bool finished = !q2_credits_advance(&c->credits, dt, rate > 0 ? rate : 50);
+    if ((back && !c->credits_back) || c->menu_esc_back || finished) {
+        if (!finished) client_play_menu_sound(c, Q2_MSND_BACK);
+        else Q2_INFO("front end: credits complete — %s",
+                     c->credits_campaign ? "unlock file" : "Options");
+        client_credits_close(c);
+    }
+    c->credits_back = back;
+    c->menu_esc_back = false;
+}
+
+static void client_campaign_complete(client *c)
+{
+    /* QFMV +3DF8 -> outer state 17 -> 0x8007CCE0(1). QFRONT +320C
+     * consumes that flag on entry and opens credits instead of the title. */
+    client_enter_front_end(c);
+    if (c->in_front_end) client_credits_open(c, true);
+}
+
 static void client_menu_requests(client *c)
 {
     switch (q2_menu_take_request(&c->menu)) {
     case Q2_MREQ_RESUME:
+        client_install_game_variables(c);
         break;
     case Q2_MREQ_RESUPPLY:
         /*
@@ -12659,32 +14607,12 @@ static void client_menu_requests(client *c)
          */
         q2_loading_show(&c->loading, Q2_LOADING_PAGE_STARTING);
         break;
-    case Q2_MREQ_CREDITS: {
-        /*
-         * The credit roll, read out of the module the front end IS. It is not
-         * a page array — 45 pages and 186 rows in QFRONT and only one of them
-         * mentions the credits, which is the row that got us here — so the
-         * words are the module's and the scroll is this port's.
-         */
-        const dat_chunk *lb = c->common.chunk[Q2_COMMON_LEVEL_BIN];
-
-        c->credits_count = 0;
-        if (lb && lb->data && lb->size)
-            c->credits_count = q2_levelbin_credits(lb->data, lb->size,
-                                                   c->credits,
-                                                   Q2_LB_CREDITS_MAX);
-        if (c->credits_count) {
-            c->credits_open   = true;
-            c->credits_scroll = 0;
-            client_menu_close(c);
-            Q2_INFO("front end: credits, %u lines", c->credits_count);
-        } else {
-            Q2_INFO("front end: this module carries no credit roll");
-            q2_menu_open(&c->menu);
-            q2_menu_goto(&c->menu, Q2_PAGE_FRONT_TITLE);
-        }
+    case Q2_MREQ_CREDITS:
+        client_credits_open(c, false);
         break;
-    }
+    case Q2_MREQ_UNLOCK_SAVE:
+        client_card_open(c, Q2_SAVE_UI_UNLOCK_SAVE);
+        break;
     case Q2_MREQ_LOAD_GAME:
         client_card_open(c, Q2_SAVE_UI_LOAD);
         break;
@@ -12785,7 +14713,7 @@ static int name_is_prefix(const char *pre, const char *s, size_t n)
  * prefix of the same name with the sample rate appended. No name is ambiguous
  * under this rule. Five of the eleven are unreachable without it.
  */
-static bool client_find_sound(client *c, const char *want, q2_vag *out)
+static bool client_find_sound(const client *c, const char *want, q2_vag *out)
 {
     size_t len;
     u32 i, pass;
@@ -12820,18 +14748,31 @@ static bool client_find_sound(client *c, const char *want, q2_vag *out)
  * two. Returns false when the map does not carry the name, which is a thing
  * that happens and is not an error — three maps ship no `frontend.lbm` either.
  */
-static bool client_play_sound(client *c, const char *want)
+static bool client_play_request(client *c, const char *want, q2_sfx_request *request,
+    client_sound_source source, u32 owner, const s32 at[3])
 {
     client_voice *v = NULL;
+    q2_sfx_request default_request;
     q2_vag vag;
     u32 i, rate;
     s32 vol;
 
-    if (!c->audio || !client_find_sound(c, want, &vag))
+    c->voice_last = NULL;
+    c->voice_last_serial = 0;
+    if (source == CLIENT_SOUND_CREATURE &&
+        (owner >= c->creatures.set.count || !c->creatures.set.monsters[owner].in_use))
+        return false;
+    if (source == CLIENT_SOUND_ENTITY &&
+        (owner >= c->sim[0].entities.count || !c->sim[0].entities.ent[owner].in_use))
+        return false;
+    if (source == CLIENT_SOUND_PLAYER && owner >= Q2_MP_MAX_PLAYERS) return false;
+    if (!client_find_sound(c, want, &vag))
         return false;
 
     if (!vag.body || vag.data_size < SPU_BLOCK_SIZE)
         return false;
+    client_sound_requests_init(c);
+    if (!request) request = client_request_for_sound(want, c);
 
     for (i = 0; i < CLIENT_VOICES; i++) {
         if (!c->voice[i].active) {
@@ -12867,32 +14808,55 @@ static bool client_play_sound(client *c, const char *want)
     memset(v, 0, sizeof(*v));
     /* AFTER the memset, or it is wiped: this is the slot's new tag, the port's
      * equivalent of the halfword 0x80073734 reads back from voice_record+52. */
-    v->serial = ++c->voice_serial_next;
-    q2_spu_voice_start(&v->dec, vag.body, vag.data_size);
-    /* Listener-local until a caller says otherwise; client_voices_update
-     * recomputes both the moment it has a position. */
-    v->level = CLIENT_SFX_LOCAL;
-    v->pan_l = 0xFF;
-    v->pan_r = 0xFF;
-    /*
-     * THE PITCH MODIFIER, which this played without.
-     *
-     * The console derives the SPU pitch from the VAG's header rate the same way
-     * and then multiplies by a per-sound modifier whose DEFAULT is 35/32 —
-     * 1.09375, about one and a half semitones. Playing at the bare header rate
-     * makes every effect in the game 9.375% flat.
-     *
-     * Q2_SFX_PITCH_DEFAULT is the default only. Individual retail request
-     * records can carry ranges and choose a randomising or direct start. Those
-     * byte-state primitives are transcribed in vag.c; this generic name-based
-     * caller cannot select a request role safely yet, so it uses the default.
-     */
-    v->step   = q2_sfx_step_16_16(rate, Q2_SFX_PITCH_DEFAULT,
-                                  XA_SAMPLE_RATE);
-    v->vol    = vol;
-    /* A fresh request, so 0x80071C5C's 63. A caller that wants the chaingun's
-     * clone overwrites it through client_sound_set_relative_volume below. */
-    v->req_vol = (u8)Q2_SFX_VOLUME_DEFAULT;
+    if (++c->voice_serial_next == 0)
+        ++c->voice_serial_next;
+    v->serial = c->voice_serial_next;
+    v->sample_rate = rate;
+    v->vol = vol;
+    /* Copy the persistent request only after successful voice allocation. */
+    if (!request) { q2_sfx_request_init(&default_request); request = &default_request; }
+    q2_sfx_request_begin(request, source == CLIENT_SOUND_PLAYER ||
+        source == CLIENT_SOUND_CREATURE || source == CLIENT_SOUND_ENTITY, q2_random_next);
+    v->req_vol = request->volume;
+    /* 0x80072474 -> SpuInit(0) -> 0x80094E18/1C clears both ADSR words.
+     * Gameplay writes only voice volume, pitch and sample address afterward. */
+    q2_spu_player_start(&v->spu, vag.body, vag.data_size,
+                        (u16)q2_sfx_spu_pitch(rate, request->pitch.current), 0, 0);
+    v->source = source;
+    v->owner_index = owner;
+    v->positional = source != CLIENT_SOUND_PLAYER;
+    if (source == CLIENT_SOUND_UI) memcpy(v->pos_world, c->cam.pos, sizeof(v->pos_world));
+    if (at) memcpy(v->pos_world, at, sizeof(v->pos_world));
+    if (source == CLIENT_SOUND_PLAYER || source == CLIENT_SOUND_CREATURE ||
+        source == CLIENT_SOUND_ENTITY) {
+        u32 duration = 9000;
+        if (source == CLIENT_SOUND_CREATURE) {
+            const q2_monster *m = &c->creatures.set.monsters[owner];
+            v->owner_generation = m->audio_generation;
+            if (m->sound_duration) duration = m->sound_duration;
+            memcpy(v->pos_world, q2_cre_origin(m), sizeof(v->pos_world));
+        } else if (source == CLIENT_SOUND_ENTITY) {
+            const q2_entity *e = &c->sim[0].entities.ent[owner];
+            v->owner_generation = e->audio_generation;
+            if (e->sound_duration) duration = e->sound_duration;
+            memcpy(v->pos_world, e->origin, sizeof(v->pos_world));
+        } else {
+            v->owner_generation = c->player_audio_generation[owner];
+            memcpy(v->pos_world, c->sim[0].player[owner].pos, sizeof(v->pos_world));
+        }
+        v->deadline = (u32)c->sim[0].level_time + duration;
+        /* 0x800728BC: multiplayer entity requests are flat mono at 84;
+         * paused requests are 254 stereo. Single-player player objects are
+         * flat mono at 127. Ordinary creatures retain positional mode. */
+        if (c->mp_enabled || source == CLIENT_SOUND_PLAYER) {
+            v->positional = false;
+            v->flat_mono = true;
+            v->level = c->mp_enabled ? 84 : 127;
+            if (c->mp_enabled && client_music_paused(c)) {
+                v->level = 254; v->flat_mono = false; v->force_stereo = true;
+            }
+        }
+    }
     v->active = true;
     c->voice_started++;
     c->voice_last        = v;
@@ -12901,17 +14865,66 @@ static bool client_play_sound(client *c, const char *want)
     return true;
 }
 
-/*
- * SoundSetRelativeVolume (0x80072BB4), applied to the voice this port has just
- * started rather than to a request record it does not keep. The byte's own
- * wrap-then-clamp is q2_sfx_volume_add, beside the same record's pitch byte.
- */
-static void client_sound_set_relative_volume(client *c, s32 delta)
+static bool client_play_sound(client *c, const char *want)
 {
-    if (!c->voice_last)
-        return;
+    return client_play_request(c, want, NULL, CLIENT_SOUND_UI, 0, NULL);
+}
 
-    c->voice_last->req_vol = q2_sfx_volume_add(c->voice_last->req_vol, delta);
+static bool client_play_player_sound(client *c, const char *name,
+    q2_sfx_request *request, int player)
+{
+    return client_play_request(c, name, request, CLIENT_SOUND_PLAYER, (u32)player, NULL);
+}
+
+static bool client_play_creature_sound(client *c, const char *name,
+    q2_sfx_request *request, const q2_monster *m)
+{
+    u32 i;
+    for (i = 0; i < c->creatures.set.count; i++)
+        if (&c->creatures.set.monsters[i] == m)
+            return client_play_request(c, name, request, CLIENT_SOUND_CREATURE, i, NULL);
+    c->voice_last = NULL; c->voice_last_serial = 0;
+    return false;
+}
+
+static void client_sound_requests_init(client *c)
+{
+    static const struct { const char *name; s32 upper, lower; } ranges[] = {
+        { "pla_gasp1", 4, -5 }, { "pla_drown1", 4, -5 },
+        { "pla_burn1", 0, -2 }, { "pla_burn2", 0, -2 },
+        { "pla_wade3", 3, -3 }
+    };
+    u32 i;
+    const q2_weapon_tables *wt = q2_weapon_tables_builtin();
+    q2_sfx_request *machinegun;
+    if (c->requests_ready) return;
+    for (i = 0; i < Q2PSX_ARRAY_COUNT(c->bank_request); i++)
+        q2_sfx_request_init(&c->bank_request[i]);
+    for (i = 0; i < Q2PSX_ARRAY_COUNT(ranges); i++) {
+        q2_sfx_request *r = client_request_for_sound(ranges[i].name, c);
+        if (r) q2_sfx_pitch_set_range(&r->pitch, ranges[i].upper, ranges[i].lower);
+    }
+    machinegun = client_request_for_sound(wt->sound[Q2_WSND_MACHINEGUN], c);
+    if (machinegun) q2_sfx_pitch_set_range(&machinegun->pitch, 8, 0);
+    q2_sfx_request_init(&c->chaingun_request);
+    if (machinegun) c->chaingun_request = *machinegun;
+    q2_sfx_pitch_set_range(&c->chaingun_request.pitch, 24, 16);
+    c->chaingun_request.volume = q2_sfx_volume_add(c->chaingun_request.volume, -40);
+    c->requests_ready = true;
+}
+
+/* SoundIndex (0x80073518) returns the bank name's existing request index.
+ * Core weapons and creature modules therefore share its mutable state. */
+static q2_sfx_request *client_request_for_sound(const char *name, void *user)
+{
+    client *c = user;
+    q2_vag found, sample;
+    u32 i;
+    if (!client_find_sound(c, name, &found)) return NULL;
+    for (i = 0; i < c->sfx.count && i < Q2PSX_ARRAY_COUNT(c->bank_request); i++)
+        if (q2_sound_bank_get(&c->sfx, i, &sample) && sample.body == found.body)
+            return &c->bank_request[i];
+    return NULL;
 }
 
 /*
@@ -12936,123 +14949,85 @@ static bool client_voice_playing(const client_voice *v, u32 serial)
  */
 static void client_voice_stop(client_voice *v, u32 serial)
 {
-    if (client_voice_playing(v, serial))
+    if (client_voice_playing(v, serial)) {
         v->active = false;
+        q2_spu_player_key_off(&v->spu);
+    }
 }
 
-/*
- * The same sound, but somewhere in the world.
- *
- * The console's own split: `0x80072E24` takes the listener-local arm when
- * `0x800AE8B4` is set and the positional one otherwise, and everything the
- * player themselves makes goes through the first. Here the caller says which,
- * because the port has no equivalent global and the distinction is per sound
- * rather than per state.
- */
+/* Direct start (0x80072A00): copy the point and current request values. */
 static bool client_play_sound_at(client *c, const char *want, const s32 at[3])
 {
-    if (!client_play_sound(c, want))
-        return false;
-
-    if (c->voice_last && at) {
-        c->voice_last->positional  = true;
-        c->voice_last->pos_world[0] = at[0];
-        c->voice_last->pos_world[1] = at[1];
-        c->voice_last->pos_world[2] = at[2];
-    }
-    return true;
+    return client_play_request(c, want, NULL, at ? CLIENT_SOUND_POINT : CLIENT_SOUND_UI, 0, at);
 }
 
-/*
- * Attenuate and pan every live voice against where the listener is NOW.
- *
- * `level = 63 * (12288 - dist) / 4096` on the horizontal distance, and the pan
- * index is the source's sideways offset in the camera's own basis over that
- * distance, fifteen either side of centre. Both are recomputed every frame
- * rather than latched at the start, because the console updates its voices per
- * frame — which is what makes a rocket's flight sweep across the stereo field
- * instead of being stamped where it was launched.
- *
- * With STEREO off the pan table is not consulted at all and both channels take
- * half, which is the else-branch of the console's own CdMix.
- */
+/* Update owner validity and position before applying the retail GameWindow spatial path. */
 static void client_voices_update(client *c)
 {
-    s32 eye[3], fwd[3], right[3];
+    q2_sfx_listener listeners[Q2_MP_MAX_PLAYERS];
+    u32 i, count = 0;
     bool stereo = c->settings.v[Q2_SET_STEREO] != 0;
-    u32 i;
-
-    q2_sim_eye(&c->sim[0], eye);
-    {
-        s32 yaw = c->cam.yaw;
-        s32 sy = q2_sin12(yaw), cy = q2_cos12(yaw);
-
-        fwd[0]   =  sy; fwd[1]   = 0; fwd[2]   =  cy;
-        right[0] =  cy; right[1] = 0; right[2] = -sy;
+    int views = c->mp_enabled ? c->screen.view_count : 1;
+    if (views < 1) views = 1;
+    if (views > Q2_MP_MAX_PLAYERS) views = Q2_MP_MAX_PLAYERS;
+    for (i = 0; i < (u32)views; i++) {
+        q2_sfx_listener *l;
+        if (i && !c->sim_ready[i]) continue;
+        l = &listeners[count++];
+        if (i == 0) {
+            memcpy(l->pos, c->cam.pos, sizeof(l->pos));
+            q2_rotation_view(l->matrix, c->cam.yaw, c->cam.pitch, c->cam.roll);
+        } else {
+            q2_sim_player_eye(&c->sim[0], (int)i, l->pos);
+            q2_rotation_view(l->matrix, c->mp_camera_angles[i][1],
+                              c->mp_camera_angles[i][0], c->mp_camera_angles[i][2]);
+        }
     }
-
     for (i = 0; i < CLIENT_VOICES; i++) {
         client_voice *v = &c->voice[i];
-        s32 d[3], along, side, dist, level, idx;
-
-        if (!v->active)
-            continue;
-
-        if (!v->positional) {
-            /*
-             * Scaled by the request's own volume, because on the console that
-             * byte IS the voice's volume field and the listener-local path does
-             * not touch it either. 63/63 leaves every existing caller exactly
-             * where it was; the chaingun's 23/63 is the one ratio that moves.
-             */
-            v->level = (CLIENT_SFX_LOCAL * (s32)v->req_vol) / CLIENT_SFX_REQ_VOL;
-            v->pan_l = v->pan_r = stereo ? 0xFF : 0x80;
-            continue;
-        }
-
-        d[0] = v->pos_world[0] - eye[0];
-        d[1] = 0;                        /* horizontal only, as the console is */
-        d[2] = v->pos_world[2] - eye[2];
-
-        along = (s32)(((s64)d[0] * fwd[0]   + (s64)d[2] * fwd[2])   >> 12);
-        side  = (s32)(((s64)d[0] * right[0] + (s64)d[2] * right[2]) >> 12);
-
-        {
-            s64 len2 = (s64)along * along + (s64)side * side;
-            s64 lo = 0, hi = 0x7FFFFFFF, len = 0;
-
-            while (lo <= hi) {
-                s64 mid = lo + (hi - lo) / 2;
-                if (mid * mid <= len2) { len = mid; lo = mid + 1; }
-                else hi = mid - 1;
+        q2_sfx_spatial spatial;
+        if (!v->active) continue;
+        if (v->source == CLIENT_SOUND_PLAYER || v->source == CLIENT_SOUND_CREATURE ||
+            v->source == CLIENT_SOUND_ENTITY) {
+            bool valid = (u32)c->sim[0].level_time < v->deadline;
+            if (v->source == CLIENT_SOUND_CREATURE) {
+                if (v->owner_index >= c->creatures.set.count) valid = false;
+                else {
+                    const q2_monster *m = &c->creatures.set.monsters[v->owner_index];
+                    valid = valid && m->in_use && m->audio_generation == v->owner_generation;
+                    if (valid) memcpy(v->pos_world, q2_cre_origin(m), sizeof(v->pos_world));
+                }
+            } else if (v->source == CLIENT_SOUND_ENTITY) {
+                if (v->owner_index >= c->sim[0].entities.count) valid = false;
+                else {
+                    const q2_entity *e = &c->sim[0].entities.ent[v->owner_index];
+                    valid = valid && e->in_use && e->audio_generation == v->owner_generation;
+                    if (valid) memcpy(v->pos_world, e->origin, sizeof(v->pos_world));
+                }
+            } else {
+                valid = valid && v->owner_index < Q2_MP_MAX_PLAYERS &&
+                    (!v->owner_index || (c->mp_enabled && c->sim_ready[v->owner_index])) &&
+                    c->player_audio_generation[v->owner_index] == v->owner_generation;
+                if (valid) memcpy(v->pos_world, c->sim[0].player[v->owner_index].pos,
+                                    sizeof(v->pos_world));
             }
-            dist = (s32)(len > 0 ? len : 1);
+            if (!valid) { client_voice_stop(v, v->serial); continue; }
         }
-
-        /* The base was this number under another name: the request's volume
-         * byte, 63 by default. Read it off the voice now that a request can
-         * carry something else. */
-        level = ((s32)v->req_vol * (CLIENT_SFX_REACH - dist)) / 4096;
-        if (level < 0)   level = 0;
-        if (level > 255) level = 255;
-        v->level = level;
-
-        if (!stereo) {
-            v->pan_l = v->pan_r = 0x80;
+        v->vol = c->settings.v[Q2_SET_SFX];
+        if (v->vol < 0) v->vol = 0;
+        if (v->vol > 127) v->vol = 127;
+        v->mono = v->flat_mono || (!v->force_stereo && !stereo);
+        if (!v->positional) {
+            v->pan_l = v->pan_r = v->mono ? 128 : k_pan[15];
             continue;
         }
-
-        idx = 15 + (15 * side) / dist;
-        if (idx < 0)                  idx = 0;
-        if (idx >= CLIENT_PAN_STEPS)  idx = CLIENT_PAN_STEPS - 1;
-
-        /* The table is one side of the curve: the far channel reads it
-         * backwards, which is what makes the pair constant-power. */
-        v->pan_l = k_pan[idx];
-        v->pan_r = k_pan[CLIENT_PAN_STEPS - 1 - idx];
+        spatial = q2_sfx_spatialize(v->pos_world, v->req_vol, listeners, count);
+        v->level = spatial.level;
+        if (client_music_paused(c)) { v->level = 255; spatial.pan = 15; }
+        v->pan_l = stereo ? k_pan[spatial.pan] : 128;
+        v->pan_r = stereo ? k_pan[30 - spatial.pan] : 128;
     }
 }
-
 static void client_play_menu_sound(client *c, q2_menu_sound snd)
 {
     const char *want = q2_menu_sound_name(snd);
@@ -13060,6 +15035,7 @@ static void client_play_menu_sound(client *c, q2_menu_sound snd)
     if (!client_play_sound(c, want) && want && want[0])
         Q2_DEBUG("menu sound '%s' is not in %s's bank", want, c->map);
 }
+
 
 /* ------------------------------------------------------------------------- */
 /*
@@ -13072,12 +15048,9 @@ static void client_play_menu_sound(client *c, q2_menu_sound snd)
  * because q2_sim_advance runs the world exactly once per frame with a variable
  * dt rather than sub-stepping (sim.h).
  *
- * The LIGHT and BURST events are not consumed. Both are real and both are
- * dropped rather than faked: a glow light wants a q2_light_world for the entity
- * draw to gather from and the client has none yet, and the pickup burst is a
- * particle effect whose emitter is not reconstructed. An item therefore glows
- * through its own tint (entitydraw.c) and vanishes without sparks, which is less
- * than the console does rather than something the console does not do.
+ * LIGHT events feed the dynamic/timed light lists; BURST events preserve the
+ * item's model bank as well as its index, so zone-only pickups use their own
+ * vertex count when spawning particles.
  */
 /*
  * THE ELEVEN ITEM SOUNDS, and the SUBSTITUTIONS a map that is missing one gets.
@@ -13222,6 +15195,12 @@ static const char *client_ent_sound_name(const client *c, u32 which)
     case Q2_SND_WATER_OUT:    return "pla_watr_out"; /* 0x800B293C */
     case Q2_SND_WATER_UNDER:  return "pla_watr_un";  /* 0x800B2940 */
     case Q2_SND_GASP:         return "pla_gasp1";    /* 0x800B28F8 */
+    case Q2_SND_BURN: {
+        q2_vag sound;
+        /* 0x8003B7EC..0x8003B894: Sound_Burn prefers burn1, then burn2.
+         * POWER1 only carries burn2. A missing pair stays silent. */
+        return client_find_sound(c, "pla_burn1", &sound) ? "pla_burn1" : "pla_burn2";
+    }
     default: break;
     }
 
@@ -13270,35 +15249,12 @@ static void client_entity_events(client *c)
     const q2_ent_events *ev = q2_sim_entity_events(&c->sim[0]);
     u32 i;
 
-    /*
-     * Empty last frame's runtime lights first — 0x80075B94 does this at the top
-     * of every frame and nothing in this port was calling it. Without it the
-     * sixteen dynamic slots fill on the first frames a projectile flies and stay
-     * full forever: a 500-frame BASE3 capture added 16 lights and dropped 481.
-     */
-    if (c->lights_ready)
-        q2_light_world_begin_frame(&c->light_world);
-
-
-
     if (!ev)
         return;
 
     for (i = 0; i < ev->count; i++) {
         const char *name;
 
-        /*
-         * Only SOUND is acted on. The entity world also raises _LIGHT (a
-         * dynamic light of `glow` and `radius`) and _BURST (the pickup particle
-         * burst at 0x8005B6C0), and both are dropped here — counted rather than
-         * silently ignored, because "the client handles entity events" was true
-         * of one kind in three and nothing said so.
-         *
-         * Neither is guessed at: the port has no preset for a pickup burst —
-         * its seven are explosion, blood, BFG, gib, scripted, spark and laser
-         * end — and choosing one of those would invent an effect rather than
-         * reconstruct it. See openquestions #60.
-         */
         if (ev->e[i].kind == Q2_ENT_EVENT_LIGHT) {
             /*
              * Fed to the light world rather than dropped. The event carries the
@@ -13349,7 +15305,8 @@ static void client_entity_events(client *c)
             continue;
         }
         if (ev->e[i].kind == Q2_ENT_EVENT_BURST) {
-            client_pickup_burst(c, ev->e[i].pos, ev->e[i].model_index);
+            client_pickup_burst(c, ev->e[i].pos, ev->e[i].model_index,
+                                ev->e[i].model_bank);
             continue;
         }
         if (ev->e[i].kind != Q2_ENT_EVENT_SOUND)
@@ -13359,28 +15316,27 @@ static void client_entity_events(client *c)
         if (name) {
             bool ok;
 
-            /*
-             * The PLAYER'S own are listener-local — footsteps, the landing
-             * thump, the pain grunts — and everything else is where the event
-             * says. That is the console's own split at 0x80072E24, made per
-             * sound because this port has no "a menu owns the frame" global to
-             * branch on.
-             */
-            if (ev->e[i].sound == Q2_SND_FOOTSTEP_A ||
-                ev->e[i].sound == Q2_SND_FOOTSTEP_B ||
-                ev->e[i].sound == Q2_SND_FOOTSTEP_WET ||
-                ev->e[i].sound == Q2_SND_LAND ||
-                ev->e[i].sound == Q2_SND_LAND_SOFT ||
-                ev->e[i].sound == Q2_SND_JUMP ||
-                ev->e[i].sound == Q2_SND_WATER_IN ||
-                ev->e[i].sound == Q2_SND_WATER_OUT ||
-                ev->e[i].sound == Q2_SND_PAIN_25 ||
-                ev->e[i].sound == Q2_SND_PAIN_50 ||
-                ev->e[i].sound == Q2_SND_PAIN_75 ||
-                ev->e[i].sound == Q2_SND_PAIN_100)
-                ok = client_play_sound(c, name);
+            client_sound_requests_init(c);
+            if (ev->e[i].sound_entity) {
+                u32 owner;
+                for (owner = 0; owner < c->sim[0].entities.count; owner++)
+                    if (c->sim[0].entities.ent[owner].audio_generation == ev->e[i].sound_entity)
+                        break;
+                ok = client_play_request(c, name, client_request_for_sound(name, c),
+                    CLIENT_SOUND_ENTITY, owner, NULL);
+            } else
+            /* 0x8003AAFC uses the direct POINT path even for wet footsteps:
+             * its configured range is not sampled. Other body requests use
+             * 0x8007270C and remain bound to their player's incarnation. */
+            if (ev->e[i].sound_player >= 0 &&
+                ev->e[i].sound != Q2_SND_FOOTSTEP_A &&
+                ev->e[i].sound != Q2_SND_FOOTSTEP_B &&
+                ev->e[i].sound != Q2_SND_FOOTSTEP_WET)
+                ok = client_play_player_sound(c, name,
+                    client_request_for_sound(name, c), ev->e[i].sound_player);
             else
-                ok = client_play_sound_at(c, name, ev->e[i].pos);
+                ok = client_play_request(c, name, client_request_for_sound(name, c),
+                    CLIENT_SOUND_POINT, 0, ev->e[i].pos);
 
             /*
              * WHICH PLAYER EVENTS RAISE AI NOISE, and this was backwards in
@@ -13415,6 +15371,9 @@ static void client_entity_events(client *c)
                 Q2_DEBUG("sound '%s' is not in %s's bank", name, c->map);
         }
     }
+    /* A drain consumes its events. This permits another batch after a weapon
+     * fires without replaying sounds, bursts, or timed-light registrations. */
+    q2_ent_events_clear(&c->sim[0].ent_world.events);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -13451,7 +15410,21 @@ static bool client_capture(client *c)
         return false;
     }
 
+    c->snapshot.native_mission_present = true;
+    client_native_lifts_capture(c);
+    c->snapshot.native_mission = c->native_mission;
     q2_save_capture_mission(&c->snapshot, &c->mission);
+    rc = q2_zone_history_capture(&c->zone_history, c->map, c->zone_index,
+                                  &c->sim[0], c->creatures_ready ? &c->creatures : NULL,
+                                  c->cre_actor, c->cre_anim, (u32)(c->ai_accum * 1000000.0 + 0.5));
+    if (rc == Q2_OK)
+        rc = q2_zone_history_copy(&c->snapshot.zone_history, &c->zone_history);
+    if (rc != Q2_OK) {
+        Q2_ERROR("cannot save zone populations: %s", q2_result_str(rc));
+        q2_save_free(&c->snapshot);
+        return false;
+    }
+    c->snapshot.zone_history_present = true;
     /*
      * ...and the help computer's current message pair, as the two Strings KEYS
      * it was resolved from. `HelpComputer_GetMessages` (0x800218A8) copies
@@ -13520,6 +15493,8 @@ static bool client_capture(client *c)
         }
     }
     q2_save_set_settings(&c->snapshot, c->settings.v, Q2_SET_COUNT);
+    c->snapshot.cheat_level_present = true;
+    c->snapshot.cheat_level = (u8)c->menu.cheat_level;
     if (c->vm_ready && q2_save_capture_viewweapon(&c->snapshot, &c->vw[0],
             c->vw_last_weapon[0], c->shot_serial_shown[0],
             c->shot_serial_heard[0], c->cock_pending[0]) != Q2_OK) {
@@ -13545,6 +15520,8 @@ static bool client_apply_save(client *c, const q2_save *s)
     s32 eye[3];
     bool was_front_end = c->in_front_end;
     q2_event_store saved_history = {0}, previous_history;
+    q2_zone_history saved_zones = {0}, previous_zones;
+    q2_native_mission previous_native = c->native_mission;
     s32 previous_skill = q2_cre_skill(), saved_skill;
 
     /* Refuse the wrong disc before loading anything or changing the screen. */
@@ -13559,6 +15536,17 @@ static bool client_apply_save(client *c, const q2_save *s)
         return false;
     }
     previous_history = c->event_store;
+    rc = q2_zone_history_copy(&saved_zones, &s->zone_history);
+    if (rc != Q2_OK) {
+        q2_event_store_free(&saved_history);
+        return false;
+    }
+    previous_zones = c->zone_history;
+    memset(&c->native_mission, 0, sizeof(c->native_mission));
+    c->native_mission.boss_phase[0] = 1000;
+    c->native_mission.boss2_quake_time = Q2_NATIVE_QUAKE_INACTIVE;
+    if (s->native_mission_present) c->native_mission = s->native_mission;
+    c->zone_history = saved_zones;
     c->event_store = saved_history;
     c->restoring_save = s;
     c->carry_player = false;
@@ -13583,11 +15571,15 @@ static bool client_apply_save(client *c, const q2_save *s)
         c->restoring_save = NULL;
         q2_event_store_free(&c->event_store);
         c->event_store = previous_history;
+        q2_zone_history_free(&c->zone_history);
+        c->zone_history = previous_zones;
+        c->native_mission = previous_native;
         q2_cre_set_skill(previous_skill);
         return false;
     }
     c->restoring_save = NULL;
     q2_event_store_free(&previous_history);
+    q2_zone_history_free(&previous_zones);
 
     rc = q2_save_apply(s, &c->sim[0], NULL, c->build.serial, c->map);
     if (rc != Q2_OK) {
@@ -13627,12 +15619,17 @@ static bool client_apply_save(client *c, const q2_save *s)
         }
     }
 
+    q2_menu_set_cheat_level(&c->menu, s->cheat_level_present ? s->cheat_level : 0);
     /* The settings travel with the save, and applying them is what states 14
      * and 16 do on the console (0x8001C698, the GAME VARIABLES application). */
     {
         s16 v[Q2_SET_COUNT];
+        q2_menu_settings defaults;
         u32 n = q2_save_get_settings(s, v, (u32)Q2_SET_COUNT);
         u32 k;
+        q2_menu_settings_defaults(&defaults);
+        for (k = n; k < Q2_SET_COUNT; k++)
+            c->settings.v[k] = defaults.v[k];
         for (k = 0; k < n; k++)
             c->settings.v[k] = v[k];
     }
@@ -13681,12 +15678,25 @@ static bool client_apply_save(client *c, const q2_save *s)
         }
     }
 
-    if (c->movers_ready)
+    if (c->movers_ready) {
+        u32 i;
         q2_save_apply_movers(s, &c->movers);
+        client_native_security_lift(c, false);
+        /* MOVR restores the drawn displacement; rebuild the collision pose
+         * before a player or creature can move. Old files have no previous
+         * step, so do not treat the entire restored offset as one tick's dy.
+         * A native lift record, when present, supplies that exact step below. */
+        q2_sim_movers_update(&c->sim[0], &c->movers);
+        for (i = 0; i < c->sim[0].mover_count; i++) c->sim[0].volumes[i].dy = 0;
+        client_native_lifts_restore(c);
+    }
     if (q2_save_apply_rotators(s, &c->rotators) != Q2_OK) {
         Q2_ERROR("save rotators do not match this map");
         return false;
     }
+    if (client_name_eq(c->map, "SECURITY") && c->zone_index == 2 &&
+        (c->native_mission.flags & (Q2_NATIVE_ORB_ACTIVE | Q2_NATIVE_ORB_DONE)) == Q2_NATIVE_ORB_ACTIVE)
+        client_native_orb_shift(c);
     q2_sim_scene_solids_update(&c->sim[0], &c->rotators);
     {
         u32 phase_us = 0;
@@ -13698,6 +15708,19 @@ static bool client_apply_save(client *c, const q2_save *s)
             Q2_ERROR("save creature behavior does not match this map");
             return false;
         }
+        for (u32 i = 0; i < c->sim[0].entities.count; i++) {
+            const q2_zone_object *o = q2_zone_saved_entity(&c->zone_history, c->map,
+                                                            c->zone_index, i);
+            if (o && !q2_zone_apply_entity(o, &c->sim[0], i,
+                                            c->zone_bank_ready ? &c->zone_bank : NULL)) {
+                Q2_ERROR("save entity %u (%s, kind %u) cannot bind in %s zone %d",
+                         i, o->runtime->entity.state.model, o->runtime->entity.state.kind,
+                         c->map, c->zone_index);
+                return false;
+            }
+        }
+        q2_zone_history_resume(&c->zone_history, c->map, c->zone_index, &c->sim[0],
+                                &c->creatures, c->cre_actor, c->cre_anim, &phase_us);
         c->ai_accum = (double)phase_us / 1000000.0;
     }
     if (q2_save_get_skill(s, &saved_skill)) c->menu.skill = saved_skill;
@@ -13817,12 +15840,16 @@ static void client_notify(client *c, const char *text)
 /* ------------------------------------------------------------------------- */
 /* The front end                                                              */
 /* ------------------------------------------------------------------------- */
-#define Q2_MP_SETTINGS_SCHEMA 1
+#define Q2_MP_SETTINGS_SCHEMA 2
 #define Q2_MP_SETTINGS_HEADER_WORDS 2
 #define Q2_MP_SETTINGS_SETUP_WORDS  6
+#define Q2_MP_SETTINGS_IDENTITY_WORDS 24 /* team, colour, four pairs of characters */
 _Static_assert(Q2_MP_SETTINGS_HEADER_WORDS + Q2_SET_COUNT +
-                   Q2_MP_SETTINGS_SETUP_WORDS <= Q2_SETTINGS_VALUE_MAX,
+                   Q2_MP_SETTINGS_SETUP_WORDS + Q2_MP_SETTINGS_IDENTITY_WORDS
+                       <= Q2_SETTINGS_VALUE_MAX,
                "menu settings no longer fit the card settings payload");
+_Static_assert(Q2_SET_COUNT <= Q2_SAVE_SETTINGS_MAX,
+               "menu settings no longer fit the saved-game payload");
 
 static void client_settings_pack(const client *c, q2_settings_blob *out)
 {
@@ -13830,6 +15857,7 @@ static void client_settings_pack(const client *c, q2_settings_blob *out)
 
     memset(out, 0, sizeof(*out));
     out->value[0] = Q2_MP_SETTINGS_SCHEMA;
+    out->cheat_level = (u8)c->menu.cheat_level;
     out->value[1] = Q2_SET_COUNT;
     for (i = 0; i < Q2_SET_COUNT; i++)
         out->value[Q2_MP_SETTINGS_HEADER_WORDS + i] = c->settings.v[i];
@@ -13841,25 +15869,63 @@ static void client_settings_pack(const client *c, q2_settings_blob *out)
     out->value[at++] = c->menu.mp_setup.time_option;
     out->value[at++] = c->menu.mp_setup.frag_option;
     out->value[at++] = c->menu.mp_setup.round_option;
+    for (i = 0; i < 4; i++) {
+        u32 j;
+        out->value[at++] = c->menu.mp_team[i];
+        out->value[at++] = c->menu.mp_colour[i];
+        for (j = 0; j < 8; j += 2)
+            out->value[at++] = (s16)((u8)c->menu.mp_name[i][j] |
+                                    ((u16)(u8)c->menu.mp_name[i][j + 1] << 8));
+    }
     out->count = at;
 }
 
 static bool client_settings_unpack(client *c, const q2_settings_blob *in)
 {
     q2_menu_mp_setup setup;
+    q2_menu_settings defaults;
+    char names[4][9];
+    s16 teams[4], colours[4];
     u32 stored, copy, at, i;
 
     if (!in || in->count < Q2_MP_SETTINGS_HEADER_WORDS ||
-        in->value[0] != Q2_MP_SETTINGS_SCHEMA || in->value[1] < 0)
+        in->cheat_level > 3 || (in->unlock_file && !in->cheat_level) ||
+        (in->value[0] != 1 && in->value[0] != Q2_MP_SETTINGS_SCHEMA) ||
+        in->value[1] < 0 || in->count > Q2_SETTINGS_VALUE_MAX)
         return false;
 
     stored = (u32)in->value[1];
     if (stored > Q2_SETTINGS_VALUE_MAX ||
-        in->count < Q2_MP_SETTINGS_HEADER_WORDS + stored +
-                    Q2_MP_SETTINGS_SETUP_WORDS)
+        in->count < Q2_MP_SETTINGS_HEADER_WORDS + stored + Q2_MP_SETTINGS_SETUP_WORDS)
         return false;
+    at = Q2_MP_SETTINGS_HEADER_WORDS + stored + Q2_MP_SETTINGS_SETUP_WORDS;
+    if (in->value[0] == 2 && in->count < at + Q2_MP_SETTINGS_IDENTITY_WORDS)
+        return false;
+    for (i = 0; i < 4; i++) {
+        u32 j;
+        teams[i] = (s16)(i & 1); colours[i] = (s16)i;
+        memset(names[i], 0, sizeof(names[i]));
+        snprintf(names[i], sizeof(names[i]), "PLAYER %u", (unsigned)i + 1);
+        if (in->value[0] == 1) continue;
+        teams[i] = in->value[at++]; colours[i] = in->value[at++];
+        if (teams[i] < 0 || teams[i] > 1 || colours[i] < 0 || colours[i] > 3)
+            return false;
+        for (j = 0; j < 8; j += 2) {
+            u16 pair = (u16)in->value[at++];
+            names[i][j] = (char)(pair & 255);
+            names[i][j + 1] = (char)(pair >> 8);
+        }
+        for (j = 0; j < 8; j++) {
+            char ch = names[i][j];
+            if (ch && ch != ' ' && !(ch >= 'A' && ch <= 'Z') &&
+                !(ch >= '0' && ch <= '9')) return false;
+        }
+    }
 
     copy = stored < Q2_SET_COUNT ? stored : Q2_SET_COUNT;
+    q2_menu_settings_defaults(&defaults);
+    for (i = copy; i < Q2_SET_COUNT; i++)
+        c->settings.v[i] = defaults.v[i];
     for (i = 0; i < copy; i++)
         c->settings.v[i] = in->value[Q2_MP_SETTINGS_HEADER_WORDS + i];
 
@@ -13891,6 +15957,10 @@ static bool client_settings_unpack(client *c, const q2_settings_blob *in)
         setup.round_option = Q2_MENU_MP_ROUND_DEFAULT;
 
     c->menu.mp_setup = setup;
+    memcpy(c->menu.mp_name, names, sizeof(names));
+    memcpy(c->menu.mp_team, teams, sizeof(teams));
+    memcpy(c->menu.mp_colour, colours, sizeof(colours));
+    q2_menu_set_cheat_level(&c->menu, in->cheat_level);
     client_apply_settings(c);
     return true;
 }
@@ -13918,7 +15988,9 @@ static void client_card_open(client *c, q2_save_ui_mode mode)
 
     c->card_return_page = Q2_PAGE_NONE;
     if (c->in_front_end) {
-        if (mode == Q2_SAVE_UI_SETTINGS_SAVE ||
+        if (mode == Q2_SAVE_UI_UNLOCK_SAVE)
+            c->card_return_page = Q2_PAGE_FRONT_UNLOCK;
+        else if (mode == Q2_SAVE_UI_SETTINGS_SAVE ||
             mode == Q2_SAVE_UI_SETTINGS_LOAD)
             c->card_return_page = Q2_PAGE_FRONT_MULTI;
         else if (mode == Q2_SAVE_UI_LOAD)
@@ -13932,9 +16004,12 @@ static void client_card_open(client *c, q2_save_ui_mode mode)
         q2_save_ui_open_save(&c->save_ui, &c->snapshot);
     else if (mode == Q2_SAVE_UI_LOAD)
         q2_save_ui_open_load(&c->save_ui);
-    else if (mode == Q2_SAVE_UI_SETTINGS_SAVE) {
+    else if (mode == Q2_SAVE_UI_SETTINGS_SAVE || mode == Q2_SAVE_UI_UNLOCK_SAVE) {
         client_settings_pack(c, &settings);
-        q2_save_ui_open_settings_save(&c->save_ui, &settings);
+        if (mode == Q2_SAVE_UI_UNLOCK_SAVE)
+            q2_save_ui_open_unlock_save(&c->save_ui, &settings);
+        else
+            q2_save_ui_open_settings_save(&c->save_ui, &settings);
     } else {
         q2_save_ui_open_settings_load(&c->save_ui);
     }
@@ -13980,6 +16055,7 @@ static void client_card_rows(client *c)
             snprintf(dst, Q2_MENU_TEXT_MAX, "%s", q2_save_ui_row(&c->save_ui, i));
             c->card_menu.disabled[i + 1] = 0;
         } else if (c->card_mode == Q2_SAVE_UI_SAVE ||
+                   c->card_mode == Q2_SAVE_UI_UNLOCK_SAVE ||
                    c->card_mode == Q2_SAVE_UI_SETTINGS_SAVE) {
             snprintf(dst, Q2_MENU_TEXT_MAX, "%d", i + 1);
             c->card_menu.disabled[i + 1] = 0;
@@ -14036,11 +16112,16 @@ static void client_card_finish(client *c)
     q2_save loaded;
     q2_settings_blob settings;
     bool settings_mode = c->card_mode == Q2_SAVE_UI_SETTINGS_SAVE ||
+                         c->card_mode == Q2_SAVE_UI_UNLOCK_SAVE ||
                          c->card_mode == Q2_SAVE_UI_SETTINGS_LOAD;
 
     switch (c->save_ui.status) {
     case Q2_SAVE_UI_SAVED:
-        client_notify(c, settings_mode ? "SETTINGS SAVED" : "GAME SAVED");
+        if (c->card_mode == Q2_SAVE_UI_UNLOCK_SAVE) {
+            client_notify(c, "UNLOCK FILE SAVED");
+            /* +9FF4's success acknowledgement builds MULTIPLAYER. */
+            c->card_return_page = Q2_PAGE_FRONT_MULTI;
+        } else client_notify(c, settings_mode ? "SETTINGS SAVED" : "GAME SAVED");
         break;
 
     case Q2_SAVE_UI_LOADED:
@@ -14346,14 +16427,59 @@ static void client_quick_load(client *c)
 
 /* ------------------------------------------------------------------------- */
 /*
- * A screenshot, of the console's framebuffer rather than of the window.
+ * A screenshot from the engine's framebuffer or optional GPU display effects.
  *
  * Entirely the port's, and the distinction is the point: the window is an
  * upscale of a 512x248 buffer, so grabbing it back off the desktop resamples
  * the very pixels — the dither pattern, the vertex snapping — that the whole
- * renderer exists to get right. This writes the buffer the frame was composed
- * into, at its own size, through the same P6 writer the offline tools use.
+ * renderer exists to get right. Without effects F11 writes the native buffer
+ * through the offline tools' P6 writer. With effects it captures the fitted display
+ * from the GPU output target (or CPU fallback), without OS capture.
  */
+static bool client_gpu_render(client *c, const psx_framebuffer *front, int w, int h)
+{
+    bool crt = c->settings.v[Q2_SET_CRT] != 0;
+    int index = (int)(front - c->screen.buf), i;
+    if (c->settings.v[Q2_SET_BLOOM] && c->screen.scene[index].px) {
+        q2_gl_scene scene = {0};
+        scene.colour = &c->screen.scene[index];
+        scene.ui_mask = c->screen.ui_mask[index];
+        scene.view_count = c->screen.view_count;
+        for (i = 0; i < scene.view_count; i++) {
+            scene.view[i][0] = c->screen.view[i].x;
+            scene.view[i][1] = c->screen.view[i].y;
+            scene.view[i][2] = c->screen.view[i].w;
+            scene.view[i][3] = c->screen.view[i].h;
+        }
+        if (q2_gl_render_effects(c->gl_display, front, w, h, crt, &scene)) {
+            c->bloom_warned = false;
+            return true;
+        }
+        if (!c->bloom_warned) Q2_WARN("GPU bloom unavailable; displaying without bloom");
+        c->bloom_warned = true;
+    }
+    return q2_gl_render(c->gl_display, front, w, h, crt);
+}
+
+static q2_result client_display_screenshot(client *c, const char *path)
+{
+    int w, h, pw, ph;
+    q2_screen_window_size(&c->screen, client_display_fit(c), c->capture_scale, &w, &h);
+    if (c->output_width > 0) { w = c->output_width; h = c->output_height; }
+    if (c->renderer) SDL_GetCurrentRenderOutputSize(c->renderer, &w, &h);
+    if (c->gl_display && c->window) SDL_GetWindowSizeInPixels(c->window, &w, &h);
+    q2_screen_fit_rect(&c->screen, client_display_fit(c), w, h, NULL, NULL, &pw, &ph);
+    if (!c->crt_cpu) {
+        if (!c->gl_display && c->headless) c->gl_display = q2_gl_create_hidden();
+        if (c->gl_display && client_gpu_render(c, q2_screen_front(&c->screen), pw, ph))
+            return q2_gl_write_ppm(c->gl_display, path);
+        if (c->headless)
+            Q2_WARN("GPU capture unavailable; using CPU reference: %s", SDL_GetError());
+    }
+    return q2_crt_write_ppm(&c->crt, q2_screen_front(&c->screen),
+                            c->settings.v[Q2_SET_CRT] != 0, pw, ph, path);
+}
+
 static void client_screenshot(client *c)
 {
     static int n = 0;
@@ -14362,7 +16488,7 @@ static void client_screenshot(client *c)
 
     snprintf(path, sizeof(path), "q2psx-%03d.ppm", n);
 
-    rc = psx_fb_write_ppm(q2_screen_front(&c->screen), path);
+    rc = client_display_screenshot(c, path);
     if (rc != Q2_OK) {
         Q2_ERROR("cannot write %s: %s", path, q2_result_str(rc));
         return;
@@ -14426,6 +16552,9 @@ static void client_write_shot(client *c, bool numbered)
             c->shot_stats.quads_rejected_flat,
             c->shot_stats.depth_min, c->shot_stats.depth_max,
             c->shot_stats.ot_overflow);
+    Q2_INFO("  parent packets %u/%u blocks, %u/255 directories, %u nodes denied",
+            c->render.packet_used, c->render.packet_capacity,
+            c->render.packet_dirs_used, c->shot_stats.nodes_packet_denied);
 
     /*
      * The lens flares. `lit` can say how many flare-carrying lights a cell
@@ -14914,6 +17043,16 @@ static void client_reset_view_model(client *c, int pi)
     client_bind_view_model(c, pi);
 }
 
+/* The spawn jump table at 0x800AC630 selects config+2 for modes 1, 2, 4
+ * and config+4 for 0, 3, 5. Animation still uses canonical Male2. */
+static int client_player_colour(const client *c, int pi)
+{
+    int colour = c->mp.mode == Q2_MP_TEAM_DEATHMATCH ||
+                 c->mp.mode == Q2_MP_CTF || c->mp.mode == Q2_MP_TEAM_TAG
+                     ? c->mp.team[pi] : c->menu.mp_colour[pi];
+    return colour >= 0 && colour < Q2_MP_MAX_PLAYERS ? colour : 0;
+}
+
 static void client_bind_player_models(client *c)
 {
     static const char *const name[Q2_MP_MAX_PLAYERS] = {
@@ -14922,10 +17061,8 @@ static void client_bind_player_models(client *c)
     int i;
 
     memset(c->player_model_ok, 0, sizeof(c->player_model_ok));
-    memset(c->player_anim, 0, sizeof(c->player_anim));
+    memset(c->player_moves, 0, sizeof(c->player_moves));
     c->player_anim_base_ok = false;
-    for (i = 0; i < Q2_MP_MAX_PLAYERS; i++)
-        c->player_anim[i].move = Q2_PMOVE_NONE;
 
     if (!c->model_bank_ready)
         return;
@@ -14941,6 +17078,23 @@ static void client_bind_player_models(client *c)
 
     c->player_anim_base_ok = c->player_model_ok[0] &&
         c->player_model[0].hdr.num_parts <= 64;
+    if (c->player_anim_base_ok) {
+        for (i = 0; i < Q2_PMOVE_COUNT; i++) {
+            q2_model_move move;
+            if (!q2_model_move_by_name(&c->player_model[0], q2_player_move_name((q2_player_move)i), &move)) {
+                c->player_anim_base_ok = false;
+                break;
+            }
+            /* BodgeAnimData, 0x8006C284..0x8006C2B0, scales all three words. */
+            c->player_moves[i].start = (u16)(move.start * 5u);
+            c->player_moves[i].end = (u16)(move.end * 5u);
+            c->player_moves[i].rest = (u16)(move.rest * 5u);
+            /* Player model binding, 0x8003CBF4/CC04, makes Stand and Run
+             * loop at their starts. Other moves retain the authored rest. */
+            if (i == Q2_PMOVE_STAND || i == Q2_PMOVE_RUN)
+                c->player_moves[i].rest = c->player_moves[i].start;
+        }
+    }
     if (c->mp_enabled && c->player_anim_base_ok) {
         u32 n = 0;
         for (i = 0; i < Q2_MP_MAX_PLAYERS; i++)
@@ -14990,14 +17144,20 @@ static bool client_film_start(client *c, const char *name)
     c->film_done       = false;
     c->film_have_frame = false;
     c->film_frames     = 0;
+    c->film_audio_mixed = c->film_audio_submitted = c->film_audio_played = 0;
+    c->film_stop_at = limit ? (u64)((limit - 1u) * (double)CLIENT_AUDIO_RATE / c->film.fps + 0.5)
+                            : ~(u64)0;
+    c->film_stopping = false;
+    c->audio_clock = 0.0;
 
     /* The film carries its own sound. Whatever the level was playing stops,
      * the way it does on the console when the drive is handed to the film —
      * and so does every effect, since none of them belong over a cutscene. */
-    c->music_open = false;
+    c->music_open = c->music_playing = false;
     client_voices_stop(c);
     c->bed_frames = 0;
     c->bed_pos    = 0;
+    q2_xa_resampler_reset(&c->bed_resampler);
     if (c->audio)
         SDL_ClearAudioStream(c->audio);
 
@@ -15016,9 +17176,11 @@ static void client_film_stop(client *c)
     c->film_open       = false;
     c->film_done       = true;
     c->film_have_frame = false;
+    c->film_stopping   = false;
     client_voices_stop(c);
     c->bed_frames = 0;
     c->bed_pos    = 0;
+    q2_xa_resampler_reset(&c->bed_resampler);
     if (c->audio)
         SDL_ClearAudioStream(c->audio);
 
@@ -15026,35 +17188,53 @@ static void client_film_stop(client *c)
      * And give the level its music back. `client_film_start` clears
      * `music_open` and nothing used to set it again, so a session was silent
      * from the first cutscene onwards — including one that was skipped.
-     * `force`, because the level record has not changed and the ordinary
-     * early-out would decline to restart it.
+     * Force a new playlist start even though the level record has not changed.
      */
     client_music_for_level(c, true, false);
 
     Q2_INFO("movie: %u frames shown", c->film_frames);
 }
 
-/*
- * Advance the film.
- *
- * Its audio is NOT pulled here. Picture and sound are separate on the console —
- * the SPU plays whatever the drive delivered and the MDEC decodes what it can,
- * so a picture that falls behind does not take the sound with it — and they are
- * separate here for the same reason: the film's track is just another bed for
- * `client_audio_pump`, which feeds the device whether or not a frame decoded.
- */
+/* Queue the same four-field CD fade on skip and natural completion. Keep the
+ * last picture until that audio drains, then hand the drive back to music. */
+static void client_film_request_stop(client *c)
+{
+    if (!c->film_open || c->film_stopping) return;
+    if (c->film_audio_submitted < c->film_stop_at)
+        c->film_stop_at = c->film_audio_submitted;
+    c->film_stopping = true;
+}
+
+/* Input format is fixed PCM16 stereo/44100. SDL's queued-input byte count
+ * gives consumed sample time, excluding the host's downstream device latency.
+ * A stalled render thread skips overdue pictures; an audio underrun holds the
+ * picture. Neither the game dt clamp nor queued-ahead audio advances video. */
 static void client_film_tick(client *c, float dt)
 {
+    u64 played;
+    double elapsed;
+    int queued;
+    (void)dt;
     if (!c->film_open)
         return;
-
-    if (q2_movie_advance(&c->film, (double)dt, c->film_rgb)) {
+    queued = c->audio ? SDL_GetAudioStreamQueued(c->audio) : 0;
+    if (queued < 0) return;
+    played = (u64)queued / (XA_CHANNELS * sizeof(s16));
+    played = played < c->film_audio_submitted ? c->film_audio_submitted - played : 0;
+    if (played > c->film_audio_played) c->film_audio_played = played;
+    if (c->film_audio_played >= client_film_audio_end(c)) {
+        client_film_stop(c);
+        return;
+    }
+    if (c->film_stopping || c->film_audio_played >= c->film_stop_at) return;
+    elapsed = (double)c->film_audio_played / CLIENT_AUDIO_RATE - c->film.clock;
+    if (q2_movie_advance(&c->film, elapsed, c->film_rgb)) {
         c->film_have_frame = true;
         c->film_frames++;
     }
 
     if (q2_movie_finished(&c->film))
-        client_film_stop(c);
+        client_film_request_stop(c);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -15265,6 +17445,8 @@ static void client_enter_front_end(client *c)
     c->film_to_front = false;
     c->film_is_start = false;
     c->start_beat    = 0.0;
+    c->film_is_extro = false;
+    c->credits_open = c->credits_campaign = false;
     c->mp_scoreboard = false;
     q2_loading_hide(&c->loading);
     q2_menu_set_multiplayer(&c->menu, false);
@@ -15317,6 +17499,7 @@ static void client_enter_front_end(client *c)
     /* The title screen is the menu's page 46 over the QFRONT scene. It is
      * opened rather than drawn, so it navigates with the same engine, the same
      * selection bar and the same font as every other page. */
+    q2_menu_set_pauser(&c->menu, 0);
     q2_menu_open(&c->menu);
     q2_menu_goto(&c->menu, Q2_PAGE_FRONT_TITLE);
 
@@ -15477,25 +17660,33 @@ static void client_boot_blit(client *c)
 
     for (i = 0; i < 2; i++) {
         int bright = client_boot_fade(&s->image[i], c->boot_frame);
-        int oy, y, step;
+        int ox, oy, dw, dh, y, step;
 
         if (!c->boot_rgb[i] || bright <= 0)
             continue;
 
-        oy = (fb->height - (int)c->boot_h[i]) / 2;
-        if (oy < 0) oy = 0;
+        q2_screen_ui_rect(&c->screen, -1, &ox, &oy, &dw, &dh);
+        dh = (int)((s64)c->boot_h[i] * dh / c->height);
+        if (dh < 1) dh = 1;
+        if (dh > fb->height) {
+            dw = (int)((s64)dw * fb->height / dh);
+            dh = fb->height;
+        }
+        ox = (fb->width - dw) / 2;
+        oy = (fb->height - dh) / 2;
         step = (int)(((u32)c->boot_w[i] << 16) /
-                     (u32)(fb->width > 0 ? fb->width : 1));
+                     (u32)(dw > 0 ? dw : 1));
 
-        for (y = 0; y < (int)c->boot_h[i]; y++) {
-            const u8 *src = c->boot_rgb[i] + (size_t)y * c->boot_w[i] * 3;
+        for (y = 0; y < dh; y++) {
+            const u8 *src = c->boot_rgb[i] +
+                (size_t)(y * c->boot_h[i] / dh) * c->boot_w[i] * 3;
             u16 *dst;
             int bx, u = 0;
 
             if (oy + y >= fb->height)
                 break;
-            dst = fb->px + (size_t)(oy + y) * fb->width;
-            for (bx = 0; bx < fb->width; bx++, u += step) {
+            dst = fb->px + (size_t)(oy + y) * fb->width + ox;
+            for (bx = 0; bx < dw; bx++, u += step) {
                 int x = u >> 16;
                 u32 r, g, b, o;
 
@@ -15566,8 +17757,14 @@ static void client_start_game(client *c)
      * thing in the image that empties save memory, which is why a map walked
      * back into WITHIN a game still remembers its script. */
     q2_event_store_clear(&c->event_store);
+    memset(&c->native_mission, 0, sizeof(c->native_mission));
+    c->native_mission.boss2_quake_time = Q2_NATIVE_QUAKE_INACTIVE;
+    q2_zone_history_free(&c->zone_history);
 
+    c->carry_player = c->carry_same_map = false;
+    c->new_game_loading = true;
     client_load_zone(c, c->first_map, client_default_zone(c, c->first_map));
+    c->new_game_loading = false;
 }
 
 /*
@@ -15638,27 +17835,30 @@ static void client_start_beat(client *c, float dt)
 static void client_film_blit(client *c)
 {
     psx_framebuffer *fb = q2_screen_back(&c->screen);
-    int oy, y, step;
+    int ox, oy, dw, dh, y, step;
 
     if (!fb || !fb->px || !c->film_have_frame || !c->film_rgb)
         return;
 
-    oy = (fb->height - (int)Q2_STX_HEIGHT) / 2;
-    if (oy < 0) oy = 0;
+    q2_screen_ui_rect(&c->screen, -1, &ox, &oy, &dw, &dh);
+    dh = (int)((s64)Q2_STX_HEIGHT * dh / c->height);
+    if (dh < 1) dh = 1;
+    oy = (fb->height - dh) / 2;
 
     /* 16.16 source step: one film pixel per buffer pixel on a 320-wide buffer,
      * five per eight on a 512-wide one. */
-    step = (int)((Q2_STX_WIDTH << 16) / (u32)(fb->width > 0 ? fb->width : 1));
+    step = (int)((Q2_STX_WIDTH << 16) / (u32)(dw > 0 ? dw : 1));
 
-    for (y = 0; y < (int)Q2_STX_HEIGHT; y++) {
-        const u8 *src = c->film_rgb + (size_t)y * Q2_STX_WIDTH * 3;
+    for (y = 0; y < dh; y++) {
+        const u8 *src = c->film_rgb +
+            (size_t)(y * Q2_STX_HEIGHT / dh) * Q2_STX_WIDTH * 3;
         u16 *dst;
         int bx, u = 0;
 
         if (oy + y >= fb->height)
             break;
-        dst = fb->px + (size_t)(oy + y) * fb->width;
-        for (bx = 0; bx < fb->width; bx++, u += step) {
+        dst = fb->px + (size_t)(oy + y) * fb->width + ox;
+        for (bx = 0; bx < dw; bx++, u += step) {
             int x = u >> 16;
 
             if (x >= (int)Q2_STX_WIDTH)
@@ -15835,9 +18035,17 @@ static void client_menu_frame(client *c)
      * or, once off, ever be turned back on.
      */
     if (c->menu.page_id == Q2_PAGE_CONTROLLER) {
-        c->menu.disabled[3] = 0;                       /* USE MOUSE   */
-        if (c->settings.v[Q2_SET_PAD_CLASS] == 0)
+        /* The host mouse belongs to player one. The other pads must not
+         * offer a switch that would claim that same device. */
+        c->menu.disabled[3] = c->menu.pauser != 0;     /* USE MOUSE   */
+        snprintf(c->menu.text[3], Q2_MENU_TEXT_MAX, "%sUSE MOUSE",
+                 c->menu.disabled[3] ? "g" : "");
+        if (c->menu.disabled[3] && c->menu.cursor == 3)
+            c->menu.cursor = 2;
+        if (c->settings.v[q2_menu_player_setting(Q2_SET_PAD_CLASS, c->menu.pauser)] == 0) {
             c->menu.disabled[2] = 0;                   /* SWAP Y AXIS */
+            c->menu.text[2][0] = '\0';
+        }
     }
 
     /*
@@ -15845,7 +18053,7 @@ static void client_menu_frame(client *c)
      * over and the cursor has to be there before the press is handed to the
      * engine.
      */
-    pad  = client_menu_pointer(c, &c->menu);
+    pad = client_menu_pointer(c, &c->menu);
     pad |= client_menu_pad(c);
     /* A key-down, not a held key, so it is one frame of TRIANGLE: the engine
      * sees the press on this advance and the release on the next. */
@@ -15886,7 +18094,26 @@ static void client_menu_frame(client *c)
      * a button can change the page, so it cannot be stale when one does. */
     q2_menu_set_front_end(&c->menu, c->in_front_end);
 
-    q2_menu_advance(&c->menu, pad);
+    if (c->menu.page_id == Q2_PAGE_FRONT_PLAYERS) {
+        u16 pads[4];
+        u32 connected = 1; /* The host keyboard remains player one's fallback. */
+        int pi;
+        c->menu.mp_host_mouse = true;
+        for (pi = 0; pi < 4; pi++) {
+            u16 pressed = (u16)c->gamepads.menu_pressed[pi];
+            pads[pi] = q2_gamepads_menu_player(&c->gamepads, pi);
+            if (pressed & (Q2_PAD_CIRCLE | Q2_PAD_SELECT)) pressed |= Q2_PAD_TRIANGLE;
+            if (pressed & Q2_PAD_START) pressed |= Q2_PAD_CROSS;
+            /* Preserve a release and fresh press between render frames. */
+            if (!c->menu.mp_panel_settle &&
+                c->menu.mp_panel[pi].page != Q2_MP_PLAYER_DISCONNECTED)
+                c->menu.mp_panel[pi].previous &= (u16)~pressed;
+            if (pads[pi] & Q2_PAD_START) pads[pi] |= Q2_PAD_CROSS;
+            if (c->gamepads.device[pi]) connected |= 1u << pi;
+        }
+        pads[0] |= pad;
+        q2_menu_advance_players(&c->menu, pads, connected);
+    } else q2_menu_advance(&c->menu, pad);
 
     snd = q2_menu_take_sound(&c->menu);
     if (snd != Q2_MSND_NONE)
@@ -15899,12 +18126,34 @@ static void client_menu_frame(client *c)
      * (levelbin.h). Stepping off the title screen therefore shrinks it, and
      * stepping back grows it again.
      */
-    if (c->in_front_end)
-        q2_sim_scene_page(&c->sim[0],
-                          c->menu.page_id == Q2_PAGE_FRONT_TITLE, true);
+    if (c->in_front_end) {
+        bool players = c->menu.page_id == Q2_PAGE_FRONT_PLAYERS;
+        int count = players ? c->menu.mp_setup.players : 1;
+        q2_screen_layout layout = count == 1 ? Q2_SCREEN_LAYOUT_ONE
+                                : count == 2 ? Q2_SCREEN_LAYOUT_TWO_H
+                                             : Q2_SCREEN_LAYOUT_QUAD;
+        int pi;
+        if (c->screen.view_count != count || c->screen.layout != layout)
+            q2_screen_set_layout(&c->screen, layout, count);
+        if (players) {
+            q2_sim_scene_players(&c->sim[0],
+                c->menu.mp_setup.mode == Q2_MENU_MP_TEAM_DEATHMATCH
+                    ? c->menu.mp_team : c->menu.mp_colour, count);
+            for (pi = 0; pi < count; pi++) {
+                c->screen.view[pi].far_z = 4000;
+                c->screen.view[pi].proj = count == 2 ? 210 : 160;
+                c->screen.native_view[pi].far_z = 4000;
+                c->screen.native_view[pi].proj = count == 2 ? 210 : 160;
+            }
+        } else {
+            c->screen.view[0].far_z = c->screen.native_view[0].far_z = 4000;
+            q2_sim_scene_page(&c->sim[0], c->menu.page_id == Q2_PAGE_FRONT_TITLE, true);
+        }
+    }
 
     client_menu_requests(c);
-    q2_prompt_sync_menu(&c->prompts, &c->menu, c->in_front_end);
+    if (c->credits_open) q2_prompt_show(&c->prompts, Q2_PROMPT_BACK, 216);
+    else q2_prompt_sync_menu(&c->prompts, &c->menu, c->in_front_end);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -16014,7 +18263,8 @@ static void client_draw_view(void *user, q2_screen *s, int p,
 {
     client *c = (client *)user;
     q2_world_stats stats;
-    int owner = c->mp_enabled ? p : 0;
+    int owner = c->mp_enabled || (c->in_front_end &&
+                c->menu.page_id == Q2_PAGE_FRONT_PLAYERS) ? p : 0;
 
     /*
      * The viewport owns the field of view: SetGeomScreen(view+262) at
@@ -16028,6 +18278,14 @@ static void client_draw_view(void *user, q2_screen *s, int p,
      * the world's own reload from quietly disagreeing with the screen's.
      */
     c->cam.projection = (u16)s->view[p].proj;
+    /* Front-end/results scenes are artwork behind a menu. Keep their whole
+     * authored composition in the same fitted area as that menu. */
+    if (s->adaptive && (c->in_front_end || c->mp_scoreboard)) {
+        int ui_w, ui_h;
+        q2_screen_ui_rect(s, p, NULL, NULL, &ui_w, &ui_h);
+        c->cam.projection = (u16)fmax(1.0, floor(
+            (double)s->native_view[p].proj * ui_h / s->native_view[p].h + 0.5));
+    }
     /* The 2D extent as well as the offset — the flare rings scale by it, and
      * the two fields only differ on the two-horizontal split. */
     c->cam.ext_w      = s->view[p].vw;
@@ -16052,9 +18310,14 @@ static void client_draw_view(void *user, q2_screen *s, int p,
         c->cam.roll  = c->mp_camera_angles[p][2];
     }
 
+    /* FindPlayerTarget reads this viewport on the following logic tick. */
+    if (!c->in_front_end && !c->mp_scoreboard && c->sim_enabled && c->sim_ready[owner])
+        q2_sim_set_aim_view(&c->sim[0], owner, c->cam.pos, client_sort_cell(c, p));
+
     /* The viewport's far distance is also the subdivision threshold: the same
      * view+264 the original parks at 0x800B2CCC serves both. */
     c->render.subdiv_threshold = s->view[p].far_z;
+    c->render.subdiv_view = (u8)p;
 
     /*
      * The LENS FLARES, which had a complete implementation and no caller: the
@@ -16144,7 +18407,9 @@ static void client_draw_view(void *user, q2_screen *s, int p,
         q2_entity_draw_stats estats;
 
         memset(&ectx, 0, sizeof(ectx));
+        ectx.glint         = &c->sim[0].glint;
         ectx.bank          = c->model_bank_ready ? &c->model_bank : NULL;
+        ectx.zone_bank     = c->zone_bank_ready ? &c->zone_bank : NULL;
         ectx.clut4_count_a = c->clut4_count_a;
         ectx.player        = (u32)owner;
         ectx.tpage         = &c->render.tpage;
@@ -16176,6 +18441,8 @@ static void client_draw_view(void *user, q2_screen *s, int p,
                            ? &c->sim[0].coll_primary : NULL;
 
         q2_entity_build_ot(&c->sim[0].entities, &ectx, &c->cam, ot, gte, &estats);
+        c->glint_prims += estats.glint_emitted;
+        c->glint_drawn |= estats.glint_draws != 0;
         /* Model entities are drawn through the same walk items are, so the
          * only way to tell a spawned Explosion from a silently-dropped one
          * is to count what the walk actually emitted. */
@@ -16211,7 +18478,7 @@ static void client_draw_view(void *user, q2_screen *s, int p,
             const q2_monster *m = &c->creatures.set.monsters[i];
             q2_model_instance inst;
             q2_model_draw_stats st;
-            q2_model_pose pose[64];
+            q2_model_pose pose[64] = {0};
             q2_model_anim clip;
             q2_light_env  cre_env;
             s32 cell = -1;
@@ -16373,6 +18640,29 @@ static void client_draw_view(void *user, q2_screen *s, int p,
                     }
                 }
 
+                /* Direct-think actors still use export 3's named poses.
+                 * Their frame numbers need not start at zero (RiderStand
+                 * starts at 414), so the whole-model timeline is not a base. */
+                if (!m->currentmove && mdl->hdr.num_parts <= Q2PSX_ARRAY_COUNT(pose)) {
+                    const q2_cre_frame_name *rec = q2_creature_world_frame_name(
+                        &c->creatures, m, frame);
+                    u32 pos;
+                    bool held = false;
+                    if (rec && q2_model_position_for_move(mdl, rec->name, frame,
+                                                          rec->first, &pos)) {
+                        s32 sample = client_model_anim_sample(&c->cre_anim[i], NULL,
+                            4u, (s32)pos, c->screen.dt, c->frame_index);
+                        if (sample < 0) sample = 0;
+                        anim_pos = sample;
+                        have_clip = q2_model_anim_at_position_held(mdl, (u32)sample,
+                            &clip, &pose_tick, &held);
+                        if (have_clip) c->pose_by_name++;
+                        else c->pose_name_no_pos++;
+                        if (held) c->pose_held++;
+                    } else if (rec) c->pose_name_absent++;
+                    else c->pose_no_name++;
+                }
+
                 /* No move installed, or no clip of that length: the timeline
                  * walk, which is what every creature used before this. */
                 if (!have_clip && mdl->hdr.num_parts <= Q2PSX_ARRAY_COUNT(pose)) {
@@ -16388,20 +18678,26 @@ static void client_draw_view(void *user, q2_screen *s, int p,
                         mdl, (u32)sample, &clip, &pose_tick);
                 }
 
-                /* `pose_tick` remains in retail's 1/10-frame unit all the way
-                 * into q2_model_pose_at. At a 30 Hz render clock the targets
-                 * are 0,30,60… while the samples are 0,10,20,30…; variable-rate
-                 * translations and rotations therefore receive the same 0..9
-                 * interpolation remainder the executable retains at
-                 * 0x8006B5D8. */
-                if (have_clip)
-                    posed = (q2_model_pose_at(mdl, &clip,
-                                              pose_tick,
-                                              pose) == Q2_OK);
+                if (m->motion.animation_ready) {
+                    q2_model_anim incoming;
+                    const q2_model_anim *next = NULL;
+                    u32 unused;
+                    anim_pos = m->motion.anim_position;
+                    have_clip = anim_pos >= 0 && q2_model_anim_at_position_held(
+                        mdl, (u32)anim_pos, &clip, &pose_tick, NULL);
+                    if ((m->motion.anim_flags & 1u) &&
+                        q2_model_anim_at_position(mdl, m->motion.anim_base, &incoming, &unused))
+                        next = &incoming;
+                    if (have_clip)
+                        posed = q2_model_pose_transition(mdl, &clip, pose_tick, next, pose) == Q2_OK;
+                } else if (have_clip) {
+                    posed = q2_model_pose_at(mdl, &clip, pose_tick, pose) == Q2_OK;
+                }
             }
 
             q2_model_instance_init(&inst);
             inst.model         = &c->cre_model[i];
+            inst.scale         = m->render_scale;
             inst.pose          = posed ? pose : NULL;
             inst.anim_pos      = anim_pos;
 
@@ -16412,8 +18708,8 @@ static void client_draw_view(void *user, q2_screen *s, int p,
             {
                 int axis;
                 for (axis = 0; axis < 3; axis++) {
-                    inst.sort_bounds_min[axis] = m->pos[axis] + m->mins[axis];
-                    inst.sort_bounds_max[axis] = m->pos[axis] + m->maxs[axis];
+                    inst.sort_bounds_min[axis] = q2_cre_origin(m)[axis] + m->mins[axis];
+                    inst.sort_bounds_max[axis] = q2_cre_origin(m)[axis] + m->maxs[axis];
                 }
                 inst.sort_bounds_valid = true;
             }
@@ -16446,7 +18742,7 @@ static void client_draw_view(void *user, q2_screen *s, int p,
                                                 Q2_ACTOR_AMBIENT_DEFAULT };
                 const q2_actor *ga = client_cre_actor(c, m);
 
-                q2_light_gather(&set, &c->light_world, m->pos, cell, 0);
+                q2_light_gather(&set, &c->light_world, q2_cre_origin(m), cell, 0);
                 q2_light_env_build(&cre_env, &set, Q2_LIGHT_ONE,
                                    Q2_LIGHT_ONE,
                                    ga ? ga->ambient : cre_glow);
@@ -16470,9 +18766,9 @@ static void client_draw_view(void *user, q2_screen *s, int p,
                             cre_env.colour.m[2][2],
                             cre_env.back[0], cre_env.back[1], cre_env.back[2]);
             }
-            inst.origin[0]     = m->pos[0];
+            inst.origin[0]     = q2_cre_origin(m)[0];
             /*
-             * `m->pos` is the entity ORIGIN; a model is placed on its FEET,
+             * `q2_cre_origin(m)` is the entity ORIGIN; a model is placed on its FEET,
              * which is Q2_EYE_BASE below.
              *
              * AND THEN RAISED AGAIN BY THE MODEL'S OWN BIAS, which this path
@@ -16491,58 +18787,24 @@ static void client_draw_view(void *user, q2_screen *s, int p,
              * ships — Soldier 251 against a posed maximum of 251, Arachner
              * 217/217, Gunner 380/376 — so subtracting it stands the model on
              * the floor the drop sweep found. Nothing else moves: the hit
-             * sphere, the AI and the collision all key off `m->pos`.
+             * sphere, the AI and the collision all key off `q2_cre_origin(m)`.
              */
-            /*
-             * ...AND A CORPSE IS PLACED BY ITS OWN POSE, which is the
-             * difference between a body that lies on the floor and one that
-             * hangs over it.
-             *
-             * `ext2` is the model's SOLE HEIGHT and it is exact for the pose it
-             * was measured on. Reading every one of the Soldier's thirty-one
-             * clips, each standing, walking and firing pose has its lowest
-             * vertex at exactly 251 — which IS ext2, so the formula above
-             * stands those on the floor to the unit. The death clips do not
-             * share it: clip 8 runs 164, 36, 61, 134, 216, 249, 312, 255 over
-             * its thirty frames as the body is thrown up and comes down. Drawn
-             * against a fixed 251 that same body floats by 190 at frame 9 and
-             * sinks by 61 at frame 25, and whichever frame it stops on is the
-             * one it keeps.
-             *
-             * A DEPARTURE, and stated as one: the console draws every pose
-             * against the one constant (0x800588F0 subtracts the copy at
-             * obj+0xF8, which 0x80058868 fills once from `lh model[+0x1C]` and
-             * nothing ever updates), so a console body rests wherever its last
-             * death frame happens to put it too. This port is asked for corpses
-             * that lie on the ground, so it measures the pose.
-             *
-             * Narrow on purpose — only once the body has come to REST. While
-             * the death animation is playing the console formula is used
-             * unchanged, because the arc of a body being thrown backwards is
-             * the animation and pinning its lowest vertex to the floor would
-             * flatten it. `frame == last_frame` on a dead creature is exactly
-             * "the death has played out".
-             *
-             * It also degenerates: on any pose whose lowest vertex is already
-             * `ext2` this computes the same number the line below it would.
-             */
-            {
-                s32 low = c->cre_model[i].hdr.ext2;
-
-                if (m->dead && posed && m->currentmove
-                    && m->frame == m->currentmove->last_frame) {
-                    s32 pose_low;
-
-                    if (q2_model_pose_low_y(&c->cre_model[i], pose,
-                                            Q2PSX_ARRAY_COUNT(pose),
-                                            &pose_low))
-                        low = pose_low;
-                }
-
-                inst.origin[1] = m->pos[1] + Q2_EYE_BASE - low;
-            }
-            inst.origin[2]     = m->pos[2];
-            inst.yaw           = m->angles[2];
+            /* Native 0x80058870 / 0x800588F0: the model height is captured
+             * once and remains constant through death and corpse posing. */
+            inst.origin[1] = q2_cre_origin(m)[1] + Q2_EYE_BASE
+                           - c->cre_model[i].hdr.ext2;
+            inst.origin[2]     = q2_cre_origin(m)[2];
+            inst.yaw           = q2_cre_yaw(m);
+            /* Creature spawn enables render bit 0 at 0x8007E5D8. Its
+             * footprint starts at the model's hit radius (+0x94), including
+             * the wider radius installed when a corpse settles. Query each
+             * draw: the AI's on_ground latch is not cleared by every mover,
+             * so using it here would pin airborne shadows to the body. */
+            inst.shadow_radius = (u16)m->hit_radius;
+            q2_model_shadow_ground(&inst,
+                c->sim[0].coll_primary_ready ? &c->sim[0].coll_primary : NULL,
+                c->sim[0].coll_ready ? &c->sim[0].coll : NULL,
+                &c->sim[0].move_world, q2_cre_origin(m), false);
             inst.clut4_count_a = c->clut4_count_a;
             /* The map's own page table, so a creature's faces reach the pages
              * they ask for — and share the world's ABR promotions. Without it
@@ -16575,6 +18837,7 @@ static void client_draw_view(void *user, q2_screen *s, int p,
             }
 
             q2_model_build_ot(&inst, &c->cam, ot, gte, &st);
+            c->cre_shadows += st.shadows_emitted;
             if (st.faces_emitted) {
                 c->cre_drawn++;
                 c->cre_faces += st.faces_emitted;
@@ -16609,8 +18872,11 @@ static void client_draw_view(void *user, q2_screen *s, int p,
                 death->stage == Q2_PDEATH_GONE)
                 continue;
 
-            body = c->player_model_ok[pi] ? &c->player_model[pi]
-                                          : &c->player_model[0];
+            {
+                int colour = client_player_colour(c, pi);
+                body = c->player_model_ok[colour] ? &c->player_model[colour]
+                                                  : &c->player_model[0];
+            }
             if (body->hdr.num_parts > Q2PSX_ARRAY_COUNT(pose))
                 continue;
 
@@ -16632,6 +18898,11 @@ static void client_draw_view(void *user, q2_screen *s, int p,
             at[0] = pl->pos[0];
             at[1] = q2_sim_origin_y(pl->pos[1]);
             at[2] = pl->pos[2];
+            inst.shadow_radius = Q2_SWEEP_HALF_EXTENT;
+            q2_model_shadow_ground(&inst,
+                c->sim[0].coll_primary_ready ? &c->sim[0].coll_primary : NULL,
+                c->sim[0].coll_ready ? &c->sim[0].coll : NULL,
+                &c->sim[0].move_world, at, pl->on_ground);
             if (c->sim[0].coll_ready)
                 cell = q2_coll_find_node(&c->sim[0].coll,
                                          at, -1, true);
@@ -16657,9 +18928,9 @@ static void client_draw_view(void *user, q2_screen *s, int p,
                  * so this ambient moves exactly as a creature's does. The live
                  * player's actor is `combat.self`; a parked one's is its own
                  * `pcombat[pi].self` (combat.h, q2_actor.ambient). */
-                static const u8 glow[3] = { Q2_ACTOR_AMBIENT_DEFAULT,
-                                            Q2_ACTOR_AMBIENT_DEFAULT,
-                                            Q2_ACTOR_AMBIENT_DEFAULT };
+                static const u8 glow[3] = { Q2_PLAYER_AMBIENT_DEFAULT,
+                                            Q2_PLAYER_AMBIENT_DEFAULT,
+                                            Q2_PLAYER_AMBIENT_DEFAULT };
                 const q2_actor *ga = (pi == c->sim[0].cur_player)
                                          ? &c->sim[0].combat.self
                                          : &c->sim[0].pcombat[pi].self;
@@ -16673,6 +18944,7 @@ static void client_draw_view(void *user, q2_screen *s, int p,
             }
 
             q2_model_build_ot(&inst, &c->cam, ot, gte, &st);
+            c->player_shadows += st.shadows_emitted;
             if (st.faces_emitted) {
                 c->player_drawn++;
                 c->player_faces += st.faces_emitted;
@@ -16694,7 +18966,15 @@ static void client_draw_view(void *user, q2_screen *s, int p,
      * has just posed (client_cre_blurs). */
     if (p == 0)
         client_cre_blurs(c);
+    client_cre_beams_update(c);
     c->fx_prims += q2_fx_build_ot(&c->sim[0].fx, &c->cam, (u32)p, ot, gte);
+    if (c->sim[0].glint.lightning_ready && c->hud_font_ready) {
+        const q2_hud_palette *pal = q2_hud_palette_get(c->hud_font.tab, 77);
+        if (pal)
+            c->lightning_prims += q2_fx_glint_lightning_draw(&c->sim[0].glint,
+                                 Q2_FX_GLINT_LIGHTNING_TPAGE,
+                                 pal->clut_id, &c->cam, ot, gte);
+    }
 
     /*
      * And the projectiles themselves, which nothing has ever drawn. Until now
@@ -16774,6 +19054,7 @@ static void client_draw_view(void *user, q2_screen *s, int p,
         q2_sbar_layout bar_layout;
         int weapon;
         int ammo;
+        u32 ui_first = ot->prim_count;
 
         /* Multiplayer parks every non-current player's combat half in its own
          * slot. The old bar always read the live slot, so every viewport showed
@@ -16932,6 +19213,7 @@ static void client_draw_view(void *user, q2_screen *s, int p,
         q2_statusbar_build_ot(bar, c->menu_font.tpage_icons,
                               c->menu_font.clut_text, ot,
                               q2_screen_view_otz(s, p, 0), 0, 0);
+        q2_screen_ui_range(s, p, ot, ui_first, true);
     }
 
     /*
@@ -16970,6 +19252,15 @@ static void client_draw_view(void *user, q2_screen *s, int p,
         q2_model_draw_stats mstats;
         q2_light_env vw_env;
         s16 aim[3], kick[3];
+        q2_camera weapon_cam = c->cam;
+
+        if (s->adaptive) {
+            int ux, uy, uw, uh;
+            q2_screen_ui_rect(s, p, &ux, &uy, &uw, &uh);
+            weapon_cam.projection = (u16)fmax(1.0, floor(
+                (double)s->native_view[p].proj * uh / s->native_view[p].h + 0.5));
+            weapon_cam.ofs_y = (s16)(s->view[p].h - uh / 2);
+        }
 
         q2_model_instance_init(&proto);
         proto.tpage         = &c->render.tpage;
@@ -17057,26 +19348,39 @@ static void client_draw_view(void *user, q2_screen *s, int p,
 
         c->vw_drawn[p] = q2_vw_build_ot(&c->vw[owner], &proto,
                        c->sim[0].player[owner].pos, c->sim[0].player[owner].view_height,
-                       aim, kick, &c->cam, ot, gte, &mstats);
+                       aim, kick, &weapon_cam, ot, gte, &mstats);
     }
 
-    /*
-     * The glint, OFF by default (F6 shows it).
-     *
-     * Nothing the engine does raises the `0x04000000` flag it draws on — only
-     * BIGGUN's level script does, and this port does not run relocated level
-     * modules yet. Drawing one anyway would be putting an effect on screen that
-     * the console never puts there, so the reconstruction sits behind a toggle
-     * and the default frame has no glint in it.
-     *
-     * The phase runs 4..1, which is what the script writes and what the band
-     * formula's `4 - phase` expects.
-     */
+    /* The level script binds this to item 20 (Blackhole P) and refreshes its
+     * six bands every tick. Use that entity's transform and screen area;
+     * the last view-weapon draw has left a different GTE matrix installed. */
     if (c->sim[0].glint.ready && (c->sim[0].glint.raised || c->show_glint)) {
-        s32 at[3];
+        const q2_fx_glint *g = &c->sim[0].glint;
+        q2_fx_glint preview;
+        s32 at[3], angles[3];
+        bool visible;
 
-        q2_sim_eye(&c->sim[0], at);
-        q2_fx_glint_draw(&c->sim[0].glint, at, c->cam.yaw, &c->cam, ot, gte);
+        if (g->raised) {
+            memcpy(at, g->origin, sizeof(at));
+            memcpy(angles, g->angles, sizeof(angles));
+        } else {
+            s16 view[3][3];
+            int axis;
+            preview = *g;
+            angles[0] = c->cam.pitch;
+            angles[2] = c->cam.roll;
+            angles[1] = c->cam.yaw;
+            q2_rotation_view(view, c->cam.yaw, c->cam.pitch, c->cam.roll);
+            for (axis = 0; axis < 3; axis++)
+                at[axis] = c->cam.pos[axis] + view[2][axis] / 4;
+            q2_rng_seed(&preview.script_rng, (u32)c->frame_index);
+            q2_fx_glint_refresh(&preview, angles);
+            g = &preview;
+        }
+        if (!g->raised)
+            c->glint_prims += q2_fx_glint_draw_entity(g, at, angles,
+                                               g->raised ? g->area : -1,
+                                               &c->cam, ot, gte);
 
         /*
          * And the LIGHT the renderer raises alongside the mesh — 0x800648B8,
@@ -17092,26 +19396,45 @@ static void client_draw_view(void *user, q2_screen *s, int p,
          * unreachability is reproduced rather than worked around. Raising it
          * earlier would put an effect on screen the console never shows.
          */
-        if (c->lights_ready)
-            q2_light_add_dynamic(&c->light_world, at, c->sim[0].glint.tint,
+        visible = !g->raised || !psx_ot_area_active(ot) ||
+                  psx_ot_area_bucket(ot, g->area, NULL);
+        if (c->lights_ready && visible) {
+            u32 n = g->band_count ? g->band_count : 1;
+            u32 i;
+            if (n > Q2_FX_GLINT_BANDS_MAX)
+                n = Q2_FX_GLINT_BANDS_MAX;
+            for (i = 0; i < n; i++) {
+                u8 tint[3];
+                if (g->band_count) {
+                    tint[0] = q2_fx_colour_r(g->band[i].colour);
+                    tint[1] = q2_fx_colour_g(g->band[i].colour);
+                    tint[2] = q2_fx_colour_b(g->band[i].colour);
+                } else {
+                    memcpy(tint, g->tint, sizeof(tint));
+                }
+                q2_light_add_dynamic(&c->light_world, at, tint,
                                  Q2_FX_GLINT_LIGHT_INNER,
                                  Q2_FX_GLINT_LIGHT_OUTER,
                                  Q2_FX_GLINT_LIGHT_STYLE,
                                  Q2_FX_GLINT_LIGHT_SHIFT);
+            }
+        }
     }
 
     /* The crosshair and messages use this viewport's dimensions and draw
      * environment. A single full-screen overlay put the crosshair in the
      * gutter and let one player's notifications cross into another view. */
-    if (c->mp_enabled && c->hud_ready && c->hud_font_ready &&
+    if (c->mp_enabled && !c->mp_scoreboard && c->hud_ready && c->hud_font_ready &&
         !c->in_front_end && !c->menu.open && !c->mission_open &&
         !c->mcard_open && !c->endmis_open && !c->credits_open) {
         q2_hud_ctx ctx;
         q2_hud *hud = &c->hud[owner];
+        u32 ui_first = ot->prim_count;
 
         hud->crosshair = (c->settings.v[Q2_SET_CROSSHAIR] != 0);
-        q2_hud_ctx_default(&ctx, s->view[p].w, s->view[p].h);
+        q2_hud_ctx_default(&ctx, s->native_view[p].w, s->native_view[p].h);
         q2_hud_build_ot(hud, &c->hud_font, &ctx, ot, 0);
+        q2_screen_ui_range(s, p, ot, ui_first, false);
     }
 }
 
@@ -17123,6 +19446,48 @@ static void client_draw_view(void *user, q2_screen *s, int p,
  * window blit have to be the same for both or a capture of the loading screen
  * would come out through a different path than every other capture.
  */
+static SDL_Texture *client_display_texture(client *c, const psx_framebuffer *front,
+                                            int w, int h)
+{
+    q2_result rc;
+    c->crt_presented = false;
+    if (!c->settings.v[Q2_SET_CRT]) {
+        if (c->crt_texture) SDL_DestroyTexture(c->crt_texture);
+        c->crt_texture = NULL;
+        q2_crt_free(&c->crt);
+        c->crt_warned = false;
+        return c->texture;
+    }
+    if (w <= 0 || h <= 0) return c->texture;
+    rc = q2_crt_render(&c->crt, front, w, h);
+    if (rc == Q2_OK) {
+        float tw = 0, th = 0;
+        if (c->crt_texture) SDL_GetTextureSize(c->crt_texture, &tw, &th);
+        if ((int)tw != w || (int)th != h) {
+            SDL_Texture *t = SDL_CreateTexture(c->renderer, SDL_PIXELFORMAT_ABGR8888,
+                                               SDL_TEXTUREACCESS_STREAMING, w, h);
+            if (t) {
+                SDL_SetTextureScaleMode(t, SDL_SCALEMODE_NEAREST);
+                if (c->crt_texture) SDL_DestroyTexture(c->crt_texture);
+                c->crt_texture = t;
+            } else rc = Q2_ERR_NO_MEMORY;
+        }
+        if (rc == Q2_OK && SDL_UpdateTexture(c->crt_texture, NULL, c->crt.pixels,
+                                             w * (int)sizeof(u32))) {
+            c->crt_presented = true;
+            c->crt_warned = false;
+            return c->crt_texture;
+        }
+        if (rc == Q2_OK) rc = Q2_ERR_IO;
+    }
+    if (!c->crt_warned) {
+        Q2_WARN("CRT display unavailable (%s, %s); using unfiltered display",
+                q2_result_str(rc), SDL_GetError());
+        c->crt_warned = true;
+    }
+    return c->texture;
+}
+
 static void client_present(client *c)
 {
     void *pixels;
@@ -17142,15 +19507,52 @@ static void client_present(client *c)
         (c->frame_index % c->shot_every) == 0)
         client_write_shot(c, true);
 
+    if (c->gl_display && c->window) {
+        int w = 0, h = 0, x, y, pw, ph;
+        bool enabled = c->settings.v[Q2_SET_CRT] != 0;
+        SDL_GetWindowSizeInPixels(c->window, &w, &h);
+        if (w < 1 || h < 1) return;
+        q2_screen_fit_rect(&c->screen, client_display_fit(c), w, h, &x, &y, &pw, &ph);
+        x += (int)lround((double)c->settings.v[Q2_SET_SCREEN_X] * pw / Q2_SCREEN_PAL_WIDTH);
+        y += (int)lround((double)(c->settings.v[Q2_SET_SCREEN_Y] -
+                       q2_menu_screen_y_default(c->screen.disp.height)) * ph / c->screen.disp.height);
+        c->crt_presented = enabled;
+        if (!client_gpu_render(c, front, pw, ph)) {
+            if (!c->crt_warned) Q2_WARN("GPU CRT unavailable; using CPU fallback");
+            c->crt_warned = true;
+            if (!enabled || q2_crt_render(&c->crt, front, pw, ph) != Q2_OK ||
+                !q2_gl_upload(c->gl_display, &c->crt)) {
+                c->crt_presented = false;
+                if (!q2_gl_render(c->gl_display, front, pw, ph, false)) return;
+            }
+        } else c->crt_warned = false;
+        q2_gl_present(c->gl_display, w, h, x, y);
+        return;
+    }
+
     if (!c->texture || !c->renderer)
         return;
 
+    {
+        float tw = 0, th = 0;
+        SDL_GetTextureSize(c->texture, &tw, &th);
+        if ((int)tw != front->width || (int)th != front->height) {
+            SDL_Texture *texture = SDL_CreateTexture(c->renderer,
+                    SDL_PIXELFORMAT_XBGR1555, SDL_TEXTUREACCESS_STREAMING,
+                    front->width, front->height);
+            if (!texture) { Q2_ERROR("resize texture: %s", SDL_GetError()); return; }
+            SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST);
+            SDL_DestroyTexture(c->texture);
+            c->texture = texture;
+        }
+    }
+
     if (SDL_LockTexture(c->texture, NULL, &pixels, &pitch)) {
         int y;
-        for (y = 0; y < c->height; y++) {
+        for (y = 0; y < front->height; y++) {
             memcpy((u8 *)pixels + (size_t)y * pitch,
-                   front->px + (size_t)y * c->width,
-                   (size_t)c->width * sizeof(u16));
+                   front->px + (size_t)y * front->width,
+                   (size_t)front->width * sizeof(u16));
         }
         SDL_UnlockTexture(c->texture);
     }
@@ -17199,7 +19601,7 @@ static void client_present(client *c)
                            q2_menu_screen_y_default(c->screen.disp.height));
 
         SDL_GetCurrentRenderOutputSize(c->renderer, &out_w, &out_h);
-        q2_screen_fit_rect(&c->screen, c->fit, out_w, out_h,
+        q2_screen_fit_rect(&c->screen, client_display_fit(c), out_w, out_h,
                            &px, &py, &pw, &ph);
 
         /*
@@ -17213,15 +19615,42 @@ static void client_present(client *c)
         dst.w = (float)pw;
         dst.h = (float)ph;
 
-        SDL_RenderTexture(c->renderer, c->texture, NULL, &dst);
+        SDL_RenderTexture(c->renderer, client_display_texture(c, front, pw, ph), NULL, &dst);
     }
     SDL_RenderPresent(c->renderer);
+}
+
+static void client_update_display(client *c)
+{
+    int w = c->output_width > 0 ? c->output_width : 1024;
+    int h = c->output_height > 0 ? c->output_height : 768;
+    if (c->renderer) SDL_GetCurrentRenderOutputSize(c->renderer, &w, &h);
+    if (c->gl_display && c->window) SDL_GetWindowSizeInPixels(c->window, &w, &h);
+    if (q2_screen_resize(&c->screen, client_display_fit(c) == Q2_SCREEN_FIT_AUTO, w, h) != Q2_OK)
+        Q2_ERROR("cannot allocate aspect-ratio render target");
 }
 
 static void client_frame(client *c)
 {
     q2_screen_hooks hooks;
 
+    client_update_display(c);
+    if (c->sim[0].fx_ready &&
+        c->sim[0].fx.viewport_count != (u32)c->screen.view_count)
+        q2_fx_world_resize(&c->sim[0].fx,
+                            c->sim[0].fx.group_count ? (s32)c->sim[0].fx.group_count : -1,
+                            (u32)c->screen.view_count);
+    {
+        bool requested = c->settings.v[Q2_SET_BLOOM] != 0;
+        bool available = !c->crt_cpu && (c->gl_display || c->headless);
+        bool scene = !c->loading.open && !c->film_open && !c->boot_open;
+        q2_result rc = q2_screen_capture_scene(&c->screen, requested && available && scene);
+        if (requested && (!available || rc != Q2_OK)) {
+            if (!c->bloom_warned) Q2_WARN("Bloom requires the GPU display and scene buffers; displaying without bloom");
+            c->bloom_warned = true;
+        } else if (!requested) c->bloom_warned = false;
+    }
+    c->glint_drawn = false;
     q2_screen_frame_begin(&c->screen, &c->ot);
 
     /*
@@ -17292,6 +19721,12 @@ static void client_frame(client *c)
     memset(&hooks, 0, sizeof(hooks));
     hooks.view = client_draw_view;
     hooks.user = c;
+    /* BIGGUN's draw hook (0x8003909C -> module+0x34FC) advances its
+     * eight noise accumulators once per rendered frame, after owner sparks.
+     * All viewports use that state. UVs read the shared frame counter, even
+     * after a pause or a streamed-zone return; they have no private clock. */
+    c->sim[0].glint.lightning_frame = (u32)c->frame_index;
+    q2_fx_glint_lightning_tick(&c->sim[0].glint, &c->sim[0].fx_rng);
     {
         q2_camera saved_cam = c->cam;
         /*
@@ -17327,6 +19762,15 @@ static void client_frame(client *c)
             c->timed_lights_emitted += q2_light_timed_tick(&c->light_world);
 
         q2_screen_build(&c->screen, &c->ot, &c->gte, &hooks);
+        q2_world_render_end_frame(&c->render);
+
+        /* Retail decrements a glint's phases after reading them for drawing
+         * (0x80064D38 / 0x80064DEC). Advancing before the script refresh in
+         * the logic tick kept every visible band at phase 4. Share one phase
+         * across the split viewports, then consume it once per rendered frame,
+         * even when this draw's bands were wholly black. */
+        if (c->glint_drawn)
+            q2_fx_glint_advance(&c->sim[0].glint);
 
         if (c->lights_ready)
             c->light_world.dynamic_world_count = dyn_before;
@@ -17359,7 +19803,7 @@ static void client_frame(client *c)
         mo.view_w   = c->width < Q2_MENU_SCREEN_W ? c->width
                                                   : Q2_MENU_SCREEN_W;
         q2_menu_build_ot(&c->menu, &c->ot, &mo);
-        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot, mo.bucket);
+        client_prompt_build_ot(c, mo.bucket);
     }
 
     /*
@@ -17460,82 +19904,49 @@ static void client_frame(client *c)
         q2_hud_print(&c->hud_font, &ctx, &pen, &c->ot, 0, line);
     }
 
-    /*
-     * The end-of-match scoreboard — what Q2_MP_REQ_RESULTS asks for.
-     *
-     * The console loads QMRESULT, a level directory of its own whose LevelBin
-     * draws the screen; this shows the lines that module composes, in its
-     * order, with the overlay's own text emitter. The words are the module's,
-     * read out of its strings; the LAYOUT is not — where QMRESULT puts each
-     * line goes through engine text calls whose offsets have not been read, so
-     * these are stacked and centred rather than placed.
-     */
-    if (c->mp_scoreboard && c->hud_font_ready) {
-        char lines[12][Q2_MP_SCORE_LINE];
-        u32 n = q2_mp_scoreboard(&c->mp, NULL, lines, 12);
-        u32 li;
-        q2_hud_ctx ctx;
-        q2_hud_pen pen;
-
-        q2_hud_ctx_centre_in(&ctx, c->width, c->height);
-        q2_hud_pen_default(&pen);
-        for (li = 0; li < (u32)c->mp.player_count; li++) {
-            if (c->mp_results.ready & (1u << li)) {
-                size_t len = strlen(lines[li + 1]);
-                snprintf(lines[li + 1] + len, Q2_MP_SCORE_LINE - len, "  READY");
-            }
+    /* QMRESULT +0x0E1C builds the sorted rows; +0x1714 supplies the title
+     * and prompts. Its frame hook draws wipteam1 behind that menu. */
+    if (c->mp_scoreboard && c->menu_font_ready) {
+        q2_mp_score_row rows[Q2_MP_SCORE_ROWS];
+        const char *names[4] = { c->menu.mp_name[0], c->menu.mp_name[1],
+                                c->menu.mp_name[2], c->menu.mp_name[3] };
+        u32 i, n = q2_mp_score_rows(&c->mp, names, c->mp_results.ready,
+                                    rows, Q2_MP_SCORE_ROWS);
+        q2_menu_draw_opts mo;
+        q2_menu_draw_opts_default(&mo, &c->menu_font);
+        client_menu_origin(c, &mo.origin_x, &mo.origin_y);
+        for (i = 0; i < 2; i++) {
+            psx_prim *p = psx_ot_add_bucket(&c->ot, mo.bucket - PSX_OT_SUBDIV);
+            if (!p) break;
+            p->kind = PSX_PRIM_SPRT;
+            p->xy[0].x = (s16)(mo.origin_x + i * 256);
+            p->xy[0].y = (s16)mo.origin_y;
+            p->xy[1].x = (s16)(p->xy[0].x + 256);
+            p->xy[1].y = p->xy[0].y;
+            p->xy[2].x = p->xy[1].x;
+            p->xy[2].y = (s16)(p->xy[0].y + 240);
+            p->xy[3].x = p->xy[0].x;
+            p->xy[3].y = p->xy[2].y;
+            p->tpage = psx_make_tpage(5 + 2 * i, 1,
+                                       PSX_BLEND_ADD, PSX_TEX_8BIT);
+            p->clut = 0x3FC0;
+            p->rgb[0].r = p->rgb[0].g = p->rgb[0].b = 64;
+            p->set_tpage = p->semi_transparent = p->textured_blend = true;
         }
-
-        /*
-         * A line's position is the CONTEXT's home, not the pen's x and y —
-         * the pen carries state across a string, the context says where the
-         * string starts. Setting the pen instead put all five lines on one
-         * row, each starting where the last one ended.
-         */
-        for (li = 0; li < n; li++) {
-            /* `q2_hud_measure` is the original's measurer and returns
-             * CHARACTERS, not pixels — the glyph advance is a constant 8. */
-            ctx.home_x = (s16)(ctx.width / 2 -
-                               q2_hud_measure(lines[li]) * 8 / 2);
-            ctx.home_y = (s16)(ctx.height / 4 + (s32)li * 16);
-            q2_hud_print(&c->hud_font, &ctx, &pen, &c->ot, 0, lines[li]);
+        q2_menu_draw_text_row(&c->ot, &mo, Q2_MENU_FACE_TITLE, 256,
+                               32, true,
+                               Q2_MENU_BAR_RED, q2_mp_score_title(c->mp.mode));
+        for (i = 0; i < n; i++) {
+            int colour = rows[i].colour;
+            if (rows[i].player >= 0 && c->mp.mode != Q2_MP_TEAM_DEATHMATCH)
+                colour = c->menu.mp_colour[rows[i].player];
+            q2_menu_draw_text_row(&c->ot, &mo, Q2_MENU_FACE_ITEM, 256,
+                                   rows[i].y, rows[i].highlight, colour, rows[i].text);
         }
-
-        /*
-         * And the two rows the module holds STATICALLY, which is the whole of
-         * what it holds — the per-player rows are built from the session, which
-         * is why nothing static describes them (#101).
-         *
-         *     module+0x051F0  ALL PLAYERS PRESS   256, 180
-         *     module+0x05208  FIRE TO CONTINUE    256, 200
-         *
-         * They used to come off the END of `q2_mp_scoreboard`'s line list and
-         * stack 16 pixels under the last score, which put them wherever the
-         * player count left them — four players pushed them two rows further
-         * down than two did. They are furniture, not scores: fixed rows on the
-         * module's own page, and the score list grows between the title and
-         * them.
-         *
-         * x is 256 because the console's screen is 512 wide and every row in
-         * this family is centred; the port centres in its own width for the
-         * same reason. y is scaled by the same ratio rather than used raw, so
-         * the pair keeps its 20-pixel gap at any height.
-         */
-        {
-            static const struct { const char *text; int y; } k_prompt[] = {
-                { "ALL PLAYERS PRESS", 180 },
-                { "FIRE TO CONTINUE",  200 }
-            };
-            u32 k;
-
-            for (k = 0; k < 2; k++) {
-                ctx.home_x = (s16)(ctx.width / 2 -
-                                   q2_hud_measure(k_prompt[k].text) * 8 / 2);
-                ctx.home_y = (s16)((s32)ctx.height * k_prompt[k].y / 240);
-                q2_hud_print(&c->hud_font, &ctx, &pen, &c->ot, 0,
-                             k_prompt[k].text);
-            }
-        }
+        q2_menu_draw_text_row(&c->ot, &mo, Q2_MENU_FACE_ITEM, 256, 180,
+                               false, Q2_MENU_BAR_NONE, "ALL PLAYERS PRESS");
+        q2_menu_draw_text_row(&c->ot, &mo, Q2_MENU_FACE_ITEM, 256, 200,
+                               false, Q2_MENU_BAR_NONE, "FIRE TO CONTINUE");
     }
 
     /*
@@ -17563,77 +19974,47 @@ static void client_frame(client *c)
      *   0x80101114              engine+524, the menu tick, every frame until
      *                           module+0x15DC counts past zero
      *
-     * So the winner line is ABOVE the banner, at the top of the screen, not
-     * under it: y = 20 against y = 124. The port draws both at those two rows
-     * with the overlay's own emitter rather than through a menu page, for the
-     * same reason the scoreboard above does — what the engine's page 45 puts
-     * around them is furniture whose offsets have not been read, and the world
-     * must keep running and keep taking no input while they are up, which a
-     * real menu page here would not do.
+     * Draw through the same menu font and palette path while the world runs
+     * with neutral player input. Entering the ordinary pause menu would hold
+     * the simulation and the match timer.
      */
-    if (c->mp_enabled && c->hud_font_ready && !c->mp_scoreboard &&
+    if (c->mp_enabled && c->menu_font_ready && !c->mp_scoreboard &&
         c->mp.end != Q2_MP_RUNNING && c->mp_last_request == Q2_MP_REQ_NONE) {
         const char *banner = q2_mp_banner(&c->mp);
 
         if (banner) {
-            q2_hud_ctx ctx;
-            q2_hud_pen pen;
-
-            q2_hud_ctx_centre_in(&ctx, c->width, c->height);
-            q2_hud_pen_default(&pen);
+            q2_menu_draw_opts mo;
+            q2_menu_draw_opts_default(&mo, &c->menu_font);
+            client_menu_origin(c, &mo.origin_x, &mo.origin_y);
 
             if (c->mp.end != Q2_MP_END_ROUND_DRAWN) {
                 char who[64];
                 int  w = q2_mp_find_winner(&c->mp);
-
-                q2_mp_winner_text(&c->mp, w, NULL, who, sizeof(who));
-                ctx.home_x = (s16)(ctx.width / 2 -
-                                   q2_hud_measure(who) * 8 / 2);
-                ctx.home_y = (s16)((s32)ctx.height * 20 / 240);
-                q2_hud_print(&c->hud_font, &ctx, &pen, &c->ot, 0, who);
+                int colour = Q2_MENU_BAR_BLUE;
+                const char *names[4] = { c->menu.mp_name[0], c->menu.mp_name[1],
+                                        c->menu.mp_name[2], c->menu.mp_name[3] };
+                q2_mp_winner_text(&c->mp, w, names, who, sizeof(who));
+                if (w >= 0 && w < Q2_MP_MAX_PLAYERS)
+                    colour = c->mp.mode == Q2_MP_TEAM_DEATHMATCH
+                                 ? c->mp.team[w] : c->menu.mp_colour[w];
+                else if (w >= 4 && w < 8)
+                    colour = w - 4;
+                q2_menu_draw_text_row(&c->ot, &mo, Q2_MENU_FACE_ITEM,
+                                       256, 20, true, colour, who);
             }
 
-            ctx.home_x = (s16)(ctx.width / 2 -
-                               q2_hud_measure(banner) * 8 / 2);
-            ctx.home_y = (s16)((s32)ctx.height * 124 / 240);
-            q2_hud_print(&c->hud_font, &ctx, &pen, &c->ot, 0, banner);
+            q2_menu_draw_text_row(&c->ot, &mo, Q2_MENU_FACE_TITLE,
+                                   256, 124, true, Q2_MENU_BAR_BLUE, banner);
             c->mp_banner_frames++;
         }
     }
 
-    /*
-     * VIEW CREDITS: the module's roll, scrolling up the middle of the screen.
-     *
-     * The scroll rate and the spacing are this port's, not a reading — the
-     * module's own arrangement is in code the port does not run, and #123 says
-     * so. What IS the disc's is every word and their order.
-     */
-    if (c->credits_open && c->hud_font_ready) {
-        q2_hud_ctx ctx;
-        q2_hud_pen pen;
-        u32 li;
-        s32 top;
-
-        q2_hud_ctx_centre_in(&ctx, c->width, c->height);
-        q2_hud_pen_default(&pen);
-
-        /* One line every 14 pixels, the whole roll sliding up at a pixel every
-         * other frame, and looping when the last line has left the top. */
-        top = (s32)ctx.height - (c->credits_scroll / 2);
-        if (top + (s32)c->credits_count * 14 < 0)
-            c->credits_scroll = 0;
-
-        for (li = 0; li < c->credits_count; li++) {
-            s32 y = top + (s32)li * 14;
-
-            if (y < -14 || y > (s32)ctx.height)
-                continue;
-            ctx.home_x = (s16)(ctx.width / 2 -
-                               q2_hud_measure(c->credits[li]) * 8 / 2);
-            ctx.home_y = (s16)y;
-            q2_hud_print(&c->hud_font, &ctx, &pen, &c->ot, 0, c->credits[li]);
-        }
-        c->credits_scroll++;
+    if (c->credits_open && c->menu_font_ready) {
+        q2_menu_draw_opts mo;
+        q2_menu_draw_opts_default(&mo, &c->menu_font);
+        client_menu_origin(c, &mo.origin_x, &mo.origin_y);
+        q2_credits_build_ot(&c->credits, &c->ot, &mo, c->height);
+        client_prompt_build_ot(c, Q2_MENU_OT_BUCKET);
     }
 
     /*
@@ -17682,8 +20063,7 @@ static void client_frame(client *c)
                             &c->ot, 0);
         /* And the press that leaves it, on the same bar the briefing and the
          * placard use. See where the board is raised. */
-        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot,
-                           psx_ot_depth_bucket(&c->ot, 0));
+        client_prompt_build_ot(c, psx_ot_depth_bucket(&c->ot, 0));
     }
 
     /*
@@ -17704,8 +20084,7 @@ static void client_frame(client *c)
         q2_hud_pen_default(&pen);
         q2_endmission_build_ot(&c->endmis, &c->hud_font, &c->menu_font,
                                &ctx, &pen, &c->ot, 2, 1, 0);
-        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot,
-                           psx_ot_depth_bucket(&c->ot, 0));
+        client_prompt_build_ot(c, psx_ot_depth_bucket(&c->ot, 0));
     }
 
     if (c->briefing_open && !c->endmis_open &&
@@ -17717,8 +20096,7 @@ static void client_frame(client *c)
         q2_hud_pen_default(&pen);
         q2_briefing_build_ot(&c->briefing, &c->hud_font, &c->menu_font,
                              &ctx, &pen, &c->ot, 2, 1, 0);
-        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot,
-                           psx_ot_depth_bucket(&c->ot, 0));
+        client_prompt_build_ot(c, psx_ot_depth_bucket(&c->ot, 0));
     }
 
     /*
@@ -17746,8 +20124,7 @@ static void client_frame(client *c)
         q2_hud_pen_default(&pen);
         q2_briefing_build_ot(&view, &c->hud_font, &c->menu_font,
                              &ctx, &pen, &c->ot, 2, 1, 0);
-        q2_prompt_build_ot(&c->prompts, &c->menu_font, &c->ot,
-                           psx_ot_depth_bucket(&c->ot, 0));
+        client_prompt_build_ot(c, psx_ot_depth_bucket(&c->ot, 0));
     }
 
     /* The prompts animate whether or not anything is showing them, which is
@@ -17789,6 +20166,9 @@ static void usage(void)
     printf("  --disc   a .cue, .bin, .img or .iso, or a drive letter; without\n"
            "           it a launcher lists your discs and drives and starts\n"
            "           on the one played last\n");
+    printf("  --launcher  show the in-window source selector, even with --disc\n");
+    printf("              --launcher --headless --shot P.bmp captures this page\n");
+    printf("  --developer  open a diagnostic console on Windows and enable debug logs\n");
     printf("  --map    level directory name (default BASE0)\n");
     printf("  --zone   zone index within the map (default: the level's own\n"
            "           start, its \"Default\" arrival point)\n");
@@ -17796,7 +20176,9 @@ static void usage(void)
            "           hands the player what the campaign would have by\n"
            "           then (q2psx-inspect loadout prints the table)\n");
     printf("  --scale  buffer pixels across, i.e. horizontal zoom (default 3)\n");
-    printf("  --aspect 4:3 (default) | tv | square | stretch\n");
+    printf("  --aspect auto (default) | 4:3 | tv | square | stretch\n");
+    printf("           auto   expand FOV and fit UI to the window's aspect\n");
+    printf("  --size WxH  initial window or headless display size (e.g. 1920x1080)\n");
     printf("           4:3    the drawn buffer as 4:3, as the game is played\n");
     printf("           tv     the strict pixel shape, 2:3 on PAL: 3%% taller\n");
     printf("           square one buffer pixel per window pixel: a 1.5x stretch\n");
@@ -17804,7 +20186,7 @@ static void usage(void)
     printf("  --saves  where save files live (default: the platform's own)\n");
     printf("\n  --version, -v  what this build is, and the commit it came from\n");
     printf("\n  running without a player:\n");
-    printf("  --headless    no window, no audio; a fixed 1/30 s step\n");
+    printf("  --headless    no visible window or audio; fixed 1/30 s (GPU captures use a hidden context)\n");
     printf("  --demo        drive the pad from a fixed script rather than keys\n");
     printf("  --dm --dm-players N  start a split-screen arena match (1..4)\n");
     printf("  --dm-split horizontal|vertical  choose the two-player split\n");
@@ -17822,6 +20204,10 @@ static void usage(void)
     printf("  --no-boot     ...and skip them in a run that would show them\n");
     printf("  --frames N    stop after N frames\n");
     printf("  --shot P.ppm  write the console's own framebuffer to P.ppm\n");
+    printf("  --crt / --no-crt  CRT display emulation (default off)\n");
+    printf("  --bloom / --no-bloom  scene-only GPU bloom (default off, excludes HUD)\n");
+    printf("  --crt-cpu  use the CPU reference/fallback display instead of the GPU (no bloom)\n");
+    printf("  --shot-display P.ppm  capture the fitted display, including bloom/CRT; --scale sets headless size\n");
     printf("  --shot-every N  ...and one every N frames, numbered\n");
     printf("  --powerup KIND hold quad|invuln|enviro|breather for HUD capture\n");
     printf("  --fire-event NAME [F]  queue ONE named Events entry point at\n"
@@ -18263,10 +20649,16 @@ static void client_report(const client *c)
      * in a map with the model adds one to each. */
     REPORT("audio.explosion_sounds", c->explosion_sounds);
     REPORT("audio.explosion_sounds_missed", c->explosion_sounds_missed);
+    REPORT("audio.grenade_bounce_sounds", c->grenade_bounce_sounds);
+    REPORT("audio.grenade_bounce_sounds_missed", c->grenade_bounce_sounds_missed);
     REPORT("audio.explosive_reports", c->explosive_sounds);
     REPORT("audio.chaingun_bangs",  c->chaingun_bangs);
     REPORT("audio.shotgun_cocks",   c->cocks_played);
     REPORT("audio.quad_gated",      c->quad_gated);
+    REPORT("audio.voices_started",  c->voice_started);
+    REPORT("audio.sample_rate",    CLIENT_AUDIO_RATE);
+    REPORT("audio.voices_dropped",  c->voice_dropped);
+    Q2_INFO("report.audio.frames_mixed %llu", (unsigned long long)c->audio_frames);
     /*
      * 0x800B2E74 and 0x800B2E50 — the live CD volume and the one it is walking
      * toward at four a tick (CdCheckMusic, 0x800718F8). A run that ends with
@@ -18299,6 +20691,9 @@ static void client_report(const client *c)
 
     REPORT("creatures.placed",      c->creatures_ready ? c->creatures.set.count : 0);
     REPORT("creatures.live",        cre_live);
+    REPORT("creatures.shadows",     c->cre_shadows);
+    REPORT("players.shadows",       c->player_shadows);
+    REPORT("items.shadows",         c->ent_shadows);
     REPORT("creatures.hunting",     cre_hunting);
     REPORT("creatures.dead",        cre_dead);
     REPORT("creatures.moved",       cre_moved);
@@ -18336,7 +20731,21 @@ static void client_report(const client *c)
     /* Not "how many bursts were raised" — how many primitives reached the
      * ordering table. The two differ by exactly the area cull. */
     REPORT("fx.prims",              c->fx_prims);
+    REPORT("fx.glint_prims",        c->glint_prims);
+    REPORT("fx.lightning_prims",    c->lightning_prims);
+    REPORT("fx.lightning_ready",    c->sim[0].glint.lightning_ready);
+    REPORT("fx.generator_flashes",  c->generator_flashes);
+    REPORT("fx.generator_power",    c->sim[0].glint.power_left);
+    REPORT("fx.generator_dying",    c->sim[0].glint.dying);
+    REPORT("fx.generator_finished", c->sim[0].glint.finished);
+    REPORT("fx.glint_active",       c->sim[0].glint.raised);
+    REPORT("fx.glint_area",         c->sim[0].glint.area);
+    REPORT("fx.glint_x",            c->sim[0].glint.origin[0]);
+    REPORT("fx.glint_y",            c->sim[0].glint.origin[1]);
+    REPORT("fx.glint_z",            c->sim[0].glint.origin[2]);
     REPORT("fx.flashes",            c->sim[0].fx.stats.flashes_drawn);
+    REPORT("fx.particle_capacity",  c->sim[0].fx.group_count);
+    REPORT("fx.particle_budget",    c->sim[0].fx.budget);
     REPORT("fx.blur_samples",       c->sim[0].fx.stats.blur_samples);
     REPORT("fx.blur_quads",         c->sim[0].fx.stats.blur_quads);
     REPORT("fx.bursts",             c->ent_bursts);
@@ -18361,6 +20770,11 @@ static void client_report(const client *c)
     REPORT("lights.world_lit",      c->world_lit_points);
     REPORT("lights.world_unslotted", c->world_lit_unslotted);
 
+    REPORT("world.packet_capacity", 32u * c->render.packet_capacity);
+    REPORT("world.heap_accounted", c->level_memory_current);
+    REPORT("world.heap_largest", c->level_memory_current ? c->level_memory.largest_payload : 0);
+    REPORT("world.heap_failures", c->level_memory_failures);
+    REPORT("world.subdiv_capacity", c->render.subdiv_capacity);
     REPORT("world.movers",          c->movers_ready ? c->movers.count : 0);
     REPORT("world.mover_boxes",     s->mover_count);
     REPORT("world.rot_steps",       c->rot_steps);
@@ -18405,11 +20819,14 @@ static void client_report(const client *c)
 
 int main(int argc, char **argv)
 {
-    client c;
+    /* The client owns all four simulation slots and lives for the process.
+     * Keep it off Windows' default stack, including the --version path. */
+    static client c;
     const char *disc_path = NULL;
     /* The launcher's choice, and its window for the game to take over. */
     static char launch_path[1024];
-    SDL_Window *launch_window = NULL;
+    q2_launcher_host launch_host = {0};
+    bool show_launcher = false;
     const char *map = "BASE0";
     bool map_given = false;
     bool zone_probe = false;
@@ -18437,8 +20854,13 @@ int main(int argc, char **argv)
         q2_version_print();
         return 0;
     }
+    if (argc >= 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
+        usage();
+        return 0;
+    }
 
     memset(&c, 0, sizeof(c));
+    c.fit = Q2_SCREEN_FIT_AUTO;
     /* PrimaryColl cell +28 carries the exact SortData byte offset used by the
      * retail renderer. Keeping the authored order on is therefore the parity
      * path; the old depth mapping remains an explicit diagnostic. */
@@ -18468,6 +20890,8 @@ int main(int argc, char **argv)
     s16        mp_horizontal_split = -1;
     s16        force_crosshair = -1;
     s16        force_vibration = -1;
+    s16        force_crt = -1;
+    s16        force_bloom = -1;
     s16        mp_frags   = -2;
     s16        mp_minutes = -2;
 
@@ -18477,7 +20901,28 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--map") && i + 1 < argc) { map = argv[++i]; map_given = true; }
         else if (!strcmp(argv[i], "--zone") && i + 1 < argc)  { zone_index = atoi(argv[++i]); zone_given = true; }
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) scale = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--size") && i + 1 < argc) {
+            char tail;
+            if (sscanf(argv[++i], "%dx%d%c", &c.output_width,
+                       &c.output_height, &tail) != 2 ||
+                c.output_width < 16 || c.output_height < 16 ||
+                c.output_width > 32768 || c.output_height > 32768) {
+                fprintf(stderr, "--size wants WxH with dimensions from 16 to 32768\n");
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--headless"))              c.headless = true;
+        else if (!strcmp(argv[i], "--launcher"))              show_launcher = true;
+        else if (!strcmp(argv[i], "--developer"))             q2_log_set_level(Q2_LOG_DEBUG);
+        else if (!strcmp(argv[i], "--version") || !strcmp(argv[i], "-v")) { q2_version_print(); return 0; }
+        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(); return 0; }
+        else if (!strcmp(argv[i], "--crt"))                   force_crt = 1;
+        else if (!strcmp(argv[i], "--no-crt"))                force_crt = 0;
+        else if (!strcmp(argv[i], "--bloom"))                 force_bloom = 1;
+        else if (!strcmp(argv[i], "--no-bloom"))              force_bloom = 0;
+        else if (!strcmp(argv[i], "--crt-cpu"))               c.crt_cpu = true;
+        else if (!strcmp(argv[i], "--shot-display") && i + 1 < argc)
+            c.display_shot_path = argv[++i];
         else if (!strcmp(argv[i], "--demo"))                  c.demo = true;
         else if (!strcmp(argv[i], "--crosshair"))             force_crosshair = 1;
         else if (!strcmp(argv[i], "--no-crosshair"))          force_crosshair = 0;
@@ -18676,7 +21121,8 @@ int main(int argc, char **argv)
             mp_minutes = (s16)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--aspect") && i + 1 < argc) {
             const char *a = argv[++i];
-            if      (!strcmp(a, "4:3"))     c.fit = Q2_SCREEN_FIT_FULL_4_3;
+            if      (!strcmp(a, "auto"))    c.fit = Q2_SCREEN_FIT_AUTO;
+            else if (!strcmp(a, "4:3"))     c.fit = Q2_SCREEN_FIT_FULL_4_3;
             else if (!strcmp(a, "tv"))      c.fit = Q2_SCREEN_FIT_TELEVISION;
             else if (!strcmp(a, "square"))  c.fit = Q2_SCREEN_FIT_SQUARE;
             else if (!strcmp(a, "stretch")) c.fit = Q2_SCREEN_FIT_STRETCH;
@@ -18690,27 +21136,39 @@ int main(int argc, char **argv)
      * run is a script, and a script that forgot --disc wants the usage and a
      * failing exit code, not a window it cannot see.
      */
-    if (!disc_path) {
-        if (c.headless) {
+    if (!disc_path || show_launcher) {
+        q2_launcher_options options = {0};
+        int launched;
+        if (c.headless && (!show_launcher || !c.shot_path)) {
             usage();
             return 1;
         }
-        if (!q2_launcher_run(launch_path, sizeof(launch_path),
-                             &launch_window)) {
+        options.width = c.output_width;
+        options.height = c.output_height;
+        options.headless = c.headless;
+        options.cpu = c.crt_cpu;
+        options.shot = c.shot_path;
+        options.disc = disc_path;
+        launched = q2_launcher_run(launch_path, sizeof(launch_path), &launch_host, &options);
+        if (launched != Q2_LAUNCH_PLAY) {
             SDL_Quit();
-            return 0;
+            return launched == Q2_LAUNCH_ERROR ? 1 : 0;
         }
         disc_path = launch_path;
     }
 
     if (disc_open(&c.disc, disc_path) != Q2_OK) {
         fprintf(stderr, "cannot open disc '%s'\n", disc_path);
+        q2_launcher_host_close(&launch_host);
+        SDL_Quit();
         return 1;
     }
 
     if (q2_identify(c.disc, &c.build) != Q2_OK) {
         fprintf(stderr, "this does not look like a Quake II PSX disc\n");
         disc_close(c.disc);
+        q2_launcher_host_close(&launch_host);
+        SDL_Quit();
         return 1;
     }
 
@@ -18736,6 +21194,8 @@ int main(int argc, char **argv)
     if (q2_screen_init(&c.screen, c.build.video) != Q2_OK) {
         fprintf(stderr, "cannot bring the screen up\n");
         disc_close(c.disc);
+        q2_launcher_host_close(&launch_host);
+        SDL_Quit();
         return 1;
     }
     Q2_INFO("screen: %ux%u, %u Hz fields", c.screen.disp.width,
@@ -18743,16 +21203,16 @@ int main(int argc, char **argv)
 
     c.width  = c.screen.disp.width;
     c.height = c.screen.disp.height;
+    c.capture_scale = scale < 1 ? 1 : scale > 8 ? 8 : scale;
 
     /* Texture pages start at ABR 0 and are promoted as opaque geometry is
      * drawn, exactly as the engine's own table is. */
     q2_world_render_init(&c.render);
 
     /*
-     * A headless run brings SDL up at all only to keep the shutdown path
-     * uniform; there is no video, no audio device and no window. Everything the
-     * frame needs — the ordering table, the rasteriser, the screen — is the
-     * port's own code and does not know SDL exists.
+     * Headless simulation has no window, audio or input. An explicit display
+     * capture may later open a hidden GL context to run the real GPU pass;
+     * the ordering table, rasterizer and fixed timestep remain independent.
      */
     if (c.headless) {
         Q2_INFO("headless: %ld frame%s at 1/30 s%s", c.frames_total,
@@ -18762,29 +21222,19 @@ int main(int argc, char **argv)
         goto no_window;
     }
 
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         disc_close(c.disc);
+        q2_launcher_host_close(&launch_host);
+        SDL_Quit();
         return 1;
     }
 
     q2_gamepads_open(&c.gamepads, c.gamepad_player_one ? 0 : 1);
 
-    /* Declare the stream at the console's own 37800 Hz and let SDL resample to
-     * whatever the device wants. */
-    {
-        SDL_AudioSpec spec;
-        spec.format   = SDL_AUDIO_S16LE;
-        spec.channels = XA_CHANNELS;
-        spec.freq     = XA_SAMPLE_RATE;
-
-        c.audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
-                                            &spec, NULL, NULL);
-        if (c.audio)
-            SDL_ResumeAudioStreamDevice(c.audio);
-        else
-            Q2_WARN("no audio device: %s", SDL_GetError());
-    }
+    /* A missing audio backend/device is nonfatal. The pump retries while the
+     * software mixer keeps gameplay and movie time advancing silently. */
+    client_audio_open(&c);
 
     /*
      * The window opens at `scale` buffer pixels across and however tall the
@@ -18803,6 +21253,7 @@ int main(int argc, char **argv)
         SDL_Rect usable;
 
         q2_screen_window_size(&c.screen, c.fit, scale, &ww, &wh);
+        if (c.output_width > 0) { ww = c.output_width; wh = c.output_height; }
 
         if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) &&
             usable.w > 0 && usable.h > 0) {
@@ -18816,15 +21267,23 @@ int main(int argc, char **argv)
         if (ww < 64) ww = 64;
         if (wh < 64) wh = 64;
 
-        /* The launcher's window, when there was one, becomes the game's: no
-         * close and reopen between choosing the disc and the first frame. */
-        if (launch_window) {
-            c.window = launch_window;
-            SDL_SetWindowSize(c.window, ww, wh);
-            SDL_SetWindowResizable(c.window, true);
-            SDL_SetWindowPosition(c.window, SDL_WINDOWPOS_CENTERED,
-                                  SDL_WINDOWPOS_CENTERED);
-        } else {
+        /* Selection and gameplay share a host, including the GL context. Keep
+         * its size/position and last presented frame throughout disc loading. */
+        if (launch_host.window) {
+            c.window = launch_host.window;
+            c.gl_display = launch_host.display;
+            memset(&launch_host, 0, sizeof(launch_host));
+        } else if (!c.crt_cpu) {
+            q2_gl_attributes();
+            c.window = SDL_CreateWindow("Q2PSX-PC", ww, wh,
+                                         SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
+            if (c.window) {
+                c.gl_display = q2_gl_create(c.window);
+                if (!c.gl_display) { SDL_DestroyWindow(c.window); c.window = NULL; }
+            }
+            if (!c.gl_display) Q2_WARN("OpenGL display unavailable; using SDL/CPU fallback: %s", SDL_GetError());
+        }
+        if (!c.window) {
             c.window = SDL_CreateWindow("Q2PSX-PC", ww, wh,
                                         SDL_WINDOW_RESIZABLE);
         }
@@ -18836,6 +21295,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (c.gl_display) goto no_window;
     c.renderer = SDL_CreateRenderer(c.window, NULL);
 
     /*
@@ -19163,6 +21623,10 @@ no_window:
      * console (0x8001BDA8 resets it to 0); this is the shortcut. */
     if (force_vibration >= 0)
         c.settings.v[Q2_SET_VIBRATION] = force_vibration;
+    if (force_crt >= 0)
+        c.settings.v[Q2_SET_CRT] = force_crt;
+    if (force_bloom >= 0)
+        c.settings.v[Q2_SET_BLOOM] = force_bloom;
 
     /* The library's SetShockData callers reach the pads through here. */
     q2_shock_attach(client_shock_sink, &c);
@@ -19311,19 +21775,8 @@ no_window:
     }
 
     if (c.show_credits) {
-        client_menu_requests(&c);   /* nothing pending; this just settles it */
-        {
-            const dat_chunk *lb = c.common.chunk[Q2_COMMON_LEVEL_BIN];
-
-            if (lb && lb->data && lb->size)
-                c.credits_count = q2_levelbin_credits(lb->data, lb->size,
-                                                      c.credits,
-                                                      Q2_LB_CREDITS_MAX);
-            c.credits_open = c.credits_count > 0;
-            if (c.credits_open)
-                client_menu_close(&c);
-            Q2_INFO("credits: %u lines", c.credits_count);
-        }
+        if (!c.in_front_end) client_enter_front_end(&c);
+        client_credits_open(&c, false);
     }
 
     c.running = true;
@@ -19333,6 +21786,8 @@ no_window:
         SDL_Event ev;
         u64   now;
         float dt;
+
+        client_update_display(&c);
 
         /*
          * A scripted run advances on a FIXED step rather than on the wall
@@ -19361,51 +21816,20 @@ no_window:
                  * again — a DualShock plugged in mid-session is shockable and
                  * the pad that just left is not. */
                 client_menu_bind_pads(&c);
+                if (ev.type == SDL_EVENT_GAMEPAD_REMOVED &&
+                    (gp == 0 || (c.mp_enabled && gp < c.screen.view_count)))
+                    client_pause_open(&c, gp);
             }
             if (gp >= 0 && ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
                 ev.gbutton.button == SDL_GAMEPAD_BUTTON_START &&
                 !c.in_front_end && !c.mp_scoreboard && !c.film_open &&
-                !c.boot_open && !c.mcard_open && !c.mission_open &&
+                (!c.mp_enabled || c.mp.end == Q2_MP_RUNNING) &&
+                !c.boot_open && !c.mcard_open && !c.save_prompt_open && !c.mission_open &&
                 !c.briefing_open && !c.endmis_open && !c.credits_open) {
                 if (c.menu.open) {
                     client_menu_close(&c);
                 } else {
-                    /* Same as the Escape path below: page 26's install is what
-                     * composes the KILLS/SECRETS row, so the numbers have to be
-                     * in the menu before it opens. */
-                    client_menu_fill_stats(&c);
-                    /*
-                     * WHO PRESSED START. 0x800AE8B8 is `Pauser`, and it decides
-                     * two things: which 34-byte configuration record
-                     * FrontEndAddPausedTitle colours the pause banner from
-                     * (0x800B32B8 + p*34 in TEAM DEATHMATCH, 0x800B32BA + p*34
-                     * otherwise), and which entry of the shockable array the
-                     * VIBRATION gate reads (0x8001C9B4). It has to be set
-                     * before the open, because page 26's install hook is what
-                     * composes the banner.
-                     */
-                    q2_menu_set_pauser(&c.menu, gp);
-                    /*
-                     * AND THE PAUSE PAGE IS A SILENT SCREEN.
-                     *
-                     * InGame_GOTO_PAUSED (0x8001FD88) is two calls and nothing
-                     * else: `jal 0x80073C68` — killallsounds, which walks all
-                     * twenty-four voice slots at 0x80073CA8..0x80073CC0
-                     * (`slti v0, a0, 24`) clearing each one's key-on record and
-                     * resetting the driver's channel word — and then
-                     * `jal 0x8001D5A8`, which builds the page. GameCheckPaused
-                     * reaches it at 0x8003E894 on the START press and calls
-                     * killallsounds itself at 0x8003E860 on the pad-violation
-                     * arm, so every effect still sounding is cut on the frame
-                     * the page appears: a hyperblaster tail, a rocket's flight
-                     * loop, a door, a creature's pain cry. Here they ran to
-                     * their ends underneath the menu.
-                     *
-                     * The music bed is a separate global and is NOT touched by
-                     * this — it ducks on its own ramp; see client_music_target.
-                     */
-                    client_voices_stop(&c);
-                    q2_menu_open(&c.menu);
+                    client_pause_open(&c, gp);
                 }
             }
             if (ev.type == SDL_EVENT_QUIT) {
@@ -19418,7 +21842,7 @@ no_window:
                  * complaint every FMV of this era earned.
                  */
                 if (c.film_open) {
-                    client_film_stop(&c);
+                    client_film_request_stop(&c);
                     continue;
                 }
                 /* A boot screen goes the same way, and see `client_boot_skip`
@@ -19438,16 +21862,17 @@ no_window:
                  */
                 if (c.start_beat > 0.0)
                     continue;
-                /* Any key leaves the credits, back to the title. */
+                /* Credits use the ordinary Back gesture. Confirm, movement
+                 * and unrelated keys must not dismiss a text-only page. */
                 if (c.credits_open) {
-                    c.credits_open = false;
-                    q2_menu_open(&c.menu);
-                    q2_menu_goto(&c.menu, Q2_PAGE_FRONT_TITLE);
+                    if (ev.key.key == SDLK_ESCAPE || ev.key.key == SDLK_BACKSPACE)
+                        c.menu_esc_back = true;
                     continue;
                 }
                 if (c.mp_scoreboard) continue;
                 switch (ev.key.key) {
                 case SDLK_ESCAPE:
+                    if (c.mp_enabled && c.mp.end != Q2_MP_RUNNING) break;
                     /* START on the console: it opens the pause menu, and
                      * closes it again from the root page. Deeper in, the
                      * menu's own TRIANGLE handling owns going back — so Esc
@@ -19474,20 +21899,8 @@ no_window:
                         /* Deliberately nothing. */
                     }
                     else if (!c.menu.open) {
-                        /*
-                         * The pause page's KILLS/SECRETS row. The numbers are
-                         * the ones the level tally already keeps; the line
-                         * itself is composed by page 26's own entry hook, the
-                         * way 0x8001D638 composes it as part of installing the
-                         * page, so filling them in before opening is correct.
-                         */
-                        client_menu_fill_stats(&c);
                         /* Escape is player one's START, so player one paused. */
-                        q2_menu_set_pauser(&c.menu, 0);
-                        /* And killallsounds with it — InGame_GOTO_PAUSED
-                         * (0x8001FD88), exactly as the gamepad twin above. */
-                        client_voices_stop(&c);
-                        q2_menu_open(&c.menu);
+                        client_pause_open(&c, 0);
                     }
                     else if (c.menu.depth == 0)
                         client_menu_close(&c);
@@ -19540,13 +21953,13 @@ no_window:
                         client_quick_load(&c);
                     break;
                 case SDLK_F11:
-                    /* The framebuffer, not the window — see above. */
+                    /* The engine's display target, including pixel aspect. */
                     client_screenshot(&c);
                     break;
                 case SDLK_V: {
                     /*
-                     * How the picture is shaped on the way out. The default is
-                     * 4:3; `square` is the raw buffer, which is what every
+                     * How the picture is shaped on the way out. Auto adapts
+                     * the camera; 4:3 retains the console view. `square` is the raw buffer, which is what every
                      * framebuffer dump of this game looks like and is a 1.5x
                      * horizontal stretch of what a television showed. Having
                      * both a key away is the point — the two are easy to argue
@@ -19670,9 +22083,7 @@ no_window:
                     c.mouse_right = down;
 
                 /*
-                 * The two screens that take ANY key also take any click: a
-                 * film and the credit roll. Answering them with the keyboard
-                 * only would be the one place the mouse stopped working.
+                 * Films and boot screens also accept a click to skip.
                  *
                  * THE TALLY BOARD IS NOT ONE OF THEM ANY MORE. A right-click
                  * used to dismiss it as "the back gesture"; the console's board
@@ -19684,13 +22095,11 @@ no_window:
                  * out; it just has to wait four seconds like a pad does.
                  */
                 if (down && c.film_open) {
-                    client_film_stop(&c);
+                    client_film_request_stop(&c);
                 } else if (down && c.boot_open) {
                     client_boot_skip(&c);
-                } else if (down && c.credits_open) {
-                    c.credits_open = false;
-                    q2_menu_open(&c.menu);
-                    q2_menu_goto(&c.menu, Q2_PAGE_FRONT_TITLE);
+                } else if (down && c.credits_open && ev.button.button == SDL_BUTTON_RIGHT) {
+                    c.menu_esc_back = true;
                 }
             } else if (ev.type == SDL_EVENT_MOUSE_WHEEL) {
                 /*
@@ -19752,6 +22161,10 @@ no_window:
              * where the load left it until YES or NO is chosen.
              */
             client_save_prompt_frame(&c);
+        } else if (c.credits_open) {
+            client_credits_frame(&c, (double)dt);
+            q2_sim_scene_advance(&c.sim[0], (double)dt);
+            client_scene_lights(&c);
         } else if (c.menu.open) {
             /* The world is frozen while the menu is up: no input, no tick.
              *
@@ -19834,11 +22247,8 @@ no_window:
              */
             client_popup_frame(&c, dt);
         } else if (c.mp_scoreboard) {
-            if (client_mp_results_input(&c, dt)) {
-                Q2_INFO("multiplayer: all players ready; returning to setup");
-                client_enter_front_end(&c);
-                q2_menu_goto(&c.menu, Q2_PAGE_FRONT_DMSETUP);
-            }
+            if (client_mp_results_input(&c, dt))
+                client_mp_return_to_menu(&c);
         } else if (c.sim_enabled) {
             client_input_simulated(&c, dt);
         } else {
@@ -19880,6 +22290,10 @@ no_window:
 
         if (!client_mp_restart_round(&c)) {
             Q2_ERROR("multiplayer: failed to reload the next round");
+            c.running = false;
+        }
+        if (!client_mp_load_results(&c)) {
+            Q2_ERROR("multiplayer: failed to load MPResults");
             c.running = false;
         }
 
@@ -20271,37 +22685,24 @@ no_window:
          * MainGameLoop calls it at 0x80018374 — the FIRST thing in the
          * iteration, before the GameIsPaused test at 0x800183C4 — so the CD
          * volume keeps moving on the frames the pause page owns and the world
-         * does not. This block sits at frame-loop level, OUTSIDE the
-         * menu / boot / film chain, for exactly that reason: a step inside that
-         * chain would stop the moment a page took the frame, and a duck that
-         * only runs while the game is not paused is no duck at all.
+         * does not. A movie blocks MainGameLoop and writes CD volume itself,
+         * so its separate gain sequence must not change the music ramp state.
          *
          * Per console TICK rather than per rendered frame, because one
          * MainGameLoop iteration is one video field. A 144 Hz host would
          * otherwise duck the music three times faster than a console does.
          */
-        c.music_ramp_clock += dt * (double)q2_build_tick_rate(&c.build);
-        while (c.music_ramp_clock >= 1.0) {
-            c.music_ramp_clock -= 1.0;
-            c.music_target = client_music_target(&c);
-            client_music_ramp(&c);
-        }
-
-        /*
-         * The music countdown, on the console's own field rate — 50 Hz on PAL,
-         * 60 on NTSC. At zero the engine moves to the next playlist entry
-         * (0x80071A58) rather than waiting for the stream to run out, which is
-         * what makes a duration a restart point and not a length.
-         */
-        if (c.music_open && c.music_total > 0) {
-            c.music_clock += dt * (double)q2_build_tick_rate(&c.build);
-            while (c.music_clock >= 1.0) {
-                c.music_clock -= 1.0;
-                if (c.music_left > 0)
-                    c.music_left--;
+        if (!c.film_open) {
+            c.music_ramp_clock += dt * (double)q2_build_tick_rate(&c.build);
+            while (c.music_ramp_clock >= 1.0) {
+                c.music_ramp_clock -= 1.0;
+                c.music_target = client_music_target(&c);
+                client_music_ramp(&c);
             }
-            if (c.music_left <= 0)
-                client_music_advance(&c);
+
+            /* The field countdown selects the next entry at zero, independently
+             * of decoded EOF (CdCheckMusic 0x80071A58). */
+            client_music_tick(&c, (double)dt);
         }
 
         /* `--save-load N`, and the report is the point: what the client owned
@@ -20334,9 +22735,8 @@ no_window:
         }
 
         /*
-         * The film, on its own 25 fps clock rather than the game's 30 Hz tick.
-         * That rate is forced by the container (movie.h) and driving it off the
-         * tick would drop or double every fifth frame.
+         * The film's measured 25/30 fps cadence follows consumed audio samples,
+         * independent of the game's dt clamp and rendering stalls.
          *
          * When it ends, the placard the port would otherwise have shown takes
          * over, so the campaign finishes on something rather than on black.
@@ -20370,7 +22770,12 @@ no_window:
         if (!c.film_open && c.film_done) {
             c.film_done = false;
 
-            if (c.film_to_front) {
+            if (c.film_arg) {
+                /* Standalone playback has no campaign/front-end successor.
+                 * Keep the last film render target for --shot and reporting. */
+                c.running = false;
+                break;
+            } else if (c.film_to_front) {
                 /*
                  * THE INTRO, WHICH IS A PRE-MENU CINEMATIC. QLOGOS asked for it
                  * by writing state 12 before the front end had ever been
@@ -20390,6 +22795,9 @@ no_window:
                  */
                 Q2_INFO("movie: opening reel over — starting the game");
                 client_start_game(&c);
+            } else if (c.film_is_extro) {
+                Q2_INFO("movie: extro over — campaign credits");
+                client_campaign_complete(&c);
             } else if (c.film_next_map[0]) {
                 char next[64];
 
@@ -20410,26 +22818,7 @@ no_window:
                 c.endmis_open = true;
                 q2_prompt_show(&c.prompts, Q2_PROMPT_BACK, 216);
             } else {
-                /*
-                 * A FILM THAT ENDS WITH NOWHERE TO GO GOES TO THE FRONT END,
-                 * because the alternative is a black screen with no way out.
-                 *
-                 * The Extro is the case that reaches here: the MISCOMPLETE arm
-                 * sets `film_screen` to "Extro FMV" and never sets
-                 * `film_next_map`, so when OUTRO1P runs out none of the three
-                 * branches above applies and the session simply stops on the
-                 * last frame. A player who finishes the campaign is left
-                 * looking at nothing.
-                 *
-                 * The console does not stop either: QFMV's extro handler
-                 * 0x80103DF8 waits four ticks and then writes 17 into the outer
-                 * state word (0x800B2E28), and the dispatcher at 0x800187F8
-                 * turns state 17 into a one-line setter and then state 6, which
-                 * RE-ENTERS the main loop. The intro's 0x80103DBC does the same
-                 * with state 6 directly. Handing the screen back is the shape of
-                 * both; which page it lands on is this port's choice and the
-                 * title is the only one that is always there.
-                 */
+                /* An unrecognised film has no authored successor. */
                 Q2_INFO("movie: over with no destination — back to the front end");
                 client_enter_front_end(&c);
             }
@@ -20442,7 +22831,7 @@ no_window:
          */
         /* Where the listener is now, before the mix that uses it. */
         client_voices_update(&c);
-        client_audio_pump(&c);
+        client_audio_pump(&c, c.headless ? 1.0 / 30.0 : (double)dt);
 
         /*
          * The screen's own clock, in the 1/300 s units everything the console
@@ -20456,6 +22845,8 @@ no_window:
          */
         q2_screen_tick_dt(&c.screen, (double)dt);
         client_frame(&c);
+        /* Gameplay taps must not reappear when a menu is opened later. */
+        memset(c.gamepads.menu_pressed, 0, sizeof(c.gamepads.menu_pressed));
         /* This level has now been seen, so a script call from here on is the
          * player having walked somewhere rather than the level arriving. */
         c.level_frames_drawn = true;
@@ -20474,6 +22865,15 @@ no_window:
         client_write_shot(&c, false);
     }
 
+    if (c.display_shot_path) {
+        q2_result rc = client_display_screenshot(&c, c.display_shot_path);
+        if (rc != Q2_OK) {
+            Q2_ERROR("cannot write %s: %s", c.display_shot_path, q2_result_str(rc));
+            exit_code = 1;
+        } else Q2_INFO("display screenshot: %s (CRT %s, bloom %s)", c.display_shot_path,
+                        c.settings.v[Q2_SET_CRT] ? "on" : "off",
+                        c.settings.v[Q2_SET_BLOOM] ? "on" : "off");
+    }
     if (c.report)
         client_report(&c);
 
@@ -20491,6 +22891,7 @@ done:
     q2_save_ui_free(&c.save_ui);
     q2_save_free(&c.snapshot);
     q2_event_store_free(&c.event_store);  /* the EVE_ blocks, one per map */
+    q2_zone_history_free(&c.zone_history);
     q2_gib_attach(NULL);            /* before the set it names goes */
     q2_shock_attach(NULL, NULL);
     q2_sim_free(&c.sim[0]);
@@ -20502,6 +22903,9 @@ done:
     psx_ot_free(&c.ot);
     if (c.audio)    SDL_DestroyAudioStream(c.audio);
     if (c.texture)  SDL_DestroyTexture(c.texture);
+    if (c.crt_texture) SDL_DestroyTexture(c.crt_texture);
+    q2_gl_destroy(c.gl_display);
+    q2_crt_free(&c.crt);
     if (c.renderer) SDL_DestroyRenderer(c.renderer);
     if (c.window)   SDL_DestroyWindow(c.window);
     q2_gamepads_close(&c.gamepads);

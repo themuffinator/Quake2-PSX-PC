@@ -296,6 +296,8 @@ static u32 loading_draw_logo(const q2_loading *l, psx_ot *ot,
 
     p->kind  = PSX_PRIM_SPRT;    /* SetSprt, 0x80038B68 */
     p->tpage = l->font.tpage_item;
+    p->tpage |= 0x0600u;
+    p->set_tpage = true; /* loading screen's paired texture-page setup */
     /*
      * PALETTE 4, THE GREY RAMP — not the sheet's own blue one.
      *

@@ -702,6 +702,13 @@ static void test_shadow_packet(void)
     check_eq_i(q2_model_build_ot(&inst, &cam, &ot, &gte, &stats), 0,
                "zero radius plus no list is degenerate");
 
+    /* A terminator ends the list even if the supplied capacity includes
+     * later valid vertices; otherwise those vertices invent a footprint. */
+    selected[0] = 0xFFFFu;
+    inst.shadow_vertex_count = 2;
+    check_eq_i(q2_model_build_ot(&inst, &cam, &ot, &gte, &stats), 0,
+               "shadow vertices stop at the first FFFF");
+
     psx_ot_free(&ot);
 }
 
@@ -789,6 +796,9 @@ static void test_weapons_stay(void)
     q2_inventory inv;
     q2_pop_place place;
     q2_entity *e;
+    q2_model_bank zone_bank;
+    u32 event_index;
+    bool saw_burst = false;
     s32 pos[3] = { 0, 0, 0 };
 
     printf("\nweapons-stay keeps the gun VISIBLE (0x8005998C)\n");
@@ -802,6 +812,9 @@ static void test_weapons_stay(void)
     place.id = 39;                       /* Shotgun P, effect 2 */
     e = q2_item_spawn(&set, &place, NULL, 0, NULL);
     check(e != NULL, "Shotgun P spawns");
+    memset(&zone_bank, 0, sizeof(zone_bank));
+    e->model_bank = &zone_bank;
+    e->model_index = 7;
 
     q2_entity_world_move_player(&w, 0, pos);
     e->think(e, &w);
@@ -811,6 +824,17 @@ static void test_weapons_stay(void)
     check(!e->hidden, "and is STILL VISIBLE — the point of the rule");
     check(!e->taken[0], "and nothing marks it taken");
     check_eq_i(e->respawn_at, 0, "and no respawn timer is armed");
+    for (event_index = 0; event_index < w.events.count; event_index++) {
+        const q2_ent_event *event = &w.events.e[event_index];
+        if (event->kind != Q2_ENT_EVENT_BURST)
+            continue;
+        saw_burst = true;
+        check(event->model_bank == &zone_bank,
+              "pickup burst keeps the item's zone model bank");
+        check_eq_i(event->model_index, 7,
+                   "pickup burst keeps the bank-local model index");
+    }
+    check(saw_burst, "collecting the visible item emits its burst");
 
     /* Standing on it a second time gives nothing: give_weapon refuses, the
      * dispatch returns 2, and the sweep moves on. */
@@ -1083,15 +1107,19 @@ static void test_zone_groups(void)
     memset(&g, 0, sizeof(g));
     snprintf(g.name, sizeof(g.name), "%s", "Zone0");
     check_eq_i(q2_pop_group_zone(&g), 0, "'Zone0' names zone 0");
+    check(q2_pop_group_is_zone(&g), "Zone0 is startup population");
     snprintf(g.name, sizeof(g.name), "%s", "Zone4");
     check_eq_i(q2_pop_group_zone(&g), 4, "'Zone4' names zone 4");
     /* A suffix is a batch WITHIN that zone, so the digits still decide. */
     snprintf(g.name, sizeof(g.name), "%s", "Zone1bob");
     check_eq_i(q2_pop_group_zone(&g), 1, "'Zone1bob' names zone 1");
+    check(!q2_pop_group_is_zone(&g), "Zone1bob is a deferred batch");
     snprintf(g.name, sizeof(g.name), "%s", "Zone2_1");
     check_eq_i(q2_pop_group_zone(&g), 2, "'Zone2_1' names zone 2");
+    check(!q2_pop_group_is_zone(&g), "Zone2_1 is a deferred batch");
     snprintf(g.name, sizeof(g.name), "%s", "zone3");
     check_eq_i(q2_pop_group_zone(&g), 3, "the match is case-insensitive");
+    check(q2_pop_group_is_zone(&g), "the exact lowercase zone also starts");
     /* The deathmatch maps' groups, which partition by category instead. */
     snprintf(g.name, sizeof(g.name), "%s", "Weapons");
     check_eq_i(q2_pop_group_zone(&g), -1, "'Weapons' names no zone");
@@ -1122,6 +1150,32 @@ static void test_zone_groups(void)
     check_eq_i(spawn_count(&pop, 0, NULL, 0, &st), 2,
                "without LevelBin only the resident zone group spawns");
     check_eq_i(st.not_selected, 2, "both unzoned groups are skipped");
+
+    /* A suffix carries ownership only. The same rule must reach items as
+     * creatures, including a script batch explicitly selected by LevelBin. */
+    put_group(buf, 72, "Zone0Room2", P3);
+    check_eq_i(spawn_count(&pop, 0, NULL, 0, &st), 2,
+               "a suffixed resident batch does not appear at load");
+    memset(levelbin, 0, sizeof(levelbin));
+    put_select(levelbin, 0, 64, "Zone0Room2");
+    check_eq_i(spawn_count(&pop, 0, levelbin, sizeof(levelbin), &st), 3,
+               "explicit selection can still start a suffixed batch");
+    check_eq_i(spawn_count(&pop, 1, levelbin, sizeof(levelbin), &st), 2,
+               "explicit selection cannot cross the zone boundary");
+    put_group(buf, 72, "Ammo", P3);
+    memset(levelbin, 0, sizeof(levelbin));
+    put_select(levelbin, 0, 64, "Weapons");
+    put_select(levelbin, 16, 80, "Zone1");
+
+    {
+        u32 selected[2] = { 0, 0xDEADBEEFu };
+        check_eq_i(q2_levelbin_selected(levelbin, sizeof(levelbin), selected, 1),
+                   1, "selector returns the number actually stored");
+        check_eq_i(selected[1], 0xDEADBEEFu,
+                   "selector never writes past its output capacity");
+        check_eq_i(q2_levelbin_selected(levelbin, sizeof(levelbin), selected, 0),
+                   0, "zero-capacity selection cannot expose unstored offsets");
+    }
 
     /* -1 is the census: every group, whichever zone it names. */
     check_eq_i(spawn_count(&pop, -1, levelbin, sizeof(levelbin), &st), 6,
@@ -1805,6 +1859,70 @@ static void test_drop_flight(void)
 }
 
 /* ------------------------------------------------------------------------- */
+static void test_spawn_placement(void)
+{
+    u8 nodes[72] = {0}, planes[72] = {0}, links[4] = {0};
+    q2_collision coll = {0};
+    q2_entity_set set = {0};
+    q2_entity *e;
+    q2_pop_place place = {0};
+    q2_item_table table = *q2_item_table_builtin();
+    s32 pos[3] = {500,500,500}, node = -1;
+    u32 i;
+    for (i = 0; i < 3; i++) q2_wr_u32(nodes + 12 + i * 4, 2000);
+    q2_wr_u16(nodes + 36 + 24, 6);
+    for (i = 0; i < 6; i++) {
+        u32 axis = i / 2;
+        q2_wr_u16(planes + i * 12 + axis * 2, (u16)((i & 1) ? 2000 : 0));
+        q2_wr_u16(planes + i * 12 + 6 + axis * 2, (u16)((i & 1) ? 4096 : -4096));
+    }
+    coll.nodes = nodes; coll.planes = planes; coll.links = links;
+    coll.node_count = 1; coll.plane_count = 6;
+    check(q2_entity_drop_to_floor(&coll, NULL, pos, 1024, &node), "airborne placement completes");
+    check_eq_i(pos[1], 1554, "a completed sweep keeps its final Y, including the 30-unit nudge");
+    check_eq_i(node, 0, "completed sweep still links its cell");
+    pos[1] = 1900;
+    check(q2_entity_drop_to_floor(&coll, NULL, pos, 1024, &node), "floor contact is success");
+    check_eq_i(pos[1], 2000, "floor clips the sweep");
+    {
+        q2_move_target platform = {0};
+        q2_move_world world = {0};
+        platform.kind = Q2_MOVE_KIND_ENTITY;
+        platform.active = true;
+        platform.max[0] = platform.max[2] = 1000;
+        platform.min[1] = platform.max[1] = 900; /* a thin scene floor */
+        world.targets = &platform; world.count = 1;
+        pos[1] = 500;
+        check(q2_entity_drop_to_floor(&coll, &world, pos, 1024, &node),
+              "solid platform participates in spawn placement");
+        check_eq_i(pos[1], 900 - Q2_EYE_BASE, "body rests on platform top");
+        check_eq_i(node, 0, "platform contact retains the resident collision cell");
+        check(pos[0] == 500 && pos[2] == 500, "drop preserves authored horizontal position");
+        platform.active = false; pos[1] = 500;
+        check(q2_entity_drop_to_floor(&coll, &world, pos, 1024, NULL) && pos[1] == 1554,
+              "inactive platform does not catch a spawn");
+        platform.active = true; platform.kind = Q2_MOVE_KIND_VOLUME; pos[1] = 500;
+        check(q2_entity_drop_to_floor(&coll, &world, pos, 1024, NULL) && pos[1] == 1554,
+              "trigger volume does not catch a spawn");
+        platform.kind = Q2_MOVE_KIND_ENTITY;
+        platform.min[1] = platform.max[1] = 2600; pos[1] = 1900;
+        check(q2_entity_drop_to_floor(&coll, &world, pos, 1024, NULL) && pos[1] == 2000,
+              "nearer static floor wins over a lower platform");
+    }
+    place.x = place.z = 500; place.y = 1500; place.id = 27;
+    e = q2_item_spawn(&set, &place, &table, 0, &coll);
+    check(e && e->node == 0 && e->pos[1] == 2000, "pickup settles and links to the resident floor");
+    for (i = 0; i < table.count; i++) table.def[i].flags |= Q2_ITEM_NO_DROP;
+    place.y = 816; /* initial origin 500, target 530 */
+    e = q2_item_spawn(&set, &place, &table, 0, &coll);
+    check(e && e->node == 0 && e->pos[1] == 530, "no-drop still resolves the placement nudge and cell");
+    place.x = 10000;
+    i = set.count;
+    check(!q2_item_spawn(&set, &place, &table, 0, &coll), "an unplaceable pickup is rejected");
+    check_eq_i(set.count, i, "rejected placement does not consume a live entity slot");
+    q2_entity_set_free(&set);
+}
+
 int main(void)
 {
     /* Unbuffered, so a crash mid-suite still shows which section reached the
@@ -1814,6 +1932,7 @@ int main(void)
     printf("test_item\n\n");
 
     test_table();
+    test_spawn_placement();
     test_glow_colours();
     test_ammo();
     test_weapons();

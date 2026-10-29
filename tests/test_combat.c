@@ -25,6 +25,9 @@
 #include "sim.h"
 #include "trig.h"
 #include "weapon.h"
+#include "fixtures/combat_armour_reference.h"
+#include "fixtures/projectile_contact_reference.h"
+#include "fixtures/autoaim_reference.h"
 
 static int g_failures;
 static int g_checks;
@@ -423,6 +426,94 @@ static void test_power_armour(void)
 }
 
 /* ------------------------------------------------------------------------- */
+static void test_native_signed_armour(void)
+{
+    u32 i;
+    printf("retail signed armour vectors\n");
+    for (i = 0; i < Q2PSX_ARRAY_COUNT(combat_armour_reference); i++) {
+        const s32 *v = combat_armour_reference[i];
+        q2_actor a;
+        q2_combat_rules rules;
+        s16 absorbed;
+        char label[80];
+        place(&a, 0, 0, 0, 100);
+        a.has_client = true;
+        a.cells = a.armour = (s16)v[2];
+        a.armour_class = (u8)v[3];
+        a.powerups = v[6] ? Q2_POWERUP_POWER_ARMOUR : 0;
+        a.armour_fade = (s8)v[7];
+        q2_combat_rules_default(&rules);
+        rules.skill = (s16)v[5];
+        absorbed = v[0] == 0 ? q2_combat_power_armour_absorb(&a, v[1]) :
+            q2_combat_armour_absorb(&a, v[1], v[4] != 0, v[7] != 0, &rules);
+        snprintf(label, sizeof(label), "native armour vector %u absorption", i);
+        check_eq_i(absorbed, v[8], label);
+        snprintf(label, sizeof(label), "native armour vector %u remaining", i);
+        check_eq_i(v[0] == 0 ? a.cells : a.armour, v[9], label);
+        snprintf(label, sizeof(label), "native armour vector %u fade", i);
+        check_eq_i(a.armour_fade, v[10], label);
+    }
+}
+
+static void test_zero_and_negative_damage(void)
+{
+    q2_actor a, attacker;
+    q2_combat_rules rules;
+    q2_damage_result hit;
+    const s32 point[3] = {1000, 0, 0};
+    printf("zero and signed damage integration\n");
+    q2_combat_rules_default(&rules);
+    place(&a, 0, 0, 0, 100); a.has_client = true;
+    a.knockback[0] = 7; a.knockback[1] = -9; a.knockback[2] = 11;
+    hit = q2_combat_damage(NULL, &a, 0, Q2_MOD_BULLET, point, &rules);
+    check(!a.knocked && a.knockback[0] == 7 && a.knockback[1] == -9 && a.knockback[2] == 11,
+          "zero damage skips knockback and preserves pending impulses");
+    check(hit.hit_sound_id != 0 && a.health == 100, "zero player damage still reaches feedback");
+    rules.cheats = Q2_CHEAT_ONE_SHOT_KILL;
+    hit = q2_combat_damage(NULL, &a, 0, Q2_MOD_BULLET, point, &rules);
+    check(hit.killed && a.health == 0 && !a.knocked, "zero damage still reaches the cheat after skipping impulse");
+    rules.cheats = 0;
+
+    place(&a, 0, 0, 0, 100); a.has_client = true;
+    hit = q2_combat_damage(NULL, &a, -30, Q2_MOD_BULLET, point, &rules);
+    check(hit.taken == -30 && a.health == 130, "negative unarmoured damage reaches the health subtraction");
+    check(a.knocked && a.knockback[0] == 800, "negative damage reverses the native impulse");
+    place(&a, 0, 0, 0, 100); a.has_client = true;
+    a.armour_class = Q2_ARMOUR_BODY; a.armour = 100;
+    hit = q2_combat_damage(NULL, &a, -30, Q2_MOD_BULLET, NULL, &rules);
+    check(hit.absorbed_armour == -24 && hit.taken == -6 && a.health == 106 && a.armour == 124,
+          "negative body-armour absorption restores armour and the residual restores health");
+    place(&a, 0, 0, 0, 100); a.has_client = true;
+    a.powerups = Q2_POWERUP_POWER_ARMOUR; a.cells = 100;
+    a.armour_class = Q2_ARMOUR_BODY; a.armour = 100;
+    hit = q2_combat_damage(NULL, &a, -30, Q2_MOD_BULLET, NULL, &rules);
+    check(hit.absorbed_power == -20 && hit.absorbed_armour == -8 && hit.taken == -2 &&
+          a.health == 102 && a.cells == 110 && a.armour == 108 && a.armour_fade == Q2_ACTOR_FADE_POWER,
+          "both signed armour stages preserve their ordering and the power fade");
+    hit = q2_combat_damage(NULL, &a, -30, Q2_MOD_NO_ARMOUR, NULL, &rules);
+    check(a.health == 132 && a.cells == 110 && a.armour == 108, "mod 8 bypasses signed absorption too");
+    a.invuln_until = 1001; rules.level_time = 1000;
+    hit = q2_combat_damage(NULL, &a, -30, Q2_MOD_ENERGY_BOLT, NULL, &rules);
+    check(hit.blocked && a.health == 132 && !a.effect[1], "invulnerability still refuses negative damage");
+    a.invuln_until = 0; a.armour = a.cells = 0;
+    hit = q2_combat_damage(NULL, &a, -1, Q2_MOD_ENERGY_BOLT, NULL, &rules);
+    check(hit.taken == -1 && a.effect[1] == 3, "negative damage reaches the effect tail");
+
+    place(&a, 0, 0, 0, 100); a.has_client = true;
+    a.powerups = Q2_POWERUP_POWER_ARMOUR; a.cells = 16384;
+    a.armour_class = Q2_ARMOUR_BODY; a.armour = 100;
+    hit = q2_combat_damage(NULL, &a, 30, Q2_MOD_BULLET, NULL, &rules);
+    check(hit.absorbed_power == -32768 && hit.absorbed_armour == 100 &&
+          hit.taken == 32698 && a.health == -32598 && a.cells == -32768 && !a.armour,
+          "the power stage's halfword cap does not truncate the following armour argument");
+
+    place(&attacker, 0, 0, 0, 100); attacker.has_client = true;
+    place(&a, 0, 0, 0, 100); a.is_monster = true;
+    hit = q2_combat_damage(&attacker, &a, -20, Q2_MOD_ENERGY_BOLT, NULL, &rules);
+    check(hit.surprised && hit.taken == -40 && a.health == 140 && a.damage_reaction_pending,
+          "a creature's nonzero signed hit reaches surprise, subtraction and reaction");
+}
+
 static void test_damage(void)
 {
     q2_actor target, attacker;
@@ -890,7 +981,7 @@ static void test_takedamage_gate(void)
         check_eq_i(target.health, 100, "but hurts nothing that cannot be hurt");
 
         place_untouchable(&target, 0, 0, 0, 100);
-        q2_combat_melee(&attacker, &target, 30, &rules);
+        q2_combat_melee(&attacker, &target, 30, attacker.origin, &rules);
         check_eq_i(target.health, 100, "nor does a claw");
     }
 
@@ -1644,22 +1735,31 @@ static void test_hitscan(void)
     check_eq_i(idx, 1, "a corpse is still a target");
     check_eq_i(a[1].health, -58, "and takes the hit");
 
+    /*
+     * BUT `takedamage` IS DoDamage'S TEST, NOT THE SWEEP'S. 0x800544EC skips
+     * only its ignore argument, so a body that cannot be hurt still stops the
+     * round — and shields whatever stands behind it. DoDamage's first test
+     * (0x80057D54) is what refuses the damage.
+     */
     place(&a[0], 0, 0, 8000, 100);
     place_untouchable(&a[1], 0, 0, 4000, 100);
     a[0].radius = a[1].radius = 100;
     idx = q2_combat_fire_bullet(&shooter, origin, dir, 8, 4096, 100,
                                 list, 2, &rules, &r);
-    check_eq_i(idx, 0, "a target with takedamage clear is passed through");
-    check_eq_i(a[1].health, 100, "and is untouched");
+    check_eq_i(idx, 1, "a body with takedamage clear still stops the round");
+    check_eq_i(a[1].health, 100, "takes nothing from it");
+    check_eq_i(a[0].health, 100, "and shields the one behind");
 
-    /* The rail does not stop. */
+    /* The rail is one query and one DoDamage (0x80049318, 0x80049334): the
+     * PC game's penetration is not this console's. */
     place(&a[0], 0, 0, 8000, 200);
     place(&a[1], 0, 0, 4000, 200);
     a[0].radius = a[1].radius = 100;
     check_eq_i(q2_combat_fire_rail(&shooter, origin, dir, 100, 4096, 100,
-                                   list, 2, &rules), 2,
-               "the rail passes through both");
-    check_eq_i(a[0].health, 100, "hurting the far one too");
+                                   list, 2, &rules), 1,
+               "the rail stops in the nearer body");
+    check_eq_i(a[1].health, 100, "which takes the hit");
+    check_eq_i(a[0].health, 200, "and the far one is shielded");
 
     /* A world surface in the way shortens the trace. */
     place(&a[0], 0, 0, 8000, 100);
@@ -1782,14 +1882,14 @@ static void test_actor_cylinder_trace(void)
                                 &rules, &damage);
     check_eq_i(idx, -1, "a wall before the entry face occludes the actor");
 
-    /* Retain the rail's established penetrating/list-order pass: a far entry
-     * listed first does not prevent the earlier second actor also being hit. */
+    /* The rail asks the same query once: whichever cylinder is entered
+     * first takes it, whatever the list order. */
     broad.health = narrow.health = 200;
     check_eq_i(q2_combat_fire_rail(NULL, beam_origin, beam_dir, 25, 4096,
-                                   Q2_HITSCAN_RADIUS, list, 2, &rules), 2,
-               "rail visits both cylinders in its target-list order");
-    check_eq_i(narrow.health, 175, "rail damages the first listed cylinder");
-    check_eq_i(broad.health, 175, "rail also damages the second cylinder");
+                                   Q2_HITSCAN_RADIUS, list, 2, &rules), 1,
+               "the rail takes one body");
+    check_eq_i(broad.health, 175, "the broad cylinder, entered first");
+    check_eq_i(narrow.health, 200, "and not the narrow one listed before it");
 
     /* The retail paths never approach this range, but the host API accepts
      * s32 coordinates. This makes b^2 and 4ac exceed s64 in the naive formula
@@ -2054,6 +2154,94 @@ static void test_glass_break_tail(void)
     q2_sim_free(sim);
 }
 
+static void test_native_projectile_contacts(void)
+{
+    size_t i;
+    int mismatches = 0;
+    for (i = 0; i < Q2PSX_ARRAY_COUNT(native_projectile_contacts); i++) {
+        q2_actor actors[4], *list[4];
+        s32 point[3], hit;
+        s32 end[3];
+        int j, k;
+        for (j = 0; j < 4; j++) {
+            q2_actor_init(&actors[j]);
+            memcpy(actors[j].origin, native_projectile_contacts[i].actors[j].centre,
+                   sizeof(actors[j].origin));
+            actors[j].radius = native_projectile_contacts[i].actors[j].radius;
+            actors[j].height = (s16)native_projectile_contacts[i].actors[j].height;
+            actors[j].takedamage = (u8)native_projectile_contacts[i].actors[j].damageable;
+            list[j] = &actors[j];
+        }
+        for (k = 0; k < 3; k++) end[k] = native_projectile_contacts[i].start[k] +
+                                       native_projectile_contacts[i].delta[k];
+        hit = q2_combat_trace_actors(native_projectile_contacts[i].start, end,
+                  native_projectile_contacts[i].skip >= 0 ? list[native_projectile_contacts[i].skip] : NULL,
+                  list, (u32)native_projectile_contacts[i].count, point);
+        g_checks++;
+        if (hit != native_projectile_contacts[i].hit ||
+            memcmp(point, native_projectile_contacts[i].point, sizeof(point))) {
+            if (mismatches < 5) printf("  native contact %zu: hit %d/%d, point %d,%d,%d / %d,%d,%d\n",
+                i, hit, native_projectile_contacts[i].hit, point[0], point[1], point[2],
+                native_projectile_contacts[i].point[0], native_projectile_contacts[i].point[1],
+                native_projectile_contacts[i].point[2]);
+            mismatches++;
+        }
+    }
+    g_failures += mismatches;
+    printf("Native actor queries: %zu cases, %d mismatches\n",
+           Q2PSX_ARRAY_COUNT(native_projectile_contacts), mismatches);
+}
+
+typedef struct {
+    const native_autoaim_case *row;
+    int count;
+} aim_visibility;
+
+static bool native_aim_visible(void *user, const s32 start[3], const s32 end[3], int ray)
+{
+    aim_visibility *state = user;
+    const native_autoaim_case *r = state->row;
+    int n = state->count++, k;
+    check(n < r->visible_count, "autoaim visibility count bounded");
+    if (n < r->visible_count) {
+        check_eq_i(ray, r->visibility[n].ray, "autoaim visibility ray");
+        for (k = 0; k < 3; k++) {
+            check_eq_i(start[k], r->visibility[n].start[k], "autoaim visibility start");
+            check_eq_i(end[k], r->visibility[n].end[k], "autoaim visibility end");
+        }
+    }
+    return !(r->blocked & (1u << ray));
+}
+
+static void test_native_autoaim(void)
+{
+    size_t i;
+    for (i = 0; i < Q2PSX_ARRAY_COUNT(native_autoaim); i++) {
+        const native_autoaim_case *r = &native_autoaim[i];
+        q2_actor actors[5], *targets[5];
+        aim_visibility visibility = {r, 0};
+        s16 direction[3] = {111, -222, 333}, pitch = -44;
+        s32 hit;
+        int j, k;
+        memset(actors, 0, sizeof(actors));
+        for (j = 0; j < 5; j++) {
+            targets[j] = &actors[j];
+            for (k = 0; k < 3; k++) actors[j].origin[k] = r->actors[j][k];
+            actors[j].radius = r->actors[j][3];
+            actors[j].height = (s16)r->actors[j][4];
+            /* No health, damageability, or screen visibility admission. */
+        }
+        hit = q2_combat_find_target(r->missing_view ? NULL : r->eye, r->angles,
+                                   &actors[0], targets, 5, native_aim_visible,
+                                   &visibility, direction, &pitch);
+        check_eq_i(hit, r->result[3], "autoaim selected actor");
+        check_eq_i(pitch, r->result[4], "autoaim pitch");
+        check_eq_i(visibility.count, r->visible_count, "autoaim visibility count");
+        for (k = 0; k < 3; k++) check_eq_i(direction[k], r->result[k], "autoaim direction");
+    }
+    printf("Native auto-aim: %zu PAL/US cases\n", Q2PSX_ARRAY_COUNT(native_autoaim));
+}
+
 int main(void)
 {
     printf("combat behaviour\n\n");
@@ -2062,6 +2250,8 @@ int main(void)
     test_ray_distance();
     test_armour_absorption();
     test_power_armour();
+    test_native_signed_armour();
+    test_zero_and_negative_damage();
     test_armour_fade_flag();
     test_damage();
     test_takedamage_gate();
@@ -2074,6 +2264,8 @@ int main(void)
     test_splash();
     test_hitscan();
     test_actor_cylinder_trace();
+    test_native_projectile_contacts();
+    test_native_autoaim();
     test_mod_classification();
 
     test_energy_light_gate();

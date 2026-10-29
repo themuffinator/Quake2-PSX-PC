@@ -20,12 +20,12 @@ static int name_casecmp(const char *a, const char *b)
 }
 
 /* Copy a fixed-width, NUL-padded name and trim trailing blanks. */
-static void copy_name(char *dst, const u8 *src)
+static void copy_name(char *dst, const u8 *src, size_t width)
 {
     size_t n;
 
-    memcpy(dst, src, Q2_LEVEL_NAME_LEN);
-    dst[Q2_LEVEL_NAME_LEN] = '\0';
+    memcpy(dst, src, width);
+    dst[width] = '\0';
 
     n = strlen(dst);
     while (n > 0 && (dst[n - 1] == ' ' || dst[n - 1] == '\t'))
@@ -103,15 +103,16 @@ q2_result q2_level_table_load(q2_level_table *out, const disc *d,
         q2_level_entry *e = &out->entries[i];
         int k;
 
-        copy_name(e->display, rec);
-        copy_name(e->directory, rec + Q2_LEVEL_NAME_LEN);
+        copy_name(e->display, rec, Q2_LEVEL_NAME_LEN);
+        copy_name(e->directory, rec + Q2_LEVEL_NAME_LEN, Q2_LEVEL_DIRECTORY_LEN);
+        e->mission_unit=(s16)q2_rd_u16(rec+0x16);
+        e->game_kind=rec[0x20];
 
         for (k = 0; k < Q2_LEVEL_PLAYLIST; k++)
             e->playlist[k] = rec[0x22 + k];
 
-        /* BADLEVEL is the engine's error placeholder, and the final record has
-         * an all-zero body. Flagging both stops a caller trying to load them
-         * as maps. */
+        /* BADLEVEL terminates the native table. Empty playlist/body records
+         * are also refused rather than exposed as loadable maps. */
         e->is_placeholder = (name_casecmp(e->directory, "BADLEVEL") == 0) ||
                             (e->playlist[0] == 0 && e->playlist[1] == 0 &&
                              e->playlist[2] == 0);

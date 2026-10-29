@@ -1,6 +1,9 @@
 #include "projectile.h"
 
 #include "trig.h"
+#include "random.h"
+#include "sdkmath.h"
+#include "trace.h"
 #include "worldscale.h"
 
 #include <string.h>
@@ -347,6 +350,21 @@ void q2_projectile_step(q2_projectiles *list, u32 index, s32 gravity, s32 dt,
     if (dt <= 0)
         dt = Q2_DT_NOMINAL;
 
+    if (p->kind == Q2_PROJ_GRENADE || p->kind == Q2_PROJ_HAND_GRENADE) {
+        bool back = ((u16)p->angles[0] & 1u) == 0;
+        if (p->flags & Q2_PROJ_TOSS_STOPPED) {
+            memcpy(out->from, p->pos, sizeof(out->from));
+            memcpy(out->to, p->pos, sizeof(out->to));
+            out->expired = p->expires && now >= p->expires;
+            return;
+        }
+        /* 0x80046BE0..0x80046CA0: three shared rand draws, independent of dt. */
+        for (k = 0; k < 3; k++) {
+            s32 turn = 160 + 2 * (q2_random_next() & 31);
+            p->angles[k] = (s16)(back ? p->angles[k] - turn : p->angles[k] + turn);
+        }
+    }
+
     /*
      * A ROCKET CIRCLES ITS LINE OF FLIGHT, before it moves — the head of
      * PrimaryRocketActive, 0x8004AD34..0x8004ADBC. Its phase at +0x48 gains
@@ -392,7 +410,7 @@ void q2_projectile_step(q2_projectiles *list, u32 index, s32 gravity, s32 dt,
 
     if (p->kind == Q2_PROJ_GRENADE || p->kind == Q2_PROJ_HAND_GRENADE) {
         s32 raw_y = fixed_to_raw(p->vel[1], Q2_VEL_DIV);
-        raw_y += gravity * dt;
+        raw_y = (s16)((u32)raw_y + (u32)gravity * (u32)dt);
         /* Shared mover 0x80046464..0x800464A0 uses the same one-sided
          * terminal clamp as the player path. Upward velocity is unrestricted;
          * only a fall past +8192 is capped. */
@@ -415,7 +433,15 @@ void q2_projectile_step(q2_projectiles *list, u32 index, s32 gravity, s32 dt,
      */
     for (k = 0; k < 3; k++) {
         s32 raw = fixed_to_raw(p->vel[k], divisor);
-        out->to[k] = p->pos[k] + (s32)(((s64)raw * dt) / divisor);
+        /* The bolt sweep stores vel*dt through a signed halfword before its
+         * 32-bit position add (0x80047D58..0x80047DA4). */
+        if (p->kind == Q2_PROJ_BOLT)
+            out->to[k] = (s32)((u32)p->pos[k] +
+                (u32)(s32)(s16)((u32)(s32)(s16)raw * (u32)dt));
+        else
+            out->to[k] = p->pos[k] + (s32)(((s64)raw * dt) / divisor);
+        if (p->kind == Q2_PROJ_GRENADE || p->kind == Q2_PROJ_HAND_GRENADE)
+            out->to[k] = p->pos[k] + (s16)(((s32)(s16)raw * dt) / divisor);
     }
 
     if (p->expires && now >= p->expires)
@@ -429,6 +455,65 @@ void q2_projectile_commit(q2_projectiles *list, u32 index, const s32 to[3])
     if (!list->p[index].in_use)
         return;
     memcpy(list->p[index].pos, to, sizeof(list->p[index].pos));
+}
+
+bool q2_projectile_ignore_owner(q2_projectile *p, const q2_actor *owner)
+{
+    int axis;
+    if (!p || !owner) return false;
+    if (p->kind != Q2_PROJ_GRENADE && p->kind != Q2_PROJ_HAND_GRENADE)
+        return true;
+    if (p->kind == Q2_PROJ_HAND_GRENADE && p->node == Q2_PROJ_NODE_HELD)
+        return true;
+    if (!(p->flags & Q2_PROJ_OWNER_CLEAR)) {
+        for (axis = 0; axis <= 2; axis += 2) {
+            s32 low = (s32)((u32)owner->origin[axis] + (u32)(s32)owner->mins[axis] - 40u);
+            s32 high = (s32)((u32)owner->origin[axis] + (u32)(s32)owner->maxs[axis] + 40u);
+            if (p->pos[axis] < low || p->pos[axis] > high)
+                p->flags |= Q2_PROJ_OWNER_CLEAR;
+        }
+    }
+    return !(p->flags & Q2_PROJ_OWNER_CLEAR);
+}
+
+void q2_projectile_rebound(q2_projectile *p, const s32 desired[3],
+                            const s32 clipped[3], const s16 normal[3])
+{
+    s16 velocity[3], push[3];
+    s32 remainder[3], direction[3], unit[3], dot2, speed;
+    u32 square = 0, dot = 0;
+    int k;
+    if (!p || !desired || !clipped || !normal) return;
+    for (k = 0; k < 3; k++) {
+        velocity[k] = (s16)fixed_to_raw(p->vel[k], Q2_VEL_DIV);
+        square += (u32)((s32)velocity[k] * velocity[k]);
+    }
+    speed = (s32)(q2_sdk_sqrt0(square) * Q2_GRENADE_RESTITUTION) >> 12;
+    q2_move_push_vector(normal, push);
+    for (k = 0; k < 3; k++) {
+        p->pos[k] = clipped[k] - push[k];
+        remainder[k] = desired[k] - p->pos[k];
+        dot += (u32)(s32)normal[k] * (u32)remainder[k];
+    }
+    dot2 = (s32)(0u - dot * 2u);
+    for (k = 0; k < 3; k++) {
+        s32 reflected = desired[k] + (s32)(((s64)normal[k] * dot2 + 0x800000) >> 24);
+        direction[k] = reflected - p->pos[k];
+    }
+    q2_sdk_vector_normal(direction, unit);
+    square = 0;
+    for (k = 0; k < 3; k++) {
+        velocity[k] = (s16)((s32)((u32)unit[k] * (u32)speed) >> 12);
+        p->vel[k] = raw_to_fixed(velocity[k], Q2_VEL_DIV);
+        square += (u32)((s32)velocity[k] * velocity[k]);
+    }
+    if ((s32)square > (s32)Q2_GRENADE_REST_SPEED_SQ) {
+        p->flags = (u16)(p->flags & ~Q2_PROJ_TOSS_REST);
+        p->angles[0] = (s16)(p->angles[0] + 1);
+    } else {
+        p->flags |= Q2_PROJ_TOSS_REST;
+    }
+    p->bounced = true;
 }
 
 bool q2_projectile_expire(q2_projectiles *list, u32 index)
@@ -476,18 +561,18 @@ u32 q2_projectile_detonate_traced(q2_projectiles *list, u32 index,
 }
 
 bool q2_projectile_impact(q2_projectiles *list, u32 index,
-                          const s32 point[3], const s32 normal[3],
+                          const s32 point[3],
                           q2_actor *attacker, q2_actor *hit,
                           q2_actor **targets, u32 target_count,
                           const q2_combat_rules *rules)
 {
-    return q2_projectile_impact_traced(list, index, point, normal, attacker,
+    return q2_projectile_impact_traced(list, index, point, attacker,
                                        hit, targets, target_count, rules,
                                        NULL, NULL);
 }
 
 bool q2_projectile_impact_traced(q2_projectiles *list, u32 index,
-                                 const s32 point[3], const s32 normal[3],
+                                 const s32 point[3],
                                  q2_actor *attacker, q2_actor *hit,
                                  q2_actor **targets, u32 target_count,
                                  const q2_combat_rules *rules,
@@ -503,33 +588,12 @@ bool q2_projectile_impact_traced(q2_projectiles *list, u32 index,
 
     memcpy(p->pos, point, sizeof(p->pos));
 
-    /*
-     * A grenade that meets the world bounces; a grenade that meets a target
-     * goes off in its face. 0x8004A2B0's spawner installs a bounce handler and
-     * the bounce sound (wep_grenlb1b) is one of the twenty-two, so the bounce
-     * is certainly there — the coefficient below is not, and is modelled.
-     */
+    /* Grenade2/3 skip direct damage on an owner contact and pass no ignored
+     * victim to radius damage (0x80049FAC -> 0x8004A024). Other contacts apply
+     * direct damage first and exclude that victim from the following blast. */
     if ((p->kind == Q2_PROJ_GRENADE || p->kind == Q2_PROJ_HAND_GRENADE) &&
-        !hit && normal) {
-        s64 dot = (s64)p->vel[0] * normal[0] + (s64)p->vel[1] * normal[1] +
-                  (s64)p->vel[2] * normal[2];
-        int k;
-
-        dot >>= 12;                       /* normal is 1.3.12 */
-        for (k = 0; k < 3; k++) {
-            s64 v = p->vel[k] - 2 * ((dot * normal[k]) >> 12);
-            v = v * Q2_GRENADE_BOUNCE_NUM / Q2_GRENADE_BOUNCE_DEN;
-            p->vel[k] = (s32)v;
-        }
-        p->bounced = true;
-        return false;
-    }
-
-    /*
-     * The rocket applies its direct hit at full damage BEFORE the blast
-     * (0x8004AE14 then 0x8004AE54), so a target that eats a rocket takes both.
-     * The bolt has no blast at all and is only ever the direct hit.
-     */
+        hit == attacker)
+        hit = NULL;
     if (hit && p->damage > 0)
         q2_combat_damage(attacker, hit, p->damage, p->mod, point, rules);
 

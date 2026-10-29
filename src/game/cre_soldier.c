@@ -260,6 +260,8 @@ const char *q2_cre_soldier_sound_name(int which)
 
 void (*q2_cre_sound_fn)(q2_monster *m, int which, void *user);
 void  *q2_cre_sound_user;
+static void (*g_pitched_sound)(q2_monster *, int, u8, void *);
+static void *g_pitched_sound_user;
 void (*q2_cre_melee_fn)(q2_monster *m, const s32 aim[3],
                         s32 damage, s32 kick, void *user);
 void  *q2_cre_melee_user;
@@ -271,6 +273,24 @@ void q2_cre_set_sound_hook(void (*fn)(q2_monster *, int, void *), void *user)
 {
     g_sound      = fn;
     g_sound_user = user;
+    g_pitched_sound = NULL;
+    g_pitched_sound_user = NULL;
+    q2_cre_set_sound_owner_hook(NULL, NULL);
+}
+
+void q2_cre_set_pitched_sound_hook(void (*fn)(q2_monster *, int, u8, void *),
+                                   void *user)
+{
+    g_pitched_sound = fn;
+    g_pitched_sound_user = user;
+}
+
+void q2_cre_play_pitched_sound(q2_monster *m, u32 handle, u8 pitch)
+{
+    if (g_pitched_sound)
+        g_pitched_sound(m, (int)handle, pitch, g_pitched_sound_user);
+    else if (g_sound)
+        g_sound(m, (int)handle, g_sound_user);
 }
 
 void q2_cre_set_melee_hook(void (*fn)(q2_monster *, const s32 *, s32, s32,

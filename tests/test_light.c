@@ -15,6 +15,7 @@
 
 #include "effect.h"     /* only for Q2_ENERGY_PULSE_TICKS, which is 0x80058718 */
 #include "flare.h"
+#include "raster.h"
 #include "gte.h"
 #include "lighting.h"
 #include "trig.h"
@@ -1066,6 +1067,33 @@ static void test_flare_geometry(void)
 
     check_eq_i(stats.flares_drawn, 1, "a light in range draws its flare");
 
+    /* Black at the edge of a glow must leave the wall alone, even when the
+     * preceding model/portal left half or subtractive blending selected. */
+    {
+        psx_framebuffer fb = {0};
+        psx_raster_opts opts;
+        int mode;
+        check(psx_fb_init(&fb, 320, 240) == Q2_OK, "flare framebuffer allocates");
+        psx_raster_opts_default(&opts);
+        opts.dither = false;
+        if (fb.px) for (mode = 0; mode < 4; mode++) {
+            psx_draw_state state = {0};
+            u32 i, darker = 0, brighter = 0;
+            state.mode = (u16)(0x0600 | (mode << 5));
+            psx_fb_clear(&fb, psx_rgb555(80, 80, 80));
+            for (i = 0; i < ot.prim_count; i++)
+                psx_raster_command(&fb, &ot.prims[i], NULL, &opts, &state);
+            for (i = 0; i < 320*240; i++) {
+                if ((fb.px[i]&31) < 10 || ((fb.px[i]>>5)&31) < 10 ||
+                    ((fb.px[i]>>10)&31) < 10) darker++;
+                if ((fb.px[i]&31) > 10) brighter++;
+            }
+            check_eq_i(darker, 0, "a flare never darkens its background");
+            check(brighter > 0, "a flare adds light");
+        }
+        psx_fb_free(&fb);
+    }
+
     /*
      * Style 2 is one BURST element and nothing else: six Gouraud quads for the
      * twelve-sided glow, then eight Gouraud lines for the star.
@@ -1088,7 +1116,7 @@ static void test_flare_geometry(void)
 
             if (!p->semi_transparent)
                 opaque++;
-            if (((p->tpage >> 5) & 3u) != PSX_BLEND_ADD)
+            if (!p->set_tpage || ((p->tpage >> 5) & 3) != PSX_BLEND_ADD)
                 wrong_blend++;
 
             if (p->kind == PSX_PRIM_G4) {
@@ -1105,8 +1133,7 @@ static void test_flare_geometry(void)
         check_eq_i(lines, Q2_FLARE_BURST_LINES, "eight lines make the star");
         check_eq_i(opaque, 0, "every flare primitive is semi-transparent");
         check_eq_i(wrong_blend, 0,
-                   "and every one blends additively, as the world leaves the "
-                   "draw mode");
+                   "flare emission establishes additive blending");
         check(have_centre, "the glow has a centre corner");
 
         /* The rim, and the arms, measured as offsets from that centre. */

@@ -143,11 +143,10 @@
  * mover's gravity, terminal velocity and no-gravity flag; every constant in
  * `q2_fx_preset`.
  *
- * MODELLED: nothing in the effect system. Two things are the CALLER's to supply
- * because the original takes them from outside the effect code — the gravity
- * step, which the shared mover reads from the same global the player's does,
- * and the glint's band data, which a level script writes through its import
- * table. Both are passed in rather than invented here.
+ * MODELLED: the debris pool's capacity (the console shares its entity pool).
+ * The caller supplies the gravity step and the glint's band data. BIGGUN's
+ * recognized script tables and frame driver supply the latter in simcombat.c;
+ * the port does not interpret arbitrary relocated level code.
  */
 #ifndef Q2PSX_EFFECT_H
 #define Q2PSX_EFFECT_H
@@ -170,11 +169,11 @@
 
 /*
  * 0x80030C70 sizes the pool: a negative argument gives zero groups, zero gives
- * thirty-two, anything else is taken as-is. Thirty-two is therefore the shipped
- * default and what this port uses unless told otherwise.
+ * thirty-two, anything else is taken as-is. The loader supplies Resources+0x18:
+ * the PAL disc requests 64 groups except JAIL4/ZONE0 and JAIL5/ZONE2, with 80.
  */
 #define Q2_FX_GROUPS_DEFAULT   32
-#define Q2_FX_GROUPS_MAX       64
+#define Q2_FX_GROUPS_MAX       80
 
 /* 0x800D5730..0x800D5C30, forty bytes each. */
 #define Q2_FX_BEAMS_MAX        32
@@ -211,8 +210,9 @@
  * It also corrects the claim that beam styles 3 and 4 are unreachable. They are
  * not reached from the laser dispatcher; they are reached from here. Style 4 —
  * the opaque red one — is filled at `0x8004E9F4` (`addiu t1, v0, -9644`, the
- * style-4 record 0x8009DA54), behind the same visibility test (0x8004E9D4); which
- * weapon or creature drives that one is not yet attributed.
+ * style-4 record 0x8009DA54), behind the same visibility test (0x8004E9D4).
+ * Parasite calls this import (+0x7C) with posed vertex 97, radius 10 and
+ * lifetime 45. The attachment and both endpoints are refreshed each frame.
  *
  * 0x8004E9F4 is 0x5C into `0x8004E998`, a separate function whose only
  * reference is its address materialised at 0x8007DB4C. It is NOT inside
@@ -230,7 +230,9 @@
 
 typedef struct q2_fx_timed_beam {
     s16 timer;                    /* +0x00 */
+    s16 attachment;               /* +0x04; -1 for a projectile's origin */
     s16 radius;                   /* +0x06 */
+    bool present;                 /* the expiry tick still submits its beam */
 
     /*
      * WHICH AREA THE RE-SUBMITTED BEAM IS FILED UNDER, and the record has no
@@ -341,14 +343,15 @@ typedef struct q2_fx_timed_beam {
  * other. A formula with the subtraction the other way round would have looked
  * just as plausible and swept backwards.
  *
- * So the answer to "which entity states raise the flag" is: the level script
- * does, on the one map that ships a mesh, and no engine state does. A port
- * cannot reproduce it without running BIGGUN's script — which is why the
- * client does NOT draw a glint by default. Inventing an entity to wear one
- * would be adding behaviour the console does not have.
+ * The level script owns the flag and the band data. q2_sim_glint_tick binds
+ * the decoded effect to its live Blackhole P owner; no camera-owned glint is
+ * substituted when that item is absent.
  */
 #define Q2_FX_GLINT_BANDS       6   /* ent+0x2B7, set by BIGGUN's script */
 #define Q2_FX_GLINT_PHASE_START 4   /* ent+0x2BE, and the 4 in the formula */
+/* BIGGUN+0x410 passes slot 12's X (832) as BOTH coordinates to GetTPage.
+ * Keep bit 11 in GPU state; the retail 1 MiB VRAM address wraps to Y=256. */
+#define Q2_FX_GLINT_LIGHTNING_TPAGE 0x083Du
 
 /* ------------------------------------------------------------------------- */
 /* One band, and where the bands come from                                    */
@@ -390,7 +393,7 @@ typedef struct q2_fx_timed_beam {
  *
  * It happens inside the DRAW in the original, which is why a two-viewport frame
  * would advance every band twice. This port steps it in `q2_fx_glint_advance`
- * on the tick instead — the glint's one divergence.
+ * after the rendered frame, sharing one phase across all viewports.
  */
 #define Q2_FX_GLINT_BANDS_MAX   7
 #define Q2_FX_GLINT_BAND_WIDTH  4096   /* 0x80064DFC, the multi-band path  */
@@ -429,6 +432,32 @@ typedef struct q2_fx_glint {
     /* The single-band path's own state: ent+0x2B4 and ent+0x2BE. */
     u8               tint[3];
     u16             phase;
+
+    /* LevelBin's authored directions, before its per-frame jitter and the
+     * subtraction of the owner's angles (BIGGUN +0x1B40..+0x1DA0). */
+    bool             scripted;
+    s16              base_angle[Q2_FX_GLINT_BANDS_MAX][3];
+    q2_rng           script_rng;
+    u32              script_time;
+    s32              origin[3];
+    s32              angles[3];
+    u8               area;
+
+    /* BIGGUN's private ribbon renderer (+0x138, +0x38C), separate from the
+     * engine's solid laser prisms. Data is recovered from the level module. */
+    bool             lightning_ready;
+    s32              lightning_target[Q2_FX_GLINT_BANDS_MAX][3];
+    u8               lightning_uv[8][2];
+    u32              lightning_noise[8];
+    s32              lightning_offset[8];
+    u32              lightning_frame;
+    s16              turn_left, turn_speed;
+    /* BIGGUN's generator lifecycle (+0x11F4, +0x131C, +0x182C). */
+    bool             zone_active, owner_active, shutting_down, dying, finished;
+    bool             burst_pending, burst_done, sparks_visible;
+    s32              power_left, death_time, crack_time;
+    s32              evacuation_left; /* module+0x35B4, initially 300 */
+    s32              spark_origin[3];
 } q2_fx_glint;
 
 /* ------------------------------------------------------------------------- */
@@ -451,17 +480,14 @@ typedef struct q2_fx_glint {
  * the phase. So the port takes the script's own numbers rather than a
  * hardcoded 6 and 4, and a map whose script uses different ones gets those.
  *
- * This is general rather than a special case for BIGGUN: any build, any map,
- * any script. A map whose script does not raise a glint gets none, which is
- * every map but one on this disc.
+ * The authored angle table is recovered from BIGGUN's +0x1B54 address/index
+ * sequence. This recognises that script, not arbitrary MIPS programs. A map
+ * with no recognised table does not activate a guessed arrangement of bands.
  *
- * WHICH ENTITY it attaches to is the one part that still needs the script to
- * run. The search loop at chunk `+0x1868` walks 48 records of 768 bytes and
- * takes the one whose `+0xD2` is 46 and whose `+0xDA` is 20 — a kind tag and a
- * sub-id, both written by the spawner (`0x8007D700` stores 47 into `+0xD2` for
- * a different kind). The rule is recorded here so that the lookup becomes exact
- * the moment the port's entity records carry those two fields; until then the
- * caller supplies the position and this module does not guess one.
+ * The +0x1868 owner search takes kind 46, item 20. The runtime entity fields
+ * now carry both keys, and simcombat.c performs that lookup each tick. The
+ * script's private RNG supplies three angular jitters and three colour bytes
+ * per band; the script refreshes their phases to four before each draw.
  */
 #define Q2_FX_GLINT_TARGET_KIND  46   /* ent+0xD2, the search key   */
 #define Q2_FX_GLINT_TARGET_ID    20   /* ent+0xDA                   */
@@ -473,6 +499,12 @@ typedef struct q2_fx_glint_script {
     u32  raise_offset;  /* where, so the finding can be re-checked      */
     u8   band_count;    /* the `sb` near it, or 0 if none was found     */
     u8   phase;         /* the `sh` near it, or 0                       */
+    bool bands_found;
+    s16  angle[Q2_FX_GLINT_BANDS_MAX][3];
+    bool lightning_found;
+    s32  target[Q2_FX_GLINT_BANDS_MAX][3];
+    u8   uv[8][2];
+    s32  spark_origin[3];
 } q2_fx_glint_script;
 
 /*
@@ -481,10 +513,19 @@ typedef struct q2_fx_glint_script {
  */
 bool q2_fx_glint_scan(q2_fx_glint_script *out, const u8 *levelbin, u32 size);
 
-/* Advance every live band's phase by one tick, wrapping at the start value.
- * The original does this inside the draw; doing it here is what keeps split
- * screen from advancing the bands once per viewport. */
+/* Consume the displayed phase, with byte/halfword underflow. Call after a
+ * rendered frame in which the owner was drawn, including wholly black bands.
+ * All viewports share that phase; logic ticks only refresh it. */
 void q2_fx_glint_advance(q2_fx_glint *g);
+
+/* Refresh the module-owned band records once per simulation frame. The
+ * script has its own rand(), seeded at zero, separate from gameplay. */
+void q2_fx_glint_refresh(q2_fx_glint *g, const s32 angles[3]);
+/* Advance the level renderer's eight signed, wrapping noise accumulators. */
+void q2_fx_glint_lightning_tick(q2_fx_glint *g, q2_rng *rng);
+s32 q2_fx_sqrt_nr(u32 n); /* 0x80055CBC, positive signed-32-bit domain */
+u32 q2_fx_glint_lightning_draw(const q2_fx_glint *g, u16 tpage, u16 clut,
+                               const q2_camera *cam, psx_ot *ot, gte_state *gte);
 
 /*
  * Draw a glint, taking whichever path its band count selects. Returns the
@@ -492,6 +533,17 @@ void q2_fx_glint_advance(q2_fx_glint *g);
  */
 u32 q2_fx_glint_draw(const q2_fx_glint *g, const s32 origin[3], s32 yaw,
                      const q2_camera *cam, psx_ot *ot, gte_state *gte);
+
+/* Entity-bound draw: full rotation, retail 768/256 scale and area routing. */
+u32 q2_fx_glint_draw_entity(const q2_fx_glint *g, const s32 origin[3],
+                            const s32 angles[3], s32 area,
+                            const q2_camera *cam, psx_ot *ot, gte_state *gte);
+
+/* Join the glint to its owner's packet chain, using the owner's actual matrix.
+ * NCLIP selects AddPrim/AddPrimEnd as at 0x80064B64. */
+u32 q2_fx_glint_draw_attached(const q2_fx_glint *g, const s32 origin[3],
+                              const s16 rotation[3][3], s32 area, s32 batch,
+                              const q2_camera *cam, psx_ot *ot, gte_state *gte);
 
 /* ------------------------------------------------------------------------- */
 /* The per-frame particle budget                                              */
@@ -581,12 +633,12 @@ typedef struct q2_fx_debris {
 /* ------------------------------------------------------------------------- */
 /*
  * 0x80031094, import +0xA0, which the Soldier's, the Infantry's and the
- * Gunner's export 1 call while their object is drawn — and ONLY while the
+ * Gunner's and Boss1's export 1 call while their object is drawn — and ONLY while the
  * sign bit of object+0x10C is up. `monster_fire_bullet` and
  * `monster_fire_shotgun` raise it (0x80061E28, 0x80061F18; the blaster, rail,
  * rocket and grenade spawners do not), and the object's per-frame handler
  * drops it before the next think (0x8007EE20, `and 0x7FFFFFFF`). So a flash is
- * one frame per round, from those three creatures and from those two weapons.
+ * one frame per round, from those four creatures and from those two weapons.
  *
  * It is a light — q2_creature_muzzle_light's radii at the muzzle — and this
  * quad: a POLY_FT4, code 0x2C with the semi-transparency bit (0x800314C8),
@@ -595,7 +647,7 @@ typedef struct q2_fx_debris {
  * (0x80031590..0x800315A8) — and CLUT `[0x800E3FAC]`, built-in palette 64.
  *
  * The corners are built in MODEL space around the posed muzzle: a square of
- * half-diagonal 120 turned by a free-running angle, (x - c, y - s), (x + s,
+ * half-diagonal 120 (Boss1: 240) turned by a free-running angle, (x - c, y - s), (x + s,
  * y - c), (x - s, y + c), (x + c, y + s) with c and s the angle's cosine and
  * sine times 120 (0x80031270..0x80031320), all at the muzzle's own z. Rotated
  * by the object's matrix, they lie across the model's X/Y plane — square to
@@ -611,6 +663,8 @@ typedef struct q2_fx_debris {
  * The flash is skipped in a viewport whose camera-space depth to the muzzle
  * is under 257 (0x80031470). Sorted at the third corner's depth (`swc2 SZ3`).
  */
+/* Inline staging capacity, not a retail limit. Retail emits directly for
+ * each firing actor; additional flashes use overflow storage for this frame. */
 #define Q2_FX_FLASH_MAX         16
 #define Q2_FX_FLASH_SIZE       120     /* a3 at 0x8010216C, 0x801014xx */
 #define Q2_FX_FLASH_U0          64
@@ -661,10 +715,9 @@ typedef struct q2_fx_flash {
  * frames. A record whose entity has gone (its +0xF4 zero, or its +0xD0 no
  * longer the key's) is freed at once — q2_fx_blur_release.
  *
- * The quads carry no texture page, so their blend is the draw mode the world
- * left: B+F, additive (flare.c makes the same argument). The colour every
- * caller on this disc passes is (32, 32, 32), so a trail is a faint grey
- * brightening of what it crosses.
+ * The quads carry no texture page, so their blend is inherited from the
+ * preceding draw-mode command or textured polygon. Every caller on this
+ * disc passes (32, 32, 32).
  */
 #define Q2_FX_BLURS             6    /* 0x800C73F4..0x800C74B4, 32 each   */
 #define Q2_FX_BLUR_POINTS      96    /* InitBlurPoints' `slti 96`          */
@@ -731,6 +784,7 @@ typedef struct q2_fx_world {
 
     u32          viewport_count;   /* [0x800B2C2C] */
     u32          budget;           /* recomputed by q2_fx_world_resize   */
+    u32          budget_left;      /* shared by every viewport this frame */
 
     /*
      * 0x800D5D46, the multiplier every spawner applies to its size argument
@@ -760,6 +814,8 @@ typedef struct q2_fx_world {
 
     /* This frame's creature muzzle flashes; see q2_fx_flash_add. */
     q2_fx_flash  flash[Q2_FX_FLASH_MAX];
+    q2_fx_flash *flash_extra;
+    u32          flash_extra_capacity;
     u32          flash_count;
     u16          flash_clut;    /* [0x800E3F2C + 128] = palette 64 */
 
@@ -790,8 +846,6 @@ void q2_fx_set_texture(q2_fx_world *w, u16 tpage_base, u16 clut);
 struct q2_hud_font;
 void q2_fx_use_hud_atlas(q2_fx_world *w, const struct q2_hud_font *font);
 
-/* Queue one creature muzzle flash for this frame's draw. False when the list
- * is full. See q2_fx_flash. */
 /*
  * AddBlurPoints for one owner: `pts` are the listed vertices' world positions
  * this frame, `count` of them (two or three on this disc), keyed on `owner`
@@ -806,6 +860,8 @@ bool q2_fx_blur_add(q2_fx_world *w, u16 owner, u16 first_vert,
 /* Free every record of `owner` — the entity-gone arm of ProcessBlurs. */
 void q2_fx_blur_release(q2_fx_world *w, u16 owner);
 
+/* Queue one creature muzzle flash for this frame's draw. False on allocation
+ * failure. Sprite count is independent of the sixteen dynamic-light slots. */
 bool q2_fx_flash_add(q2_fx_world *w, const s32 corner[4][3],
                      const s32 centre[3], u8 area);
 
@@ -820,7 +876,7 @@ void q2_fx_flash_clear(q2_fx_world *w);
 s32 q2_fx_flash_angle(s32 spin, u32 frame);
 
 /* The four model-space corners around `centre`, in hardware Z order. */
-void q2_fx_flash_corners(const s32 centre[3], s32 angle, s32 out[4][3]);
+void q2_fx_flash_corners(const s32 centre[3], s32 angle, s32 size, s32 out[4][3]);
 
 /* 512, so that `size_scale == Q2_FX_SIZE_SCALE_UNITY` passes the argument
  * through. The disc's own value lives in level data, not in the executable. */
@@ -870,8 +926,8 @@ void q2_fx_flash_corners(const s32 centre[3], s32 angle, s32 out[4][3]);
 void q2_fx_world_init(q2_fx_world *w, const q2_fx_tables *tab);
 
 /* Change the group pool size and recompute the budget. `groups` follows
- * 0x80030C70: zero means the shipped default of thirty-two. */
-void q2_fx_world_resize(q2_fx_world *w, u32 groups, u32 viewports);
+ * 0x80030C70: zero means thirty-two, negative disables the pool. */
+void q2_fx_world_resize(q2_fx_world *w, s32 groups, u32 viewports);
 
 /* Free every group, beam and debris piece. 0x80048C54 + 0x80064EF4. */
 void q2_fx_world_clear(q2_fx_world *w);
@@ -1053,28 +1109,10 @@ s32 q2_fx_bullet_puff(q2_fx_world *w, q2_rng *rng, const s32 at[3], u8 area);
  * part walk only picks the POSE — the vertex itself is fetched by the original
  * global index (0x8006CCA4 uses the pre-walk value), not by the residue.
  *
- * THIS PORT HAS NO SUCH FUNCTION and cannot grow one here. src/formats/model.c's
- * q2_model_get_vertex returns the RAW STORAGE vertex in model-local space, and
- * src/game/modeldraw.c's `shadow_pose_vertex` does the part walk and the pose
- * but stops in MODEL space and is static — neither applies the entity rotation
- * or its origin, so neither is what 0x8006CC44 returns. Writing a third copy of
- * the pose walk inside effect.c would be worse than asking for one, so the
- * drawers take the lookup as a callback and the presentation layer supplies it.
- * The intended body is a public world-vertex helper in modeldraw.c layered on
- * the existing static one: pose (0x8006C6C8), rotate by the instance's own
- * matrix (0x8006FC1C), add the origin (0x8006CD58..0x8006CD94).
- *
- * Until something supplies it, every caller passes `src == NULL` and every
- * drawer takes the console's model-less path, documented at each one. The
- * timers and the lights are exact either way; the quads are missing, and so
- * are some GENERATOR DRAWS. `src == NULL` is exact only for an entity that
- * genuinely has no model. The spark's one early exit is a null model pointer
- * (0x800589D8 `lw a0, 16(s7)` / 0x800589E0 `beq a0, zero`), so on an actor
- * that HAS a model the console draws its 45 velocities (0x80058A08..
- * 0x80058AB4) on every firing, whether or not the vertex walk then finds
- * anything; handed no mesh, the port draws none. So while the mesh source is
- * missing, each effect[0], effect[2] or effect[4] firing on a modelled actor
- * leaves the port's stream 45 draws behind the console's.
+ * q2_model_world_vertex supplies this lookup. The client binds posed player,
+ * creature and pickup meshes through q2_fx_mesh_src. A NULL source remains
+ * the original model-less branch; it must not replace an available model,
+ * because that also skips the spark's 45 velocity draws from the RNG.
  *
  * `total` is 0x8006D6AC: the SUM of each part's `lbu +3` over the `lh 22(obj)`
  * records at `lw 40(obj)`, not the model header's own vertex count — the
@@ -1696,6 +1734,10 @@ void q2_fx_beams_reset(q2_fx_world *w);
 bool q2_fx_beam_timed(q2_fx_world *w, s32 owner, s32 target,
                       const s32 from[3], const s32 to[3],
                       s16 radius, u32 style, s16 life, u8 area);
+/* 0x8004E998: style 4, radius 10, life 45, keyed on owner/target/vertex.
+ * The host updates posed endpoints and their clipped area before drawing. */
+bool q2_fx_beam_attached(q2_fx_world *w, s32 owner, s32 target, s16 vertex,
+                         const s32 from[3], const s32 to[3], u8 area);
 
 /*
  * Age the timed list by one frame's worth. 0x80048CE8 subtracts the frame delta
@@ -1847,7 +1889,7 @@ void q2_fx_glint_shade(const s16 *vertex_band, u32 count,
  * .DAT directory and hands the chunk pointer to `0x800651BC`, which splits it
  * at a fixed offset and parks the halves at `gp+0x4614` and `gp+0x4610`.
  *
- *     [0, 864)      216 faces, four u8 indices each, in the GPU's Z order
+ *     [0, 864)      216 faces, four u8 indices each, in perimeter order
  *     [864, end)    (size - 864) / 8 vertices: s16 x, y, z, band
  *
  * The split is a literal 864 (`addiu v0, a0, 864`), not a header field, so a
@@ -1875,8 +1917,8 @@ void q2_fx_glint_shade(const s16 *vertex_band, u32 count,
 /*
  * What one call to the renderer can actually cover. `0x800649C8` transforms
  * vertices in threes while its counter is under 94 — 96 vertices — into the
- * shared scratch at 0x800B2DFC, and `0x80064BC4` stops emitting at 79
- * primitives. Both are literal bounds in the original, so the port honours them
+ * shared scratch at 0x800B2DFC, and `0x80064BC4` stops after 79 faces visited,
+ * including the black-face skip at 0x80064A38. Both are literal bounds, so the port honours them
  * rather than drawing the whole 216-face mesh and calling it an improvement.
  */
 #define Q2_FX_GLINT_MAX_FACES   79
@@ -2151,6 +2193,8 @@ bool q2_fx_laser(q2_fx_world *w, q2_rng *rng, u32 kind,
  * the models, which is the whole point of an ordering table and the reason a
  * spark can sort behind a crate.
  *
+ * Call viewports in ascending order. Viewport zero starts the frame's shared
+ * particle packet allowance; later views spend what remains (0x80030AE8).
  * `viewport` selects which view_mask bit is honoured. Beams are drawn once and
  * the pool is left alone; call q2_fx_beams_reset after the last viewport, which
  * is where 0x80064F10 does it.

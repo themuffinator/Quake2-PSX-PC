@@ -21,6 +21,7 @@ static void upload_palette(psx_vram *vram, const q2_hud_palette *p)
         return;
     if (p->vram_y < 0 || p->vram_y >= PSX_VRAM_HEIGHT)
         return;
+    psx_vram_transfer(vram);
     for (i = 0; i < Q2_HUD_PALETTE_SIZE; i++) {
         int x = p->vram_x + i;
         if (x < 0 || x >= PSX_VRAM_WIDTH)
@@ -69,6 +70,7 @@ q2_result q2_hud_font_upload(q2_hud_font *out, const q2_hud_tables *tab,
      * halfwords — the same rule the texture pages follow (vram.h). At 4bpp that
      * makes chars.lbm 256 texels across.
      */
+    psx_vram_transfer(vram);
     halfwords = (u32)section->images[index].width >> 1;
     for (row = 0; row < section->images[index].height; row++) {
         int vy = Q2_HUD_ATLAS_VRAM_Y + (int)row;
@@ -184,7 +186,8 @@ static psx_prim *emit_sprite(psx_ot *ot, u16 otz, const q2_hud_font *font,
     y += ctx->origin_y;
 
     p->kind  = PSX_PRIM_SPRT;
-    p->tpage = font->tpage;
+    p->tpage = font->tpage | 0x0600u;
+    p->set_tpage = true; /* the text renderer's preceding DR_TPAGE */
     p->clut  = clut;
 
     p->xy[0].x = (s16)x;          p->xy[0].y = (s16)y;

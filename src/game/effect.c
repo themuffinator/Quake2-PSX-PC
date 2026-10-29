@@ -3,10 +3,10 @@
 #include "combat.h"   /* q2_actor: the presentation pass ticks its effect[] slots */
 #include "fixed.h"
 #include "hud.h"
-#include "surface.h"  /* the blend the world leaves for the blur */
 #include "trig.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 /* ------------------------------------------------------------------------- */
 /* Small helpers                                                              */
@@ -218,9 +218,29 @@ bool q2_fx_flash_add(q2_fx_world *w, const s32 corner[4][3],
 {
     q2_fx_flash *f;
 
-    if (!w || !corner || !centre || w->flash_count >= Q2_FX_FLASH_MAX)
+    if (!w || !corner || !centre)
         return false;
-    f = &w->flash[w->flash_count++];
+    if (w->flash_count < Q2_FX_FLASH_MAX) {
+        f = &w->flash[w->flash_count];
+    } else {
+        u32 index = w->flash_count - Q2_FX_FLASH_MAX;
+        if (index >= w->flash_extra_capacity) {
+            u32 capacity;
+            q2_fx_flash *extra;
+            if (w->flash_extra_capacity > UINT32_MAX / 2)
+                return false;
+            capacity = w->flash_extra_capacity ? w->flash_extra_capacity * 2
+                                                : Q2_FX_FLASH_MAX;
+            if ((u64)capacity * sizeof(*extra) > SIZE_MAX)
+                return false;
+            extra = realloc(w->flash_extra, (size_t)capacity * sizeof(*extra));
+            if (!extra) return false;
+            w->flash_extra = extra;
+            w->flash_extra_capacity = capacity;
+        }
+        f = &w->flash_extra[index];
+    }
+    w->flash_count++;
     memcpy(f->corner, corner, sizeof(f->corner));
     vec_copy(f->centre, centre);
     f->area = area;
@@ -229,8 +249,12 @@ bool q2_fx_flash_add(q2_fx_world *w, const s32 corner[4][3],
 
 void q2_fx_flash_clear(q2_fx_world *w)
 {
-    if (w)
+    if (w) {
+        free(w->flash_extra);
+        w->flash_extra = NULL;
+        w->flash_extra_capacity = 0;
         w->flash_count = 0;
+    }
 }
 
 s32 q2_fx_flash_angle(s32 spin, u32 frame)
@@ -239,12 +263,12 @@ s32 q2_fx_flash_angle(s32 spin, u32 frame)
     return (frame & 1u) ? (spin & 0xFFF) : ((spin - 128) & 0xFFF);
 }
 
-void q2_fx_flash_corners(const s32 centre[3], s32 angle, s32 out[4][3])
+void q2_fx_flash_corners(const s32 centre[3], s32 angle, s32 size, s32 out[4][3])
 {
     /* 0x80031288..0x800312B4: the table's cosine and sine scaled by the size
      * and divided by 4096 toward zero. */
-    s32 c = (q2_cos12(angle) * Q2_FX_FLASH_SIZE) / 4096;
-    s32 s = (q2_sin12(angle) * Q2_FX_FLASH_SIZE) / 4096;
+    s32 c = (q2_cos12(angle) * size) / 4096;
+    s32 s = (q2_sin12(angle) * size) / 4096;
     int k;
 
     if (!centre || !out)
@@ -257,14 +281,14 @@ void q2_fx_flash_corners(const s32 centre[3], s32 angle, s32 out[4][3])
         out[k][2] = centre[2];
 }
 
-void q2_fx_world_resize(q2_fx_world *w, u32 groups, u32 viewports)
+void q2_fx_world_resize(q2_fx_world *w, s32 requested, u32 viewports)
 {
+    u32 groups;
     if (!w)
         return;
 
     /* 0x80030C88: a zero argument means the shipped default. */
-    if (groups == 0)
-        groups = Q2_FX_GROUPS_DEFAULT;
+    groups = requested < 0 ? 0 : requested == 0 ? Q2_FX_GROUPS_DEFAULT : (u32)requested;
     if (groups > Q2_FX_GROUPS_MAX)
         groups = Q2_FX_GROUPS_MAX;
     if (viewports == 0)
@@ -279,6 +303,7 @@ void q2_fx_world_resize(q2_fx_world *w, u32 groups, u32 viewports)
     w->group_count    = groups;
     w->viewport_count = viewports;
     w->budget         = q2_fx_budget(groups, viewports);
+    w->budget_left    = w->budget;
 }
 
 void q2_fx_world_clear(q2_fx_world *w)
@@ -291,6 +316,8 @@ void q2_fx_world_clear(q2_fx_world *w)
 
     if (!w)
         return;
+
+    q2_fx_flash_clear(w);
 
     groups = w->group_count;
     views  = w->viewport_count;
@@ -314,7 +341,7 @@ void q2_fx_world_clear(q2_fx_world *w)
     w->clut       = clut;
     w->flash_clut = flash_clut;
     w->untextured = untextured;
-    q2_fx_world_resize(w, groups, views);
+    q2_fx_world_resize(w, groups ? (s32)groups : -1, views);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -567,7 +594,6 @@ static u32 draw_blurs(q2_fx_world *w, const q2_camera *cam, psx_ot *ot,
                     prim->rgb[c] = c < 2 ? colour : prev_colour;
                 prim->semi_transparent = true;
                 prim->textured_blend   = false;
-                prim->tpage = q2_surf_blend_table[Q2_SURF_WORLD_BLEND_SELECTOR];
                 emitted++;
                 w->stats.blur_quads++;
             }
@@ -1193,20 +1219,19 @@ s32 q2_fx_bolt_trail(q2_fx_world *w, q2_rng *rng, const s32 at[3],
          * word by `sll 16` first, so this is an arithmetic halving that rounds
          * toward negative infinity, not C's truncating `/ 2`.
          */
-        s32 half = ((s32)disp[k] << 16) >> 17;
+        s32 half = (s32)disp[k] >> 1;
 
-        origin[k] = at[k] - half;
+        origin[k] = (s32)((u32)at[k] - (u32)half);
 
         /* 0x80048364 `sra v0, a0, 20`: the same sign-extension, then >> 4. */
-        base[k] = (s16)(((s32)disp[k] << 16) >> 20);
+        base[k] = (s16)((s32)disp[k] >> 4);
 
         /*
          * 0x80048384 `sra a0, a0, 12` then `div` by record+0x4A. The shift is
          * on the ALREADY sign-extended word, so it is `disp << 4`, and the
          * divide is the compiler's signed one and truncates toward zero.
          */
-        step[k] = (s16)(((((s32)disp[k] << 16) >> 12)) /
-                        Q2_FX_BOLT_TRAIL_COUNT);
+        step[k] = (s16)(((s32)disp[k] * 16) / Q2_FX_BOLT_TRAIL_COUNT);
 
         /* 0x80048434..0x8004846C — and the spawner throws this entry away. */
         offs[0][k] = (s16)(-half);
@@ -1241,9 +1266,7 @@ s32 q2_fx_bolt_trail(q2_fx_world *w, q2_rng *rng, const s32 at[3],
 /* ------------------------------------------------------------------------- */
 /* The rail's spiral — the tail of 0x8004917C                                  */
 /* ------------------------------------------------------------------------- */
-/* An exact floor root standing in for SquareRootNR (0x80055CBC), whose seed is
- * libgte's table; shock.c makes the same substitution. The segment count only
- * moves when the length crosses a multiple of 1024, so a unit cannot show. */
+/* Floor root, also used below to derive the libgte seed table exactly. */
 static s32 rail_sqrt(s64 n)
 {
     u64 v = (u64)n, r = 0, bit = (u64)1 << 62;
@@ -1262,6 +1285,27 @@ static s32 rail_sqrt(s64 n)
         bit >>= 2;
     }
     return (s32)r;
+}
+
+/* SquareRootNR, 0x80055CBC. The 192 halfwords at 0x800AA340 are exactly
+ * floor(sqrt(index * 2^18)), index 64..255 (checked against the disc).
+ * Recreate the table entry, normalize like 0x8008A7E8, then perform the TWO
+ * signed integer Newton corrections. A floor root differs at segment/width
+ * boundaries; e.g. this returns 256 for 65535, not 255. Positive s32 input. */
+s32 q2_fx_sqrt_nr(u32 n)
+{
+    u32 bits = n, leading = 0, normalized, seed;
+    s32 root;
+    int i;
+    if (!n || n > 0x7FFFFFFFu) return 0;
+    while (!(bits & 0x80000000u)) { leading++; bits <<= 1; }
+    leading &= ~1u;
+    normalized = leading >= 24 ? n << (leading - 24) : n >> (24 - leading);
+    seed = (u32)rail_sqrt((s64)normalized << 18);
+    root = (s32)((seed << ((31 - leading) / 2)) >> 12);
+    for (i = 0; i < 2; i++)
+        root -= (s32)((u32)root * (u32)root - n) / (2 * root);
+    return root;
 }
 
 u32 q2_fx_rail_trail(q2_fx_world *w, const s32 start[3], const s32 end[3],
@@ -1851,9 +1895,9 @@ void q2_fx_beams_reset(q2_fx_world *w)
 }
 
 /* ------------------------------------------------------------------------- */
-bool q2_fx_beam_timed(q2_fx_world *w, s32 owner, s32 target,
+static bool beam_timed(q2_fx_world *w, s32 owner, s32 target,
                       const s32 from[3], const s32 to[3],
-                      s16 radius, u32 style, s16 life, u8 area)
+                      s16 radius, u32 style, s16 life, u8 area, s16 attachment)
 {
     const q2_fx_beam_style *s;
     q2_fx_timed_beam *slot = NULL;
@@ -1874,7 +1918,8 @@ bool q2_fx_beam_timed(q2_fx_world *w, s32 owner, s32 target,
      */
     for (i = 0; i < Q2_FX_TIMED_BEAMS_MAX; i++) {
         if (w->timed[i].timer > 0 &&
-            w->timed[i].owner == owner && w->timed[i].target == target) {
+            w->timed[i].owner == owner && w->timed[i].target == target &&
+            w->timed[i].attachment == attachment) {
             slot = &w->timed[i];
             break;
         }
@@ -1898,6 +1943,8 @@ bool q2_fx_beam_timed(q2_fx_world *w, s32 owner, s32 target,
     slot->owner  = owner;
     slot->target = target;
     slot->timer  = life;
+    slot->present = life > 0;
+    slot->attachment = attachment;
     slot->radius = radius;
     /* The area the submit will spend, resolved by the caller from the owner's
      * own cell — 0x80048D24's helper does it from the owner entity on every
@@ -1912,6 +1959,19 @@ bool q2_fx_beam_timed(q2_fx_world *w, s32 owner, s32 target,
     return true;
 }
 
+bool q2_fx_beam_timed(q2_fx_world *w, s32 owner, s32 target,
+                      const s32 from[3], const s32 to[3],
+                      s16 radius, u32 style, s16 life, u8 area)
+{
+    return beam_timed(w, owner, target, from, to, radius, style, life, area, -1);
+}
+
+bool q2_fx_beam_attached(q2_fx_world *w, s32 owner, s32 target, s16 vertex,
+                         const s32 from[3], const s32 to[3], u8 area)
+{
+    return beam_timed(w, owner, target, from, to, 10, 4, 45, area, vertex);
+}
+
 void q2_fx_timed_tick(q2_fx_world *w, s32 frame_delta)
 {
     u32 i;
@@ -1919,8 +1979,10 @@ void q2_fx_timed_tick(q2_fx_world *w, s32 frame_delta)
     if (!w)
         return;
 
-    /* 0x80048CE8: subtract and clamp at zero. The record is left in place. */
+    /* 0x80048CE0 tests before subtracting. Even the tick that reaches zero
+     * continues to the submit at 0x80048D98, in every viewport that frame. */
     for (i = 0; i < Q2_FX_TIMED_BEAMS_MAX; i++) {
+        w->timed[i].present = w->timed[i].timer > 0;
         if (w->timed[i].timer <= 0)
             continue;
         w->timed[i].timer = (s16)(w->timed[i].timer - frame_delta);
@@ -2412,30 +2474,34 @@ void q2_fx_glint_shade(const s16 *vertex_band, u32 count,
     }
 }
 
-u32 q2_fx_glint_build_ot(const q2_fx_glint_mesh *mesh,
-                         const s32 origin[3], s32 yaw,
+static u32 glint_build_ot(const q2_fx_glint_mesh *mesh,
+                         const s32 origin[3], const s16 spin[3][3], s32 area,
+                         s32 owner_batch,
                          const u8 tint_rgb[3], s32 width, s32 phase,
                          const q2_camera *cam, psx_ot *ot, gte_state *gte)
 {
-    /* The Z-order-to-perimeter swap, as everywhere else here. */
-    static const int k_perimeter[4] = { 0, 1, 3, 2 };
-
-    s16 spin[3][3];
+    gte_matrix view;
     gte_sxy xy[Q2_FX_GLINT_VERTS];
     u16     z[Q2_FX_GLINT_VERTS];
     bool    ok[Q2_FX_GLINT_VERTS];
     u8      rgb[Q2_FX_GLINT_VERTS][3];
     s16     vz[Q2_FX_GLINT_VERTS];
     u32     count, i, f, emitted = 0;
+    u32     area_bucket = 0;
+    bool    routed;
+    s32     batch = PSX_OT_BATCH_INVALID;
 
     if (!mesh || !mesh->vert || !mesh->index || !origin || !tint_rgb ||
         !cam || !ot || !gte || width == 0)
         return 0;
 
-    /* The retail custom-entity driver selects entity+0x9E before reaching this
-     * emitter.  This legacy entry point has no area argument, so it likewise
-     * consumes the caller's current projection.  In particular, selector -1
-     * must not be used as a reset: 0x80065684 returns immediately for it. */
+    routed = area >= 0 && psx_ot_area_active(ot);
+    if (routed && !psx_ot_area_bucket(ot, (u32)area & 0x7Fu, &area_bucket))
+        return 0;
+    q2_camera_apply_area_projection(cam, ot, area, gte);
+    q2_rotation_view_anamorphic(view.m, cam->yaw, cam->pitch, cam->roll);
+    gte_set_rotation(gte, &view);
+    gte_set_translation(gte, 0, 0, 0);
 
     /*
      * 0x800649C8 transforms vertices in threes while its counter is under 94,
@@ -2447,8 +2513,6 @@ u32 q2_fx_glint_build_ot(const q2_fx_glint_mesh *mesh,
         count = Q2_FX_GLINT_VERTS;
     if (count == 0 || mesh->face_count == 0)
         return 0;
-
-    q2_rotation_yaw_pitch(spin, yaw, 0);
 
     /*
      * The band reads the vertex's FOURTH halfword, before any transform —
@@ -2479,16 +2543,13 @@ u32 q2_fx_glint_build_ot(const q2_fx_glint_mesh *mesh,
                                   &xy[i], &z[i]);
     }
 
-    for (f = 0; f < mesh->face_count; f++) {
+    for (f = 0; f < mesh->face_count && f < Q2_FX_GLINT_MAX_FACES; f++) {
         const u8 *idx = &mesh->index[f * 4u];
         psx_prim *prim;
         u32 depth = 0;
         bool good = true;
+        bool lit = false;
         int c;
-
-        /* 0x80064BC4 stops at 79 primitives, whatever the mesh has left. */
-        if (emitted >= Q2_FX_GLINT_MAX_FACES)
-            break;
 
         for (c = 0; c < 4; c++) {
             if (idx[c] >= count || !ok[idx[c]]) {
@@ -2496,25 +2557,46 @@ u32 q2_fx_glint_build_ot(const q2_fx_glint_mesh *mesh,
                 break;
             }
             depth += z[idx[c]];
+            lit |= rgb[idx[c]][0] || rgb[idx[c]][1] || rgb[idx[c]][2];
         }
-        if (!good)
+        /* 0x80064A38 skips wholly black faces; 0x80064BC4 counts visited
+         * faces, including skipped ones, rather than emitted packets. */
+        if (!good || !lit)
             continue;
 
-        prim = psx_ot_add_depth(ot,
+        if (routed && batch < 0 && owner_batch < 0)
+            batch = psx_ot_batch_begin_point(ot, (u32)area & 0x7Fu, false,
+                                             (s16)(depth / 4), origin, cam->pos);
+        prim = owner_batch >= 0 ? psx_ot_alloc(ot)
+             : batch >= 0 ? psx_ot_batch_add(ot, batch)
+             : routed ? psx_ot_add_bucket_depth(ot, area_bucket, (u16)(depth / 4),
+                                                 depth / 4)
+             : psx_ot_add_depth(ot,
                                 (u16)bucket_for(ot, depth, 4, cam->sort_range),
                                 sort_key_for(depth, 4));
         if (!prim)
             break;
 
-        /* Gouraud and additive: the band is a brightness, and a glint that
-         * occluded what was behind it would be a solid tube rather than a
-         * glow. */
+        if (owner_batch >= 0) {
+            /* The disc indices are perimeter order; retail swaps 2/3 when
+             * writing hardware's Z-order packet. Its NCLIP uses 0,1,3. */
+            gte->sxy[0] = xy[idx[0]];
+            gte->sxy[1] = xy[idx[1]];
+            gte->sxy[2] = xy[idx[3]];
+            gte_nclip(gte);
+            if (gte->mac0 < 0)
+                psx_ot_batch_link_prim(ot, owner_batch, prim);
+            else
+                psx_ot_batch_append_prim(ot, owner_batch, prim);
+        }
+
+        /* An untextured Gouraud packet: ABE is explicit, but ABR comes from
+         * the last textured polygon or draw-mode command in the final OT. */
         prim->kind = PSX_PRIM_G4;
         prim->semi_transparent = true;
-        prim->tpage = Q2_FX_ABR_ADD;
 
         for (c = 0; c < 4; c++) {
-            u32 v = idx[k_perimeter[c]];
+            u32 v = idx[c];
             /* Field by field: gte_sxy and psx_xy have the same layout but
              * are distinct types, so reading one through the other is
              * undefined. The compiler emits the same load either way. */
@@ -2533,6 +2615,17 @@ u32 q2_fx_glint_build_ot(const q2_fx_glint_mesh *mesh,
 }
 
 /* ------------------------------------------------------------------------- */
+u32 q2_fx_glint_build_ot(const q2_fx_glint_mesh *mesh,
+                         const s32 origin[3], s32 yaw,
+                         const u8 tint_rgb[3], s32 width, s32 phase,
+                         const q2_camera *cam, psx_ot *ot, gte_state *gte)
+{
+    s16 spin[3][3];
+    q2_rotation_yaw_pitch(spin, yaw, 0);
+    return glint_build_ot(mesh, origin, (const s16 (*)[3])spin, -1, -1,
+                          tint_rgb, width, phase, cam, ot, gte);
+}
+
 bool q2_fx_glint_scan(q2_fx_glint_script *out, const u8 *levelbin, u32 size)
 {
     u32 i;
@@ -2621,10 +2714,81 @@ bool q2_fx_glint_scan(q2_fx_glint_script *out, const u8 *levelbin, u32 size)
         }
     }
 
+    /* BIGGUN +0x1B54: address of the authored angle triples, followed by
+     * halfword indexing and the table-base addition. This works on the raw
+     * module too: relocation changes the LUI, not this small data offset. */
+    for (i = out->raise_offset; i + 12 <= size; i += 4) {
+        u32 p = q2_rd_u32(levelbin + i);
+        u32 off, n, k;
+        if ((p & 0xFFFF0000u) != 0x24420000u ||
+            q2_rd_u32(levelbin + i + 4) != 0x00161840u ||
+            q2_rd_u32(levelbin + i + 8) != 0x00628021u)
+            continue;
+        off = p & 0xFFFFu;
+        n = out->band_count;
+        if (!n || n > Q2_FX_GLINT_BANDS_MAX || off > size || n * 6 > size - off)
+            break;
+        for (k = 0; k < n * 3; k++)
+            out->angle[k / 3][k % 3] = q2_rd_s16(levelbin + off + k * 2);
+        out->bands_found = true;
+        break;
+    }
+    if (out->bands_found) {
+        u32 target = 0, uv = 0, k;
+        /* +0x1C94: endpoint table, with the AddBeam copy's index in the
+         * call's delay slot. +0x438: eight animated UV pairs. */
+        for (i = 0; i + 16 <= size; i += 4) {
+            u32 p = q2_rd_u32(levelbin + i);
+            if ((p & 0xFFFF0000u) != 0x24420000u)
+                continue;
+            if (q2_rd_u32(levelbin + i + 12) == 0x02228021u &&
+                (q2_rd_u32(levelbin + i + 8) >> 26) == 3)
+                target = p & 0xFFFFu;
+            if (q2_rd_u32(levelbin + i + 4) == 0x0062B021u)
+                uv = p & 0xFFFFu;
+        }
+        if (target && uv && target <= size && uv <= size &&
+            out->band_count * 12u <= size - target && 16 <= size - uv) {
+            for (k = 0; k < out->band_count * 3u; k++)
+                out->target[k / 3][k % 3] = q2_rd_s32(levelbin + target + k * 4);
+            memcpy(out->uv, levelbin + uv, sizeof(out->uv));
+            out->lightning_found = true;
+        }
+        for (i = 0; i + 20 <= size; i += 4) {
+            u32 p = q2_rd_u32(levelbin + i), off = p & 0xFFFFu;
+            if ((p & 0xFFFF0000u) == 0x24840000u &&
+                q2_rd_u32(levelbin + i + 12) == 0x02602821u &&
+                q2_rd_u32(levelbin + i + 16) == 0x8CE600DCu &&
+                off <= size && 12 <= size - off) {
+                for (k = 0; k < 3; k++)
+                    out->spark_origin[k] = q2_rd_s32(levelbin + off + k * 4);
+                break;
+            }
+        }
+    }
     return true;
 }
 
 /* ------------------------------------------------------------------------- */
+void q2_fx_glint_refresh(q2_fx_glint *g, const s32 angles[3])
+{
+    u32 i, k;
+    if (!g || !angles || !g->scripted)
+        return;
+    g->phase = Q2_FX_GLINT_PHASE_START;
+    for (i = 0; i < g->band_count && i < Q2_FX_GLINT_BANDS_MAX; i++) {
+        u32 rgb = 0;
+        /* BIGGUN +0x1B78: signed divide by 256, toward zero. */
+        for (k = 0; k < 3; k++)
+            g->band[i].angle[k] = (s16)(g->base_angle[i][k] - angles[k] +
+                (q2_rng_next(&g->script_rng) - 16384) / 256);
+        g->band[i].phase = Q2_FX_GLINT_PHASE_START; /* +0x1D50 */
+        for (k = 0; k < 3; k++)
+            rgb |= (u32)(u8)q2_rng_next(&g->script_rng) << (k * 8);
+        g->band[i].colour = rgb;
+    }
+}
+
 void q2_fx_glint_advance(q2_fx_glint *g)
 {
     u32 i, n;
@@ -2646,9 +2810,9 @@ void q2_fx_glint_advance(q2_fx_glint *g)
      * to the start would look tidier and would be this port inventing a reload
      * the console does not perform.
      *
-     * The one divergence is WHERE this happens. The original decrements inside
-     * the draw, once per band per call, so a two-viewport frame advances every
-     * band twice; doing it on the tick instead keeps split screen honest.
+     * The caller advances after the rendered frame, only if the owner was
+     * drawn. The original decrements inside each viewport draw; this port
+     * shares that frame's phase across viewports before consuming it once.
      */
     if (g->band_count == 0) {
         g->phase = (u16)(g->phase - 1u);
@@ -2666,15 +2830,45 @@ void q2_fx_glint_advance(q2_fx_glint *g)
 u32 q2_fx_glint_draw(const q2_fx_glint *g, const s32 origin[3], s32 yaw,
                      const q2_camera *cam, psx_ot *ot, gte_state *gte)
 {
-    u32 emitted = 0, i, n;
+    s32 angles[3] = { 0, yaw, 0 };
+    return q2_fx_glint_draw_entity(g, origin, angles, -1, cam, ot, gte);
+}
 
-    if (!g || !g->ready || !origin || !cam || !ot || !gte)
+u32 q2_fx_glint_draw_entity(const q2_fx_glint *g, const s32 origin[3],
+                            const s32 angles[3], s32 area,
+                            const q2_camera *cam, psx_ot *ot, gte_state *gte)
+{
+    s16 rotation[3][3];
+    if (!angles)
         return 0;
+    q2_rotation_euler(rotation, angles[0], angles[1], angles[2]);
+    return q2_fx_glint_draw_attached(g, origin, (const s16 (*)[3])rotation,
+                                    area, -1, cam, ot, gte);
+}
+
+u32 q2_fx_glint_draw_attached(const q2_fx_glint *g, const s32 origin[3],
+                              const s16 rotation[3][3], s32 area, s32 batch,
+                              const q2_camera *cam, psx_ot *ot, gte_state *gte)
+{
+    u32 emitted = 0, i, n;
+    s16 entity[3][3];
+    int r, c;
+
+    if (!g || !g->ready || !origin || !rotation || !cam || !ot || !gte ||
+        (batch >= 0 && (u32)batch >= ot->batch_count))
+        return 0;
+
+    /* 0x80064DB4 calls 0x80055AF8 with the three 768s at 0x800AEB30.
+     * That helper divides by 256 (toward zero), NOT the rotation matrix's
+     * 4096 unit. The glint's object scale is 3, not 3/16. */
+    for (r = 0; r < 3; r++)
+        for (c = 0; c < 3; c++)
+            entity[r][c] = (s16)(((s32)rotation[r][c] * 768) / 256);
 
     /* 0x80064CE4: a zero count takes the single-band path, which uses the
      * entity's own colour, phase and width. */
     if (g->band_count == 0) {
-        return q2_fx_glint_build_ot(&g->mesh, origin, yaw, g->tint,
+        return glint_build_ot(&g->mesh, origin, (const s16 (*)[3])entity, area, batch, g->tint,
                                     Q2_FX_GLINT_ONE_WIDTH, (s32)g->phase,
                                     cam, ot, gte);
     }
@@ -2686,28 +2880,181 @@ u32 q2_fx_glint_draw(const q2_fx_glint *g, const s32 origin[3], s32 yaw,
     for (i = 0; i < n; i++) {
         const q2_fx_glint_band *b = &g->band[i];
         u8 tint[3];
+        s16 band[3][3], spin[3][3];
 
         tint[0] = q2_fx_colour_r(b->colour);
         tint[1] = q2_fx_colour_g(b->colour);
         tint[2] = q2_fx_colour_b(b->colour);
 
-        /*
-         * Each band composes its own orientation with the entity's — 0x80064DA4
-         * builds a matrix from the record's three angles and 0x80064DC4
-         * multiplies it by the entity's own. The port folds the band's yaw into
-         * the instance yaw, which is the same composition for the single axis
-         * the mesh is ever placed on; a band with pitch or roll would need the
-         * full multiply, and none on this disc has one.
-         *
-         * The multi-band width is 4096, HALF the single path's — which by the
-         * shading formula makes each band narrower and twice as bright.
-         */
-        emitted += q2_fx_glint_build_ot(&g->mesh, origin, yaw + b->angle[1],
+        q2_rotation_euler(band, b->angle[0], b->angle[1], b->angle[2]);
+        for (r = 0; r < 3; r++) {
+            for (c = 0; c < 3; c++) {
+                s32 sum = 0;
+                int k;
+                for (k = 0; k < 3; k++)
+                    sum += (s32)entity[r][k] * band[k][c];
+                spin[r][c] = (s16)(sum >> 12);
+            }
+        }
+        emitted += glint_build_ot(&g->mesh, origin, (const s16 (*)[3])spin, area, batch,
                                         tint, Q2_FX_GLINT_BAND_WIDTH,
                                         (s32)b->phase, cam, ot, gte);
     }
 
     return emitted;
+}
+
+/* ------------------------------------------------------------------------- */
+/* BIGGUN's lightning — LevelBin +0x138 / +0x38C                              */
+/* ------------------------------------------------------------------------- */
+void q2_fx_glint_lightning_tick(q2_fx_glint *g, q2_rng *rng)
+{
+    static const s32 bias[8] = {24000, 20000, 8000, 16384,
+                                12000, 6000, 24000, 27000};
+    u32 i;
+    if (!g || !rng || !g->raised || !g->lightning_ready)
+        return;
+    for (i = 0; i < 8; i++) {
+        s32 v;
+        /* Unsigned addition reproduces the MIPS wrap without signed C
+         * overflow. The following divide is signed and truncates to zero. */
+        g->lightning_noise[i] += (u32)(q2_rng_next(rng) - bias[i]) << 15;
+        v = (s32)g->lightning_noise[i] / 131072;
+        g->lightning_offset[i] = (v < 0 ? -v : v) - 8192;
+    }
+}
+
+u32 q2_fx_glint_lightning_draw(const q2_fx_glint *g, u16 tpage, u16 clut,
+                               const q2_camera *cam, psx_ot *ot, gte_state *gte)
+{
+    s16 owner[3][3];
+    gte_matrix view;
+    u32 b, n, made = 0, area_bucket = 0;
+    bool routed;
+    const u8 *uv;
+
+    if (!g || !g->ready || !g->raised || !g->lightning_ready ||
+        !cam || !ot || !gte)
+        return 0;
+    routed = psx_ot_area_active(ot);
+    if (routed && !psx_ot_area_bucket(ot, g->area, &area_bucket))
+        return 0;
+    q2_camera_apply_area_projection(cam, ot, g->area, gte);
+    q2_rotation_view_anamorphic(view.m, cam->yaw, cam->pitch, cam->roll);
+    gte_set_rotation(gte, &view);
+    gte_set_translation(gte, 0, 0, 0);
+    q2_rotation_euler(owner, g->angles[0], g->angles[1], g->angles[2]);
+    uv = g->lightning_uv[((g->lightning_frame + (g->lightning_frame >> 31)) & 14u) >> 1];
+    n = g->band_count;
+    if (n > Q2_FX_GLINT_BANDS_MAX)
+        n = Q2_FX_GLINT_BANDS_MAX;
+
+    /* Two 1280-byte pools, 40 bytes per FT4: 32 polygons for ALL six beams,
+     * not 32 per beam (+0x32D8). A full pool leaves later beams undrawn. */
+    for (b = 0; b < n && made < 32; b++) {
+        const q2_fx_glint_band *band = &g->band[b];
+        s16 spin[3][3];
+        s32 from[3], delta[3], lo[3], hi[3], length, segments, full;
+        gte_sxy xy[33];
+        u16 z[33];
+        psx_xy edge[33][2];
+        s32 dx[33], dy[33], step[3];
+        s32 batch = PSX_OT_BATCH_INVALID;
+        s32 i;
+        int r, k;
+        s64 distance = 0;
+
+        q2_rotation_euler(spin, band->angle[0], band->angle[1], band->angle[2]);
+        for (r = 0; r < 3; r++) {
+            s32 sum = 0;
+            for (k = 0; k < 3; k++)
+                sum += (((s32)owner[r][k] * 768) / 256) * spin[k][2];
+            /* Scale/compose the same matrix as the glow, then transform its
+             * (0,0,512) tip (+0x1C10..+0x1C88). */
+            from[r] = g->origin[r] + (((sum >> 12) * 512) >> 12);
+            delta[r] = g->lightning_target[b][r] - from[r];
+            distance += (s64)delta[r] * delta[r];
+            lo[r] = delta[r] < 0 ? g->lightning_target[b][r] : from[r];
+            hi[r] = delta[r] > 0 ? g->lightning_target[b][r] : from[r];
+        }
+        length = q2_fx_sqrt_nr((u32)distance);
+        if (!length)
+            continue;
+        segments = (length + 255) / 256;
+        if (segments > 32)
+            segments = 32;
+        full = length / 256;
+        if (full > segments)
+            full = segments;
+        for (k = 0; k < 3; k++)
+            step[k] = (s32)((s64)delta[k] * (16777216 / length));
+        for (i = 0; i <= segments; i++) {
+            s32 rel[3];
+            for (k = 0; k < 3; k++) {
+                s32 point = i == segments ? g->lightning_target[b][k]
+                    : from[k] + (s32)((s64)step[k] * i / 65536);
+                /* The original projects signed halfword differences. */
+                rel[k] = (s16)(point - cam->pos[k]);
+            }
+            (void)gte_project_point(gte, rel[0], rel[1], rel[2], &xy[i], &z[i]);
+        }
+        for (i = 0; i < segments; i++) {
+            dx[i] = (s32)xy[i].x - xy[i + 1].x;
+            dy[i] = (s32)xy[i].y - xy[i + 1].y;
+        }
+        dx[segments] = dx[segments - 1];
+        dy[segments] = dy[segments - 1];
+        for (i = 0; i <= segments; i++) {
+            s32 sx = 0, sy = 0, jx = 0, jy = 0;
+            s32 denom = q2_fx_sqrt_nr((u32)(dx[i] * dx[i] + dy[i] * dy[i]))
+                      * (s16)z[i];
+            if (denom) {
+                sx = dy[i] * 16384 / denom;
+                sy = dx[i] * 16384 / denom;
+                if (i && i != segments) {
+                    jx = (s32)((s64)dy[i] * 2 * g->lightning_offset[i & 7] / denom);
+                    jy = (s32)((s64)dx[i] * 2 * g->lightning_offset[(i + 4) & 7] / denom);
+                }
+            }
+            edge[i][0].x = (s16)(xy[i].x - sx + jx);
+            edge[i][0].y = (s16)(xy[i].y + sy + jy);
+            edge[i][1].x = (s16)(xy[i].x + sx + jx);
+            edge[i][1].y = (s16)(xy[i].y - sy + jy);
+        }
+        for (i = 0; i < segments && made < 32; i++) {
+            s32 width = i < full ? 63 : ((length & 255) * 64 / 256);
+            psx_prim *p;
+            u32 depth;
+            if (!width || (s16)z[i] < 192 || (s16)z[i + 1] < 192)
+                continue;
+            depth = ((u32)z[i] + z[i + 1]) / 2;
+            if (routed && batch < 0)
+                batch = psx_ot_batch_begin_box(ot, g->area, false, 0,
+                                                lo, hi, cam->pos);
+            p = batch >= 0 ? psx_ot_batch_add(ot, batch)
+                : routed ? psx_ot_add_bucket(ot, area_bucket)
+                : psx_ot_add_depth(ot, (u16)bucket_for(ot, depth, 1, cam->sort_range), depth);
+            if (!p)
+                return made;
+            p->kind = PSX_PRIM_FT4;
+            p->quad_zorder = true;
+            p->semi_transparent = true;
+            p->textured_blend = true;
+            p->tpage = tpage;
+            p->clut = clut;
+            p->rgb[0].r = p->rgb[0].g = p->rgb[0].b = 128;
+            p->xy[0] = edge[i][0];
+            p->xy[1] = edge[i + 1][0];
+            p->xy[2] = edge[i][1];
+            p->xy[3] = edge[i + 1][1];
+            for (k = 0; k < 4; k++) {
+                p->uv[k].u = (u8)(uv[0] + ((k & 1) ? width : 0));
+                p->uv[k].v = (u8)(uv[1] + ((k & 2) ? 23 : 0));
+            }
+            made++;
+        }
+    }
+    return made;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2799,7 +3146,7 @@ static u32 draw_groups(q2_fx_world *w, const q2_camera *cam, u32 viewport,
                        psx_ot *ot, gte_state *gte, const s16 view[3][3])
 {
     u32 emitted = 0, slot;
-    s32 budget = (s32)w->budget;
+    s32 budget = (s32)w->budget_left;
 
     for (slot = 0; slot < w->group_count; slot++) {
         q2_fx_group *g = &w->group[slot];
@@ -3002,6 +3349,7 @@ static u32 draw_groups(q2_fx_world *w, const q2_camera *cam, u32 viewport,
         }
 
         budget -= (s32)g->count;
+        w->budget_left = (u32)budget;
         w->stats.groups_drawn++;
     }
 
@@ -3118,7 +3466,7 @@ static void submit_timed(q2_fx_world *w)
     for (i = 0; i < Q2_FX_TIMED_BEAMS_MAX; i++) {
         const q2_fx_timed_beam *t = &w->timed[i];
 
-        if (t->timer <= 0 || !t->tube)
+        if (!t->present || !t->tube)
             continue;
 
         /* 0x80048D50 `lh a3, 64(sp)` — the area 0x8004E920 resolved for the
@@ -3262,7 +3610,8 @@ static u32 draw_flashes(q2_fx_world *w, const q2_camera *cam, psx_ot *ot,
     u32 emitted = 0, i;
 
     for (i = 0; i < w->flash_count; i++) {
-        const q2_fx_flash *f = &w->flash[i];
+        const q2_fx_flash *f = i < Q2_FX_FLASH_MAX ? &w->flash[i]
+                                    : &w->flash_extra[i - Q2_FX_FLASH_MAX];
         static const u8 uv[4][2] = {
             { Q2_FX_FLASH_U0, Q2_FX_FLASH_V0 }, { Q2_FX_FLASH_U1, Q2_FX_FLASH_V0 },
             { Q2_FX_FLASH_U0, Q2_FX_FLASH_V1 }, { Q2_FX_FLASH_U1, Q2_FX_FLASH_V1 }
@@ -3354,8 +3703,10 @@ u32 q2_fx_build_ot(q2_fx_world *w,
      * every viewport would queue each timed beam twice in split screen, so it
      * happens only for the first.
      */
-    if (viewport == 0)
+    if (viewport == 0) {
+        w->budget_left = w->budget;
         submit_timed(w);
+    }
 
     emitted += draw_groups(w, cam, viewport, ot, gte, view);
     emitted += draw_beams(w, cam, ot, gte);

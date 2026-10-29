@@ -115,6 +115,7 @@ python scripts/version.py resolve --bump minor      # what would this release be
 python scripts/changelog.py show                    # what would the notes say?
 python scripts/release_notes.py --version 0.2.0     # the whole rendered body
 python scripts/package.py stage --platform linux-x64
+python scripts/package.py stage --build-dir build-msvc --config Release --platform windows-x64
 python scripts/package.py checksums --archive-dir dist
 ```
 
@@ -129,10 +130,37 @@ here fails on a pull request rather than at release time.
 
 ## What ends up in an archive
 
-An explicit list, in [`scripts/package.py`](../scripts/package.py) — the three
-executables, any runtime library they need beside them, and the documentation.
-Never a glob over a directory.
+[`scripts/package.py`](../scripts/package.py) uses an explicit allowlist:
 
-This project ships **no game assets**, and a glob is one stray output file away
-from redistributing something that is not ours to redistribute. A list cannot
-be. If you add a file to a release, add it to that list and say why.
+- `q2psx`, `q2psx-inspect` and `stx2avi`, with their platform extensions and runtime libraries.
+- `USER-GUIDE.html`, the complete offline player manual, stamped with the release version.
+- `README.txt`, a short, platform-specific entry point to the manual and game.
+- `LICENSE`, `CREDITS.md` and the full `CHANGELOG.md`.
+- `Play.cmd` and `Play.vbs` on Windows.
+
+The repository README, implementation notes and format specifications stay in
+the source repository. The manual links to them online where appropriate;
+its essential instructions, styling and navigation need no internet access.
+Commercial artwork, disc-derived media, reconstructed fonts, disc images,
+saves and local settings are excluded. Do not add a directory glob to the
+package allowlist.
+
+## Maintaining the player guide
+
+Edit [`USER-GUIDE.html`](../USER-GUIDE.html) directly; it is a standalone,
+readable source document. Keep its single `build-version` marker intact.
+The packager replaces “Development edition” with the resolved release version.
+Windows `stage-local` stamps and copies the same guide using CMake, so a normal
+local build also leaves a current manual in `.install/` without requiring Python.
+
+Follow [the visual design reference](DESIGN.md), especially document mode,
+readability, editorial voice and the user-guide layout. Use the palette from
+`docs/design/tokens.json`, installed reading-font fallbacks, restrained section
+numbers and one-column procedures. Local reconstructed display fonts and
+commercial reference imagery are not release assets.
+
+Before release, run the tooling tests, open the **packaged** HTML offline,
+check a narrow viewport and browser print preview, and follow its local links.
+The tests check version stamping, navigation targets, offline dependencies,
+palette consistency and archive contents. They do not replace visual review
+or checking instructions against the current client.

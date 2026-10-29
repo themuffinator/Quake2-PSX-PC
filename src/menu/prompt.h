@@ -152,6 +152,12 @@ void q2_prompt_sync_menu(q2_prompt_bar *b, const q2_menu *m, bool front_end);
 u32 q2_prompt_build_ot(const q2_prompt_bar *b, const q2_menu_font *font,
                        psx_ot *ot, u32 bucket);
 
+/* Host bindings as "BUTTON ACTION", with inset keycaps, the disc's small face
+ * and the same animated positions. NULL entries omit individual prompts. */
+u32 q2_prompt_build_labels(const q2_prompt_bar *b, const q2_menu_font *font,
+                           psx_ot *ot, u32 bucket, int ox, int oy,
+                           const char *const labels[Q2_PROMPT_COUNT]);
+
 #ifdef __cplusplus
 }
 #endif

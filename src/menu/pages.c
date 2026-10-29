@@ -120,6 +120,21 @@ static const q2_menu_item k_video_sp[] = {
     { "RESET TO DEFAULTS", 256, 137, Q2_ACT_RESET_VIDEO,   Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
 };
 
+/* PC display controls, deliberately separate from the disc transcriptions. */
+static const q2_menu_item k_video_host_sp[] = {
+    { "SCREEN POSITION",   256,  85, Q2_ACT_PAGE_POSITION, Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+    { "CRT EMULATION",     256, 111, Q2_ACT_NONE, Q2_SET_CRT, Q2_WIDGET_TOGGLE, 0 },
+    { "BLOOM",             256, 137, Q2_ACT_NONE, Q2_SET_BLOOM, Q2_WIDGET_TOGGLE, 0 },
+    { "RESET TO DEFAULTS", 256, 163, Q2_ACT_RESET_VIDEO, Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+};
+static const q2_menu_item k_video_host_mp[] = {
+    { "HORIZONTAL SPLIT",  256,  72, Q2_ACT_NONE, Q2_SET_HORIZONTAL_SPLIT, Q2_WIDGET_TOGGLE, 0 },
+    { "SCREEN POSITION",   256,  98, Q2_ACT_PAGE_POSITION, Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+    { "CRT EMULATION",     256, 124, Q2_ACT_NONE, Q2_SET_CRT, Q2_WIDGET_TOGGLE, 0 },
+    { "BLOOM",             256, 150, Q2_ACT_NONE, Q2_SET_BLOOM, Q2_WIDGET_TOGGLE, 0 },
+    { "RESET TO DEFAULTS", 256, 176, Q2_ACT_RESET_VIDEO, Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+};
+
 /* SCREEN POSITION — 0x8009AF4C, followed by the empty table at 0x8009B30C,
  * so nothing on it is navigable: the d-pad drives the offset directly and
  * the page's own hook (0x8001CD64) applies it. */
@@ -493,6 +508,17 @@ static const q2_menu_item k_front_rules_versus[] = {
     { "REACH SCORE LIMIT WINS.",     256, 196, Q2_ACT_NONE, Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
 };
 
+/* QFRONT +4454: both tables use the 16-pixel face; no title or Back action.
+ * The fourth static row is replaced with SILVER/GOLD at runtime. */
+static const q2_menu_item k_front_unlock[] = {
+    { "WELL DONE",            256,  61, Q2_ACT_NONE,             Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+    { "DO YOU WISH TO SAVE",  256,  82, Q2_ACT_NONE,             Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+    { "AN UNLOCK FILE",       256, 103, Q2_ACT_NONE,             Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+    { "FOR BRONZE CHEATS?",   256, 124, Q2_ACT_NONE,             Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+    { "YES",                  256, 166, Q2_ACT_UNLOCK_SAVE,      Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+    { "NO",                   256, 187, Q2_ACT_PAGE_FRONT_TITLE, Q2_SET_NONE, Q2_WIDGET_TEXT, 0 },
+};
+
 static const q2_menu_page k_pages[] = {
     { Q2_PAGE_SCREEN_POSITION,  "POSITION",   k_position,         N(k_position),         N(k_position),      Q2_ACT_PAGE_VIDEO,   0x8009AF4Cu, EMPTY },
     { Q2_PAGE_PAUSE_SP,         "PAUSED",     k_pause_sp,         N(k_pause_sp),         0,                  Q2_ACT_NONE,         0x8009AA0Cu, 0 },
@@ -534,6 +560,8 @@ static const q2_menu_page k_pages[] = {
     { Q2_PAGE_FRONT_NEWLOAD,    "SINGLE PLAYER", k_front_newload,    N(k_front_newload),    0,                  Q2_ACT_BACK,         0x8010EF9Cu, 0 },
     { Q2_PAGE_FRONT_SKILL,      "DIFFICULTY",    k_front_skill,      N(k_front_skill),      0,                  Q2_ACT_BACK,         0x8010EFE4u, 0 },
     { Q2_PAGE_FRONT_MULTI,      "MULTIPLAYER",   k_front_multi,      N(k_front_multi),      0,                  Q2_ACT_BACK,         0x8010F104u, 0 },
+    { Q2_PAGE_FRONT_PLAYERS, NULL, NULL, 0, 0, Q2_ACT_NONE, 0, 0 },
+    { Q2_PAGE_FRONT_UNLOCK, NULL, k_front_unlock, N(k_front_unlock), 4, Q2_ACT_NONE, 0x8010F044u, 0x8010F0BCu },
     { Q2_PAGE_FRONT_DMSETUP,    "DEATHMATCH",   k_front_dmsetup,    N(k_front_dmsetup),    0,                  Q2_ACT_BACK,         0x8010F914u, 0 },
     { Q2_PAGE_FRONT_RULES,      "DEATHMATCH",    k_front_rules_dm,   N(k_front_rules_dm),   N(k_front_rules_dm), Q2_ACT_BACK,        0x8010F434u, EMPTY_FRONT },
 };
@@ -634,6 +662,15 @@ const q2_menu_page *q2_menu_variables_page(int cheat_level)
 const q2_menu_page *q2_menu_video_page(bool multiplayer)
 {
     return multiplayer ? &k_video_mp_page : q2_menu_page_find(Q2_PAGE_VIDEO);
+}
+
+const q2_menu_page *q2_menu_video_host_page(bool multiplayer)
+{
+    static const q2_menu_page pages[2] = {
+        { Q2_PAGE_VIDEO, "VIDEO", k_video_host_sp, N(k_video_host_sp), 0, Q2_ACT_BACK, 0, 0 },
+        { Q2_PAGE_VIDEO, "VIDEO", k_video_host_mp, N(k_video_host_mp), 0, Q2_ACT_BACK, 0, 0 }
+    };
+    return &pages[multiplayer ? 1 : 0];
 }
 
 const q2_menu_page *q2_menu_controller_page(bool front_end)

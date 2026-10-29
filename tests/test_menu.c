@@ -824,6 +824,45 @@ static void test_video_variant(void)
     CHECK(mp->count == 3, "multiplayer video has %u items", mp->count);
     CHECK(strcmp(mp->items[0].label, "HORIZONTAL SPLIT") == 0,
           "multiplayer item 0 is %s", mp->items[0].label);
+    {
+        q2_menu_settings s;
+        q2_menu m;
+        int mode, i, crt, bloom, reset;
+        for (mode = 0; mode < 3; mode++) {
+            q2_menu_settings_defaults(&s);
+            CHECK(s.v[Q2_SET_CRT] == 0, "CRT defaults off");
+            q2_menu_init(&m, &s, Q2_MENU_SCREEN_H);
+            m.multiplayer = mode == 1;
+            q2_menu_set_front_end(&m, mode == 2);
+            m.open = true;
+            q2_menu_goto(&m, Q2_PAGE_VIDEO);
+            crt = bloom = reset = -1;
+            for (i = 0; i < m.page->count; i++) {
+                if (m.page->items[i].setting == Q2_SET_CRT) crt = i;
+                if (m.page->items[i].setting == Q2_SET_BLOOM) bloom = i;
+                if (m.page->items[i].action == Q2_ACT_RESET_VIDEO) reset = i;
+            }
+            CHECK(crt >= 0 && reset >= 0, "CRT and reset in each video menu");
+            CHECK(bloom >= 0 && s.v[Q2_SET_BLOOM] == 0, "bloom exists and defaults off");
+            if (crt < 0 || bloom < 0 || reset < 0) continue;
+            q2_menu_point_at(&m, crt);
+            tap(&m, Q2_PAD_LEFT);
+            CHECK(s.v[Q2_SET_CRT] == 1, "LEFT enables CRT");
+            tap(&m, Q2_PAD_RIGHT);
+            CHECK(s.v[Q2_SET_CRT] == 0, "RIGHT disables CRT");
+            tap(&m, Q2_PAD_LEFT);
+            q2_menu_point_at(&m, bloom);
+            tap(&m, Q2_PAD_LEFT);
+            CHECK(s.v[Q2_SET_BLOOM] == 1, "LEFT enables bloom");
+            tap(&m, Q2_PAD_RIGHT);
+            CHECK(s.v[Q2_SET_BLOOM] == 0, "RIGHT disables bloom");
+            tap(&m, Q2_PAD_LEFT);
+            q2_menu_point_at(&m, reset);
+            tap(&m, Q2_PAD_CROSS);
+            CHECK(s.v[Q2_SET_CRT] == 0, "video reset disables CRT");
+            CHECK(s.v[Q2_SET_BLOOM] == 0, "video reset disables bloom");
+        }
+    }
 }
 
 /*
@@ -933,18 +972,18 @@ static void test_front_end_tables(void)
     tap(&m, Q2_PAD_CROSS);
     CHECK(m.page_id == Q2_PAGE_VIDEO, "VIDEO OPTIONS landed on page %d",
           m.page_id);
-    CHECK(m.page->count == 3, "the front-end VIDEO page has %u rows",
+    CHECK(m.page->count == 5, "the front-end VIDEO page has %u rows",
           m.page->count);
     CHECK(strcmp(m.page->items[0].label, "HORIZONTAL SPLIT") == 0,
           "its first row is %s", m.page->items[0].label);
 
     /* SCREEN POSITION's back action names the VIDEO page rather than popping,
-     * so the page it lands on must still be the front end's three-row one.
+     * so the page it lands on must still include the host video controls.
      * CROSS is what leaves that page (0x8001CD64 hands the d-pad to the offset
      * and only the select button calls the back handler). */
     q2_menu_goto(&m, Q2_PAGE_SCREEN_POSITION);
     tap(&m, Q2_PAD_CROSS);
-    CHECK(m.page_id == Q2_PAGE_VIDEO && m.page->count == 3,
+    CHECK(m.page_id == Q2_PAGE_VIDEO && m.page->count == 5,
           "backing out of SCREEN POSITION gives page %d with %u rows",
           m.page_id, m.page ? m.page->count : 0);
 
@@ -963,7 +1002,7 @@ static void test_front_end_tables(void)
     CHECK(strcmp(m.page->items[1].label, "VIBRATION") == 0,
           "the in-game controller row 1 is %s", m.page->items[1].label);
     q2_menu_goto(&m, Q2_PAGE_VIDEO);
-    CHECK(m.page->count == 2, "the in-game single-player VIDEO page has %u rows",
+    CHECK(m.page->count == 4, "the in-game single-player VIDEO page has %u rows",
           m.page->count);
 }
 
@@ -1124,8 +1163,9 @@ static void test_front_multiplayer_setup(void)
 
     m.cursor = 5;
     tap(&m, Q2_PAD_CROSS);
-    CHECK(q2_menu_take_request(&m) == Q2_MREQ_MP_PROCEED,
-          "PROCEED raises its own request");
+    CHECK(m.open && m.page_id == Q2_PAGE_FRONT_PLAYERS &&
+          q2_menu_take_request(&m) == Q2_MREQ_NONE,
+          "PROCEED opens each player's setup before starting the match");
 
     /* TEAM and VERSUS install different live setup variants. */
     q2_menu_init(&m, &s, Q2_MENU_SCREEN_H);
@@ -1958,8 +1998,191 @@ static void test_save_prompt(void)
     CHECK(latch == 0, "and does not spend the counter either");
 }
 
+static void test_controller_owners(void)
+{
+    q2_menu_settings s;
+    q2_menu m;
+    char line[64];
+    int pi, other;
+    q2_menu_settings_defaults(&s);
+    open_menu(&m, &s, true);
+    for (pi = 0; pi < Q2_MENU_MP_MAX_PLAYERS; pi++) {
+        s.v[q2_menu_player_setting(Q2_SET_PAD_CLASS, pi)] = 1;
+        s.v[q2_menu_player_setting(Q2_SET_PAD_STYLE, pi)] = 3;
+        q2_menu_set_pad_shockable(&m, pi, true);
+    }
+    for (pi = 0; pi < Q2_MENU_MP_MAX_PLAYERS; pi++) {
+        q2_menu_set_pauser(&m, pi);
+        q2_menu_goto(&m, Q2_PAGE_CONTROLLER);
+        m.cursor = 0;
+        tap(&m, Q2_PAD_RIGHT);
+        q2_menu_item_display(&m, 0, line, sizeof(line));
+        CHECK(strstr(line, "LEFT STICK") != NULL, "player %d style label: %s", pi, line);
+        m.cursor = 1;
+        tap(&m, Q2_PAD_LEFT);
+        CHECK(q2_menu_set_slider(&m, 4, 10 + pi), "player %d slider is bound", pi);
+        for (other = 0; other < Q2_MENU_MP_MAX_PLAYERS; other++) {
+            CHECK(s.v[q2_menu_player_setting(Q2_SET_PAD_STYLE, other)] == (other <= pi ? 4 : 3),
+                  "player %d edited player %d style", pi, other);
+            CHECK(s.v[q2_menu_player_setting(Q2_SET_VIBRATION, other)] == (other <= pi),
+                  "player %d edited player %d vibration", pi, other);
+            CHECK(s.v[q2_menu_player_setting(Q2_SET_MOUSE_SPEED, other)] == (other <= pi ? 10 + other : 64),
+                  "player %d edited player %d slider", pi, other);
+        }
+        q2_menu_goto(&m, Q2_PAGE_SOUND);
+        CHECK(q2_menu_set_slider(&m, 0, 70), "shared music slider is bound");
+        CHECK(s.v[Q2_SET_MUSIC] == 70, "music remains shared");
+    }
+}
+
+static void player_tap(q2_menu *m, int player, u16 button)
+{
+    u16 pads[4] = {0};
+    q2_menu_advance_players(m, pads, 15);
+    pads[player] = button;
+    q2_menu_advance_players(m, pads, 15);
+    pads[player] = 0;
+    q2_menu_advance_players(m, pads, 15);
+}
+
+static void test_player_setup(void)
+{
+    q2_menu m;
+    q2_menu_settings s;
+    q2_menu_player_row rows[7];
+    u16 pads[4] = { Q2_PAD_CROSS, Q2_PAD_CROSS, 0, 0 };
+    int i;
+    q2_menu_settings_defaults(&s);
+    q2_menu_init(&m, &s, 248);
+    m.open = true;
+    m.mp_setup.players = 4;
+    q2_menu_goto(&m, Q2_PAGE_FRONT_DMSETUP);
+    m.cursor = 5;
+    tap(&m, Q2_PAD_CROSS);
+    q2_menu_advance_players(&m, pads, 15);
+    q2_menu_advance_players(&m, pads, 15);
+    CHECK(m.open && m.mp_panel[0].page == Q2_MP_PLAYER_MAIN &&
+          m.mp_panel[1].page == Q2_MP_PLAYER_MAIN, "held PROCEED cannot ready any player");
+    player_tap(&m, 2, Q2_PAD_UP);
+    player_tap(&m, 2, Q2_PAD_CROSS);
+    player_tap(&m, 2, Q2_PAD_CROSS);
+    CHECK(m.mp_panel[2].page == Q2_MP_PLAYER_NAME, "player three opens their name");
+    player_tap(&m, 2, Q2_PAD_UP);
+    CHECK(!strcmp(m.mp_name[2], "QLAYER 3") && !strcmp(m.mp_name[0], "PLAYER 1"),
+          "name editing stays with its controller");
+    memcpy(m.mp_name[2], "Z", 2);
+    player_tap(&m, 2, Q2_PAD_UP);
+    CHECK(!strcmp(m.mp_name[2], "0"), "name alphabet crosses Z to 0");
+    player_tap(&m, 2, Q2_PAD_RIGHT);
+    CHECK(!strcmp(m.mp_name[2], "0 "), "right extends a short name");
+    player_tap(&m, 2, Q2_PAD_LEFT);
+    CHECK(!strcmp(m.mp_name[2], "0"), "left trims its trailing blank");
+    player_tap(&m, 2, Q2_PAD_TRIANGLE);
+    player_tap(&m, 2, Q2_PAD_DOWN);
+    player_tap(&m, 2, Q2_PAD_CROSS);
+    player_tap(&m, 2, Q2_PAD_RIGHT);
+    CHECK(m.mp_colour[2] == 3 && m.mp_colour[1] == 1, "personal colour is independent");
+    CHECK(q2_menu_player_rows(&m, 2, rows) == 3 && !strcmp(rows[0].text, "GREEN"),
+          "colour display follows the selected model");
+    player_tap(&m, 2, Q2_PAD_TRIANGLE);
+    player_tap(&m, 2, Q2_PAD_DOWN);
+    player_tap(&m, 2, Q2_PAD_CROSS);
+    s.v[q2_menu_player_setting(Q2_SET_PAD_CLASS, 2)] = 1;
+    s.v[q2_menu_player_setting(Q2_SET_PAD_STYLE, 2)] = 3;
+    player_tap(&m, 2, Q2_PAD_RIGHT);
+    CHECK(s.v[q2_menu_player_setting(Q2_SET_PAD_STYLE, 2)] == 4 &&
+          s.v[Q2_SET_PAD_STYLE] == 6, "setup changes only its controller style");
+    player_tap(&m, 2, Q2_PAD_DOWN);
+    CHECK(m.mp_panel[2].cursor == 2, "non-rumbling pad skips vibration");
+    memset(pads, 0, sizeof(pads));
+    q2_menu_set_controller_count(&m, 3);
+    CHECK(m.mp_setup.players == 4, "disconnect cannot remove an active setup panel");
+    q2_menu_advance_players(&m, pads, 11);
+    CHECK(m.mp_panel[2].page == Q2_MP_PLAYER_DISCONNECTED, "disconnection retains its slot");
+    pads[2] = Q2_PAD_TRIANGLE;
+    q2_menu_advance_players(&m, pads, 15);
+    CHECK(m.mp_panel[2].page == Q2_MP_PLAYER_CONTROLLER && m.mp_panel[2].cursor == 2,
+          "reconnect restores page and cursor without a phantom back");
+    player_tap(&m, 2, Q2_PAD_TRIANGLE);
+    player_tap(&m, 2, Q2_PAD_TRIANGLE);
+    player_tap(&m, 2, Q2_PAD_DOWN);
+    player_tap(&m, 2, Q2_PAD_CROSS);
+    for (i = 0; i < 4; i++) if (i != 2) {
+        CHECK(m.open, "match waits for every player");
+        player_tap(&m, i, Q2_PAD_CROSS);
+    }
+    CHECK(!m.open && q2_menu_take_request(&m) == Q2_MREQ_MP_PROCEED,
+          "all READY starts once");
+    m.open = true;
+    m.mp_setup.players = 2;
+    m.mp_setup.mode = Q2_MENU_MP_TEAM_DEATHMATCH;
+    m.mp_team[0] = m.mp_team[1] = 0;
+    q2_menu_goto(&m, Q2_PAGE_FRONT_PLAYERS);
+    q2_menu_players_begin(&m);
+    player_tap(&m, 0, Q2_PAD_CROSS);
+    CHECK(m.mp_panel[0].page == Q2_MP_PLAYER_OPTIONS && m.open,
+          "one-team match disables START and selects OPTIONS");
+    CHECK(q2_menu_player_rows(&m, 1, rows) == 4 && rows[1].disabled,
+          "both players see the two-team requirement");
+    player_tap(&m, 0, Q2_PAD_DOWN);
+    player_tap(&m, 0, Q2_PAD_CROSS);
+    player_tap(&m, 0, Q2_PAD_LEFT);
+    CHECK(m.mp_team[0] == 1 && m.mp_team[1] == 0 && q2_menu_players_two_teams(&m),
+          "team chooser wraps between the two retail teams");
+    player_tap(&m, 0, Q2_PAD_TRIANGLE);
+    player_tap(&m, 0, Q2_PAD_TRIANGLE);
+    player_tap(&m, 0, Q2_PAD_TRIANGLE);
+    CHECK(m.page_id == Q2_PAGE_FRONT_DMSETUP, "back returns to match setup");
+}
+
+static void test_player_setup_pointer(void)
+{
+    q2_menu m;
+    q2_menu_settings s;
+    q2_menu_hit hit;
+    int x, y;
+    q2_menu_settings_defaults(&s);
+    q2_menu_init(&m, &s, 248);
+    m.open = true;
+    q2_menu_goto(&m, Q2_PAGE_FRONT_PLAYERS);
+    q2_menu_players_begin(&m);
+    q2_menu_player_origin(&m, 0, &x, &y);
+    CHECK(x == 0 && y == 1, "two-player setup starts in upper stacked viewport");
+    q2_menu_player_origin(&m, 1, &x, &y);
+    CHECK(x == 256 && y == 121, "second player's text uses native right offset");
+    CHECK(q2_menu_hit_test(&m, 128, 63, &hit) && hit.index == 0,
+          "host mouse can reach player-one options");
+    CHECK(q2_menu_point_at(&m, hit.index), "pointer selects the player-one row");
+    CHECK(m.mp_panel[0].cursor == 0 && m.mp_panel[1].cursor == 1,
+          "pointer cannot move another player's selection");
+    CHECK(!q2_menu_hit_test(&m, 384, 183, &hit), "other player's rows do not belong to mouse");
+    m.mp_setup.mode = Q2_MENU_MP_TEAM_DEATHMATCH;
+    m.mp_team[1] = 0;
+    CHECK(!q2_menu_hit_test(&m, 128, 89, &hit), "mouse also skips one-team START");
+    m.mp_panel[0].page = Q2_MP_PLAYER_NAME;
+    CHECK(q2_menu_hit_test(&m, 176, 76, &hit) && hit.index == 7 && hit.part == Q2_MENU_HIT_CHAR,
+          "name characters can be selected and cycled by mouse");
+    CHECK(q2_menu_point_at(&m, hit.index) && m.mp_panel[0].letter == 7,
+          "pointing selects the character without cycling another");
+    m.mp_panel[0].page = Q2_MP_PLAYER_COLOUR;
+    CHECK(q2_menu_hit_test(&m, 120, 76, &hit) && hit.part == Q2_MENU_HIT_PREV,
+          "left half of team selector means previous team");
+    m.mp_panel[0].page = Q2_MP_PLAYER_CONTROLLER;
+    m.mp_host_mouse = true;
+    CHECK(q2_menu_hit_test(&m, 136, 29, &hit) && hit.part == Q2_MENU_HIT_NEXT,
+          "controller style can be clicked forward");
+    CHECK(!q2_menu_hit_test(&m, 128, 46, &hit), "mouse skips unavailable vibration");
+    m.mp_setup.players = 4;
+    q2_menu_player_origin(&m, 0, &x, &y);
+    CHECK(x == 1 && y == 1, "quad panel starts inside native viewport");
+    CHECK(q2_menu_hit_test(&m, 137, 29, &hit) && hit.part == Q2_MENU_HIT_NEXT,
+          "quad controls retain their actual drawn hit areas");
+}
+
 int main(void)
 {
+    test_player_setup();
+    test_player_setup_pointer();
     test_font_upload_alias_order();
     test_defaults();
     test_variables_apply();
@@ -1971,6 +2194,7 @@ int main(void)
     test_slider();
     test_music_audition();
     test_choice();
+    test_controller_owners();
     test_press_versus_release();
     test_page_graph();
     test_cursor_policy();

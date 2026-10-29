@@ -9,24 +9,16 @@
  *
  * What is left over, and is genuinely code, is the body of each think
  * function: the sound, the shot, the claw. Those are small and are written by
- * hand per creature in `creatures/`.
+ * hand per creature in `cre_*.c`.
  *
  * ---------------------------------------------------------------------------
- * There are only seven creature modules on the whole disc
+ * Creature modules live in COMMON.DAT AND ZONE*.DAT
  * ---------------------------------------------------------------------------
- * Walking every map's `CreAIBin` chain gives, in full:
- *
- *     Soldier    BASE0 BASE1 BASE2 BASE3 JAIL5 MAGDEMO WASTE1
- *     Tankcomm   COMMAND WASTE4
- *     Gunner     POWER1 WASTE3
- *     Arachner   POWER1
- *     Infantry   POWER2
- *     Berserk    WASTE4
- *     Insane     LAB
- *
- * Thirteen modules over the disc, seven distinct. The class table names 26
- * creatures, so most of them are placed models with no brain shipped — which
- * is worth knowing before anyone goes looking for the other nineteen.
+ * The complete PAL census finds 166 instances and 22 distinct names. The old
+ * seven-module count scanned only COMMON.DAT and missed zone-local code,
+ * including bosses. Native implementation coverage is recorded in the audit.
+ * Decoding a move or finding an import call does not implement its branches,
+ * aim or damage. See docs/CREATURE-AUDIT.md for the coverage boundary.
  *
  * ---------------------------------------------------------------------------
  * How a module is decoded, and why none of it is guesswork
@@ -57,6 +49,7 @@
  */
 #ifndef Q2PSX_CREATURE_H
 #define Q2PSX_CREATURE_H
+#include "vag.h"
 
 #include "monster.h"
 #include "q2psx.h"
@@ -156,6 +149,7 @@ typedef struct q2_creature {
     /* From export 2 — the class bytes this module serves and the method table
      * it registers for them. */
     u8  class_byte[Q2_CRE_MAX_CLASSES];
+    u32 class_method_table[Q2_CRE_MAX_CLASSES];
     u32 class_count;
     u32 method_table_addr;
     u32 method[Q2_CLASS_METHOD_COUNT];
@@ -192,6 +186,11 @@ extern const char *const q2_cre_callback_names[13];
  */
 bool q2_creature_decode(q2_creature *out, const u8 *image, size_t size,
                         u32 base, const char *name);
+/* Decode a secondary class embedded in a module (Jorg's Rider). The entry
+ * and class are native code identities, not an inferred animation variant. */
+bool q2_creature_decode_entry(q2_creature *out, const u8 *image, size_t size,
+                              u32 base, const char *name, u32 spawn_entry,
+                              s32 method_class);
 
 /*
  * The module's own name for each move.
@@ -261,12 +260,31 @@ u32 q2_creature_sound_names(const q2_creature *c, const u8 *image, size_t size,
 typedef struct q2_cre_sound_bind {
     u32  addr;              /* the BSS word the handle is stored in */
     char name[13];          /* the name registered for it           */
+    u16 request_id;         /* aliases share this ID; clones do not */
+    bool cloned;
+    q2_sfx_request request;
 } q2_cre_sound_bind;
 
-/*
- * Decode a module's sound registrations. `load_base` is where the image was
- * relocated to. Returns how many were found; `max` bounds what is written.
- */
+/* Execute export 2 with isolated module/stack memory and a sample-presence
+ * callback. The final handle slots include conditional aliases, overwrites
+ * and cloned requests. Input image is never modified. Unsupported imports,
+ * instructions, out-of-range memory and runaway code return BAD_FORMAT with
+ * fault_pc; no partial table is returned. NULL has means every sample exists.
+ * count is the required capacity; only max records are written. */
+q2_result q2_creature_init_sounds(const u8 *image, size_t size, u32 load_base,
+                                  bool (*has)(const char *, void *), void *user,
+                                  q2_cre_sound_bind *out, u32 max, u32 *count,
+                                  u32 *fault_pc);
+/* Production SoundIndex aliases the bank's existing request. Seed from and,
+ * on successful initialization, update that shared state; clones stay local. */
+q2_result q2_creature_init_sound_requests(const u8 *image, size_t size, u32 load_base,
+    bool (*has)(const char *, void *), void *user,
+    q2_sfx_request *(*lookup)(const char *, void *),
+    q2_cre_sound_bind *out, u32 max, u32 *count, u32 *fault_pc);
+
+/* Diagnostic registration trace from all-present and all-missing runs.
+ * Includes overwritten stores and fallback registrations; for playback use
+ * init_sounds with the actual bank, which follows its specific branches. */
 u32 q2_creature_sound_bindings(const u8 *image, size_t size, u32 load_base,
                                q2_cre_sound_bind *out, u32 max);
 
@@ -275,15 +293,16 @@ const char *q2_creature_sound_for_addr(const q2_cre_sound_bind *binds,
                                        u32 count, u32 addr);
 
 /* ------------------------------------------------------------------------- */
-/* SOUND FALLBACK GROUPS — a module substituting one handle for another       */
+/* Legacy fallback inspection helpers (not the runtime sound resolver)       */
 /* ------------------------------------------------------------------------- */
 /*
- * A REGISTRATION IS NOT ALWAYS WHAT PLAYS, and no decoder that reads
- * registrations can see the difference, because the substitution is a
- * handle-to-handle MOVE in the module's own spawn code.
+ * A registration is not always what plays: initialization can copy handles,
+ * register conditional alternates, or overwrite slots. Playback now executes
+ * that code with q2_creature_init_sounds; these older helpers retain the
+ * documented groups for callers inspecting a registration list alone.
  *
- * Two of them are on this disc, both confirmed with `moddisasm` and both
- * firing on every map that carries the creature:
+ * Two examples confirmed with `moddisasm`, both firing on every map that
+ * carries the creature:
  *
  *  SOLDIER, module+0xE50..+0xF28. Two identical fill-if-zero passes over a trio
  *  of handles. The pain trio is +0x32AC/+0x32B0/+0x32B4 (sol_pain1/2/3) and its
@@ -406,9 +425,9 @@ typedef struct q2_cre_frame_name {
 /*
  * Read the module's name table straight through, one entry per record.
  *
- * Anchored rather than scanned: the table begins immediately past the module's
- * last instruction and runs at a fixed 20-byte stride, so it is walked from
- * there until a record fails validation. Returns the number written.
+ * Export 3 anchors the table. Walk its 20-byte {s16 first, s16 last, char[16]}
+ * records to the negative first-frame terminator, skipping reversed ranges.
+ * Returns the number written.
  */
 u32 q2_creature_frame_names(const q2_creature *c, const u8 *image, size_t size,
                             q2_cre_frame_name *out, u32 out_count);

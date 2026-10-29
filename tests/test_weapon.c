@@ -13,6 +13,8 @@
 #include "random.h"
 #include "shock.h"
 #include "worldscale.h"   /* Q2_DT_NOMINAL, Q2_GRAVITY, Q2_VEL_DIV */
+#include "fixtures/toss_reference.h"
+#include "fixtures/projectile_contact_reference.h"
 
 static int g_failures;
 static int g_checks;
@@ -272,6 +274,13 @@ static void test_firing(void)
     r = q2_weapon_fire(&inv, &rng, NULL, Q2_WID_CHAINGUN, eye, 0, 0, 0, aim,
                        0, 0, false, false, 3);
     check_eq_i(r.shot_count, 3, "three bullets from a spun-up chaingun");
+    check_eq_i(inv.ammo[Q2_AMMO_BULLETS], 197, "three rounds cost three bullets");
+    inv.ammo[Q2_AMMO_BULLETS] = 2;
+    r = q2_weapon_fire(&inv, &rng, NULL, Q2_WID_CHAINGUN, eye, 0, 0, 0, aim,
+                       0, 0, false, false, 3);
+    check(r.fired && !r.dry, "the last two chaingun rounds still fire");
+    check_eq_i(r.shot_count, 2, "the burst is clamped to available rounds");
+    check_eq_i(inv.ammo[Q2_AMMO_BULLETS], 0, "the partial burst spends only its rounds");
 
     /* Slot 0 is a call that returns. */
     give_all(&inv);
@@ -281,6 +290,69 @@ static void test_firing(void)
 }
 
 /* ------------------------------------------------------------------------- */
+static void test_all_weapon_contracts(void)
+{
+    static const int damage[] = {0, 8, 6, 8, 8, 8, 120, 120, 100, 20, 100, 200};
+    static const int pellets[] = {0, 1, 5, 10, 1, 3, 1, 1, 1, 1, 1, 1};
+    const q2_weapon_tables *tab = q2_weapon_tables_builtin();
+    const s32 eye[3] = {0, 0, 0};
+    const s16 aim[3] = {0, 0, 4096};
+    int w, quad, dm;
+    printf("all weapon ammo and damage contracts\n");
+    for (w = 1; w <= Q2_WID_COUNT; w++) {
+        for (quad = 0; quad < 2; quad++) {
+            for (dm = 0; dm < 2; dm++) {
+                q2_inventory inv;
+                q2_rng rng;
+                q2_fire_result_v2 r;
+                int i, expected = damage[w];
+                give_all(&inv);
+                q2_rng_seed(&rng, 9);
+                r = q2_weapon_fire(&inv, &rng, NULL, w, eye, 0, 0, 0, aim,
+                                   100, 0, quad != 0, dm != 0, 3);
+                if (w == Q2_WID_RAILGUN && dm) expected = 150;
+                if (quad) expected *= 4;
+                check(r.fired && !r.dry, "every owned, fed weapon fires");
+                check_eq_i(r.shot_count, pellets[w], "correct projectile or pellet count");
+                for (i = 0; i < (int)r.shot_count; i++) {
+                    if (w == Q2_WID_ROCKET_LAUNCHER)
+                        check(r.shot[i].damage >= expected &&
+                              r.shot[i].damage <= expected + (quad ? 76 : 19),
+                              "rocket roll and quad stay within retail limits");
+                    else
+                        check_eq_i(r.shot[i].damage, expected,
+                                   "normal, quad and deathmatch damage");
+                }
+            }
+        }
+        {
+            q2_inventory inv;
+            q2_rng rng;
+            q2_fire_result_v2 r;
+            int type = tab->ammo_type[w], cost = (int)tab->ammo_per_shot[w];
+            give_all(&inv);
+            q2_rng_seed(&rng, 9);
+            inv.weapons &= (u16)~tab->owned_bit[w];
+            r = q2_weapon_fire(&inv, &rng, NULL, w, eye, 0, 0, 0, aim,
+                               100, 0, false, false, 3);
+            check(!r.fired && !r.dry && r.shot_count == 0,
+                  "an unowned weapon cannot fire or dry-click");
+            if (!cost) continue;
+            give_all(&inv);
+            inv.ammo[type] = (s16)(cost - 1);
+            r = q2_weapon_fire(&inv, &rng, NULL, w, eye, 0, 0, 0, aim,
+                               100, 0, false, false, 3);
+            check(r.dry && !r.fired && r.shot_count == 0,
+                  "insufficient ammo produces no damage");
+            check_eq_i(inv.ammo[type], cost - 1, "a dry attempt spends nothing");
+            r = q2_weapon_fire(&inv, &rng, NULL, w, eye, 0, 0, 0, aim,
+                               101, r.next_fire, false, false, 3);
+            check(!r.dry && !r.fired && r.sound == -1,
+                  "holding an empty trigger respects the dry-click gate");
+        }
+    }
+}
+
 static void test_muzzle(void)
 {
     const q2_weapon_tables *t = q2_weapon_tables_builtin();
@@ -423,7 +495,7 @@ static void test_projectiles(void)
         shooter.health = 100;
         targets[0] = &near_by;
 
-        check(q2_projectile_impact(&list, (u32)idx, point, NULL,
+        check(q2_projectile_impact(&list, (u32)idx, point,
                                    &shooter, NULL, targets, 1, &rules),
               "the rocket is consumed by the wall");
         check(near_by.health < 500, "and the blast reaches a bystander");
@@ -821,6 +893,94 @@ static void test_kick_and_shock(void)
 }
 
 /* ------------------------------------------------------------------------- */
+static void test_native_toss(void)
+{
+    size_t i;
+    for (i = 0; i < Q2PSX_ARRAY_COUNT(native_toss); i++) {
+        q2_projectiles list;
+        q2_projectile *p;
+        q2_proj_step step;
+        s32 intent[3], hit[3];
+        s16 normal[3];
+        int k;
+        q2_projectiles_init(&list);
+        p = &list.p[0]; p->in_use = true; list.live = 1;
+        p->kind = Q2_PROJ_GRENADE;
+        p->flags = (u16)native_toss[i].flags;
+        for (k = 0; k < 3; k++) {
+            p->pos[k] = native_toss[i].start[k];
+            p->vel[k] = native_toss[i].velocity[k] * 4096 / Q2_VEL_DIV;
+            p->angles[k] = (s16)native_toss[i].angles[k];
+            normal[k] = (s16)native_toss[i].normal[k];
+        }
+        q2_random_seed(native_toss[i].seed);
+        q2_projectile_step(&list, 0, native_toss[i].gravity, native_toss[i].dt, 0, &step);
+        for (k = 0; k < 3; k++) {
+            s32 delta = step.to[k] - step.from[k];
+            intent[k] = step.to[k];
+            if (!(p->flags & Q2_PROJ_TOSS_STOPPED) && native_toss[i].mode == 2)
+                intent[k] = step.from[k] + delta * native_toss[i].fraction / 4096 - delta;
+            hit[k] = intent[k];
+            if (!(p->flags & Q2_PROJ_TOSS_STOPPED) && native_toss[i].mode == 1)
+                hit[k] = step.from[k] + (intent[k] - step.from[k]) * native_toss[i].fraction / 4096;
+            check_eq_i(intent[k], native_toss[i].intent[k], "native toss hull destination");
+            check_eq_i(hit[k], native_toss[i].hit[k], "explicit collision service output");
+        }
+        if (native_toss[i].contact)
+            q2_projectile_rebound(p, intent, hit, normal);
+        else
+            q2_projectile_commit(&list, 0, step.to);
+        for (k = 0; k < 3; k++) {
+            check_eq_i(p->pos[k], native_toss[i].position[k], "native toss position");
+            check_eq_i(q2_projectile_raw_velocity(p, k), native_toss[i].result_velocity[k], "native toss velocity");
+            check_eq_i(p->angles[k], native_toss[i].result_angles[k], "native toss tumble");
+        }
+        check_eq_i(p->flags, native_toss[i].result_flags, "native toss rest flags");
+        check_eq_i(q2_random_state(), native_toss[i].result_seed, "native toss shared RNG");
+    }
+}
+
+static void test_native_projectile_owners(void)
+{
+    size_t i;
+    q2_actor owner;
+    q2_projectile p;
+    for (i = 0; i < Q2PSX_ARRAY_COUNT(native_projectile_owners); i++) {
+        int k;
+        bool ignore;
+        q2_actor_init(&owner);
+        memset(&p, 0, sizeof(p));
+        p.kind = native_projectile_owners[i].hand ? Q2_PROJ_HAND_GRENADE : Q2_PROJ_GRENADE;
+        p.flags = Q2_PROJ_TOSS_REST | (native_projectile_owners[i].cleared ? Q2_PROJ_OWNER_CLEAR : 0);
+        for (k = 0; k < 3; k++) {
+            owner.origin[k] = native_projectile_owners[i].centre[k];
+            owner.mins[k] = (s16)native_projectile_owners[i].mins[k];
+            owner.maxs[k] = (s16)native_projectile_owners[i].maxs[k];
+            p.pos[k] = native_projectile_owners[i].point[k];
+        }
+        ignore = q2_projectile_ignore_owner(&p, native_projectile_owners[i].present ? &owner : NULL);
+        check_eq_i(ignore, native_projectile_owners[i].result_ignored, "native grenade ignored owner");
+        check_eq_i((p.flags & Q2_PROJ_OWNER_CLEAR) != 0,
+                   native_projectile_owners[i].result_cleared, "native grenade owner-mask lifetime");
+        check((p.flags & Q2_PROJ_TOSS_REST) != 0, "owner state preserves toss flags");
+    }
+    q2_actor_init(&owner);
+    memset(&p, 0, sizeof(p)); p.kind = Q2_PROJ_GRENADE;
+    p.pos[0] = 326; p.pos[1] = 1000000;
+    check(q2_projectile_ignore_owner(&p, &owner), "expanded boundary is inclusive and ignores Y");
+    p.pos[0]++;
+    check(!q2_projectile_ignore_owner(&p, &owner), "leaving the box releases the owner");
+    p.pos[0] = 0;
+    check(!q2_projectile_ignore_owner(&p, &owner), "returning cannot re-arm owner exclusion");
+    owner.origin[0] = 10000;
+    check(!q2_projectile_ignore_owner(&p, &owner), "moving the owner cannot re-arm exclusion");
+    p.flags = 0; p.kind = Q2_PROJ_HAND_GRENADE; p.node = Q2_PROJ_NODE_HELD;
+    check(q2_projectile_ignore_owner(&p, &owner) && !(p.flags & Q2_PROJ_OWNER_CLEAR),
+          "a held hand grenade has not entered the owner-release gate");
+    p.kind = Q2_PROJ_ROCKET; p.node = Q2_PROJ_NODE_UNKNOWN;
+    check(q2_projectile_ignore_owner(&p, &owner), "rockets retain their separate owner rule");
+}
+
 int main(void)
 {
     printf("weapon behaviour\n\n");
@@ -829,9 +989,12 @@ int main(void)
     test_tables();
     test_selection();
     test_firing();
+    test_all_weapon_contracts();
     test_kick_and_shock();
     test_muzzle();
     test_projectiles();
+    test_native_toss();
+    test_native_projectile_owners();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

@@ -55,13 +55,12 @@
  * `tpageTable[page] | blendTable[2]` — it WRITES IT BACK (`sh` at 0x80068320).
  * The table is built by GetTPage(0, 0, ...) with an ABR argument of 0, so a page
  * starts at ABR 0 (half) and is permanently promoted to ABR 1 (additive) the
- * first time any opaque polygon on it is drawn. Transparent polygons then
- * inherit whatever the table has reached.
+ * first time an opaque parent packet is constructed. Transparent constructions
+ * inherit whatever the table has reached; existing packets retain their page.
  *
- * So "world semi-transparency is additive" is true in the steady state and not
- * true on the first frame a page is touched, and the port models the mutable
- * table rather than the constant, because that is the mechanism. See
- * q2_tpage_table.
+ * World semi-transparency therefore depends on construction order and cached
+ * packet lifetime, not just the current table. See q2_tpage_table and the
+ * parent allocator in world.c.
  *
  * ---------------------------------------------------------------------------
  * 2. Scene.flags08 — four fields, not one

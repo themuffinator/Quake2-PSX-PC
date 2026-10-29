@@ -754,21 +754,11 @@ typedef struct q2_statusbar {
      *          ALL WEAPONS grant is the one that was already in them.
      *
      * THE PORT. q2_statusbar_weapon_slots() below is the pair of calls, and
-     * this array is the latch. Five of the six events exist here — the pickups
-     * in item.c's touch dispatch, the spawn loadout, q2_sim_cycle_weapon and
-     * q2_sim_autoselect_weapon — and the sixth does not: Q2_CHEAT_ALL_WEAPONS
-     * is set by menu.c and tested nowhere (the cheat word's readers test
-     * infinite ammo in item.c, one-shot kill in combat.c and no fall damage
-     * in the client), so nothing grants what 0x8003B040 grants. The row is not
-     * reachable either, and that is the order the gap has to be closed in: the
-     * ALL WEAPONS row lives only on the GOLD variant of the GAME VARIABLES page
-     * (pages.c's k_vars_gold / k_front_vars_gold), menu.c's `resolve` picks the
-     * variant from `q2_menu.cheat_level`, and `q2_menu_set_cheat_level` has no
-     * caller outside the tests — the memory card carries the value
-     * (`q2_mcard.cheat_level`) and nothing moves it across. Until that hop
-     * exists the page is three rows and INFINITE AMMO and ONE SHOT KILL are as
-     * unreachable as this one; they differ only in being ready. A caller that
-     * sees an event calls the writer there; the pickups happen inside the
+     * this array is the latch. The client calls it on spawn, selection,
+     * auto-selection and the model-filtered ALL WEAPONS grant, including
+     * respawn. The campaign reward and loaded Game Config now provide the
+     * unlock tier that exposes the GOLD page. A caller that sees an event
+     * calls the writer there; the pickups happen inside the
      * sim, where a once-a-frame caller cannot see them, and
      * q2_statusbar_weapon_slots_track() infers those from what they leave.
      * Recomputing every frame instead is NOT what the console does, and shows

@@ -33,14 +33,10 @@
  * first real test is the `takedamage` gate at 0x80062838 — so that bit gates
  * creatures and never gates a player.
  *
- * Two things it does NOT do, and both matter for a port:
- *
- *   - **It does not kill anything.** There is no die callback and no pain
- *     callback. Health goes negative and the entity's own think notices later.
- *   - **For a creature with an AI brain it does not even subtract health.** It
- *     posts the damage to the module through 0x800627F8 and returns; the
- *     module owns the creature's health. Only brainless entities and players
- *     have their health decremented here.
+ * The client arm leaves death handling to the player's think. The creature
+ * arm calls 0x800627F8 (T_Damage), which subtracts health and dispatches pain,
+ * death and enemy reactions. The port drains those pending reactions into the
+ * bound creature callbacks after updating its actor state.
  *
  * ---------------------------------------------------------------------------
  * Armour
@@ -72,6 +68,11 @@
  *
  * Mod 8 skips both stages entirely — the only damage class in the game that
  * ignores armour outright.
+ *
+ * Both helpers accept a full signed word and reject ZERO, not negative damage.
+ * A negative saved amount restores inventory. The power cap is the signed
+ * halfword of twice the cells; ordinary armour sign-extends its shifted result
+ * before the cap. Keep the full remaining word between the two stages.
  *
  * ---------------------------------------------------------------------------
  * Knockback
@@ -227,13 +228,14 @@ bool q2_mod_knocks_back(s16 mod);
 #define Q2_ENERGY_LIGHT_OUTER 1300
 
 /*
- * The fade this port walks q2_actor.ambient back toward, and how many steps
- * 0x8005B88C asks for. The seven is the console's; the 0x30 is the literal the
- * creature and player-body draws already fed q2_light_env_build, kept so that
- * an actor nothing has hit is lit exactly as before. See q2_actor.ambient for
- * why the entity's real +0x2B0 is not available to read.
+ * Native entity allocation seeds current/target ambient to 0x40
+ * (0x8006C1D8..0x8006C200); gameplay player spawn replaces both with 0x20
+ * (0x8003B444..0x8003B470). Creature spawn retains the allocator's value.
+ * 0x8005B88C supplies seven steps to their shared fade. Items and the menu's
+ * player showcase have separate initialization paths, not these actor targets.
  */
-#define Q2_ACTOR_AMBIENT_DEFAULT 0x30
+#define Q2_ACTOR_AMBIENT_DEFAULT 0x40
+#define Q2_PLAYER_AMBIENT_DEFAULT 0x20
 #define Q2_ACTOR_AMBIENT_STEPS      7
 
 /* The damage-effect timer a mod arms, or 0. Returns the slot in `slot` and the
@@ -263,6 +265,9 @@ u8 q2_mod_hit_sound(s16 mod, s16 *volume);
 /* ------------------------------------------------------------------------- */
 /* Rules that live in globals rather than in the damage function              */
 /* ------------------------------------------------------------------------- */
+struct q2_actor;
+typedef void (*q2_combat_environment_fn)(void *user, const struct q2_actor *target, s16 mod);
+
 typedef struct q2_combat_rules {
     bool deathmatch;      /* 0x800AEBCC                                      */
     s16  skill;           /* 0x800B334A; 0 halves what monsters do to you,
@@ -276,6 +281,11 @@ typedef struct q2_combat_rules {
      * Q2_CHEAT_ONE_SHOT_KILL is read here.
      */
     u32  cheats;
+    /* 0x8005827C/0x800582C0: admitted acid/lava hits request a body sound
+     * before the general protection/armour stages. The world owns playback
+     * and the shared lava cadence; standalone combat may omit this hook. */
+    q2_combat_environment_fn environment_sound;
+    void *environment_sound_user;
 } q2_combat_rules;
 
 void q2_combat_rules_default(q2_combat_rules *r);
@@ -372,6 +382,7 @@ typedef struct q2_actor {
 
     s16  health;
     s16  gib_health;        /* below this the body is destroyed              */
+    s16  entity_kind;       /* Population kind, entity+0xD2 (not CRE row)     */
 
     /* Client-only. `has_client` is the engine's `entity+0x0C != NULL`, and it
      * is what decides whether armour exists at all. */
@@ -500,6 +511,11 @@ typedef struct q2_actor {
      * wherever the console stores the byte (0x80057E84, 0x80057EBC).
      */
     u32  damage_serial;
+    /* Transient identity for the AI damage drain. The client compares this
+     * with its live actor arrays; it never dereferences or serializes it. */
+    struct q2_actor *damage_source;
+    /* T_Damage reached its AI tail, including a hit absorbed to zero. */
+    bool damage_reaction_pending;
     /*
      * Six damage-effect timer bytes, entity+0x2F0..0x2F5. The last slot is
      * real: the ticker 0x8005B830 reads +0x2F5 at 0x8005B844 and decrements it
@@ -531,13 +547,11 @@ typedef struct q2_actor {
      * neither q2_monster nor q2_inventory holds a copy, and the fade only
      * means anything if the value survives the frame it was written in.
      *
-     * WHAT +0x2B0 HOLDS FOR A CREATURE IS NOT ESTABLISHED. The pool allocator
-     * (0x8006C1D8..0x8006C1FC, entity.c) seeds both bytes to 0x40 and the ITEM
-     * spawner 0x80058944 writes 0x30 into both (item.c); nothing found writes
-     * +0x2B0 after a spawn, so it is a per-entity constant this port cannot yet
-     * read. The fade target is therefore the 0x30 the creature and body draws
-     * were already using as a literal, seeded equal so an actor that is never
-     * hit draws exactly as it did before.
+     * The target at +0x2B0 is constant for these actors: 0x40 for creatures,
+     * 0x20 for gameplay players. PAL/US allocation and player-spawn execution
+     * establish both values; the shared creature spawner and every distinct
+     * module's initialization retain 0x40 in the native fixture. The item
+     * spawner's 0x30 does not apply to creatures or player bodies.
      */
     u8   ambient[3];        /* entity+0x2AC                                  */
 
@@ -678,8 +692,8 @@ q2_damage_result q2_combat_damage(q2_actor *attacker, q2_actor *target,
                                   const q2_combat_rules *rules);
 
 /* The two absorption stages, exposed because each is separately checkable. */
-s16 q2_combat_power_armour_absorb(q2_actor *a, s16 damage);
-s16 q2_combat_armour_absorb(q2_actor *a, s16 damage, bool energy,
+s16 q2_combat_power_armour_absorb(q2_actor *a, s32 damage);
+s16 q2_combat_armour_absorb(q2_actor *a, s32 damage, bool energy,
                             bool power_armour_fired,
                             const q2_combat_rules *rules);
 
@@ -761,10 +775,11 @@ s16 q2_combat_splash_at(s16 damage, s32 dist);
 /* caller supplies it, so binding a module later needs no change here.         */
 /* ------------------------------------------------------------------------- */
 
-/* A creature's contact hit. Nothing more than the damage call with mod 7 and
- * the attacker's own position as the point, which is what 0x800612F0 does. */
+/* Damage at fire_hit's computed contact point. The separate kick is delivered
+ * by the creature host after this returns, as at 0x800613B0..0x800614B0. */
 q2_damage_result q2_combat_melee(q2_actor *attacker, q2_actor *target,
-                                 s16 damage, const q2_combat_rules *rules);
+                                 s16 damage, const s32 point[3],
+                                 const q2_combat_rules *rules);
 
 /* The creature wrapper's grenade argument. It participates in the ballistic
  * solve and is then reused as the fuse passed at 0x80061724. */
@@ -785,7 +800,8 @@ s64 q2_combat_ray_dist_sq(const s32 origin[3], const s32 dir[3],
                           const s32 point[3], s64 *out_along);
 
 /*
- * 0x800544EC's narrow phase, with the entity unpacked — a vertical cylinder of
+ * Older approximation of 0x800544EC's narrow phase, with the entity unpacked
+ * as a vertical cylinder of
  * `radius` around `centre`, intersected with the Y slab that runs from
  * `centre.y + 286` upward by `height` (0x80054834..0x8005483C builds exactly
  * those two endpoints). `out_enter` and `out_exit` come back as 1.0.12
@@ -797,8 +813,11 @@ s64 q2_combat_ray_dist_sq(const s32 origin[3], const s32 dir[3],
  * rather than writing it twice is trace.h's rule about five copies of a slab
  * test being how they drift apart.
  *
- * `q2_combat_centre_is_ahead` is the sweep's other gate, 0x800546B4's dot
- * product: a candidate behind the ray is not a candidate.
+ * These helpers retain exact-root/fraction approximations that differ from
+ * native integer execution; see q2_combat_trace_actors for the measured
+ * query. Their existing hitscan/AI consumers have not been migrated.
+ * `q2_combat_centre_is_ahead` implements the conceptual dot-product gate:
+ * a candidate behind the ray is not a candidate.
  */
 bool q2_combat_cylinder_interval(const s32 origin[3], const s32 dir[3],
                                  const s32 centre[3], s32 radius, s16 height,
@@ -825,6 +844,28 @@ s32 q2_combat_nearest_on_segment(const s32 origin[3], const s32 dir[3],
                                  s32 fallback_radius, q2_actor **targets,
                                  u32 count);
 
+/* Native 0x800544EC actor collision, including its integer root, clipping
+ * after each accepted candidate and strict horizontal endpoint gate. The
+ * caller supplies the native candidate set; damage immunity does not remove
+ * a collision body. ignore is omitted before scanning, never after selection.
+ * out receives the clipped point, or to if clear. NULL out returns the first
+ * accepted candidate, as the native early-return mode does. */
+s32 q2_combat_trace_actors(const s32 from[3], const s32 to[3],
+                            const q2_actor *ignore, q2_actor *const *targets,
+                            u32 count, s32 out[3]);
+
+/* FindPlayerTarget, 0x80039DDC. Angles use native pitch/yaw/roll; the caller
+ * converts the host pitch sign. The eleven elevation rays use the complete
+ * actor list: retail overwrites its earlier projected-screen filter. The
+ * visibility callback tests PrimaryColl only, after the actor query clips the
+ * segment. A missing eye leaves direction/pitch unchanged and returns -1. */
+typedef bool (*q2_aim_visible_fn)(void *user, const s32 from[3],
+                                const s32 to[3], int ray);
+s32 q2_combat_find_target(const s32 eye[3], const s32 angles[3],
+                          const q2_actor *ignore, q2_actor *const *targets,
+                          u32 count, q2_aim_visible_fn visible, void *user,
+                          s16 direction[3], s16 *pitch);
+
 /*
  * The same question cut short by the world: the nearest actor entered before
  * `world_fraction` (1.0.12, 4096 = the whole segment), with the 1.0.12
@@ -836,15 +877,32 @@ s32 q2_combat_nearest_hit(const s32 origin[3], const s32 dir[3],
                           q2_actor **targets, u32 count, s64 *out_along);
 
 /*
- * One hitscan trace, 0x8004874C.
+ * THE NATIVE HITSCAN'S ACTOR HALF, which every instant weapon on the disc
+ * shares: the bullet (0x8004891C), the rail (0x80049318), the creatures'
+ * rounds through those two, the mission laser (0x80048F8C) and the creature
+ * laser (0x80049AA8) all call LineIntersectCreCylinder 0x800544EC, and only
+ * that.
  *
- * The trace runs from `origin` to `origin + dir` and stops at the first actor
- * cylinder it crosses. `world_fraction` is 4096 when nothing solid is in the
- * way, or the 1.0.12 fraction at which the world stops it — pass the result of
- * the caller's own world trace, so this module does not need to know about
- * collision hulls.
+ * The world is traced first; `world_fraction` is where it stopped `origin +
+ * dir` (4096 when nothing did). The actor query then runs to THAT point and
+ * overwrites it with the nearest body's entry, which is the point DoDamage is
+ * handed. The query ignores `attacker` and nothing else: an immune body still
+ * stops the shot and shields what is behind it, and it is DoDamage's own first
+ * test (0x80057D54) that refuses the damage. `point`, when given, receives the
+ * entry or, with no body hit, the world's stopping point.
  *
  * Returns the index of the actor hit, or -1.
+ */
+s32 q2_combat_hitscan(q2_actor *attacker, const s32 origin[3],
+                      const s32 dir[3], s16 damage, s16 mod,
+                      s32 world_fraction, q2_actor **targets, u32 count,
+                      const q2_combat_rules *rules, q2_damage_result *out,
+                      s32 point[3]);
+
+/*
+ * One bullet, 0x8004874C: q2_combat_hitscan with mod 18. `fallback_radius` is
+ * unused — the native query reads each body's own radius — and is kept for
+ * the callers that still pass it.
  */
 s32 q2_combat_fire_bullet(q2_actor *attacker, const s32 origin[3],
                           const s32 dir[3], s16 damage, s32 world_fraction,
@@ -853,9 +911,10 @@ s32 q2_combat_fire_bullet(q2_actor *attacker, const s32 origin[3],
                           q2_damage_result *out);
 
 /*
- * The rail, 0x8004917C. Same trace, mod 3, and it does not stop at the first
- * target: every actor along the beam takes the full damage. Returns how many
- * were hit.
+ * The rail, 0x8004917C. ONE query and ONE DoDamage (mod 3, `a3 = 3` at
+ * 0x80049330): the beam is drawn to the world's end, but only the nearest
+ * body along it is hurt. Quake II on the PC penetrates; this console's rail
+ * does not. Returns 1 when a body was hit, else 0.
  */
 u32 q2_combat_fire_rail(q2_actor *attacker, const s32 origin[3],
                         const s32 dir[3], s16 damage, s32 world_fraction,

@@ -201,7 +201,8 @@ bool q2_vw_take_event(q2_viewweapon *vw, s16 *event_out)
 
 bool q2_vw_wants_fire(const q2_viewweapon *vw)
 {
-    return vw && vw->state == Q2_VM_IDLE && !vw->fire_latch;
+    return vw && vw->state == Q2_VM_IDLE && !vw->fire_latch &&
+           vw->pending == vw->weapon;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -220,6 +221,10 @@ bool q2_vw_wants_fire(const q2_viewweapon *vw)
 static void q2_vw_idle_fire_check(q2_viewweapon *vw, bool fire_held,
                                   q2_vw_fire_result fired)
 {
+    /* 0x8004FAB4 checks the pending selection before entering the idle
+     * fire arm. A held trigger must not postpone lowering indefinitely. */
+    if (vw->pending != vw->weapon)
+        return;
     if (!fire_held && !vw->fire_latch)
         return;                     /* 0x8004FB18: nothing to do */
 
@@ -258,6 +263,7 @@ static void q2_vw_idle_fire_check(q2_viewweapon *vw, bool fire_held,
          */
         vw->fire_latch = true;
         vw->refire     = true;
+        vw->result     = 2;
         return;
     }
 
@@ -281,6 +287,7 @@ static void q2_vw_idle_fire_check(q2_viewweapon *vw, bool fire_held,
     if (vw->quad_active)
         vw->quad_sound = true;
 
+    vw->result          = 1;
     vw->state           = Q2_VM_FIRE;
     vw->frame           = 0;
     vw->frame_sound     = -1;
@@ -316,7 +323,33 @@ static void q2_vw_idle_fire_check(q2_viewweapon *vw, bool fire_held,
 /* +52 accumulates the step and fires each time it passes 30 (0x8004FFB8). */
 #define VW_SPIN_THRESHOLD 30
 
-static void fire_state_step(q2_viewweapon *vw, s32 step, bool fire_held)
+/* The console's own word for a fire function's answer: 1 for a shot (the
+ * blaster's 0x8004C1A4), 2 for dry, 0 for neither. The port's enum numbers
+ * them differently — a shot is 0 there — so the driver's return, which the
+ * player think tests for nonzero, is kept in the console's encoding. */
+static s16 native_fire_word(q2_vw_fire_result r)
+{
+    return r == Q2_VW_FIRED ? 1 : r == Q2_VW_FIRE_DENIED ? 2 : 0;
+}
+
+static void frame_fire(q2_viewweapon *vw, int rounds, q2_vw_fire_fn fire,
+                       void *user)
+{
+    /* The arm stores the fire function's return over the substep's result
+     * (`sh v0, 0(s6)`), a quiet zero included. */
+    if (fire) {
+        q2_vw_fire_result result = fire(user, vw->weapon, rounds);
+        vw->result = native_fire_word(result);
+        if (result != Q2_VW_FIRE_NONE)
+            q2_vw_frame_fire_result(vw, result == Q2_VW_FIRE_DENIED);
+    } else {
+        vw->frame_fires += (u32)rounds;
+        vw->result = 1;
+    }
+}
+
+static void fire_state_step(q2_viewweapon *vw, s32 step, bool fire_held,
+                            q2_vw_fire_fn fire, void *user)
 {
     if (vw->state != Q2_VM_FIRE)
         return;
@@ -342,7 +375,7 @@ static void fire_state_step(q2_viewweapon *vw, s32 step, bool fire_held)
                  * accumulator standing, so the next substep asks again. The
                  * quad's sound waits for the shot's result (0x80050004). */
                 if (vw->frame != 2) {
-                    vw->frame_fires++;
+                    frame_fire(vw, 1, fire, user);
                     vw->spin_accum = 0;
                 }
             }
@@ -428,20 +461,15 @@ static void fire_state_step(q2_viewweapon *vw, s32 step, bool fire_held)
         else if (vw->frame >= 10)
             vw->spin_rate = 3;
 
-        /*
-         * 0x800501C8 clamps that count to the rounds actually left, reading
-         * the ammo type off 0x8009DC5C and the count out of the player's own
-         * block. This module cannot see an inventory, and does not need to:
-         * the caller turns each unit of `frame_fires` into one call of the
-         * weapon's fire function, and a fire function that runs out reports
-         * dry and stops. Asking for three and getting two IS the clamp.
-         */
+        /* The fire callback clamps this single burst to available ammo.
+         * Splitting it into independent shots changes recoil, RNG and sound
+         * and incorrectly reports dry halfway through a partial burst. */
         {
             s32 n = vw->spin_rate;
 
             if (n < 1)
                 n = 1;
-            vw->frame_fires += (u32)n;
+            frame_fire(vw, n, fire, user);
             /* 0x80050234's quad sound follows the result, as above. */
         }
         break;
@@ -460,7 +488,7 @@ static void fire_state_step(q2_viewweapon *vw, s32 step, bool fire_held)
             vw->spin_accum += step;
             if (vw->spin_accum >= VW_SPIN_THRESHOLD) {
                 if (vw->frame != 6)
-                    vw->frame_fires++;    /* quad: 0x80050300, on the result */
+                    frame_fire(vw, 1, fire, user);
                 vw->spin_accum = 0;
             }
         } else if (!fire_held) {
@@ -819,6 +847,10 @@ static bool machine_step(q2_viewweapon *vw, bool clip_done, bool fire_held,
 {
     bool swapped = false;
 
+    /* Every pass rewrites the result: 0x8004FA58, 0x8004FAB0 and 0x8004FC40
+     * all store into it, and only the idle arm stores anything but zero. */
+    vw->result = 0;
+
     switch (vw->state) {
     case Q2_VM_LOWER:
         if (!clip_done)
@@ -906,6 +938,13 @@ static bool machine_step(q2_viewweapon *vw, bool clip_done, bool fire_held,
 bool q2_vw_advance(q2_viewweapon *vw, s32 dt, bool fire_held,
                    q2_vw_fire_result fired)
 {
+    return q2_vw_advance_firing(vw, dt, fire_held, fired, NULL, NULL);
+}
+
+bool q2_vw_advance_firing(q2_viewweapon *vw, s32 dt, bool fire_held,
+                          q2_vw_fire_result fired, q2_vw_fire_fn fire,
+                          void *user)
+{
     bool swapped = false;
     int guard = 0;
 
@@ -927,7 +966,14 @@ bool q2_vw_advance(q2_viewweapon *vw, s32 dt, bool fire_held,
      * The guard is a port's own: the original cannot spin here because every
      * clip has at least one key with a non-zero duration, but a mis-read table
      * could, and hanging is a worse failure than a stalled animation.
+     *
+     * The first substep's state-machine pass clears the result; each later
+     * substep's pass is the machine_step that ended the one before it. With no
+     * substep at all the console returns the stale global (0x8004EE9C skips
+     * straight to the `lh` at 0x8004F6D4), so the value is left alone.
      */
+    if (dt > 0)
+        vw->result = 0;
     while (dt > 0 && guard++ < 512) {
         s32 step = dt;
 
@@ -947,7 +993,7 @@ bool q2_vw_advance(q2_viewweapon *vw, s32 dt, bool fire_held,
          * them the other way round un-pins it every substep.
          */
         anim_step(vw, step);
-        fire_state_step(vw, step, fire_held);
+        fire_state_step(vw, step, fire_held, fire, user);
         hyper_ramp_step(vw);
 
         interpolate(vw);
@@ -999,6 +1045,11 @@ bool q2_vw_advance(q2_viewweapon *vw, s32 dt, bool fire_held,
     }
 
     return swapped;
+}
+
+s16 q2_vw_result(const q2_viewweapon *vw)
+{
+    return vw ? vw->result : 0;
 }
 
 /* ------------------------------------------------------------------------- */

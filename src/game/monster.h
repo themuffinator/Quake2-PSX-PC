@@ -97,6 +97,7 @@
 #define Q2PSX_MONSTER_H
 
 #include "q2psx.h"
+#include "cremotion.h"
 
 /* The AI clock: 10 ticks per second. */
 #define Q2_AI_HZ 10
@@ -104,9 +105,8 @@
 
 /*
  * One AI tick in the engine's dt units: 300 to the second (Q2_DT_HZ,
- * worldscale.h) over the ten ticks above. A handler the console runs every
- * frame with the dt global 0x800B2DB4, and this port runs on the AI clock,
- * spends this much per call — the corpse dissolve below is the one that does.
+ * worldscale.h) over the ten ticks above. Whole-AI-tick callers use this
+ * interval; the physical actor and corpse handlers accept the actual frame dt.
  * It is also Q2_DT_MAX, the console's own long-frame clamp (0x800184B8), so
  * no dt the console could have passed is larger.
  */
@@ -138,6 +138,7 @@ typedef struct q2_mframe {
 } q2_mframe;
 
 struct q2_monster;
+struct q2_cre_bind;
 
 /* A move's end callback. Returning is enough; it may install a new move. */
 typedef void (*q2_endfunc)(struct q2_monster *m);
@@ -372,7 +373,8 @@ typedef enum q2_attack_state {
 typedef enum q2_cre_start_kind {
     Q2_CRE_START_WALK = 0,   /* 0x80062240 */
     Q2_CRE_START_FLY,        /* 0x8006229C, and it sets FL_FLY  */
-    Q2_CRE_START_SWIM        /* 0x80062268, and it sets FL_SWIM */
+    Q2_CRE_START_SWIM,       /* 0x80062268, and it sets FL_SWIM */
+    Q2_CRE_START_SCRIPT      /* export 0 installs its own think; no start wrapper */
 } q2_cre_start_kind;
 
 typedef enum q2_range_band {
@@ -400,6 +402,11 @@ typedef enum q2_range_band {
  * against a disassembly without hunting for it.
  */
 typedef struct q2_monster {
+    /* Runtime incarnation, never a saved identity. Reinitializing a roster
+     * slot (including a Medic revive) invalidates voices owned by the old body. */
+    u32 audio_generation;
+    u32 sound_duration; /* entity+0x110; zero selects the retail 9000 units */
+    q2_cre_motion motion;
     /* --- placement ------------------------------------------------------- */
     s32 pos[3];             /* +0x00  origin; index 1 is up, and points DOWN */
     s32 velocity[3];
@@ -440,6 +447,7 @@ typedef struct q2_monster {
      */
     s16 hit_radius;         /* +0x94  GetCreHitSize's first halfword          */
     s16 hit_height;         /* +0x96  its second; the slab hangs off the feet */
+    s16 live_hit_radius, live_hit_height; /* immutable model header, for revival */
 
     s16 view_height;        /* +0x4C  added to origin[1] by visible()        */
 
@@ -495,6 +503,7 @@ typedef struct q2_monster {
      * permuted all three: see soldier_skin.
      */
     u8  pop_class_id;
+    struct q2_cre_bind *cre_bind; /* owning module, including classes without methods */
 
     /*
      * WHICH START WRAPPER THIS CREATURE WENT THROUGH, and its model's ext2.
@@ -539,6 +548,8 @@ typedef struct q2_monster {
      * what lets one be held back and then released.
      */
     u16 group;
+    u32 population_slot;  /* authored slot, stable across zone module rosters */
+    bool population_active; /* actually spawned here, even after being freed */
     u32 svflags;            /* +0x40  SVF_MONSTER and the freed bit          */
     bool client;            /* +0x3C  non-NULL for a player                  */
 
@@ -550,6 +561,8 @@ typedef struct q2_monster {
     /* --- animation ------------------------------------------------------- */
     s16 frame;              /* +0x38                                         */
     s32 next_think;         /* +0x90  on the 10 Hz AI clock                  */
+    s16 render_scale;       /* actor+0xFC, 4096 normally; RiderStand shrinks it */
+    bool script_pain_used;  /* RiderStand replaces pain with a no-op after one hit */
 
     /*
      * The pain handler's own clock, on the same 10 Hz tick as `next_think`.
@@ -571,6 +584,7 @@ typedef struct q2_monster {
      */
     bool hurt;
     void (*think)(struct q2_monster *m);   /* +0x94 — M_MoveFrame when awake */
+    void (*use)(struct q2_monster *m);     /* +0x9C — scripted creature activation */
 
     /* --- targeting ------------------------------------------------------- */
     struct q2_monster *enemy;        /* +0xBC                                */
@@ -652,7 +666,7 @@ typedef struct q2_monster {
      * swing a long way plays an animation rather than spinning on the spot.
      * Zero threshold disables it, which is what most creatures use.
      */
-    void (*bigturn)(struct q2_monster *m);                     /* +0x108 */
+    void (*bigturn)(struct q2_monster *m, s32 turn);           /* +0x108 */
     s32  bigturn_threshold;                                    /* +0x140 */
 
     s32 pausetime;          /* +0x10C */
@@ -672,6 +686,12 @@ typedef struct q2_monster {
     /* --- port bookkeeping ------------------------------------------------ */
     bool in_use;
     bool dead;
+    /* An unselected Population record accepted by the resident geometry and
+     * module/skill filters, eligible for one CREBATCH. Excluded and freed
+     * creatures are not pending; a group-name suffix is not a residency test. */
+    bool spawn_pending;
+    bool spawn_initialized; /* export 0 ran when this record was activated */
+    bool resume_pending;    /* session-only: restore runtime after zone wake */
 
     /*
      * Blown apart rather than killed. Damage past `gib_health` destroys the
@@ -1174,7 +1194,8 @@ s16 q2_corpse_dissolve_drain(s16 level, s32 dt);
 
 /*
  * One tick of a corpse — 0x8007F71C, or the dissolve handler that has
- * replaced it. It runs on the AI clock and spends Q2_AI_TICK_DT a call.
+ * replaced it. The _dt entry accepts the engine frame delta; the compatibility
+ * wrapper spends Q2_AI_TICK_DT for whole-AI-tick callers.
  *
  * Returns true when the body was destroyed this tick, which is the caller's
  * cue to stop drawing it. That happens two ways, and on both the record is
@@ -1191,6 +1212,7 @@ s16 q2_corpse_dissolve_drain(s16 level, s32 dt);
  * On the tick the gate fires it returns false: the body is still there.
  */
 bool q2_monster_corpse_tick(q2_monster *m);
+bool q2_monster_corpse_tick_dt(q2_monster *m, s32 dt);
 
 /* ------------------------------------------------------------------------- */
 /* The class method table                                                     */

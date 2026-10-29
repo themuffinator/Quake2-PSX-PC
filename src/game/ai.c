@@ -116,39 +116,9 @@ s32 q2_anglemod(s32 a)
  */
 s16 q2_vectoyaw(const s32 v[3])
 {
-    s32 best = 0;
-    s64 best_dot;
-    s32 a;
-
-    if (!v)
-        return 0;
-
-    if (v[2] == 0 && v[0] == 0)
-        return 0;
-
-    /*
-     * The original reaches a table-driven atan2 here. Searching the same sine
-     * table for the angle whose direction best matches gives the same answer
-     * to the unit and keeps every intermediate in fixed point, which matters
-     * because the result is compared for exact equality in M_ChangeYaw.
-     */
-    best_dot = INT64_MIN;
-    for (a = 0; a < Q2_ANGLE_360; a += 16) {
-        s64 dot = (s64)q2_sin12(a) * v[0] + (s64)q2_cos12(a) * v[2];
-        if (dot > best_dot) {
-            best_dot = dot;
-            best = a;
-        }
-    }
-    for (a = best - 16; a <= best + 16; a++) {
-        s64 dot = (s64)q2_sin12(a) * v[0] + (s64)q2_cos12(a) * v[2];
-        if (dot > best_dot) {
-            best_dot = dot;
-            best = a;
-        }
-    }
-
-    return (s16)q2_anglemod(best);
+    /* 0x8005F91C returns ratan2 directly, including its negative half-circle.
+     * Normalizing here changes exact-yaw branches in the creature modules. */
+    return v ? (s16)q2_ratan2(v[0], v[2]) : 0;
 }
 
 /* Integer square root, the shape 0x8008A7E8 has. */
@@ -373,11 +343,12 @@ void q2_project_source(const s32 point[3], const s16 distance[3],
         return;
 
     for (i = 0; i < 3; i++) {
-        s64 v = (s64)point[i] << 12;
-        if (forward) v += (s64)forward[i] * distance[0];
-        if (right)   v += (s64)right[i]   * distance[2];
-        out[i] = (s32)((v + 2048) >> 12);
+        /* 0x8005F5FC truncates each product separately, toward zero. */
+        out[i] = point[i];
+        if (forward) out[i] += (s32)((s64)forward[i] * distance[0]) / 4096;
+        if (right) out[i] += (s32)((s64)right[i] * distance[2]) / 4096;
     }
+    out[1] += distance[1]; /* 0x8005F6A0..0x8005F6AC */
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1621,6 +1592,8 @@ void q2_ai_charge(q2_monster *m, s32 dist)
  * where it last saw you, then follows your footsteps, then leans around the
  * corner to look.
  */
+u32 q2_ai_native_s2 = 1;
+
 void q2_ai_run(q2_monster *m, s32 dist)
 {
     s32 v[3];
@@ -1661,8 +1634,14 @@ void q2_ai_run(q2_monster *m, s32 dist)
             return;
     }
 
-    if (q2_ai_checkattack(m, dist))
-        return;
+    {
+        u32 saved = q2_ai_native_s2;
+        bool acted;
+        q2_ai_native_s2 = 1; /* 0x8005E38C loads the live player pointer. */
+        acted = q2_ai_checkattack(m, dist);
+        q2_ai_native_s2 = saved;
+        if (acted) return;
+    }
 
     if (m->attack_state == Q2_AS_SLIDING) {
         q2_ai_run_slide(m, dist);

@@ -346,7 +346,7 @@ const q2_vram_ui_image q2_vram_ui_images[] = {
     { "multipics.lbm",    8,   0,   8 },  /* ten deathmatch previews         */
     { "multipic2.lbm",   12,   0,   8 },  /* two more                        */
     { "frontend.lbm",    13,   0,   4 },  /* 0x8003FE74, via 0x8006901C     */
-    { "Squiggle.lbm",    12, 159,   0 },
+    { "Squiggle.lbm",    12, 159,   4 },  /* BIGGUN LevelBin+0x410 GetTPage */
     { "chars.lbm",       15, 128,   4 },
     { "qkm_menu.lbm",    14,   0,   4 },  /* the three are one slot, picked  */
     { "qk2_menu.lbm",    14,   0,   4 },  /* by session mode at 0x8003FEAC   */
@@ -472,6 +472,7 @@ q2_result q2_vram_upload_named(const q2_vram_section *section, const char *name,
      * bytes even for a texture page, because that is what the decoder wrote;
      * the rect's width is what reaches VRAM.
      */
+    psx_vram_transfer(dst);
     for (row = 0; row < rect.h; row++) {
         int vy = rect.y + row;
         const u8 *src = pixels + (size_t)row * img->width;
@@ -583,6 +584,7 @@ q2_result q2_vram_upload(const q2_vram_section *section, struct psx_vram *vram)
     if (!section || !v)
         return Q2_ERR_INVALID_ARG;
 
+    psx_vram_transfer(v);
     /* Palettes first: they live at x 0..63, y 256+, which is exactly the cell
      * the texture pages deliberately skip over. */
     for (i = 0; i < section->clut4_count; i++) {
@@ -606,11 +608,8 @@ q2_result q2_vram_upload(const q2_vram_section *section, struct psx_vram *vram)
          * every NON-ZERO entry gets the STP bit, and a zero entry stays zero so
          * that fully transparent texels keep working.
          *
-         * It changes no pixel today — the backend reads bits 0..14 for colour
-         * and tests `texel == 0` for transparency, and every model face on the
-         * disc is opaque so per-texel STP never arms — but the VRAM the console
-         * holds after a load has these bits set, and this is the function that
-         * is supposed to reproduce it.
+         * The rasterizer reads bits 0..14 for colour and bit 15 to decide
+         * whether an ABE textured packet blends this particular texel.
          */
         for (e = 0; e < Q2_VRAM_CLUT4_ENTRIES; e++) {
             u16 entry;

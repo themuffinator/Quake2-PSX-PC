@@ -25,16 +25,9 @@
  *   0x20  u32    ofs_faces     ofs_block_a - ofs_faces == 16 * num_faces
  *   0x24  u32    ofs_verts     ALWAYS 0x40; num_verts = (ofs_parts - 0x40) / 12
  *   0x28  u32    ofs_parts     ofs_faces - ofs_parts == 8 * num_parts
- *   0x2C  u32    ofs_block_a   8 x {u16 count; u16 offset; u32 force} — the
- *                              FACE BATCH directory. `count` is how many faces
- *                              the batch holds and `force` is a per-face
- *                              FORCE-DRAW MASK, one bit per face MSB first,
- *                              which the linker tests with `bltz` to skip
- *                              backface rejection outright (0x800B2498).
- *                              It is ZERO in all 13,784 entries of all 1,723
- *                              models on this disc, which is why an earlier
- *                              pass recorded the field as the constant 0 —
- *                              see q2_model_batch_forces_draw and #65.
+ *   0x2C  u32    ofs_block_a   8 x {u16 start; u16 offset; u32 pad} — the
+ *                              octant FACE DRAW ORDER directory, described below.
+ *                              The force-draw word instead belongs at part+4.
  *   0x30  u32    ofs_block_b   16 zero bytes on 821/965; larger on 144
  *   0x34  u32    ofs_block_c
  *   0x38  u32    ofs_block_d
@@ -175,16 +168,15 @@
  *   block C  is the ANIMATION BANK; its per-clip u16 at +0 is a duration and
  *            the multiply by 10 is what makes the runtime clock tick ten times
  *            per animation frame. See the animation section below.
- *   block D  is a run of 20-byte records ending at a zero word. The claim that
- *            its u16 at +12, +14 and +16 are multiplied by 5 at load is
- *            UNSUPPORTED -- no such site exists; the x5 shape in this EXE is a
- *            20-byte record stride. See the move table below and #51f.
+ *   block D  is a run of 20-byte records ending at a zero word. Its u16 at
+ *            +12, +14 and +16 are multiplied by 5 at 0x8006C284..0x8006C2B0.
+ *            Executed PAL/US loader fixtures confirm all three stores. The
+ *            contrary historical conclusion in #51f is withdrawn.
  *
  * The ten in block C is TIME, not distance. An earlier note here guessed it was
  * spatial on the grounds that ten is also the world's lattice step; the pose
- * selector shows it is a subtick rate. Whether block B's tens are times or
- * distances is still open — its entries are pairs, which fits neither a 3-vector
- * nor a duration obviously.
+ * selector shows it is a subtick rate. Block B's pairs are animation-position
+ * ranges for the octant draw-order overrides, consumed by CalcSortList.
  */
 #ifndef Q2PSX_MODEL_H
 #define Q2PSX_MODEL_H
@@ -234,6 +226,7 @@ typedef struct q2_model_part {
     u16 num_faces;       /* may legitimately be 0                              */
     u8  vert_base;       /* base slot in the shared scratch window             */
     u8  num_verts;
+    u32 force_draw;      /* part+4: first 32 faces, MSB first; bypass NCLIP     */
 } q2_model_part;
 
 typedef struct q2_model_face {
@@ -450,8 +443,8 @@ bool q2_model_class_bodges_transparent(const char *name);
  *                          animation frame -- see 0x8006B5D8, which divides the
  *                          position by 10 (magic 0x66666667, sra 2) for a frame
  *                          index and keeps the remainder as the lerp fraction.
- *                          That division is the proof of the unit; the claim
- *                          that a LOADER multiplies durations is unverified.
+ *                          BodgeAnimData scales the on-disc duration by ten
+ *                          during load; this reader keeps the file immutable.
  *          u16 flags       bit 0 selects the variable-rate path (below)
  *          u32 next        BYTE DELTA to the next clip; 0 ends the chain
  *          then per frame f:  u16 rateOfs; u16 keyOfs
@@ -841,11 +834,10 @@ u32 q2_model_anim_base(const q2_model *m, const q2_model_anim *clip);
  * mismatches.** So a move of span S is S/2 + 1 frames, the two-unit gap between
  * moves is exactly one frame, and the k-th move drives the k-th clip.
  *
- * That also recovers the factor of 5 arithmetically, without needing the load
- * site that does not exist: block D counts 2 per frame, the animation position
- * counts 10 per frame (`0x8006B5D8` divides by ten), and 2 * 5 = 10. The
- * earlier claim of a load-time multiply was right about the RATIO and wrong
- * about the mechanism, which is why it survived so long — see #51f and #51g.
+ * Block D counts 2 per frame on disc; 0x8006C214 multiplies start/end/rest by
+ * 5 when loading it. The animation position counts 10 per frame
+ * (`0x8006B5D8` divides by ten). This parser preserves the disc records, so
+ * runtime consumers apply that conversion. See the correction to #51f.
  *
  * WHAT THIS TABLE IS NOT: the table `0x8007E9DC` walks. That one is reached
  * through the entity's linked object (`entity+0x2EC`, then its `+0x28`) and is
@@ -870,11 +862,10 @@ typedef struct q2_model_move {
     char name[13];       /* 12 bytes on disc, NUL-padded; "Pain1", "Death4"   */
     u16  start;          /* +12 — first position of the move on the timeline  */
     u16  end;            /* +14 — last position, inclusive                    */
-    u16  rest;           /* +16 — the record's CURRENT POSITION, a cursor.
-                          * 0x8003CBF4 writes `start` here to rewind a record,
-                          * so the 15 records sitting at `start` are rewound and
-                          * the 77 at `end` have played out. Not a flag. */
-    u16  one;            /* +18 — 1 on every record seen so far               */
+    u16  rest;           /* +16 — reset position after passing end. The live
+                          * cursor is entity+0x100. Player binding rewrites
+                          * Stand/Run rest=start; terminal moves keep end. */
+    u16  one;            /* +18 — usually 1; two observed mover records use 0 */
 } q2_model_move;
 
 /* Read move `index` from block D. False past the end of the table. */
@@ -947,14 +938,9 @@ bool q2_model_position_for_move(const q2_model *m, const char *move_name,
 #define Q2_MODEL_POS_PER_MOVE_FRAME 30
 
 /*
- * The entity animation cursor at +0x100/+0xB0 in retail.
- *
- * AI chooses key bases in 10 Hz steps, 30 position units apart. Rendering
- * samples BASE + PHASE, where 0x8007EB10 supplies a 0..29 phase in 1/300-second
- * units; when the AI base changes, the phase returns to zero. 0x8006B924 then
- * retains the remainder after division by ten for translation lerp /
- * quaternion slerp. `q2_model_cursor_phase` reconstructs that first half;
- * q2_model_pose_at already implements the second.
+ * Generic display cursor for fallback/preview callers. Native creature actors
+ * use q2_cre_motion_animate: their previous AI base, phase, hold bit and
+ * transition flags are distinct state and must not be replaced by this helper.
  */
 typedef struct q2_model_cursor {
     s32  position;       /* tenths of a model frame */
@@ -994,10 +980,16 @@ bool q2_model_part_rotation_word(const q2_model *m, const q2_model_anim *clip,
 /*
  * Decode every part's pose at `tick` of `clip` into `out`, which must hold
  * num_parts entries. Uniform clips select a key; variable-rate clips interpolate
- * each part's duration stream. Ticks past the last key hold its final pose.
+ * each part's duration stream. Tick is clamped to duration-10; the successor
+ * read can cross into block D but must remain inside the model allocation.
  */
 q2_result q2_model_pose_at(const q2_model *m, const q2_model_anim *clip,
                            u32 tick, q2_model_pose *out);
+/* 0x8006B4DC's optional second clip: interpolate the outgoing final key to
+ * the incoming first key over its last ten position units. */
+q2_result q2_model_pose_transition(const q2_model *m, const q2_model_anim *clip,
+                                   u32 tick, const q2_model_anim *next,
+                                   q2_model_pose *out);
 
 /*
  * THE LOWEST POINT OF A POSE, which is not the same as the model's own.
@@ -1014,8 +1006,9 @@ q2_result q2_model_pose_at(const q2_model *m, const q2_model_anim *clip,
  * thirty frames as the body is thrown up and comes down. Drawn against a fixed
  * 251 the same body floats by 190 at frame 9 and sinks by 61 at frame 25.
  *
- * This returns the pose's OWN lowest vertex in model space, so a caller that
- * wants a body to rest on the floor can use it in place of `ext2`. Returns
+ * This returns the pose's own lowest vertex for bounds queries. Native
+ * creature drawing retains ext2 even for settled corpses; replacing it with
+ * this value would change the animation's authored vertical motion. Returns
  * false when the model has no vertices to measure.
  *
  * `pose` is the per-part transform `q2_model_pose_at` produced, and must have

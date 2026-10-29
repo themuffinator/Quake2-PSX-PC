@@ -54,15 +54,20 @@ def main():
         records.append({"case": arena, "owners": owners, "positions": positions})
         print(f"PASS {arena}: four live players", flush=True)
 
-    for name, mode, split in [("deathmatch", 0, "horizontal"),
-                              ("team-deathmatch", 1, "vertical"),
-                              ("versus", 5, "horizontal")]:
+    for name, mode, split, players in [("deathmatch", 0, "horizontal", 2),
+                                       ("team-deathmatch", 1, "vertical", 2),
+                                       ("versus", 5, "horizontal", 2),
+                                       ("deathmatch-four", 0, "horizontal", 4),
+                                       ("team-deathmatch-four", 1, "horizontal", 4)]:
         log = run(name, "MATRIX5", 1800,
-                  ["--dm-players", "2", "--dm-mode", str(mode), "--dm-stage", "--demo",
+                  ["--dm-players", str(players), "--dm-mode", str(mode), "--dm-stage", "--demo",
                    "--dm-frags", "1", "--dm-rounds", "2", "--dm-split", split])
         require("request 11 (load MPResults)" in log, f"{name}: results never opened")
-        require("results ready mask 3" in log, f"{name}: both players never became ready")
-        require("all players ready; returning to setup" in log,
+        require("QMRESULT loaded; one results viewport, scores preserved" in log,
+                f"{name}: results scene was never loaded")
+        require(f"results ready mask {(1 << players) - 1:X}" in log,
+                f"{name}: not every player became ready")
+        require("all players ready; returning to multiplayer menu" in log,
                 f"{name}: results never released")
         rounds = re.findall(r"round restarted (\d+); wins (\d+) (\d+) (\d+) (\d+)", log)
         if mode == 5:
@@ -72,7 +77,7 @@ def main():
                     "round wins were lost while reloading the arena")
         else:
             require(not rounds, f"{name}: incorrectly used Versus round restart")
-        records.append({"case": name, "rounds": rounds, "returned_to_setup": True})
+        records.append({"case": name, "rounds": rounds, "returned_to_multiplayer_menu": True})
         print(f"PASS {name}: complete match and all-player continuation", flush=True)
 
     (output / "results.json").write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")

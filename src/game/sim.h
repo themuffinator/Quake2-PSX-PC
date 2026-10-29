@@ -158,7 +158,21 @@ typedef struct q2_input {
  * and the same one the engine's own `killer < 4 && victim < 4` guard enforces. */
 #define Q2_SIM_MAX_PLAYERS 4
 
+/* Selected by the client's death handler before a tick. A library-only caller
+ * can keep LIVE: Q2_ENT2_DEAD selects CORPSE automatically. This is derived
+ * runtime state, not an additional field in the saved-game format. */
+typedef enum q2_player_motion {
+    Q2_PLAYER_MOTION_LIVE = 0,
+    Q2_PLAYER_MOTION_CORPSE,  /* 0x80039550: brake, then move */
+    Q2_PLAYER_MOTION_BODY,    /* 0x8003E238: move without braking */
+    Q2_PLAYER_MOTION_NONE     /* fade, dissolve, gibbed or freed */
+} q2_player_motion;
+
 typedef struct q2_player {
+    q2_player_motion motion;
+    /* The client's death chain raises DEAD later than the sim's input gate.
+     * Until then a corpse still takes the mover's body-separation pass. */
+    bool corpse_separate;
     s32  pos[3];        /* world units                                        */
     s32  vel[3];        /* world units per dt, pre-divide by Q2_VEL_DIV       */
 
@@ -169,6 +183,14 @@ typedef struct q2_player {
      * than from input.
      */
     s32  yaw, pitch, roll;
+
+    /* FindPlayerTarget's client+0x3C direction and +0x44/+0x46 barrel pitch.
+     * Acquire/ease once per live logic tick; every weapon substep consumes
+     * the same direction. The last published GameWindow position/cell is
+     * separate from the player's current, possibly already moved, eye. */
+    s16 aim_direction[3], aim_pitch, aim_assist;
+    s32 aim_eye[3], aim_node;
+    bool aim_ready, aim_view_valid;
 
     /*
      * The wish velocity at client+0x04: side, vertical, forward. The engine
@@ -256,7 +278,8 @@ typedef struct q2_player {
      *   `kick` / `kick_time`   client+0xA0..0xA4 and +0xCC — pitch, yaw and
      *                          roll, decaying over 30 ticks. What a shot posts.
      *   `hurt_kick` / `pain_time`  client+0x9C, +0x9E and +0xD0 — pitch and
-     *                          roll from taking damage, decaying over 150.
+     *                          roll scaled over 150. Native damage preserves
+     *                          the amplitudes; they begin at zero.
      *
      * `pain_time` is genuinely one field doing two jobs: 0x8003AF50 also uses
      * it as the pain SOUND throttle and sets it to now+210, which is longer
@@ -277,25 +300,9 @@ typedef struct q2_player {
      */
     s16  prev_health, prev_armour;
 
-    /*
-     * THE PLAYER'S FLINCH, published for whoever poses the body.
-     *
-     * 0x8003A1C8 builds one animation id in s5 and hands it to `player_anim`
-     * (0x8003CE14) at 0x8003AFC8. Every other request is conditional — STAND at
-     * 0x8003A2F0, RUN at 0x8003AB5C, ATTACK only over STAND at 0x8003ADAC — but
-     * 0x8003AE08 `addiu s5, zero, 3` is not: whenever the damage byte at
-     * entity+0xDF is non-zero (`lb v0, 223(s3)` at 0x8003ADF8) the request is
-     * PAIN, outranking all of them, and the byte is cleared at 0x8003AE0C so it
-     * asks once per hit. The killing tick never reaches that read, because the
-     * death arm at 0x8003ADB8 returns first.
-     *
-     * The port carries it as a SERIAL rather than a flag, the way `shot_serial`
-     * already reaches the view weapon: the pose runs on the display clock and
-     * may ask several times for one tick, so a flag it had to clear would be
-     * consumed by whichever viewport asked first. Refreshed by update_pain from
-     * `q2_actor.damage_serial`, and only while the player is alive.
-     */
-    u32  pain_serial;
+    /* The native JUMP request is the successful impulse, not airborne state.
+     * Transient output of this player's most recent game tick. */
+    bool jumped_this_tick;
 
     s32  footstep_time; /* client+0x8C                                        */
     int  foot;          /* client+0x90, which of the two sounds is next       */
@@ -703,6 +710,8 @@ typedef struct q2_sim {
      * `sounds` — lands here. Drain with q2_sim_next_explosion_sound.
      */
     q2_model_ent_sounds explosion_sounds;
+    /* Grenade2/3 geometry contact, wep_grenlb1b at the rebound position. */
+    q2_model_ent_sounds grenade_bounce_sounds;
 
     /*
      * AND WHERE EACH PANE SHATTERED, so the owner can play Q2_GLASS_SOUND.
@@ -867,6 +876,11 @@ typedef struct q2_sim {
      * count that includes itself, as a console frame does.
      */
     u32  tick_count;
+    /* Calls to 0x8003DF0C, shared by all players. Retail's counter at
+     * 0x800AE898 starts at 3; storing calls since startup (zero) gives the
+     * same first/fifth/ninth sound with (calls++ & 3) == 0. The client carries
+     * it across every load, including saved games; it is not card state. */
+    u32  lava_burn_calls;
     s32  dt_per_field;  /* 6 on PAL, 5 on NTSC — the build's field rate       */
 
     /*
@@ -1106,6 +1120,8 @@ void q2_sim_attach_effects(q2_sim *sim, const q2_fx_tables *tab, u32 seed);
  * vertices.
  */
 bool q2_sim_attach_glint(q2_sim *sim, const q2_common_file *common);
+void q2_sim_glint_tick(q2_sim *sim);
+void q2_sim_glint_evacuation_tick(q2_sim *sim, s32 dt);
 
 /*
  * Throw a burst of debris. `bmin`/`bmax` are a Scene node's box and `at` an
@@ -1292,6 +1308,11 @@ void q2_sim_scene_solids_update(q2_sim *sim,
 /* OBJDRAWOFF frees the node's box; later visibility alone cannot recreate it. */
 void q2_sim_scene_solids_hide(q2_sim *sim, s32 node);
 
+/* LevelBin-created box, e.g. JAIL3's lowered bridge. Repeated reconstruction
+ * replaces the same node's box instead of allocating duplicate solids. */
+bool q2_sim_scene_solid_set(q2_sim *sim, s32 node,
+                             const s32 min[3], const s32 max[3]);
+
 /*
  * Put a zone's `func_explosive` groups into the same registry.
  *
@@ -1468,6 +1489,11 @@ q2_damage_result q2_sim_mover_crush(q2_sim *sim);
  */
 q2_result q2_sim_attach_gameplay(q2_sim *sim, const q2_common_file *common);
 
+/* Rebind contact hazards once resident-zone operands are available. COMMON
+ * owns the trigger records; LASERWALL's zone-specific object slot and damage
+ * come from the resident Events copy. NULL retains the COMMON operands. */
+void q2_sim_bind_hazards(q2_sim *sim, const q2_uf_operands *ops);
+
 /*
  * Spawn the map's items and start running their thinks.
  *
@@ -1520,6 +1546,7 @@ u32 q2_sim_attach_scene(q2_sim *sim, const q2_common_file *common,
  * object 0, so they stay hidden whatever the page.
  */
 void q2_sim_scene_page(q2_sim *sim, bool title, bool visible);
+void q2_sim_scene_players(q2_sim *sim, const s16 colours[4], int players);
 
 /*
  * One frame of the TITLE SCREEN, which is not one frame of the game.
@@ -1746,7 +1773,7 @@ void q2_sim_player_eye(const q2_sim *sim, int index, s32 out_pos[3]);
  * (0x8004F404) adds three decaying offsets to the weapon instead:
  *
  *     kick        30 ticks   what firing posts; pitch, yaw and roll
- *     hurt_kick  150 ticks   what taking damage posts; pitch and roll
+ *     hurt_kick  150 ticks   stored pitch and roll; not assigned by damage
  *     fall_value  90 ticks   what landing posts; pitch only
  *
  * Each is scaled by `(deadline - now) / period` computed in 1.0.12 — so a kick
@@ -1883,6 +1910,11 @@ bool q2_sim_autoselect_weapon(q2_sim *sim);
  */
 q2_fire_result_v2 q2_sim_fire(q2_sim *sim);
 
+/* The view model retains its fire function until the switch completes.
+ * weapon_id may therefore differ from the inventory's selected weapon. */
+q2_fire_result_v2 q2_sim_fire_weapon(q2_sim *sim, int weapon_id,
+                                    int chaingun_bullets);
+
 typedef enum q2_hand_grenade_update {
     Q2_HAND_GRENADE_NONE = 0,
     Q2_HAND_GRENADE_HELD,
@@ -1926,19 +1958,47 @@ s32 q2_sim_creature_hitscan(q2_sim *sim, q2_actor *attacker,
                             const s32 start[3], const s32 dir[3], s16 damage,
                             s16 mod, bool mark_world, s32 impact[3]);
 
+/* Mission beam damage, 0x80048DC8: nearest actor on the complete authored
+ * segment, without a world trace. Returns a creature index, HIT_PLAYER or -1.
+ * Call once per logic tick; the visual emitter is independent. */
+s32 q2_sim_mission_laser(q2_sim *sim, const s32 start[3], const s32 end[3],
+                          s16 damage, s16 mod);
+
+typedef struct q2_cre_rail_result {
+    u32 creatures_hit;
+    bool player_hit;
+    s32 end[3];
+} q2_cre_rail_result;
+
+/* The rail passes through actors and stops at world geometry. `dir` is the
+ * full trace displacement, as for creature_hitscan; end is also the trail's
+ * endpoint. The shooter is excluded from the damage sweep. */
+q2_cre_rail_result q2_sim_creature_rail(q2_sim *sim, q2_actor *attacker,
+                                       const s32 start[3], const s32 dir[3],
+                                       s16 damage);
+/* 0x800621F8 -> 0x800499A0: one damaged body, but the beam reaches the wall.
+ * Aim components narrow to halfwords and scale by eight in the engine. */
+q2_cre_rail_result q2_sim_creature_laser(q2_sim *sim, q2_actor *attacker,
+                                        const s32 start[3], const s32 aim[3],
+                                        s16 damage);
+
 /*
- * A creature's BOLT or ROCKET, launched as the engine's own projectile rather
+ * A creature's BOLT, ROCKET or GRENADE, launched as an engine projectile rather
  * than resolved along its line: monster_fire_blaster (0x80062000) and
  * monster_fire_rocket (0x8006210C) hand the player's spawners a velocity made
  * from the module's 1.12 aim — `aim / 64` for the bolt, `aim * 3/2` for the
  * rocket — so it flies, trails or smokes, bursts where it lands and splashes.
  * `shooter` is credited and never hit; the player is a target of it. A
  * rocket points along the shooter's yaw, as 0x8004B210 takes it (projectile.h).
- * Returns the slot, or -1 when the list is full or `kind` is neither.
+ * The grenade wrapper (0x800614D4) adds its two random toss components,
+ * scales by 3/2 and passes a 600-tick fuse. Only that wrapper uses `speed`.
+ * Blaster `effects & 0x40` selects hyper bolts (flags 14, MOD 5); otherwise
+ * it uses flags 11, MOD 6. The Flyer supplies a raw aim delta, not a unit vector.
+ * Returns the slot, or -1 for a full pool or invalid kind/speed.
  */
 s32 q2_sim_creature_launch(q2_sim *sim, q2_actor *shooter, q2_fire_kind kind,
                            const s32 start[3], const s32 aim[3], s16 damage,
-                           s32 shooter_yaw);
+                           s32 shooter_yaw, s32 speed, u32 effects);
 
 /* Apply a validated Events FX item to the current player. Returns false when
  * the item is not the retail fixed-size FX form. The original leaves
@@ -1946,8 +2006,13 @@ s32 q2_sim_creature_launch(q2_sim *sim, q2_actor *shooter, q2_fire_kind kind,
  * so the hit has no invented directional knockback. */
 bool q2_sim_apply_event_fx(q2_sim *sim, const q2_event_item *item);
 
-/* The aim vector the fire functions read, built from the current view. 1.3.12,
- * which is the scale every weapon's own shift assumes. */
+/* Publish the rendered GameWindow position for the next acquisition pass.
+ * An offline caller without a published view uses the current player eye. */
+void q2_sim_set_aim_view(q2_sim *sim, int player, const s32 eye[3], s32 node);
+void q2_sim_find_target(q2_sim *sim, s32 dt);
+
+/* The latched client+0x3C firing direction, in 1.3.12. Before the first live
+ * logic tick, direct/offline fire falls back to the player's unassisted aim. */
 void q2_sim_aim(const q2_sim *sim, s16 out[3]);
 
 #endif /* Q2PSX_SIM_H */

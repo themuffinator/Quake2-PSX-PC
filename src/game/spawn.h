@@ -93,6 +93,11 @@ void q2_monster_set_free(q2_monster_set *set);
  * creature from an unregistered one. */
 void q2_monster_set_register(q2_monster_set *set, u32 class_id);
 
+/* Resolve one authored feet position against the current resident geometry.
+ * Used at level load and again when a dormant script batch actually appears. */
+bool q2_spawn_place(const q2_pop_spawn *record, q2_collision *coll,
+                     const q2_move_world *world, s32 origin[3]);
+
 /*
  * Create creatures from every non-path spawn group in the population.
  *
@@ -104,10 +109,12 @@ void q2_monster_set_register(q2_monster_set *set, u32 class_id);
  * `coll` is the zone's SecondaryCol, and it is what puts a creature ON THE
  * FLOOR: the console's shared placement routine sweeps 1024 units down from
  * the nudged record height and takes the Y it stops at. NULL skips the drop,
- * which is right for a census and wrong for a live level.
+ * which is right for a census and wrong for a live level. `world` adds the
+ * solid platforms and scene boxes that are absent from this collision mesh.
  */
 q2_result q2_spawn_from_population(q2_monster_set *out, const q2_population *pop,
-                                   q2_collision *coll, q2_spawn_stats *stats);
+                                   q2_collision *coll, const q2_move_world *world,
+                                   q2_spawn_stats *stats);
 
 /*
  * Wake every placed creature: monster_start_go on each, which points its think

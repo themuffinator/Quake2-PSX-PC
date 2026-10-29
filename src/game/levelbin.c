@@ -77,7 +77,7 @@ u32 q2_levelbin_selected_slot(const u8 *module, u32 size, s32 slot_off,
             continue;
         target = RS(w);
 
-        /* Walk back for `lw rD, 40(rB)`, the slot fetch that produced it. A
+        /* Walk back for `lw rD, slot_off(rB)`, the slot fetch that produced it. A
          * different offset is a different service and not ours. */
         for (j = 4; j <= LOOKBACK && j <= i; j += 4) {
             u32 p = q2_rd_u32(module + i - j);
@@ -141,8 +141,7 @@ u32 q2_levelbin_selected_slot(const u8 *module, u32 size, s32 slot_off,
             continue;
 
         if (n < max)
-            out[n] = name_at;
-        n++;
+            out[n++] = name_at;
     }
 
     return n;
@@ -544,6 +543,11 @@ u32 q2_laserbeams_build(q2_laserbeam_set *out, const q2_events *events,
             if (call.prim != Q2_UF_LASERBEAM || item.len != 36)
                 continue;
 
+            /* Check before taking a writable slot: a zone may declare more
+             * beams than the retail pool can hold. */
+            if (out->count >= Q2_LASERBEAM_MAX)
+                return out->count;
+
             /* The constructor's own restore: both endpoints come from the
              * pristine buffer, not the working one (0x8002E744). */
             p = q2_uf_operand_at(ops, item.payload - 2, 36);
@@ -573,9 +577,14 @@ u32 q2_laserbeams_build(q2_laserbeam_set *out, const q2_events *events,
              * the near end wherever in the hull it happens to be.
              */
             if (coll) {
+                q2_coll_node cell;
                 node = q2_coll_find_node(coll, b->from, -1, true);
-                if (node >= 0)
-                    b->area = (s16)node;
+                /* Retail stores the node here, then dereferences its +32
+                 * byte in the beam renderer. Our effect queue stores that
+                 * byte directly, like the particle and timed-beam queues. */
+                b->area = node >= 0 &&
+                          q2_collision_get_node(coll, (u32)node, &cell)
+                        ? (s16)(cell.contents & 0x7F) : 0;
             }
 
             /*
@@ -586,11 +595,6 @@ u32 q2_laserbeams_build(q2_laserbeam_set *out, const q2_events *events,
                 out->declined++;
                 continue;
             }
-
-            /* `slti v0, v1, 32` — the list is a fixed 32 and the overflow is
-             * dropped, not wrapped. */
-            if (out->count >= Q2_LASERBEAM_MAX)
-                return out->count;
 
             out->count++;
         }
@@ -631,6 +635,67 @@ u32 q2_laserbeams_draw(const q2_laserbeam_set *set, const q2_event_rt *rt,
     }
 
     return n;
+}
+
+u32 q2_laserwalls_build(q2_laserwall_set *out, const q2_events *events,
+                       const q2_userfuncs *uf, const q2_uf_operands *ops)
+{
+    q2_event_record rec;
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    if (!events || !uf || !q2_events_first_record(events, &rec)) return 0;
+    do {
+        u32 i;
+        for (i = 0; i < rec.n_items; i++) {
+            q2_event_item item;
+            q2_uf_call call;
+            const u8 *p;
+            q2_laserwall *wall;
+            int k;
+            if (!q2_events_get_item(events, &rec, i, &item)) break;
+            if (!item.payload || (item.opcode & Q2_EVOP_MASK) != Q2_EVOP_CALL ||
+                item.len != 24 || q2_uf_decode_call(&call, uf, &item) != Q2_OK ||
+                call.prim != Q2_UF_LASERWALL) continue;
+            p = q2_uf_operand_at(ops, item.payload - 2, 24);
+            if (q2_rd_s16(p + 18) < 0 || p[4] > 2) {
+                out->declined++;
+                continue;
+            }
+            if (out->count >= Q2_LASERWALL_MAX) return out->count;
+            wall = &out->wall[out->count++];
+            wall->raiser = rec.offset;
+            wall->scene_node = q2_rd_s16(p + 18);
+            wall->axis = p[4]; wall->rows = p[5];
+            wall->rise = q2_rd_s16(p + 6);
+            wall->length = q2_rd_s16(p + 8);
+            wall->spread = q2_rd_s16(p + 10);
+            for (k = 0; k < 3; k++) wall->offset[k] = q2_rd_s16(p + 12 + 2*k);
+        }
+    } while (q2_events_next_record(events, &rec, &rec));
+    return out->count;
+}
+
+bool q2_laserwall_segment(const q2_laserwall *wall, const q2_scene *scene,
+                         u32 row, s32 from[3], s32 to[3])
+{
+    q2_scene_node node;
+    u32 spread_axis;
+    int k;
+    if (!wall || !scene || !from || !to || wall->axis > 2 || row >= wall->rows ||
+        wall->scene_node < 0 || !q2_scene_get_node(scene, (u32)wall->scene_node, &node))
+        return false;
+    /* Native signed division truncates toward zero, including negative odd
+     * sums. Read live Scene bounds: a moving emitter moves its whole wall. */
+    for (k = 0; k < 3; k++)
+        from[k] = to[k] = (s32)(((s64)node.bbox_min[k] + node.bbox_max[k]) / 2) +
+                         (k == 1 ? -wall->offset[k] : wall->offset[k]);
+    to[wall->axis] += wall->length;
+    spread_axis = wall->axis == 0 ? 0 : 2;
+    from[spread_axis] -= (s32)row * wall->spread;
+    to[spread_axis] += (s32)row * wall->spread;
+    from[1] -= (s32)row * wall->rise;
+    to[1] -= (s32)row * wall->rise;
+    return true;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -815,78 +880,71 @@ u32 q2_teleports_draw(const q2_teleport_set *set, const q2_triggers *trigs,
 /* ------------------------------------------------------------------------- */
 /* VIEW CREDITS — see levelbin.h                                              */
 /* ------------------------------------------------------------------------- */
-/* Is `p` the start of a printable, NUL-terminated string of at least two
- * characters? The pool is packed and 4-aligned, which is what makes walking it
- * possible at all. */
-static bool credit_string_at(const u8 *module, u32 size, u32 off, u32 *len_out)
+static bool credit_row_at(const u8 *module, u32 size, u32 base, u32 off,
+                            q2_credit_row *out)
 {
-    u32 i = 0;
-
-    while (off + i < size && module[off + i] != 0) {
-        u8 ch = module[off + i];
-
-        if (ch < 0x20 || ch > 0x7E)
-            return false;
-        i++;
-        if (i > 63)
-            return false;
+    u32 text, i;
+    if (off > size || size - off < 24) return false;
+    text = q2_rd_u32(module + off);
+    if (!text || text < base || text - base >= size) return false;
+    text -= base;
+    for (i = 0; i < 64 && i < size - text; i++) {
+        u8 ch = module[text + i];
+        if (!ch) break;
+        if (ch < 0x20 || ch > 0x7E) return false;
     }
-    if (i < 2 || off + i >= size)
-        return false;
-    *len_out = i;
+    if (i == 64 || i == size - text) return false;
+    if (q2_rd_s16(module + off + 4) != 256 ||
+        q2_rd_s16(module + off + 6) < 0 ||
+        q2_rd_s16(module + off + 6) > 480) return false;
+    /* The last blank is an ordinary menu record with y=223 and a Back
+     * callback. The stream uses only text/x, replacing y with 210. */
+    i = q2_rd_u32(module + off + 8);
+    if (i && (i < base || i - base >= size)) return false;
+    for (i = 12; i < 24; i += 4)
+        if (q2_rd_u32(module + off + i)) return false;
+    if (out) {
+        out->text = (const char *)module + text;
+        out->x = q2_rd_s16(module + off + 4);
+        out->y = q2_rd_s16(module + off + 6);
+    }
     return true;
 }
 
-u32 q2_levelbin_credits(const u8 *module, u32 size,
-                        const char **out, u32 max)
+static bool credit_end_at(const u8 *module, u32 size, u32 off)
 {
-    static const char k_first[] = "HAMMERHEAD LTD";
-    static const char k_stop[]  = "PLEASE WAIT WHILE";
-    u32 off, start = 0, n = 0;
+    u32 i;
+    if (off > size || size - off < 24) return false;
+    for (i = 0; i < 24; i += 4)
+        if (q2_rd_u32(module + off + i)) return false;
+    return true;
+}
 
-    if (!module || size == 0)
-        return 0;
-
-    /* Find the roll's first line. */
-    for (off = 0; off + sizeof(k_first) <= size; off += 4) {
-        u32 len;
-
-        if (!credit_string_at(module, size, off, &len))
-            continue;
-        if (len == sizeof(k_first) - 1 &&
-            memcmp(module + off, k_first, len) == 0) {
-            start = off;
-            break;
+u32 q2_levelbin_credits(const u8 *module, u32 size, u32 load_base,
+                        q2_credit_row *out, u32 max)
+{
+    u32 off;
+    if (!module || size < 120) return 0;
+    for (off = 0; off <= size - 120; off += 4) {
+        q2_credit_row first, sentinel;
+        u32 at, n = 1, i;
+        if (!credit_row_at(module, size, load_base, off, &first) ||
+            strcmp(first.text, "DEVELOPED BY") || first.y != 210 ||
+            !credit_end_at(module, size, off + 24) ||
+            !credit_row_at(module, size, load_base, off + 48, &sentinel) ||
+            sentinel.text[0]) continue;
+        for (at = off + 72; n < Q2_CREDITS_MAX; at += 24, n++)
+            if (!credit_row_at(module, size, load_base, at, NULL)) break;
+        if (n < 3 || !credit_end_at(module, size, at)) continue;
+        if (out && max) {
+            out[0] = first;
+            for (i = 1; i < n && i < max; i++)
+                credit_row_at(module, size, load_base, off + 48 + i * 24,
+                                &out[i]);
         }
+        return n;
     }
-    if (!start)
-        return 0;
-
-    /*
-     * Then walk the pool forward, string by string, to the disc-swap prompt.
-     * Strings are packed and each is padded to the next 4 bytes, which is what
-     * `+= (len + 4) & ~3` steps over — a run that does not step exactly onto
-     * the next string is not this pool and the walk stops.
-     */
-    for (off = start; off < size; ) {
-        u32 len;
-
-        if (!credit_string_at(module, size, off, &len))
-            break;
-        if (len == sizeof(k_stop) - 1 &&
-            memcmp(module + off, k_stop, len) == 0)
-            break;
-
-        if (out && n < max)
-            out[n] = (const char *)module + off;
-        n++;
-        if (n >= Q2_LB_CREDITS_MAX)
-            break;
-
-        off += (len + 4u) & ~3u;
-    }
-
-    return n;
+    return 0;
 }
 
 /* ------------------------------------------------------------------------- */

@@ -1,6 +1,9 @@
 add_library(q2psx_menu STATIC
     menu.c
     menu.h
+    mpselect.c
+    credits.c
+    credits.h
     menudraw.c
     menudraw.h
     menufont.c

@@ -1,4 +1,5 @@
 #include "gamepad.h"
+#include "controller_ui.h"
 #include <string.h>
 
 static u32 button_mask(Uint8 button)
@@ -78,6 +79,8 @@ int q2_gamepads_event(q2_gamepads *pads, const SDL_Event *event)
         pads->device[pi] = NULL;
         pads->id[pi] = 0;
         pads->held[pi] = pads->pressed[pi] = 0;
+        pads->menu_pressed[pi] = 0;
+        memset(pads->menu_axis[pi], 0, sizeof(pads->menu_axis[pi]));
         memset(pads->axis[pi], 0, sizeof(pads->axis[pi]));
         pads->changed[pi] = true;
         return pi;
@@ -86,6 +89,16 @@ int q2_gamepads_event(q2_gamepads *pads, const SDL_Event *event)
         pi = find_slot(pads, event->gaxis.which);
         if (pi < 0 || event->gaxis.axis >= SDL_GAMEPAD_AXIS_COUNT) return -1;
         pads->axis[pi][event->gaxis.axis] = event->gaxis.value;
+        if (event->gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX ||
+            event->gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY) {
+            int a = event->gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY;
+            int before = pads->menu_axis[pi][a];
+            pads->menu_axis[pi][a] = q2_ui_axis(event->gaxis.value, before);
+            if (pads->menu_axis[pi][a] != before && pads->menu_axis[pi][a])
+                pads->menu_pressed[pi] |= a ? (pads->menu_axis[pi][a] < 0 ? Q2_PAD_UP : Q2_PAD_DOWN)
+                    : (pads->menu_axis[pi][a] < 0 ? Q2_PAD_LEFT : Q2_PAD_RIGHT);
+            if (pads->menu_axis[pi][a]) pads->prompt_id = event->gaxis.which;
+        }
         mask = event->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ? Q2_PAD_L2 :
                event->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER ? Q2_PAD_R2 : 0;
         if (mask) {
@@ -103,9 +116,45 @@ int q2_gamepads_event(q2_gamepads *pads, const SDL_Event *event)
     mask = button_mask(event->gbutton.button);
     if (event->gbutton.down) {
         pads->pressed[pi] |= mask & ~pads->held[pi];
+        pads->menu_pressed[pi] |= mask & ~pads->held[pi];
         pads->held[pi] |= mask;
+        pads->prompt_id = event->gbutton.which;
     } else pads->held[pi] &= ~mask;
     return pi;
+}
+
+u16 q2_gamepads_menu_player(q2_gamepads *pads, int player)
+{
+    u32 mask;
+    if (!pads || player < 0 || player >= Q2_SIM_MAX_PLAYERS) return 0;
+    mask = pads->held[player] | pads->menu_pressed[player];
+    pads->menu_pressed[player] = 0;
+    if (pads->menu_axis[player][0] < 0) mask |= Q2_PAD_LEFT;
+    if (pads->menu_axis[player][0] > 0) mask |= Q2_PAD_RIGHT;
+    if (pads->menu_axis[player][1] < 0) mask |= Q2_PAD_UP;
+    if (pads->menu_axis[player][1] > 0) mask |= Q2_PAD_DOWN;
+    /* East is the host's consistent Back button. North remains an alias for
+     * players used to the retail PSX mapping. */
+    if (mask & (Q2_PAD_CIRCLE | Q2_PAD_SELECT)) mask |= Q2_PAD_TRIANGLE;
+    return (u16)mask;
+}
+
+u16 q2_gamepads_menu(q2_gamepads *pads)
+{
+    u16 mask = 0;
+    int i;
+    for (i = 0; i < Q2_SIM_MAX_PLAYERS; i++)
+        mask |= q2_gamepads_menu_player(pads, i);
+    return mask;
+}
+
+SDL_Gamepad *q2_gamepads_prompt(const q2_gamepads *pads)
+{
+    int i = find_slot(pads, pads->prompt_id);
+    if (i >= 0 && pads->device[i]) return pads->device[i];
+    for (i = 0; i < Q2_SIM_MAX_PLAYERS; i++)
+        if (pads->device[i]) return pads->device[i];
+    return NULL;
 }
 
 static s8 stick(s16 value)
@@ -116,6 +165,15 @@ static s8 stick(s16 value)
     scaled = (magnitude - 8000) * Q2_PAD_FULL / (32767 - 8000);
     if (scaled > Q2_PAD_FULL) scaled = Q2_PAD_FULL;
     return (s8)(value < 0 ? -scaled : scaled);
+}
+
+int q2_gamepads_primary(const q2_gamepads *pads, bool multiplayer)
+{
+    int i;
+    if (pads->id[0] || multiplayer) return 0;
+    for (i = 1; i < Q2_SIM_MAX_PLAYERS; i++)
+        if (pads->id[i]) return i;
+    return 0;
 }
 
 u32 q2_gamepads_read(const q2_gamepads *pads, int pi, int style,

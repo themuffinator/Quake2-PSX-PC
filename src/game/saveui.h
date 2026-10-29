@@ -69,7 +69,8 @@ typedef enum q2_save_ui_mode {
     Q2_SAVE_UI_SAVE = 0,
     Q2_SAVE_UI_LOAD,
     Q2_SAVE_UI_SETTINGS_SAVE,
-    Q2_SAVE_UI_SETTINGS_LOAD
+    Q2_SAVE_UI_SETTINGS_LOAD,
+    Q2_SAVE_UI_UNLOCK_SAVE /* same settings slots, MULTI UNLOCK label */
 } q2_save_ui_mode;
 
 typedef enum q2_save_ui_status {
@@ -139,6 +140,8 @@ void q2_save_ui_open_load(q2_save_ui *ui);
 void q2_save_ui_open_settings_save(q2_save_ui *ui,
                                    const q2_settings_blob *settings);
 void q2_save_ui_open_settings_load(q2_save_ui *ui);
+void q2_save_ui_open_unlock_save(q2_save_ui *ui,
+                                 const q2_settings_blob *settings);
 
 /* Abandon the session. The status becomes CANCELLED. */
 void q2_save_ui_close(q2_save_ui *ui);

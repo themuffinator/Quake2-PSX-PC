@@ -179,6 +179,7 @@ typedef struct q2_item_spawn_stats {
     u32 inert;          /* spawned, but its effect index has no handler    */
     u32 scenery;        /* spawned with effect 0 — decoration by design    */
     u32 no_memory;
+    u32 no_placement;   /* no valid SecondaryCol cell for the spawn sweep */
     u32 skill_filtered; /* +0x0C difficulty flags rejected this place       */
     u32 other_zone;     /* groups skipped: their name claims another zone  */
     u32 not_selected;   /* unzoned groups the LevelBin did not select       */
@@ -192,8 +193,8 @@ typedef struct q2_item_spawn_stats {
  * model bank open passes it; 0 is correct for a caller that does not, and only
  * shifts the draw origin.
  *
- * Returns NULL when no table record matches the place id, which is the engine's
- * behaviour too: nothing spawns and the record is silently skipped.
+ * Returns NULL for an unknown id, allocation failure, or a placement outside
+ * the supplied resident hull. NULL hull supports asset-only callers.
  */
 q2_entity *q2_item_spawn(q2_entity_set *set, const q2_pop_place *place,
                          const q2_item_table *table, s16 model_offset,
@@ -210,11 +211,13 @@ q2_entity *q2_item_spawn(q2_entity_set *set, const q2_pop_place *place,
  * a whole map wants.
  *
  * `levelbin` is the map's own LevelBin module. `q2_levelbin_selected` recovers
- * its calls to the retail group selector, so an unzoned group such as `Weapons`
- * or `ShotgunRoom` spawns only when the module selected it. This is the same
+ * its calls to the retail group selector, so an unzoned or suffixed group such
+ * as `Weapons` or `Zone1Key` needs an explicit selection. This is the same
  * rule `q2_creature_world_hold_batches` applies to creature groups. A resident
  * `Zone<N>` group remains the fallback when the module is absent or empty;
- * unzoned script batches do not appear early.
+ * script batches do not appear early merely because their names start with a
+ * zone. Conditional mission selections use q2_sim_attach_item_batches instead
+ * of treating this static call scan as executed control flow.
  *
  * Before either spawner runs, retail's list walker at `0x8007F538` rejects a
  * place carrying NOT_EASY / NOT_MEDIUM / NOT_HARD for the current global
@@ -420,6 +423,7 @@ void q2_item_drop_think(q2_entity *e, q2_entity_world *w);
 /* The velocity an in-flight drop carries (+0xE0..+0xE4); false when `e` is not
  * one. For the test and the census. */
 bool q2_item_drop_velocity(const q2_entity *e, s16 out[3]);
+bool q2_item_drop_restore(const q2_entity_set *set, u32 slot, const s16 vel[3]);
 
 /* How many drops are in the air. */
 u32 q2_item_drop_in_flight(void);

@@ -528,7 +528,9 @@ static int draw_frame(const q2_fx_tables *t, const disc *d, const char *out_ppm)
                     q2_fx_glint_mesh_decode(&mesh, chunk->data, chunk->size)) {
                     s32 at[3] = { -1500, -900, 2600 };
                     q2_fx_glint gl;
-                    u32 k;
+                    const dat_chunk *lb = common.chunk[Q2_COMMON_LEVEL_BIN];
+                    q2_fx_glint_script script;
+                    s32 angles[3] = { 0, 700, 0 };
 
                     /*
                      * The MULTI-BAND path, with the six bands BIGGUN's script
@@ -539,12 +541,13 @@ static int draw_frame(const q2_fx_tables *t, const disc *d, const char *out_ppm)
                     memset(&gl, 0, sizeof(gl));
                     gl.mesh       = mesh;
                     gl.ready      = true;
-                    gl.band_count = Q2_FX_GLINT_BANDS;
-                    for (k = 0; k < Q2_FX_GLINT_BANDS; k++) {
-                        gl.band[k].angle[1] =
-                            (s16)((s32)k * 4096 / Q2_FX_GLINT_BANDS);
-                        gl.band[k].phase  = (u8)(1 + (k % 4));
-                        gl.band[k].colour = 0x3AA0DCFFu;
+                    if (lb && q2_fx_glint_scan(&script, lb->data, lb->size) &&
+                        script.bands_found) {
+                        gl.scripted = true;
+                        gl.band_count = script.band_count;
+                        memcpy(gl.base_angle, script.angle, sizeof(gl.base_angle));
+                        q2_rng_seed(&gl.script_rng, 0);
+                        q2_fx_glint_refresh(&gl, angles);
                     }
 
                     trail = q2_fx_glint_draw(&gl, at, 700, &cam, &ot, &gte);
@@ -738,10 +741,18 @@ static u32 check_glint_meshes(const disc *d)
                            " %u bands, phase %u\n",
                            s.raise_offset, s.band_count, s.phase);
                     if (s.band_count != Q2_FX_GLINT_BANDS ||
-                        s.phase != Q2_FX_GLINT_PHASE_START) {
+                        s.phase != Q2_FX_GLINT_PHASE_START || !s.bands_found ||
+                        !s.lightning_found) {
                         printf("  PROBLEM   %-44s\n",
-                               "the scan did not recover both immediates");
+                               "the scan did not recover the bands and lightning");
                         bad++;
+                    }
+                    if (s.bands_found) {
+                        u32 band;
+                        for (band = 0; band < s.band_count; band++)
+                            printf("    band %u: %d, %d, %d\n", band,
+                                   s.angle[band][0], s.angle[band][1],
+                                   s.angle[band][2]);
                     }
                 } else {
                     printf("  PROBLEM   %-44s\n",

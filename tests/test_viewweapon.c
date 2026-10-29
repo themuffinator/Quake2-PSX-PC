@@ -1151,6 +1151,80 @@ static void test_aim_assist_eases_and_clamps(void)
 }
 
 /* ------------------------------------------------------------------------- */
+/*
+ * THE DRIVER'S RETURN — the halfword at 0x800B2B7E that 0x8004F6D4 hands back
+ * and the player think turns into an ATTACK request on any nonzero value.
+ * Every substep's state-machine pass rewrites it, the idle arm writes its fire
+ * function's answer and the continuous arms write their own shot over it, so
+ * it is the LAST substep's word and not "did anything fire".
+ */
+static q2_vw_fire_result g_arm_answer;
+static int               g_arm_calls;
+
+static q2_vw_fire_result arm_fire(void *user, int weapon, int rounds)
+{
+    (void)user; (void)weapon; (void)rounds;
+    g_arm_calls++;
+    return g_arm_answer;
+}
+
+static void test_driver_result(void)
+{
+    q2_viewweapon vw;
+
+    q2_vw_init(&vw, &g_tab, 1);
+    run_until(&vw, Q2_VM_IDLE, false, 100);
+    CHECK(q2_vw_result(&vw) == 0, "an idle gun returns 0, got %d",
+          q2_vw_result(&vw));
+
+    q2_vw_advance(&vw, 10, true, Q2_VW_FIRED);
+    CHECK(vw.state == Q2_VM_FIRE && q2_vw_result(&vw) == 1,
+          "the idle arm's shot is the return, got %d", q2_vw_result(&vw));
+    q2_vw_advance(&vw, 10, true, Q2_VW_FIRE_NONE);
+    CHECK(q2_vw_result(&vw) == 0,
+          "the next advance's pass clears it, got %d", q2_vw_result(&vw));
+
+    /* 0x8004EE9C: no substep, no write — the global keeps its last value. */
+    vw.result = 1;
+    q2_vw_advance(&vw, 0, true, Q2_VW_FIRE_NONE);
+    CHECK(q2_vw_result(&vw) == 1, "a zero step leaves the stale return");
+
+    /* A dry click returns 2, which still asks the body for ATTACK. */
+    q2_vw_init(&vw, &g_tab, 1);
+    run_until(&vw, Q2_VM_IDLE, false, 100);
+    q2_vw_advance(&vw, 10, true, Q2_VW_FIRE_DENIED);
+    CHECK(q2_vw_result(&vw) == 2 && vw.state == Q2_VM_IDLE,
+          "a dry idle shot returns 2 and stays idle, got %d state %d",
+          q2_vw_result(&vw), (int)vw.state);
+
+    /* The machinegun arm's round is written over the pass's zero... */
+    park_in_fire(&vw, 4, 0);
+    g_arm_answer = Q2_VW_FIRED;
+    g_arm_calls  = 0;
+    q2_vw_advance_firing(&vw, 30, true, Q2_VW_FIRE_NONE, arm_fire, NULL);
+    CHECK(g_arm_calls == 1 && q2_vw_result(&vw) == 1,
+          "a round in the last substep is the return: %d calls, result %d",
+          g_arm_calls, q2_vw_result(&vw));
+
+    /* ...and erased by a later substep that takes none: 100 ticks fire at
+     * the key boundary, whose pass writes zero, and the next 20 stay quiet. */
+    park_in_fire(&vw, 4, 0);
+    g_arm_calls = 0;
+    q2_vw_advance_firing(&vw, DRV_KEY_TICKS + 20, true, Q2_VW_FIRE_NONE,
+                         arm_fire, NULL);
+    CHECK(g_arm_calls == 1 && q2_vw_result(&vw) == 0,
+          "an earlier substep's round is erased: %d calls, result %d",
+          g_arm_calls, q2_vw_result(&vw));
+
+    /* A dry round from the arm is 2, even as it drops the gun to IDLE. */
+    park_in_fire(&vw, 4, 0);
+    g_arm_answer = Q2_VW_FIRE_DENIED;
+    q2_vw_advance_firing(&vw, 30, true, Q2_VW_FIRE_NONE, arm_fire, NULL);
+    CHECK(q2_vw_result(&vw) == 2 && vw.state == Q2_VM_IDLE,
+          "a dry machinegun round returns 2, got %d state %d",
+          q2_vw_result(&vw), (int)vw.state);
+}
+
 int main(void)
 {
     build_bank();
@@ -1173,6 +1247,7 @@ int main(void)
     test_chaingun_loop_and_spin_down();
     test_machinegun_accumulator_resets();
     test_dry_frame_fire();
+    test_driver_result();
     test_hyperblaster_loop();
     test_grenade_cook_waits_for_the_arm();
     test_rotmatrix_order();
