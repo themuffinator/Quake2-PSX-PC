@@ -1335,6 +1335,15 @@ q2_fire_result_v2 q2_sim_fire_weapon(q2_sim *sim, int weapon_id,
         p->kick_time = sim->level_time + Q2_VIEW_KICK_FIRE;
     }
 
+    /*
+     * PLAYERNOISE, type 1, from nine of the eleven fire functions (0x8004C150
+     * the blaster's .. 0x8004D6E0 the railgun's). The hand grenade's
+     * (0x8004EBDC) and the BFG's (0x8004EB10) have no call, so neither is
+     * heard. At the shot's start, where the console passes it.
+     */
+    if (r.fired && weapon_id != Q2_WID_HAND_GRENADE && weapon_id != Q2_WID_BFG)
+        q2_sim_player_noise(sim, 1, r.shot_count ? r.shot[0].origin : eye);
+
     player_damage_begin(sim); /* after the fire function spends ammunition */
     switch (r.kind) {
     case Q2_FK_BULLET:
@@ -1358,6 +1367,12 @@ q2_fire_result_v2 q2_sim_fire_weapon(q2_sim *sim, int weapon_id,
             fx_hitscan_impact(sim, s->origin, s->dir, at,
                               victim < 0 && frac < 4096, frac_area,
                               victim, &dr, s->damage);
+
+            /* 0x80048998..0x800489AC: DoNoise, type 2, at the round's end
+             * after the blood or the puff — a player's shots only, which is
+             * what DoNoise's client test is. */
+            if (victim >= 0 || frac < 4096)
+                q2_sim_player_noise(sim, 2, at);
         }
         break;
 
@@ -2487,6 +2502,11 @@ static void bolt_contact_tick(q2_sim *sim, u32 index, const q2_proj_step *step,
         if (!complete) {
             memcpy(p->pos, clipped, sizeof(p->pos));
             consumed = true;
+            /* 0x8004861C / 0x80048650: DoNoise, type 2, on both arms of the
+             * hull impact and before the flag-8 test, for a bolt a player
+             * fired. A bolt's actor contacts raise none. */
+            if (!p->shooter && p->owner >= 0 && p->owner < Q2_SIM_MAX_PLAYERS)
+                q2_sim_player_noise(sim, 2, p->pos);
             if (p->flags & Q2_PROJ_FLAG_IMPACT)
                 bolt_impact_effect(sim, Q2_FX_EXPLOSION, p->pos);
         }

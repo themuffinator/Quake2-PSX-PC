@@ -957,9 +957,6 @@ void q2_ai_set_sight_client(void)
 /* ------------------------------------------------------------------------- */
 /* FindTarget — 0x8005D334                                                    */
 /* ------------------------------------------------------------------------- */
-/* The class id of the noise entity a player's own footsteps spawn. Read as the
- * equality at 0x8005D784. */
-#define Q2_CLASS_PLAYER_NOISE 201
 /* The class id of a scripted actor, which a good guy will not shoot. */
 #define Q2_CLASS_ACTOR        204
 
@@ -1031,7 +1028,11 @@ bool q2_find_target(q2_monster *self)
             return false;
         if (client->enemy->flags & Q2_FL_NOTARGET)
             return false;
-    } else if (!heardit) {
+    } else if (heardit) {
+        /* 0x8005D4FC: a noise is refused if its maker is NOTARGET. */
+        if (client->owner && (client->owner->flags & Q2_FL_NOTARGET))
+            return false;
+    } else {
         return false;
     }
 

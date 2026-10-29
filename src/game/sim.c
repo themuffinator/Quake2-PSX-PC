@@ -2373,9 +2373,16 @@ static bool player_jump(q2_sim *sim, bool pressed, s32 dt)
      * here. So a gated jump stays silent, which is what makes the sound a
      * usable signal that the press was actually taken.
      *
-     * The queue carries the sound; the client's drain raises the noise beside
-     * it, because the creature world is the client's to reach.
+     * The noise is requested here at the entity origin (+0x54); the client
+     * hands it to the creature world, which is the client's to reach.
      */
+    {
+        s32 origin[3];
+        origin[0] = p->pos[0];
+        origin[1] = q2_sim_origin_y(p->pos[1]);
+        origin[2] = p->pos[2];
+        q2_sim_player_noise(sim, 0, origin);
+    }
     q2_ent_sound_player(&sim->ent_world.events, sim->cur_player, Q2_SND_JUMP, p->pos);
     return true;
 }
@@ -2862,6 +2869,16 @@ static void world_effects(q2_sim *sim)
     if (p->ent.flags & Q2_ENT_UNDERWATER) {
         /* 0x8003D2A8: the submerge EDGE. */
         if (p->water_air == 0) {
+            s32 origin[3];
+
+            /* 0x8003D2B8: PlayerNoise at the entity origin, type 0, BEFORE
+             * the cooldown test below — the dive is heard even when its sound
+             * is skipped. */
+            origin[0] = p->pos[0];
+            origin[1] = q2_sim_origin_y(p->pos[1]);
+            origin[2] = p->pos[2];
+            q2_sim_player_noise(sim, 0, origin);
+
             /* 0x8003D2D0: `sltu`, so the sound is skipped while the wade's own
              * cooldown is still running. */
             if ((u32)p->splash_time < (u32)sim->level_time)
@@ -2924,9 +2941,17 @@ static void world_effects(q2_sim *sim)
         return;
     }
 
-    /* 0x8003D450: the surface EDGE, taken only if we were under. */
-    if (p->water_air != 0)
+    /* 0x8003D450: the surface EDGE, taken only if we were under, with its
+     * PlayerNoise at the entity origin (0x8003D460). Wading in, below, makes
+     * none: 0x8003D480's arm has no call. */
+    if (p->water_air != 0) {
+        s32 origin[3];
+        origin[0] = p->pos[0];
+        origin[1] = q2_sim_origin_y(p->pos[1]);
+        origin[2] = p->pos[2];
+        q2_sim_player_noise(sim, 0, origin);
         q2_ent_sound_player(&sim->ent_world.events, sim->cur_player, Q2_SND_WATER_OUT, p->pos);
+    }
 
     p->water_air = 0;
 
@@ -3908,6 +3933,19 @@ s32 q2_sim_next_dt(const q2_sim *sim, double elapsed_seconds)
         return 0;
 
     return accum > Q2_DT_MAX ? Q2_DT_MAX : accum;
+}
+
+void q2_sim_player_noise(q2_sim *sim, int type, const s32 at[3])
+{
+    int k;
+
+    if (!sim || !at || sim->multiplayer)
+        return;
+    k = type < 2 ? 0 : 1;
+    sim->noise[k].pending = true;
+    sim->noise[k].at[0] = at[0];
+    sim->noise[k].at[1] = at[1];
+    sim->noise[k].at[2] = at[2];
 }
 
 u32 q2_sim_advance(q2_sim *sim, const q2_input *input, double elapsed_seconds)

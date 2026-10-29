@@ -934,6 +934,18 @@ typedef struct q2_sim {
     bool multiplayer;
 
     /*
+     * PLAYERNOISE REQUESTS raised inside the tick, for the client's creature
+     * world to take: [0] the body and the guns (types 0 and 1), [1] impacts
+     * (type 2). The console re-places one noise entity per pair on every call,
+     * so the last request of a tick is the one that stands. Never raised in
+     * multiplayer, where PlayerNoise and DoNoise return at once (0x800AEBCC).
+     */
+    struct {
+        bool pending;
+        s32  at[3];
+    } noise[2];
+
+    /*
      * 0x800B2AA4, a GAME VARIABLES setting. Non-zero routes all movement through
      * the full view-basis rotation instead of the yaw-only path, which lets pitch
      * steer horizontal movement.
@@ -1934,6 +1946,9 @@ q2_hand_grenade_update q2_sim_hand_grenade_update(
  * shooter's own angles — the player's view, or a creature's facing — because
  * the console rings it in the SHOOTER's matrix, entity+0x2C0, not the beam's.
  */
+/* Ask for PlayerNoise of `type` (0 body, 1 gun, 2 impact) at `at`. */
+void q2_sim_player_noise(q2_sim *sim, int type, const s32 at[3]);
+
 void q2_sim_rail_trail(q2_sim *sim, const s32 start[3], const s32 end[3],
                        s32 yaw, s32 pitch, s32 roll);
 

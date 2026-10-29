@@ -1123,19 +1123,7 @@ host policy.
 
 **Identified, not yet corrected:**
 
-- Player noise. Native PlayerNoise (0x80062B80) spawns two noise entities per
-  player: class 201, no client and no object, with their origin frozen at the
-  noise and `teleport_time` stamped. The port points both slots at the live
-  player stand-in. As a result, hearing propagates sight (FoundTarget
-  publishes only for a client, 0x8005D11C), a creature hunting a noise never
-  re-runs its sight checks against the player (0x8005D4A4), and it follows the
-  player rather than the noise point. Its 50-tick expiry reads the noise's
-  health through a null object pointer (0x8005DE48); that read is undefined,
-  but in practice the noise counts as dead. Missile and bullet impacts make
-  type-2 noise natively (0x8004861C, 0x80048650, 0x800489AC), the grenade
-  and BFG fire functions make none, and wading in makes none. This needs
-  separate noise entities, save and zone references to them, and AI
-  regressions.
+- Player noise; corrected in the next section.
 - The BFG beam freezes its endpoints for up to about four ticks when a
   refresh is skipped; native recomputes them every frame (ProcessSplurges).
   This is visual only.
@@ -1145,6 +1133,73 @@ host policy.
 All 73 CTests pass. The disc-backed muzzle, weapon (grenade, projectile
 contact, bolt, auto-aim), save, player-animation and split-screen suites pass
 on both PAL and US.
+
+## Player noise, 29 October
+
+PlayerNoise (0x80062B80) returns in multiplayer (0x800AEBCC) and for a
+NOTARGET player (0x80062C14). On its first call it spawns two entities
+(0x80062C30, 0x80062C4C): class 201, owner the player (+0x48), svflags 1, and
+no client and no object, so no health. It keeps them at who+0xC8 and +0xCC.
+A type below 2 goes to `sound_entity`, type 2 to `sound2_entity`
+(0x80062C68). The noise is moved to `where` and stamped with
+`teleport_time = level.time` (0x80062CA0..0x80062CD4). The port pointed both
+slots at the live player stand-in, and three behaviours followed from that:
+
+- FoundTarget publishes a sighting only for a client (0x8005D11C), so a
+  hearing creature woke others with a sighting it never made.
+- FindTarget's "already got one" (0x8005D4A4) returned before any sight
+  check, so a creature hunting a "noise" never re-saw the player.
+- While the player kept firing, each shot refreshed the 50-tick window, so
+  hearing creatures held fire indefinitely.
+
+`q2_creature_world` now owns the two noise entities, `noise[0]` and
+`noise[1]`. FindTarget refuses a heard noise whose owner is NOTARGET
+(0x8005D4FC).
+
+The sim raises the requests where the console calls PlayerNoise:
+
+- Type 0 at the entity origin for the jump (0x8003E208), the dive
+  (0x8003D2B8) and surfacing (0x8003D460). The dive's noise comes before the
+  splash cooldown that can skip its sound. Wading in makes none.
+- Type 1 at the shot's start from nine fire functions. The hand grenade's
+  and the BFG's make none.
+- Type 2 at the end of a player's bullet after its blood or puff
+  (0x80048998..0x800489AC).
+- Type 2 at a player's bolt hitting the world. This comes from both arms of
+  ProcessMissiles_Many's hull impact (0x8004861C, 0x80048650); a bolt
+  striking a body makes none.
+
+The client hands these requests to the creature world once per frame.
+
+Cold saves write CAIS version 6, which adds both noise entities' position
+and stamp, and references to them from the alert slots and creature targets.
+Versions 1..5 still read. Zone history captures a noise reference as none.
+Each zone keeps its own AI clock, so a carried stamp would be meaningless,
+and a returning creature then has no enemy, which is what a stale noise
+leaves it.
+
+The 50-tick expiry reads the noise's health through its null object pointer
+(0x8005DE48). That is undefined native state; the port's zero health makes
+the creature give the noise up. This matches the expected kernel-RAM read,
+but no hardware trace has confirmed it.
+
+Two new `test_creature` regressions cover the entities, the channel split,
+the frozen position, the NOTARGET early-out, no sighting propagation,
+re-sighting the player, and expiry. A control build pointing the slots back
+at the player fails 11 of their checks. `test_save` round-trips a noise
+entity through disk. All 73 CTests pass. The disc-backed suites pass on PAL
+and US, including the full 851-check creature client.
+
+The table below compares 1,500-frame headless `--demo` PAL runs of the
+previous commit (`0b5d7dc`) with this change:
+
+| Map | Creature rounds before -> after | Outcome |
+| --- | --- | --- |
+| WASTE1 | 0 -> 93 | Before, three creatures hunted the player but never fired; after, the player is killed by a rail |
+| JAIL2 | 82 -> 109 | Hits on the player rise from 4 to 12 |
+| BASE2 | 29 -> 42 | The player dies in both runs |
+
+These are port demo runs, not matched retail traces.
 
 ## Limits
 
@@ -1225,7 +1280,7 @@ question are different kinds of evidence; none is silently counted as complete.
 | Projectile and other collision/toss details | Grenade bounce/owner lifetime, projectile actor queries, owner self-splash, cold-save cells and bolt flight/impact effects are corrected. Hitscan now uses the native query, with a single rail victim, immune shielding and entry-point blood. Knockback uses the entity origin, and gib rebounds use SDK arithmetic. Still open: the AI body clip's arithmetic, GenMissileHitPlane for client targets, the cached bolt hull marcher, posed contact refinement, final-frame body submission, other entity/contact and simultaneous-sound ordering, and extreme math domains. | Migrate the AI body clip and compare it with native list order. Qualify the remaining collision, presentation and sound boundaries and reachable numeric domains. |
 | Shared gameplay randomness | The port retains separate combat, effect and global gameplay streams. Bolt trail/impact draws now share their saved combat stream, but native BIOS randomness is shared across subsystems. | Reconstruct reachable caller order, unify stream ownership and qualify integrated gameplay plus cold-save histories without claiming isolated seeded fixtures establish whole-frame parity. |
 | Other explicit source deviations | Reviewed 29 October. The chime origin, knockback, BFG beam centring and drowning arms are corrected. Secret dedup, path-corner order, briefing-unit selection, actor effect areas and the muzzle's roll composition are equivalent or unreachable. The unit-five camera stays host policy. Remaining: a one-unit muzzle rounding difference and the BFG beam's endpoint freeze when a refresh is skipped. | Pin the muzzle rounding against a native RotMatrix/RotateS fixture, and recompute BFG beam endpoints per submit while the ball lives. |
-| Creature hearing (player noise) | Confirmed defect. Both noise slots point at the live player stand-in instead of PlayerNoise's frozen, client-less class-201 entities. Impact noise and the grenade/BFG/wade noise rules differ (29 October section). | Separate noise entities with save and zone references, FindTarget's NOTARGET owner test, impact DoNoise, and AI regressions for propagation, re-sighting, the walk target and expiry. |
+| Creature hearing (player noise) | Corrected (Player noise section): native noise entities, sources, saves and FindTarget's owner test. The expiry relies on the noise's zero health standing in for an undefined null-pointer read. Zone history deliberately drops a heard noise. The silencer and rebreather arms are unreachable in shipped data. | Matched retail traces of creatures responding to noise, if the undefined expiry read needs confirming. |
 | Native mission and campaign behavior | Named handlers are implemented, but static LevelBin fallback does not execute arbitrary branches or track registers. Registered frame callbacks, trigger combinations and their persistent state are not exhaustively qualified. | Compare reachable native branches and state transitions across difficulties, zone returns, deaths, restarts and saves; extend regressions for each discrepancy. |
 | Whole-game behavior | Creature callbacks, movement, weapons, menus and multiplayer have focused native/functional coverage; a scripted campaign route is not a complete retail playthrough. | Matched retail state/input traces for remaining interactions, including boss combat and movement edge cases. |
 | PAL rendering | No paired retail scenes with matching camera, animation, lighting and RNG are available for current gameplay output. | Compare matched native frames, including near-eye geometry, translucency, water and split-screen. |

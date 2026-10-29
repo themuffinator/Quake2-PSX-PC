@@ -900,6 +900,27 @@ void q2_creature_world_wake(q2_creature_world *w, const s32 player_origin[3],
     w->sight.view_height = -(s16)(Q2_VIEW_STAND - Q2_EYE_BASE);
     sight_place(w, player_origin);
 
+    /*
+     * The two noise entities, as 0x80062C30..0x80062C64 builds them. Neither
+     * is noisy yet: nothing points at them until the first noise, and their
+     * zero health is what ai_checkattack reads, through a null object pointer
+     * on the console (0x8005DE48), once a noise has gone stale.
+     */
+    {
+        int k;
+        for (k = 0; k < 2; k++) {
+            q2_monster *n = &w->noise[k];
+            q2_monster_init(n);
+            n->in_use      = true;
+            n->spawnflags |= Q2_SVFLAG_INUSE;
+            n->class_id    = Q2_CLASS_PLAYER_NOISE;
+            n->owner       = &w->sight;
+            n->svflags     = 1;
+            n->client      = false;
+            n->health      = 0;
+        }
+    }
+
     q2_monster_set_wake(&w->set, &w->sight);
 }
 
@@ -926,38 +947,47 @@ u32 q2_creature_world_tick(q2_creature_world *w, const s32 player_origin[3],
 }
 
 /*
- * PlayerNoise — 0x80062C74, and without it two of FindTarget's three alert arms
- * can never fire.
+ * PlayerNoise — 0x80062B80, and without it two of FindTarget's three alert
+ * arms can never fire.
  *
  * `q2_find_target` reads `sound_entity`/`sound_entity_framenum` (0x800E46EC and
- * 0x800E46F0) and `sound2_entity`/`sound2_entity_framenum` (0x800E46F4, F8)
- * exactly as the original does — and NOTHING in this port ever wrote them. The
- * only alerting that worked was `sight_client`, which needs a creature to
- * already be looking the right way. So a player could empty a magazine in a
- * corridor and wake nobody: measured at 126 shots fired, 0 creatures hunting.
+ * 0x800E46F0) and `sound2_entity`/`sound2_entity_framenum` (0x800E46F4, F8).
+ * 0x80062C68's `sltiu v0, s4, 2` sends types 0 and 1 to the first pair and
+ * type 2 to the second, which an ambush creature ignores; each pair points at
+ * its own noise entity, moved to `where` (0x80062CA0..0x80062CC0).
  *
- * The original spawns a noise ENTITY and keeps it; this port has one entity it
- * can point at — the sight client, which already stands where the player is —
- * so the pair is written with that. What matters to FindTarget is the position
- * and the framenum, and both are right.
+ * The port used to point both at the sight client, the live player. A
+ * creature that heard a shot then hunted the player rather than the noise,
+ * woke the others with a sighting, and could not see the player it was hunting
+ * because FindTarget's "already got one" returned first. See the note on
+ * `noise` in creworld.h.
  *
- * 0x80062C80's own split: a noise type under 2 is WEAPON noise and goes to the
- * first pair; anything else is the player's own and goes to the second. The
- * second is additionally suppressed for an ambush creature, which is the whole
- * reason the engine keeps them apart.
+ * The console's early outs: none at all in multiplayer (0x800AEBCC), none for
+ * a NOTARGET player (0x80062C14), and the silencer's quiet shots (type 1,
+ * 0x80062BC8). No shipped map places a silencer, and the callers in this port
+ * raise noise only in single player.
  */
-void q2_creature_world_player_noise(q2_creature_world *w, bool weapon)
+void q2_creature_world_player_noise(q2_creature_world *w, const s32 where[3],
+                                    int type)
 {
-    if (!w || !w->ready)
+    q2_monster *n;
+
+    if (!w || !w->ready || !where)
+        return;
+    if (w->sight.flags & Q2_FL_NOTARGET)
         return;
 
-    if (weapon) {
-        q2_level_state.sound_entity          = &w->sight;
+    n = &w->noise[type < 2 ? 0 : 1];
+    if (type < 2) {
+        q2_level_state.sound_entity          = n;
         q2_level_state.sound_entity_framenum = q2_level_state.framenum;
     } else {
-        q2_level_state.sound2_entity          = &w->sight;
+        q2_level_state.sound2_entity          = n;
         q2_level_state.sound2_entity_framenum = q2_level_state.framenum;
     }
+    n->pos[0] = where[0];
+    n->pos[1] = where[1];
+    n->pos[2] = where[2];
 
     /*
      * AND THE STAMP THAT KEEPS THE NOISE ALIVE. 0x80062CC8 loads level.time
@@ -970,13 +1000,8 @@ void q2_creature_world_player_noise(q2_creature_world *w, bool weapon)
      * check and the sound target was dropped before the investigate behaviour
      * — walk to the noise, stop and look at 768 units, hold fire — could run
      * for even one tick. A creature that heard a shot opened fire instead.
-     *
-     * DEVIATION: the original stamps the noise entity it spawned; this port
-     * points both noise slots at the sight stand-in, so the stamp lands there.
-     * The stand-in is the only thing FindTarget is ever handed as a noise, so
-     * the window it produces is the same.
      */
-    w->sight.teleport_time = q2_level_state.time;
+    n->teleport_time = q2_level_state.time;
 }
 
 /* Case-insensitive substring, over a name that is not NUL-terminated in the

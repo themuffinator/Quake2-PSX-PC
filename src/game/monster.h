@@ -786,6 +786,10 @@ void q2_monster_init(q2_monster *m);
 
 /* True while the entity is a live participant: the original's
  * `flags & 0x20000000` test, which every AI path opens with. */
+/* The class of the noise entities PlayerNoise spawns (0x80062C34), read as
+ * the equality at 0x8005D784. */
+#define Q2_CLASS_PLAYER_NOISE 201
+
 static inline bool q2_ent_inuse(const q2_monster *m)
 {
     return m != NULL && m->in_use && (m->spawnflags & Q2_SVFLAG_INUSE) != 0;

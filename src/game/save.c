@@ -99,6 +99,11 @@ struct q2_save_ai {
     bool script_state_present;
     bool shared_state_present;
     bool motion_present;
+    /* Version 6: the player's two noise entities, where each was last made
+     * and when (creworld.h, `noise`). */
+    bool noise_present;
+    s32 noise_pos[2][3];
+    s32 noise_time[2];
 };
 
 /* One field list keeps capture, portable encoding and apply in agreement. */
@@ -2439,11 +2444,18 @@ static void read_ai_state(rbuf *r, q2_monster *m)
 }
 
 /* -1 = no target, -2 = player proxy, -(3+i) = path corner, i >= 0 = monster. */
+/* Beyond every corner code (-3 - index, index < SAVE_MAX_ENTITIES). */
+#define AI_REF_NOISE (-0x01000000)
+
 static bool ai_ref(const q2_creature_world *w, const q2_monster *m, s32 *out)
 {
     u32 i;
     if (!m) { *out = -1; return true; }
     if (m == &w->sight) { *out = -2; return true; }
+    if (m == &w->noise[0] || m == &w->noise[1]) {
+        *out = AI_REF_NOISE - (s32)(m - w->noise);
+        return true;
+    }
     for (i = 0; i < w->set.count; i++)
         if (m == &w->set.monsters[i]) { *out = (s32)i; return true; }
     for (i = 0; i < w->corner_count; i++)
@@ -2454,6 +2466,7 @@ static bool ai_ref(const q2_creature_world *w, const q2_monster *m, s32 *out)
 static bool valid_ai_ref(s32 ref, u32 count, u32 corners)
 {
     if (ref == -1 || ref == -2) return true;
+    if (ref == AI_REF_NOISE || ref == AI_REF_NOISE - 1) return true;
     return ref >= 0 ? (u32)ref < count : -(s64)ref - 3 < (s64)corners;
 }
 
@@ -2461,6 +2474,8 @@ static q2_monster *resolve_ai_ref(q2_creature_world *w, const u32 *map, s32 ref)
 {
     if (ref == -1) return NULL;
     if (ref == -2) return &w->sight;
+    if (ref == AI_REF_NOISE || ref == AI_REF_NOISE - 1)
+        return &w->noise[AI_REF_NOISE - ref];
     if (ref >= 0) return &w->set.monsters[map[ref]];
     return &w->corner[-(s64)ref - 3];
 }
@@ -2507,6 +2522,11 @@ q2_result q2_save_capture_ai(q2_save *s, const q2_creature_world *w, u32 phase_u
     a->script_state_present = true;
     a->shared_state_present = true;
     a->motion_present = true;
+    a->noise_present = true;
+    for (i = 0; i < 2; i++) {
+        memcpy(a->noise_pos[i], w->noise[i].pos, sizeof(a->noise_pos[i]));
+        a->noise_time[i] = w->noise[i].teleport_time;
+    }
     a->phase_us = phase_us;
     a->monsters = a->count ? calloc(a->count, sizeof(*a->monsters)) : NULL;
     if (a->count && !a->monsters) { free_ai(a); return Q2_ERR_NO_MEMORY; }
@@ -2624,6 +2644,11 @@ q2_result q2_save_apply_ai(const q2_save *s, q2_creature_world *w, u32 *phase_us
         }
     }
     copy_ai_state(&w->sight, &a->sight);
+    if (a->noise_present)
+        for (i = 0; i < 2; i++) {
+            memcpy(w->noise[i].pos, a->noise_pos[i], sizeof(w->noise[i].pos));
+            w->noise[i].teleport_time = a->noise_time[i];
+        }
     q2_level_state = a->level;
     if (!a->motion_present) {
         for (i = 0; i < a->count; i++) {
@@ -2653,6 +2678,11 @@ q2_zone_ref q2_zone_ref_capture(const q2_creature_world *w, const q2_monster *m)
     u32 i;
     if (!m || !w) return r;
     if (m == &w->sight) { r.kind = Q2_ZREF_PLAYER; return r; }
+    /* A heard noise does not follow the player through a zone gate: each
+     * zone keeps its own AI clock (zonestate.c), so the noise's stamp would
+     * mean nothing on return. A creature that was hunting one comes back
+     * with no enemy, which is what the stale noise would have left it. */
+    if (m == &w->noise[0] || m == &w->noise[1]) return r;
     for (i = 0; i < w->set.count; i++) if (m == &w->set.monsters[i]) {
         r.kind = Q2_ZREF_CREATURE; r.group = m->group;
         r.slot = m->population_slot; r.id = m->pop_class_id;
@@ -2833,7 +2863,7 @@ static void write_ai(wbuf *w, const q2_save *s)
     u32 i;
     if (!a) return;
     at = w_chunk_begin(w, TAG_CAIS);
-    w_u32(w, a->motion_present ? 5 : a->shared_state_present ? 4 : a->script_state_present ? 3 : a->spawn_pending_present ? 2 : 1);
+    w_u32(w, a->noise_present ? 6 : a->motion_present ? 5 : a->shared_state_present ? 4 : a->script_state_present ? 3 : a->spawn_pending_present ? 2 : 1);
     w_u32(w, a->count); w_u32(w, a->corner_count);
     w_u32(w, a->phase_us);
     w_s32(w, a->level.framenum); w_s32(w, a->level.time);
@@ -2848,6 +2878,11 @@ static void write_ai(wbuf *w, const q2_save *s)
         w_s32v(w, a->trail.spot[i].origin, 3);
         w_s32(w, a->trail.spot[i].timestamp); w_s16(w, a->trail.spot[i].yaw);
     }
+    if (a->noise_present)
+        for (i = 0; i < 2; i++) {
+            w_s32v(w, a->noise_pos[i], 3);
+            w_s32(w, a->noise_time[i]);
+        }
     for (i = 0; i < a->count; i++) {
         const save_ai_monster *d = &a->monsters[i];
         write_ai_state(w, &d->state);
@@ -2869,7 +2904,7 @@ static bool read_ai(rbuf *r, q2_save *s)
 {
     struct q2_save_ai *a;
     u32 version = r_u32(r), n = r_u32(r), i, j;
-    if (r->bad || version < 1 || version > 5 || s->ai || n > SAVE_MAX_ENTITIES ||
+    if (r->bad || version < 1 || version > 6 || s->ai || n > SAVE_MAX_ENTITIES ||
         n > (r->len - r->at) / 128) return false;
     a = calloc(1, sizeof(*a));
     if (!a) return false;
@@ -2878,6 +2913,7 @@ static bool read_ai(rbuf *r, q2_save *s)
     a->script_state_present = version >= 3;
     a->shared_state_present = version >= 4;
     a->motion_present = version >= 5;
+    a->noise_present = version >= 6;
     a->count = n; a->corner_count = r_u32(r); a->phase_us = r_u32(r);
     if (a->corner_count > SAVE_MAX_ENTITIES || a->phase_us > 500000) return false;
     a->monsters = n ? calloc(n, sizeof(*a->monsters)) : NULL;
@@ -2897,6 +2933,11 @@ static bool read_ai(rbuf *r, q2_save *s)
         r_s32v(r, a->trail.spot[i].origin, 3);
         a->trail.spot[i].timestamp = r_s32(r); a->trail.spot[i].yaw = r_s16(r);
     }
+    if (a->noise_present)
+        for (i = 0; i < 2; i++) {
+            r_s32v(r, a->noise_pos[i], 3);
+            a->noise_time[i] = r_s32(r);
+        }
     for (i = 0; i < n; i++) {
         save_ai_monster *d = &a->monsters[i];
         read_ai_state(r, &d->state);

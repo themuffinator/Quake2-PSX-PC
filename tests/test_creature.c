@@ -194,33 +194,120 @@ static void test_batch_zone_eligibility(void)
 /* ------------------------------------------------------------------------- */
 static void test_player_noise_stamps_the_window(void)
 {
-    q2_creature_world w;
+    static q2_creature_world w;
+    const s32 player[3] = { 0, 0, 0 };
+    const s32 shot[3]   = { 100, -300, 200 };
+    const s32 impact[3] = { 900, -100, 4000 };
 
-    puts("PlayerNoise stamps the noise so the five-second window can run");
+    puts("PlayerNoise stamps its own noise entity so the window can run");
 
     memset(&w, 0, sizeof(w));
-    q2_monster_init(&w.sight);
+    q2_creature_world_wake(&w, player, 100);
     w.ready = true;
+
+    check(w.noise[0].class_id == Q2_CLASS_PLAYER_NOISE &&
+          w.noise[1].class_id == Q2_CLASS_PLAYER_NOISE &&
+          w.noise[0].owner == &w.sight && !w.noise[0].client &&
+          w.noise[0].health == 0 && q2_ent_inuse(&w.noise[0]),
+          "two class-201 entities, owned by the player, with no client "
+          "and no health (0x80062C30..0x80062C64)");
 
     q2_level_reset();
     q2_level_state.time     = 137;
     q2_level_state.framenum = 137;
 
-    q2_creature_world_player_noise(&w, true);
-    check(q2_level_state.sound_entity == &w.sight,
-          "a weapon noise goes to the loud channel");
+    q2_creature_world_player_noise(&w, shot, Q2_PNOISE_WEAPON);
+    check(q2_level_state.sound_entity == &w.noise[0],
+          "a gun's noise goes to the first noise entity, not the player");
     check_eq_i(q2_level_state.sound_entity_framenum, 137,
                "with this tick's framenum");
-    check_eq_i(w.sight.teleport_time, 137,
+    check(w.noise[0].pos[0] == 100 && w.noise[0].pos[1] == -300 &&
+          w.noise[0].pos[2] == 200, "placed where the noise was made");
+    check_eq_i(w.noise[0].teleport_time, 137,
                "and 0x80062CD4's level.time stamp, which ai_checkattack "
                "measures staleness against");
+    check_eq_i(w.sight.teleport_time, 0, "the player is not stamped");
 
     q2_level_state.time     = 200;
     q2_level_state.framenum = 200;
-    q2_creature_world_player_noise(&w, false);
-    check(q2_level_state.sound2_entity == &w.sight,
-          "the player's own noise goes to the quiet channel");
-    check_eq_i(w.sight.teleport_time, 200, "and is stamped the same way");
+    q2_creature_world_player_noise(&w, impact, Q2_PNOISE_IMPACT);
+    check(q2_level_state.sound2_entity == &w.noise[1],
+          "an impact goes to the second, which an ambush creature ignores");
+    check_eq_i(w.noise[1].teleport_time, 200, "and is stamped the same way");
+    check(q2_level_state.sound_entity == &w.noise[0] &&
+          w.noise[0].pos[0] == 100, "leaving the first where it was");
+
+    w.sight.flags |= Q2_FL_NOTARGET;
+    q2_level_state.framenum = 300;
+    q2_creature_world_player_noise(&w, impact, Q2_PNOISE_WEAPON);
+    check(q2_level_state.sound_entity_framenum == 137,
+          "a NOTARGET player makes no noise (0x80062C14)");
+}
+
+/*
+ * WHAT A HEARD NOISE IS TO A CREATURE. With the player stand-in as the noise
+ * (the port's old shape) every one of these went the other way: the hearer
+ * published a sighting, chased the player's live position, never re-ran its
+ * sight checks because "already got one" returned first, and hunted the
+ * player for good because the player's health never ran out.
+ */
+static void test_heard_noise_is_not_the_player(void)
+{
+    static q2_creature_world w;
+    q2_monster m;
+    const s32 player[3] = { 0, 0, 0 };
+    const s32 noise_at[3] = { 0, 0, 3000 };
+
+    puts("a creature that hears a noise hunts the noise, not the player");
+
+    memset(&w, 0, sizeof(w));
+    q2_creature_world_wake(&w, player, 100);
+    w.ready = true;
+    q2_ai_set_world(NULL);
+    q2_level_reset();
+    q2_level_state.time = q2_level_state.framenum = 100;
+    q2_level_state.sight_client = &w.sight;
+
+    q2_monster_init(&m);
+    m.in_use = true;
+    m.spawnflags |= Q2_SVFLAG_INUSE;
+    m.svflags |= Q2_SVF_MONSTER;
+    m.health = 100;
+    m.pos[2] = 6000;
+    m.angles[2] = 2048;              /* facing back toward the origin */
+    m.ideal_yaw = 2048;
+
+    /* Hide the player beyond FindTarget's sight range so the noise decides. */
+    w.sight.pos[2] = -60000;
+    q2_creature_world_player_noise(&w, noise_at, Q2_PNOISE_WEAPON);
+    check(q2_find_target(&m), "the creature hears the shot");
+    check(m.enemy == &w.noise[0] && m.enemy->class_id == Q2_CLASS_PLAYER_NOISE &&
+          (m.aiflags & Q2_AI_SOUND_TARGET),
+          "its enemy is the class-201 noise, as a sound target");
+    check_eq_i(q2_level_state.sight_entity_framenum, 0,
+               "and hearing tells no one else (FoundTarget, 0x8005D11C)");
+
+    w.sight.pos[2] = -50000;
+    check(m.enemy->pos[2] == 3000,
+          "the noise stays where it was made while the player moves");
+
+    /* The noise is no longer fresh; the player steps into view. */
+    q2_level_state.framenum += 3;
+    w.sight.pos[2] = 2000;
+    check(q2_find_target(&m) && m.enemy == &w.sight &&
+          !(m.aiflags & Q2_AI_SOUND_TARGET),
+          "a creature hunting a noise still turns on the player it sees");
+
+    /* Fifty ticks after the noise the console finds it dead and gives up. */
+    q2_level_state.framenum += 3;
+    m.enemy = m.goalentity = &w.noise[0];
+    m.aiflags |= Q2_AI_SOUND_TARGET;
+    m.movetarget = NULL;
+    w.sight.pos[2] = -60000;
+    q2_level_state.time = w.noise[0].teleport_time + 51;
+    q2_ai_checkattack(&m, 0);
+    check(m.enemy == NULL && !(m.aiflags & Q2_AI_SOUND_TARGET),
+          "a stale noise is dropped and, having no health, not hunted on");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -3423,6 +3510,7 @@ int main(int argc, char **argv)
     test_summoned_batch_is_started();
     test_batch_zone_eligibility();
     test_player_noise_stamps_the_window();
+    test_heard_noise_is_not_the_player();
     test_bind();
     test_population_spawn_flags();
     test_spawn_difficulty_masks();

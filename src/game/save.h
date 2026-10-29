@@ -193,7 +193,9 @@
  * CAIS v3 adds script callback/scale state; v4 adds export-0 initialization
  * and module-shared decisions/explosion phases. Version 5 adds physical actor
  * motion, pending impulses, local clock/phase and animation transition state.
- * Versions 1..4 still read,
+ * Version 6 adds the player's two noise entities (position and stamp) and
+ * references to them from the alert slots and creature targets.
+ * Versions 1..5 still read,
  * remapping old roster indices around newly supported Jorg/Rider/Medic slots.
  * Missing ROTR/CAIS retains the older endpoint replay/basic creature restore.
  * Older readers skip these chunks under the existing container contract. */

@@ -2292,6 +2292,10 @@ static void test_ai_resume(void)
     q2_level_state.sound_entity = &live->sight;
     q2_level_state.sound_entity_framenum = 199;
     live->sight.teleport_time = 198;
+    q2_level_state.sound2_entity = &live->noise[1];
+    q2_level_state.sound2_entity_framenum = 197;
+    live->noise[1].pos[0] = 4321; live->noise[1].pos[2] = -1234;
+    live->noise[1].teleport_time = 196;
     q2_trail_add(crumb);
     m->in_use = true; m->spawnflags |= Q2_SVFLAG_INUSE;
     m->enemy = &live->sight; m->oldenemy = &live->set.monsters[1];
@@ -2361,6 +2365,11 @@ static void test_ai_resume(void)
           q2_level_state.sound_entity_framenum == 199 &&
           rebuilt->sight.teleport_time == 198 && phase == 33333,
           "AI clock, pending noise and fractional tick survive");
+    check(q2_level_state.sound2_entity == &rebuilt->noise[1] &&
+          q2_level_state.sound2_entity_framenum == 197 &&
+          rebuilt->noise[1].pos[0] == 4321 && rebuilt->noise[1].pos[2] == -1234 &&
+          rebuilt->noise[1].teleport_time == 196,
+          "a noise entity survives disk with its place and stamp");
     q2_trail_capture(&trail);
     check(trail.active && trail.head == 1 && trail.spot[0].timestamp == 200 &&
           trail.spot[0].origin[2] == 900, "pursuit breadcrumbs survive");

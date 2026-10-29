@@ -11365,8 +11365,6 @@ static q2_vw_fire_result client_fire_view_weapon(void *user, int weapon, int rou
     if (shot.fired) {
         if (pi == 0) c->shots_fired++;
         c->mp_shots[pi]++;
-        if (pi == 0 && c->creatures_ready)
-            q2_creature_world_player_noise(&c->creatures, true);
         if (shot.shock)
             client_shock(c, pi, shot.shock, Q2_SHOCK_FULL, NULL, 0, 0);
         /* 0x8004CCB4: one quiet clone per bullet, then 0x8004CCD8's
@@ -11393,6 +11391,27 @@ static q2_vw_fire_result client_fire_view_weapon(void *user, int weapon, int rou
         }
     }
     return shot.dry ? Q2_VW_FIRE_DENIED : Q2_VW_FIRED;
+}
+
+/*
+ * THE PLAYER'S NOISE, as the sim raised it this frame: the body's and the
+ * guns' to the first noise entity, impacts to the second (sim.h, `noise`).
+ * Taken whether or not the creature world is up, so a request cannot
+ * outlive the frame it was made in.
+ */
+static void client_drain_player_noise(client *c)
+{
+    int k;
+
+    for (k = 0; k < 2; k++) {
+        if (!c->sim[0].noise[k].pending)
+            continue;
+        c->sim[0].noise[k].pending = false;
+        if (c->creatures_ready)
+            q2_creature_world_player_noise(&c->creatures,
+                c->sim[0].noise[k].at,
+                k ? Q2_PNOISE_IMPACT : Q2_PNOISE_WEAPON);
+    }
 }
 
 /*
@@ -12483,6 +12502,7 @@ static void client_input_simulated(client *c, float dt)
     }
 
     client_entity_events(c);
+    client_drain_player_noise(c);
 
     /* Damage tracking is per player, like the viewport's flash tile
      * (0x8003AE10 writes the same view+672 that 0x80076764 draws). */
@@ -15339,33 +15359,14 @@ static void client_entity_events(client *c)
                     CLIENT_SOUND_POINT, 0, ev->e[i].pos);
 
             /*
-             * WHICH PLAYER EVENTS RAISE AI NOISE, and this was backwards in
-             * both directions.
-             *
-             * `xrefs 0x80062B80` gives PlayerNoise fourteen callers. Ten are
-             * weapons. The other four are water entry (0x8003D2B8), the breath
-             * (0x8003D3FC), water exit (0x8003D460) and the JUMP (0x8003E208).
-             * The footstep block at 0x8003AA3C..0x8003AB04 contains no `jal`
-             * except its own sound play, and the fall handler makes only
-             * 0x8007270C and 0x80057D54. So retail raises no noise for walking
-             * or landing at all, and raises one for the jump — the exact
-             * opposite of what was here.
-             *
-             * And the pair was wrong too. All four player-body callers pass
-             * type 0, and 0x80062C68's `sltiu v0, s4, 2` sends anything below 2
-             * to level.sound_entity at 0x800E46EC. That is the `true` branch of
-             * this helper. `false` writes sound2_entity, which an ambush
-             * creature ignores — so even the noise that was being raised went
-             * to the pair least likely to be heard.
-             *
-             * Expect this to read as a regression at first: creatures stop
-             * noticing you walk. They did not notice on the console either.
+             * NO AI NOISE HERE. PlayerNoise's body callers are the jump
+             * (0x8003E208), the dive (0x8003D2B8) and surfacing (0x8003D460),
+             * and the dive is heard even when its splash sound is skipped by
+             * the wade cooldown, so a sound event cannot stand in for it.
+             * The sim raises them where the console does
+             * (q2_sim_player_noise) and client_drain_player_noise hands them
+             * over. Walking and landing raise none, on the console too.
              */
-            if (c->creatures_ready &&
-                (ev->e[i].sound == Q2_SND_JUMP ||
-                 ev->e[i].sound == Q2_SND_WATER_IN ||
-                 ev->e[i].sound == Q2_SND_WATER_OUT))
-                q2_creature_world_player_noise(&c->creatures, true);
 
             if (!ok)
                 Q2_DEBUG("sound '%s' is not in %s's bank", name, c->map);

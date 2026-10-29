@@ -182,6 +182,24 @@ typedef struct q2_creature_world {
     q2_monster         sight;
 
     /*
+     * THE PLAYER'S TWO NOISE ENTITIES — PlayerNoise (0x80062B80) spawns them on
+     * the first noise and keeps them at who+0xC8 and who+0xCC: class 201, the
+     * player as owner (+0x48), svflags 1, and no client (+0x0C) and no object
+     * (+0x24), so no health. The noise is where it was made, frozen there:
+     * [0] carries types 0 and 1 (the body and the guns) for `sound_entity`, [1]
+     * type 2 (impacts) for `sound2_entity`.
+     *
+     * They are not the sight client, and that difference is the behaviour.
+     * A creature hunting one walks to where the noise was rather than to where
+     * the player is, does not tell the others (FoundTarget publishes a sighting
+     * only for a client, 0x8005D11C), still runs its sight checks on the player
+     * and turns on them when it sees them, and after 50 ticks finds the noise
+     * "dead" and goes back to what it was doing. Pointing both slots at the
+     * sight client gave none of the four.
+     */
+    q2_monster         noise[2];
+
+    /*
      * THE MAP'S PATH CORNERS — the "PathCorner" group, spawned by 0x8007F390.
      *
      * They are ordinary entities on the console and G_PickTarget hands one
@@ -280,21 +298,20 @@ u32 q2_creature_world_tick(q2_creature_world *w, const s32 player_origin[3],
 void q2_creature_world_actor_tick(q2_creature_world *w);
 
 /*
- * The player made a noise, and creatures may look for it.
+ * The player made a noise at `where`, and creatures may look for it.
  *
- * `weapon` true is the console's noise type < 2, which goes to `sound_entity`;
- * false is type 2 and up, which goes to `sound2_entity` and which an AMBUSH
- * creature ignores. Without this two of FindTarget's three alert arms are dead.
- * See the note on the definition.
- *
- * The names mislead slightly, so be careful choosing: type < 2 is not only
- * gunfire. `xrefs 0x80062B80` shows the player's own body raising type 0 for
- * the jump and for entering, leaving and breathing under water — all of them
- * `true` here. Walking and landing raise nothing at all. An earlier note here
- * cited "a footstep, a landing" as the `false` case; the real one is a bullet
- * impact, PNOISE_IMPACT, type 2.
+ * The console's three types: 0 is the body (the jump 0x8003E208, the dive
+ * 0x8003D2B8 and the surfacing 0x8003D460, all at the entity origin), 1 a gun
+ * (nine fire functions; not the hand grenade's or the BFG's), 2 an impact
+ * (DoNoise 0x8007F15C, for a player's bullet and bolt). Below 2 goes to
+ * `sound_entity`; 2 to `sound2_entity`, which an AMBUSH creature ignores.
+ * Walking and landing raise nothing. See the note on the definition.
  */
-void q2_creature_world_player_noise(q2_creature_world *w, bool weapon);
+#define Q2_PNOISE_SELF    0
+#define Q2_PNOISE_WEAPON  1
+#define Q2_PNOISE_IMPACT  2
+void q2_creature_world_player_noise(q2_creature_world *w, const s32 where[3],
+                                    int type);
 
 /* The model name for a live creature — the class table's name, which is also
  * the name its model carries in the map's CastList. NULL when unresolvable. */
