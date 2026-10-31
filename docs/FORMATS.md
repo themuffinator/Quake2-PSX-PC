@@ -5502,10 +5502,14 @@ lurch.
 
 ### 12.9 Negative results worth keeping
 
-* **The screen-position settings have no reader.** `0x800B3368` / `0x800B336A` (the SCREEN POSITION page's x
-  and y, defaults 0 and 24) are written only by the reset routine at `0x8001FA18`, and the sweep finds no
-  load anywhere in the image — not gp-relative, not through a materialised base, and the addresses do not
-  appear as data words either. Nothing in the executable moves the display by them.
+* ~~**The screen-position settings have no reader.**~~ **WITHDRAWN — the reader was there and the sweep
+  missed it.** `0x800B3368` / `0x800B336A` are read by `Config_InstallVideo` (`0x8001C29C`), which
+  materialises the block base with `addiu a0, v0, 0x2FE4` and loads `900(a0)` / `902(a0)`. `xrefs` dropped
+  the tracked address on that `addiu` — it discarded any register an `addiu` wrote that was not its own
+  source — so only the reset routine's store through `900(v0)` was found. The rule is fixed:
+  `xrefs 0x800B3368` reported **1** reference and now reports **9**. A "no reader" result taken before that
+  fix is worth re-running. The settings become both display envs' `screen`
+  rectangle, and `PutDispEnv` moves the picture by them. See §12.10 and openquestions #40.
 * **The fade globals have no reader either.** `gp+16660 = 255` and `gp+16676 = -16` are set at the top of
   every session (`0x8001834C`, `0x80018354`) and read nowhere. 255 with a step of −16 is exactly a fade level
   and its per-frame decrement, so a fade plausibly exists in an overlay module — but nothing in this image
@@ -5531,6 +5535,71 @@ lurch.
   halfwords at `0x800B3290`, restores the music volume and calls `0x800213B0(1, 15)` — i.e. it leaves the
   menu with exit code 15. What state 15 then does is the outer state machine's business (`0x80018680` sets
   `0x800B2A88`), not the screen's.
+
+### 12.10 Where the picture is on the television — SCREEN POSITION
+
+The display env is libgpu's `DISPENV`, 20 bytes at db+10940, and it carries two rectangles that are easy to
+confuse. `disp` at +0 is **where in VRAM scan-out starts**: its origin becomes GP1(05h), its width picks the
+dot clock, and its height is looked at only by the interlace test. `screen` at +8 is **where on the
+television**, and it is the one SCREEN POSITION fills.
+
+`SetDefDispEnv` (`0x8008AD5C`) stores only `disp` x/y/w/h at +0…+6 and zeroes offsets 8, 10, 12, 14 and bytes
+16…19 — which is why the page looked inert for so long (§12.9). `Config_InstallVideo` (`0x8001C29C`,
+QFR_SING.C line 2059) fills it back in, for **both** buffers, reaching the second through the block's
+double-buffer pointer at +188 with a stride of 32408:
+
+| write | buffer 0 | buffer 1 | value |
+|---|---|---|---|
+| `screen.x` | db+10948 | db+43356 | the page's x, `lhu 900(a0)` |
+| `screen.y` | db+10950 | db+43358 | the page's y, **signed** `lh 902(a0)` |
+| `disp.y`   | db+10942 | db+43350 | `-y` when y < 0, else 0 |
+| `disp.h`   | db+10946 | db+43354 | `y + 248` when y < 0, else 248 |
+
+The 248 is an immediate (`0x8001C30C` in the y<0 arm's delay slot, `0x8001C330` in the other) equal to the
+framebuffer height; SLUS-00757 carries 240 at both. Seven `jal`s reach the function — `0x80018DEC`,
+`0x8001CF1C`, `0x8001FA38`, `0x80033154`, `0x800774B8`, `0x80077700`, `0x80081014` — and the last two are the
+tails of `SetupDrawDisplay3D` and `SetupScreenLoading`, so a layout's `SetDefDispEnv` pair never leaves the
+position behind it. An eighth reference at `0x8007A004` stores the address at `1000(v1)` in the level
+modules' import block.
+
+**What `PutDispEnv` (`0x80083BCC`) makes of it.** The width picks a mode through the thresholds 281/353/401/561
+(`0x80083E64`…`0x80083E94`), which indexes the dot clocks at `0x800A52A8` — `{10, 8, 7, 5, 4}` — and the
+`{start, end}` clock pairs at `0x800A5280`, five NTSC entries then five PAL (indexed `pad0 * 5 + mode`):
+
+| mode | 256 | 320 | 368 | 512 | 640 |
+|---|---|---|---|---|---|
+| NTSC | 590–3150 | 600–3160 | 539–3227 | 615–3175 | 620–3180 |
+| PAL  | 610–3170 | 624–3184 | 560–3248 | **635–3195** | 640–3200 |
+
+Then, with `span = end - start`:
+
+```
+y1 = screen.y + (PAL ? 19 : 16)          clamp 19..303 | 16..257
+y2 = y1 + (screen.h ? screen.h : 240)    from the UNCLAMPED y1; then >= y1+2, <= 305 | 258
+x1 = start + screen.x * dot              clamp 540..3220 | 500..3250
+x2 = x1 + (screen.w ? span*screen.w >> 8 : span)
+                                         from the UNCLAMPED x1; then >= x1+4*dot, <= 3260 | 3290
+```
+
+Both far edges are formed before the starts are clamped, which is the whole mechanism: a negative `screen.y`
+would otherwise shrink the window from the top rather than slide it, and `Config_InstallVideo`'s
+`disp.y = -y` is what turns it back into motion — scan-out starts `-y` rows down, so framebuffer row *k*
+still lands on raster line `19 + y + k`, and the rows that would have been above line 19 are the ones given
+up. The picture moves one line per step across the page's whole `-32..64`.
+
+**Nothing ever sets `screen.h`.** No instruction in the image writes db+10954 or its twin, so the field is
+PutDispEnv's default **240 lines** (the immediate at `0x80083E58`). PAL draws 248, so its last eight rows are
+composed every frame and never displayed; the 240-line NTSC build is shown all of its buffer. `disp.h`, the
+other thing the negative-y branch writes, reaches only the interlace test (289 on PAL, `0x80083D78`).
+
+**The page itself**, `InGame_CHECK_FOR_SCREENPOSITION` (`0x8001CD64`), tests the **held** pad word
+(`lhu 684(v1)`) against four counters at `0x800B277C`…`0x800B2782`, one per direction in the order LEFT
+(0x80), RIGHT (0x20), UP (0x10), DOWN (0x40). Each counter saturates at 5 (`slti count, 5` then
+`addu count, count, that`) and a step is taken on the frame it reads 1 and on every frame it reads 5 — press
+once to move once, hold to move every frame after four. The clamps are one-sided — `slti -19`, `slti 20`,
+`slti -31`, `slti 64` — so the values **reached** are **-20..20 and -32..64**, lopsided vertically because
+PAL's reset default (`FrontEndResetVideoDefaults`, `0x8001FA18`) is 24 lines down and NTSC's is 0. The
+function calls `Config_InstallVideo` every frame the page is up, whether or not anything moved.
 
 ---
 

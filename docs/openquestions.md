@@ -1333,17 +1333,30 @@ The residues of the resolved blockers keep their parents' numbers.
       this item was describing and it would have been satisfying to close two things at once. It is not the
       same thing:** the water ramps `view+776` per VIEW by 24 per `dt` unit toward 4096, not a `$gp` global
       per SESSION by −16 from 255. Both fade addresses still have one writer and no reader. #39 stands.
-- [~] **40. What SCREEN POSITION moves. — INERT ON THIS BUILD; the port honours it anyway.**
-      The menu page writes `0x800B3368` / `0x800B336A` (defaults 0 and 24), and the sweep finds **no reader**.
-      The obvious consumer would be the display env's screen rectangle, which `SetDefDispEnv` at
-      `0x8008AD5C` explicitly *zeroes* — the game never fills it. So either the offsets are applied somewhere
-      not in this image, or the page is inert on this build, and nothing here can distinguish those.
-      That is the finding, and the port does not pretend otherwise about the console. It does, however,
-      apply the offset **at presentation** — after the ordering table, where it shifts the finished image the
-      way a television's own position control would and cannot perturb clipping or the viewport rectangles
-      the reconstruction depends on. A control that exists and does nothing is a bug from the player's side;
-      the default y of 24 is treated as the neutral point because that is what the reset routine writes.
-      *Still open:* whether an overlay or a relocatable module reads them. Same capability as #6.
+- [x] **40. What SCREEN POSITION moves. — SOLVED: the display env's screen rectangle, after all.**
+      This was recorded as a negative result — "the sweep finds no reader" — and the sweep was wrong. The
+      reader is `Config_InstallVideo` at `0x8001C29C` (MAIN.SYM: QFR_SING.C line 2059). It materialises the
+      shared block's base into `a0` with `lui v0, 0x800B; addiu a0, v0, 0x2FE4` and then reads
+      `lhu 900(a0)` / `lh 902(a0)` — and `q2psx-inspect xrefs` discarded the tracked address on the
+      `addiu` itself, because its rule dropped any register an `addiu` wrote that was not its own source.
+      Only the same-register form survived, which is why the *store* through `900(v0)` in
+      `FrontEndResetVideoDefaults` was found and this *load* through `900(a0)` was not. The tool is fixed —
+      `xrefs 0x800B3368` reported 1 reference and now reports 9.
+      What it does: it writes both buffers' display envs — `screen.x`/`screen.y` at db+10948/10950 and the
+      twin 32408 bytes on, and, when y is negative, `disp.y = -y` with `disp.h = y + 248` (the 248 is the
+      framebuffer height; SLUS-00757 has 240 there). Seven `jal`s reach it, two of them the tails of
+      `SetupDrawDisplay3D` (`0x800774B8`) and `SetupScreenLoading` (`0x80077700`) — the only two functions
+      that call `SetDefDispEnv` — so the zeroing that made this look inert is undone immediately afterwards,
+      every time. An eighth reference at `0x8007A004` hands the address to the level modules' import block.
+      `PutDispEnv` (`0x80083BCC`) turns the rectangle into GP1(05h/06h/07h) from the clock tables at
+      `0x800A5280` and `0x800A52A8`: one step is one buffer pixel across and one line down. Transcribed in
+      `src/screen/screen.c`; the port no longer shifts the finished image as a courtesy but derives the
+      picture's position and extent from the same three display words the GPU gets.
+      **Two findings fall out of it.** Nothing ever sets `screen.h`, so the field is PutDispEnv's default
+      240 lines (`0x80083E58`): PAL draws 248 and the last eight rows never leave the console, while the
+      240-line NTSC build is shown all of its buffer. And the page's own clamps
+      (`InGame_CHECK_FOR_SCREENPOSITION`, `0x8001CD64`) reach **-20..20 and -32..64**, with a held-direction
+      repeat — not the -32..32 / 0..48 and one-step-per-press the port had.
 - [x] **20a. The menu system. — SOLVED, and it is data, not script.** Every menu is an array of 24-byte item
       records in the executable's data segment, walked by an engine at `0x80019B88`…`0x8001BA14`: the record
       is `{label, s16 x, s16 y, action, *toggle, *slider, on-release}`, the loader is `0x8001A474`, and a
