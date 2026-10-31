@@ -793,6 +793,47 @@ static void test_screen_position(void)
     tap(&m, Q2_PAD_UP);
     CHECK(s.v[Q2_SET_SCREEN_Y] == 23, "up -> %d", s.v[Q2_SET_SCREEN_Y]);
 
+    /*
+     * 0x8001CD64 reads the HELD pad through a counter per direction: a step on
+     * the first frame, none on the next three, then one every frame. Eight
+     * frames of LEFT from 1 is steps on frames 1, 5, 6, 7 and 8.
+     */
+    {
+        int i;
+        for (i = 0; i < 8; i++)
+            q2_menu_advance(&m, Q2_PAD_LEFT);
+        q2_menu_advance(&m, 0);
+        CHECK(s.v[Q2_SET_SCREEN_X] == -4, "8 frames of left from 1 -> %d, expected -4",
+              s.v[Q2_SET_SCREEN_X]);
+
+        /* The page's own clamps, -20..20 and -32..64 — not the offsets the
+         * video reset writes. Negative y is reachable, which is what
+         * Config_InstallVideo's y < 0 branch is for. */
+        for (i = 0; i < 100; i++)
+            q2_menu_advance(&m, Q2_PAD_LEFT);
+        q2_menu_advance(&m, 0);
+        CHECK(s.v[Q2_SET_SCREEN_X] == Q2_MENU_SCREEN_X_MIN, "x floor %d",
+              s.v[Q2_SET_SCREEN_X]);
+        for (i = 0; i < 100; i++)
+            q2_menu_advance(&m, Q2_PAD_RIGHT);
+        q2_menu_advance(&m, 0);
+        CHECK(s.v[Q2_SET_SCREEN_X] == Q2_MENU_SCREEN_X_MAX, "x ceiling %d",
+              s.v[Q2_SET_SCREEN_X]);
+        for (i = 0; i < 200; i++)
+            q2_menu_advance(&m, Q2_PAD_UP);
+        q2_menu_advance(&m, 0);
+        CHECK(s.v[Q2_SET_SCREEN_Y] == Q2_MENU_SCREEN_Y_MIN, "y floor %d",
+              s.v[Q2_SET_SCREEN_Y]);
+        for (i = 0; i < 200; i++)
+            q2_menu_advance(&m, Q2_PAD_DOWN);
+        q2_menu_advance(&m, 0);
+        CHECK(s.v[Q2_SET_SCREEN_Y] == Q2_MENU_SCREEN_Y_MAX, "y ceiling %d",
+              s.v[Q2_SET_SCREEN_Y]);
+        CHECK(Q2_MENU_SCREEN_X_MIN == -20 && Q2_MENU_SCREEN_X_MAX == 20 &&
+              Q2_MENU_SCREEN_Y_MIN == -32 && Q2_MENU_SCREEN_Y_MAX == 64,
+              "the page clamps are the executable's");
+    }
+
     tap(&m, Q2_PAD_CROSS);
     CHECK(m.page_id == Q2_PAGE_VIDEO, "cross leaves to page %d", m.page_id);
 }

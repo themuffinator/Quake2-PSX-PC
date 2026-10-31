@@ -109,6 +109,24 @@ typedef enum q2_menu_setting {
 #define Q2_MENU_SLIDER_MAX  127
 #define Q2_MENU_SLIDER_STEP 2
 
+/*
+ * SCREEN POSITION's range, as InGame_CHECK_FOR_SCREENPOSITION (0x8001CD64,
+ * QFR_SING.C line 2338) clamps it: a step is taken only while x >= -19 /
+ * x < 20 / y >= -31 / y < 64 (`slti` at 0x8001CDD0, 0x8001CE38, 0x8001CE9C and
+ * 0x8001CF04), so the values REACHED are -20..20 and -32..64. Lopsided
+ * vertically because PAL's default is 24 lines down
+ * (FrontEndResetVideoDefaults), and the page is the same code on NTSC, where
+ * the default is 0. Units are one buffer pixel and one line — see
+ * q2_screen_install_video for what the numbers become.
+ */
+#define Q2_MENU_SCREEN_X_MIN  (-20)
+#define Q2_MENU_SCREEN_X_MAX    20
+#define Q2_MENU_SCREEN_Y_MIN  (-32)
+#define Q2_MENU_SCREEN_Y_MAX    64
+
+/* A held direction moves once, then every frame from the fifth frame held. */
+#define Q2_MENU_SCREEN_REPEAT   5
+
 typedef struct q2_menu_settings {
     s16 v[Q2_SET_COUNT];
 } q2_menu_settings;
@@ -625,6 +643,10 @@ typedef struct q2_menu {
 
     /* Held-direction repeat gate for the slider sound (gp+184). */
     s32                 slide_repeat;
+
+    /* SCREEN POSITION's four held-direction counters, left/right/up/down —
+     * gp+16764..gp+16770 (0x800B277C..0x800B2782). */
+    s16                 position_held[4];
 
     q2_menu_sound       sound;        /* one-shot, cleared by the reader     */
     q2_menu_request     request;      /* one-shot, cleared by the reader     */

@@ -109,6 +109,29 @@ typedef struct q2_screen_buf_origin {
     s16 x, y;
 } q2_screen_buf_origin;
 
+/*
+ * libgpu's DISPENV, field for field — the 20 bytes at db+10940. Two rectangles,
+ * and they are easy to confuse:
+ *
+ *   disp    +0   WHERE IN VRAM scan-out starts. Its origin becomes GP1(05h);
+ *                its width picks the dot clock; its height is looked at only to
+ *                decide whether the picture is interlaced.
+ *   screen  +8   WHERE ON THE TELEVISION. PutDispEnv turns it into the line's
+ *                active clocks, GP1(06h), and the field's active lines, GP1(07h).
+ *                A zero width or height means libgpu's default: the full span
+ *                of clocks, and 240 lines.
+ *
+ * SetDefDispEnv (0x8008AD5C) stores only disp x/y/w/h, at +0…+6, and ZEROES all
+ * of `screen` and the four bytes after it — offsets 8, 10, 12, 14 and bytes
+ * 16…19. SCREEN POSITION lives in `screen.x` and `screen.y`, which is why only
+ * Config_InstallVideo ever puts anything there; see q2_screen_install_video.
+ */
+typedef struct q2_screen_dispenv {
+    s16 disp_x, disp_y, disp_w, disp_h;         /* +0  */
+    s16 screen_x, screen_y, screen_w, screen_h; /* +8  */
+    u8  isinter, isrgb24, pad0, pad1;           /* +16 */
+} q2_screen_dispenv;
+
 typedef struct q2_screen_display {
     u16 width, height;          /* 0x800B2DA0 / 0x800B2DA2                    */
     u32 video_mode;             /* 0x800A9E70 — 1 == MODE_PAL, 0 == MODE_NTSC */
@@ -126,8 +149,22 @@ typedef struct q2_screen_display {
      * `SetDefDispEnv(db1+10940, 0, 0, ...)` — and no session layout touches
      * them again; only 0x80077540 rewrites both, to (0,0), which is what makes
      * the boot layout single buffered.
+     *
+     * Both of those functions call Config_InstallVideo straight after their
+     * SetDefDispEnv pair (0x800774B8, 0x80077700), so an env is never seen
+     * without SCREEN POSITION in it. The two envs are 32408 bytes apart in the
+     * console's double-buffer block, which is how 0x8001C29C reaches the second
+     * one as `+0x8000` with its offsets 360 lower.
      */
-    q2_screen_buf_origin env[2];
+    q2_screen_dispenv env[2];
+
+    /*
+     * The SCREEN POSITION the envs were last given — 0x800B3368 / 0x800B336A,
+     * which Config_InstallVideo reads through the shared block. The port keeps
+     * the copy here so that a layout can re-apply it after its SetDefDispEnv
+     * the way the console's layout functions do.
+     */
+    s16 pos_x, pos_y;
 
     u8  draw_buffer;            /* 0x800B2738                                 */
     u8  disp_buffer;            /* 0x800B2739 — always 1 - draw_buffer        */
@@ -720,9 +757,139 @@ void q2_screen_buffer_origin(const q2_screen *s, int index, int *x, int *y);
  * buffer being drawn, which the cross pairing makes the *other* buffer's
  * rectangle. When the two come out equal the layout is single buffered and the
  * frame is visible as it is drawn — which is only the boot layout.
+ *
+ * It is the rectangle SCANNED, which is not the env's `disp` rectangle: that
+ * says the whole framebuffer, and PutDispEnv shows 240 lines of it
+ * (q2_screen_range).
  */
 void q2_screen_display_rect(const q2_screen *s, int *x, int *y, int *w, int *h);
 bool q2_screen_single_buffered(const q2_screen *s);
+
+/* ------------------------------------------------------------------------- */
+/* Where the picture is on the television — SCREEN POSITION                   */
+/* ------------------------------------------------------------------------- */
+/*
+ * `Config_InstallVideo`, 0x8001C29C — the name and the source file, QFR_SING.C
+ * line 2059, are the NTSC disc's MAIN.SYM. It reads SCREEN POSITION's two
+ * halfwords through the shared block — `lhu 900(a0)` and a SIGNED `lh 902(a0)`
+ * with a0 = 0x800B2FE4 — and writes them into BOTH buffers' display envs,
+ * reaching them through the block's pointer to the double-buffer array at +188:
+ *
+ *      env.screen.x = x                                  db+10948, db+32408+10948
+ *      env.screen.y = y                                  db+10950, ...
+ *      if y < 0:  env.disp.y = -y,  env.disp.h = y + 248 db+10942, db+10946
+ *      else:      env.disp.y =  0,  env.disp.h =     248
+ *
+ * The 248 is an immediate (0x8001C30C in the y<0 arm's delay slot, 0x8001C330
+ * in the other) that equals the framebuffer height: SLUS-00757 carries 240 at
+ * both, with its 240-line buffer. So it is taken from `disp.height` here rather
+ * than written out.
+ *
+ * Seven `jal`s reach it — 0x80018DEC, 0x8001CF1C, 0x8001FA38, 0x80033154,
+ * 0x800774B8, 0x80077700 and 0x80081014: main after the video reset,
+ * FrontEndResetVideoDefaults itself, the SCREEN POSITION page every frame it is
+ * up, a settings load, and the two functions that SetDefDispEnv the envs —
+ * SetupDrawDisplay3D (0x80077454) and SetupScreenLoading (0x80077540) — which is
+ * why this module's layouts re-apply `pos_x`/`pos_y` after theirs. An eighth
+ * reference at 0x8007A004 forms the address and stores it at `1000(v1)`, handing
+ * it to the level modules through the import block.
+ */
+void q2_screen_install_video(q2_screen *s, int x, int y);
+
+/*
+ * PutDispEnv's numbers, per standard — index 0 is NTSC and 1 is PAL, the way
+ * the library indexes its own table (`pad0 * 5 + mode`).
+ */
+typedef struct q2_screen_disp_limits {
+    s16 y_base;             /* first line = screen.y + this  (0x80083E40/44)  */
+    s16 y1_min, y1_max;     /* and its clamp                                  */
+    s16 y2_max;             /* the last line's ceiling                        */
+    s16 x1_min, x1_max;     /* the first clock's clamp                        */
+    s16 x2_max;             /* the last clock's ceiling                       */
+    u16 span[5][2];         /* {start, end} clocks per width, 0x800A5280      */
+} q2_screen_disp_limits;
+
+extern const q2_screen_disp_limits q2_screen_disp_limits_by_std[2];
+extern const u8 q2_screen_disp_dot[5];      /* clocks per pixel, 0x800A52A8   */
+
+#define Q2_SCREEN_DISP_LINES  240   /* the window when screen.h is 0 (0x80083E58) */
+
+/*
+ * What PutDispEnv (0x80083BCC, libgpu) programs the GPU with for one env: the
+ * three display-control words, and the numbers they are made of.
+ *
+ *   GP1(05h)  scan-out starts at VRAM (disp.x, disp.y)      0x80083C1C
+ *   GP1(06h)  the line is active from clock x1 to x2        0x80084048
+ *   GP1(07h)  the field is active from line y1 to y2        0x80084074
+ *
+ * Every pixel follows from those: raster line y1 + k shows VRAM row
+ * `vram_y + k`, and clock x1 + dot*c shows column `vram_x + c`. So the picture
+ * is `(x2 - x1) / dot` pixels by `y2 - y1` lines, and a line or column the
+ * range does not reach is border.
+ *
+ * The arithmetic, as the library does it:
+ *
+ *   y1 = screen.y + (PAL ? 19 : 16)        clamped to 19..303 | 16..257
+ *   y2 = y1 + (screen.h ? screen.h : 240)  from the UNCLAMPED y1, then
+ *                                          at least y1 + 2, at most 305 | 258
+ *   x1 = start + screen.x * dot            clamped to 540..3220 | 500..3250
+ *   x2 = x1 + (screen.w ? span*w >> 8      from the UNCLAMPED x1, then
+ *                       : span)            at least x1 + 4*dot, at most
+ *                                          3260 | 3290
+ *
+ * with `start`/`span` from the table at 0x800A5280 and `dot` from 0x800A52A8,
+ * both chosen by the env's width through the thresholds 281/353/401/561
+ * (0x80083E64…0x80083E94). For this game's 512-wide PAL picture that is start
+ * 635, span 2560, dot 5 — one SCREEN POSITION step is one buffer pixel across
+ * and one line down.
+ *
+ * Two consequences decide what the television shows:
+ *
+ *   - NOTHING SETS `screen.h`. SetDefDispEnv zeroes it and no instruction in
+ *     the image writes db+10954 or its twin, so the field is 240 lines tall.
+ *     On PAL, whose buffer is 248, rows 240..247 are drawn and never displayed;
+ *     on NTSC the buffer is 240 and nothing is cropped.
+ *   - Because y2 is taken from the unclamped y1, a negative `screen.y` shrinks
+ *     the window from the top instead of sliding it: y1 stops at 19 and y2
+ *     keeps moving. Config_InstallVideo's other half, `disp.y = -y`, is what
+ *     turns that into motion — scan-out starts -y rows down, so row k still
+ *     lands on line `19 + y + k`, exactly where it would without the clamp, and
+ *     the rows above line 19 are the ones lost. The picture moves one line per
+ *     step across the whole of the page's -32..64.
+ *
+ * `disp.h`, the other thing that branch writes, reaches only the interlace test
+ * (289 lines on PAL, 0x80083D78); PutDispEnv never uses it for the window.
+ */
+typedef struct q2_screen_range {
+    s32 vram_x, vram_y;         /* GP1(05h), from disp.x / disp.y              */
+    s32 x1, x2;                 /* GP1(06h), GPU clocks                        */
+    s32 y1, y2;                 /* GP1(07h), raster lines                      */
+    s32 dot;                    /* clocks per pixel of the env's width         */
+    u32 gp1_05, gp1_06, gp1_07; /* the words themselves                        */
+} q2_screen_range;
+
+void q2_screen_put_dispenv(const q2_screen *s, const q2_screen_dispenv *env,
+                           q2_screen_range *out);
+
+/* The range the television is showing now: the drawn buffer's env, as
+ * PutDispEnv is handed it at 0x800185AC. */
+void q2_screen_shown_range(const q2_screen *s, q2_screen_range *out);
+
+/*
+ * The range an env set up the way the layouts set them up would get at SCREEN
+ * POSITION (x, y) — SetDefDispEnv, then Config_InstallVideo, then PutDispEnv —
+ * without touching `s`. A presentation measures the live range against the one
+ * at the reset routine's position.
+ */
+void q2_screen_range_at(const q2_screen *s, int x, int y, q2_screen_range *out);
+
+/*
+ * The picture's size in buffer pixels: what an unmoved env shows — 512 across
+ * and 240 down. It is a property of PutDispEnv's defaults and not of the
+ * framebuffer, which on PAL is eight lines taller than what reaches the
+ * television.
+ */
+void q2_screen_picture_size(const q2_screen *s, int *w, int *h);
 
 /* ------------------------------------------------------------------------- */
 /* The shape of a pixel, and therefore of the field of view                   */
@@ -746,9 +913,15 @@ bool q2_screen_single_buffered(const q2_screen *s);
  *      PAL   512 wide, 256-line picture ->  4*256 / (3*512) = 2/3 exactly
  *      NTSC  512 wide, 240-line picture ->  4*240 / (3*512) = 5/8
  *
- * This game draws 248 of PAL's 256 lines, so its picture is very slightly
- * shorter than the full 4:3 frame: 512 * 2/3 by 248, i.e. 1.376:1. The eight
- * missing lines are a border on the television, not a stretch.
+ * This game draws 248 of PAL's 256 lines, and the television is shown 240 of
+ * those — the display window PutDispEnv programs when nothing has set
+ * `screen.h` (see q2_screen_range) — so its picture is shorter than the full
+ * 4:3 frame: 512 * 2/3 by 240, i.e. 1.422:1. The sixteen missing lines are a
+ * border on the television, not a stretch. On NTSC the buffer is itself 240,
+ * so the window takes all of it and only the standard's own 5:8 pixel applies.
+ *
+ * The viewports are still laid out, projected and measured on the drawn buffer
+ * — the numbers below describe what is drawn, not what is cropped.
  *
  * ---------------------------------------------------------------------------
  * What that makes the field of view — and the squeeze IS the console's
@@ -804,30 +977,31 @@ void q2_screen_pixel_aspect(const q2_screen *s, int *num, int *den);
 /* How the finished picture is fitted into a host window of `win_w` x `win_h`. */
 typedef enum q2_screen_fit {
     /*
-     * The drawn buffer as exactly 4:3, letterboxed or pillarboxed into whatever
-     * the window is. THE DEFAULT, and it is the default because it is what
-     * capture of the running game shows: a 4:3 picture pillarboxed inside a 16:9
-     * frame, with the 512 x 248 buffer filling it.
+     * The displayed picture as exactly 4:3, letterboxed or pillarboxed into
+     * whatever the window is. THE DEFAULT, and it is the default because it is
+     * what capture of the running game shows: a 4:3 picture pillarboxed inside a
+     * 16:9 frame. What fills that picture is the 512 x 240 PutDispEnv displays,
+     * not PAL's 512 x 248 buffer — the last eight lines never leave the console.
      *
-     * It differs from FIT_TELEVISION below by 3%, because this treats the 248
-     * lines the game draws as the whole 4:3 picture where that one treats them
-     * as 248 of PAL's 256. Three percent is not worth arguing about; matching
-     * what the game is actually played and captured at is.
+     * It differs from FIT_TELEVISION below by 6% on PAL, because this treats the
+     * 240 lines the television is shown as the whole 4:3 picture where that one
+     * treats them as 240 of PAL's 256. Matching what the game is actually played
+     * and captured at is worth more than the strict reading.
      */
     Q2_SCREEN_FIT_FULL_4_3 = 0,
 
     /*
      * The strict reading of the hardware: a pixel is 4*256 : 3*512 = 2:3, so the
-     * 248 drawn lines are 248/256 of the 4:3 raster and the picture comes out at
-     * 1.376:1 with the eight missing lines as extra border. Very slightly taller
-     * than FULL_4_3 and arguably what a real television did.
+     * 240 displayed lines are 240/256 of PAL's 4:3 raster and the picture comes
+     * out at 1.422:1 with the sixteen missing lines as extra border. Taller than
+     * FULL_4_3 and arguably what a real television did.
      */
     Q2_SCREEN_FIT_TELEVISION,
 
     /*
      * One buffer pixel to one window pixel, aspect preserved. Not what the
-     * console looked like — it is the 1.5x stretch — but it is what every raw
-     * framebuffer dump of this game is, so it is worth being able to ask for.
+     * console looked like — it is the 1.5x stretch — but it is the shape of a
+     * raw dump of the displayed lines, so it is worth being able to ask for.
      */
     Q2_SCREEN_FIT_SQUARE,
 
@@ -844,6 +1018,10 @@ const char *q2_screen_fit_name(q2_screen_fit fit);
  * rectangle of the right aspect that fits, centred, with the remainder left as
  * border. Every output is optional.
  *
+ * "The picture" is q2_screen_picture_size's 512 x 240, i.e. where the television
+ * would show an unmoved one. SCREEN POSITION moves the image relative to this
+ * rectangle — see q2_screen_place.
+ *
  * `win_w` / `win_h` may be anything, including shapes no television ever was —
  * 16:9, 16:10, 21:9, a portrait window, one pixel tall. The result is clamped
  * to at least 1x1 so a caller can always blit it.
@@ -855,10 +1033,48 @@ void q2_screen_fit_rect(const q2_screen *s, q2_screen_fit fit,
 /*
  * The size a host window should open at to hold `scale` buffer pixels across
  * with no vertical squash: `scale * fb_w` wide, and tall enough to make the
- * pixels the right shape. For PAL at scale 3 that is 1536 x 1116.
+ * pixels the right shape. For PAL at scale 3 that is 1536 x 1080.
  */
 void q2_screen_window_size(const q2_screen *s, q2_screen_fit fit, int scale,
                            int *w, int *h);
+
+/*
+ * Putting the finished frame in the window, the way the television would.
+ *
+ * The window stands in for the screen of a television whose picture area, at
+ * the reset routine's SCREEN POSITION, is the fit rectangle. `neutral` is the
+ * range at that position (q2_screen_range_at) and `shown` the range the envs
+ * hold now (q2_screen_shown_range). Every line and clock of `shown` is placed
+ * at its distance from `neutral`'s start, one line to `fit_h / 240` window
+ * pixels and one clock to `fit_w / span` — so a step of the setting is a buffer
+ * pixel and a line, and the clamps, the crop at line 19 and the 240-line window
+ * all fall out of the ranges rather than being restated here.
+ *
+ * `src` is the part of the framebuffer that is displayed and `dst` where it
+ * lands; a caller blits one onto the other over a cleared window, and whatever
+ * the window shows outside `dst` is border. `src_w` or `src_h` of zero means
+ * nothing of the frame is on screen. The outputs are floats because the window
+ * scale is not an integer, and rounding each edge separately would make the
+ * picture breathe as it moves.
+ */
+typedef struct q2_screen_placement {
+    int   src_x, src_y, src_w, src_h;   /* framebuffer pixels                 */
+    float dst_x, dst_y, dst_w, dst_h;   /* window pixels                      */
+} q2_screen_placement;
+
+void q2_screen_place(const q2_screen *s, q2_screen_fit fit, int win_w, int win_h,
+                     const q2_screen_range *neutral,
+                     const q2_screen_range *shown,
+                     q2_screen_placement *out);
+
+/*
+ * The framebuffer pixel under window point (wx, wy), through a placement. False
+ * when the placement shows nothing. The point may land outside the displayed
+ * part — a pointer over the border maps to coordinates off the frame, which is
+ * what a hit test wants to be told.
+ */
+bool q2_screen_window_to_buffer(const q2_screen_placement *p, double wx,
+                                double wy, double *bx, double *by);
 
 /* ------------------------------------------------------------------------- */
 /* A viewport's field of view                                                 */

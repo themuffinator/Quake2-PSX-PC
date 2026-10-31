@@ -1398,9 +1398,32 @@ int q2_menu_music_audition(const q2_menu *m, int full)
 }
 
 /*
+ * One direction's counter on the SCREEN POSITION page: count up while held,
+ * stopping at 5 (`slti count, 5` then `addu count, count, that`, so it
+ * saturates), and take a step on the frame it reaches 1 and on every frame it
+ * sits at 5 — so a press moves once and a hold, after four frames, moves every
+ * frame. Released, it goes back to zero. The count keeps running when a clamp
+ * refuses the step.
+ */
+static bool position_step(s16 *count, bool held)
+{
+    if (!held) {
+        *count = 0;
+        return false;
+    }
+    if (*count < Q2_MENU_SCREEN_REPEAT)
+        (*count)++;
+    return *count == 1 || *count == Q2_MENU_SCREEN_REPEAT;
+}
+
+/*
  * The SCREEN POSITION page has no items at all: the d-pad moves the display
- * offset directly and × or △ leaves. 0x8001CD64 is the hook that applies it;
- * the range is the one the video reset writes back into (0, 24).
+ * directly and × or △ leaves. InGame_CHECK_FOR_SCREENPOSITION, 0x8001CD64, is
+ * the hook, and it tests the four directions in this order against the HELD
+ * pad (`lhu 684(v1)`), each against its own counter and its own one-sided
+ * clamp. It then calls Config_InstallVideo every frame, whether or not anything
+ * moved — which the client does for the port, since the screen is its to own
+ * (q2_screen_install_video).
  */
 static void update_position_page(q2_menu *m)
 {
@@ -1412,15 +1435,18 @@ static void update_position_page(q2_menu *m)
     x = &m->set->v[Q2_SET_SCREEN_X];
     y = &m->set->v[Q2_SET_SCREEN_Y];
 
-    if (m->pad_new & Q2_PAD_LEFT)  (*x)--;
-    if (m->pad_new & Q2_PAD_RIGHT) (*x)++;
-    if (m->pad_new & Q2_PAD_UP)    (*y)--;
-    if (m->pad_new & Q2_PAD_DOWN)  (*y)++;
-
-    if (*x < -32) *x = -32;
-    if (*x >  32) *x =  32;
-    if (*y < 0)   *y = 0;
-    if (*y >  48) *y = 48;
+    if (position_step(&m->position_held[0], (m->pad_cur & Q2_PAD_LEFT) != 0) &&
+        *x > Q2_MENU_SCREEN_X_MIN)
+        (*x)--;
+    if (position_step(&m->position_held[1], (m->pad_cur & Q2_PAD_RIGHT) != 0) &&
+        *x < Q2_MENU_SCREEN_X_MAX)
+        (*x)++;
+    if (position_step(&m->position_held[2], (m->pad_cur & Q2_PAD_UP) != 0) &&
+        *y > Q2_MENU_SCREEN_Y_MIN)
+        (*y)--;
+    if (position_step(&m->position_held[3], (m->pad_cur & Q2_PAD_DOWN) != 0) &&
+        *y < Q2_MENU_SCREEN_Y_MAX)
+        (*y)++;
 
     if (m->pad_new & Q2_PAD_CROSS) {
         m->sound = Q2_MSND_SELECT;

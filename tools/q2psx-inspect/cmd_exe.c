@@ -402,6 +402,7 @@ int cmd_xrefs(const disc *d, const char *addr_s)
         for (a = begin; a + 4 <= end; a += 4) {
             q2_mips_insn in;
             u32 word;
+            bool formed = false;
 
             if (!q2_exe_u32(&exe, a, &word))
                 break;
@@ -439,6 +440,7 @@ int cmd_xrefs(const disc *d, const char *addr_s)
                 if (in.rt < 32 && in.rt != 0) {
                     pending[in.rt]     = true;
                     pending_val[in.rt] = v;
+                    formed = true;
                 }
             }
 
@@ -454,8 +456,18 @@ int cmd_xrefs(const disc *d, const char *addr_s)
 
             /* A register written by anything else no longer holds a high
              * half; not tracking that produces false positives that cost more
-             * time than the missed reference would. */
-            if (in.op == 0x0F)
+             * time than the missed reference would.
+             *
+             * EXCEPT the register an addiu/ori just formed an address in. The
+             * rule below used to fire on that very instruction whenever it
+             * wrote a register other than its source — `addiu a0, v0, lo` —
+             * and throw the address away as soon as it was made. Only the
+             * same-register form, `addiu v0, v0, lo`, survived. That is how
+             * openquestions #40 came to say SCREEN POSITION had no reader:
+             * FrontEndResetVideoDefaults stores through `900(v0)` and was
+             * found, while Config_InstallVideo reads `900(a0)` after
+             * `addiu a0, v0, 0x2FE4` and was not. */
+            if (in.op == 0x0F || formed)
                 continue;
             if (in.kind == Q2_MIPS_LOAD && in.rt < 32)
                 pending[in.rt] = false;

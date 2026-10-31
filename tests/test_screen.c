@@ -902,15 +902,235 @@ static void test_display_envs(void)
     CHECK(q2_screen_front(&s) != q2_screen_back(&s), "two buffers");
 
     /* PutDispEnv takes the DRAWN buffer's env, and the cross pairing makes that
-     * the other buffer's rectangle. */
+     * the other buffer's rectangle — 240 lines of it, not the 248 drawn. */
     s.disp.draw_buffer = 0;
     q2_screen_display_rect(&s, &x, &y, &w, &h);
-    CHECK(x == 512 && y == 0 && w == 512 && h == 248,
-          "drawing buffer 0 should display (512,0), got (%d,%d) %dx%d",
+    CHECK(x == 512 && y == 0 && w == 512 && h == 240,
+          "drawing buffer 0 should display (512,0) 512x240, got (%d,%d) %dx%d",
           x, y, w, h);
     s.disp.draw_buffer = 1;
     q2_screen_display_rect(&s, &x, &y, NULL, NULL);
     CHECK(x == 0 && y == 0, "drawing buffer 1 should display (0,0)");
+
+    q2_screen_free(&s);
+}
+
+/* ------------------------------------------------------------------------- */
+/*
+ * SCREEN POSITION into the display envs — Config_InstallVideo (0x8001C29C).
+ * Both buffers' envs, every time; and the two functions that SetDefDispEnv the
+ * envs put it straight back, so no layout change can lose it.
+ */
+static void test_install_video(void)
+{
+    q2_screen s;
+    int i;
+
+    printf("install video\n");
+    CHECK(q2_screen_init(&s, Q2_VIDEO_PAL) == Q2_OK, "init failed");
+
+    q2_screen_install_video(&s, 0, 24);
+    for (i = 0; i < 2; i++) {
+        const q2_screen_dispenv *e = &s.disp.env[i];
+        CHECK(e->screen_x == 0 && e->screen_y == 24,
+              "env %d: screen (%d,%d), expected (0,24)", i, e->screen_x, e->screen_y);
+        CHECK(e->disp_y == 0 && e->disp_h == 248,
+              "env %d: disp.y %d h %d, expected 0 and 248", i, e->disp_y, e->disp_h);
+        CHECK(e->screen_w == 0 && e->screen_h == 0,
+              "env %d: nothing may size the window (%dx%d)", i, e->screen_w, e->screen_h);
+    }
+
+    /* The y < 0 branch: scan-out starts -y rows down and the height follows. */
+    q2_screen_install_video(&s, 3, -10);
+    for (i = 0; i < 2; i++) {
+        const q2_screen_dispenv *e = &s.disp.env[i];
+        CHECK(e->screen_x == 3 && e->screen_y == -10,
+              "env %d: screen (%d,%d), expected (3,-10)", i, e->screen_x, e->screen_y);
+        CHECK(e->disp_y == 10 && e->disp_h == 238,
+              "env %d: disp.y %d h %d, expected 10 and 238", i, e->disp_y, e->disp_h);
+    }
+
+    /* SetupDrawDisplay3D: SetDefDispEnv twice, cross paired, then the position. */
+    q2_screen_install_video(&s, 5, 30);
+    q2_screen_set_layout(&s, Q2_SCREEN_LAYOUT_ONE, 1);
+    CHECK(s.disp.env[0].disp_x == 512 && s.disp.env[1].disp_x == 0,
+          "a session layout is cross paired (%d, %d)",
+          s.disp.env[0].disp_x, s.disp.env[1].disp_x);
+    for (i = 0; i < 2; i++)
+        CHECK(s.disp.env[i].screen_x == 5 && s.disp.env[i].screen_y == 30,
+              "env %d lost SCREEN POSITION to the session layout: (%d,%d)", i,
+              s.disp.env[i].screen_x, s.disp.env[i].screen_y);
+
+    /* SetupScreenLoading: each buffer's own origin, then the position. */
+    q2_screen_set_layout(&s, Q2_SCREEN_LAYOUT_FULL_SINGLE, 1);
+    CHECK(q2_screen_single_buffered(&s), "the boot layout is single buffered");
+    for (i = 0; i < 2; i++)
+        CHECK(s.disp.env[i].screen_x == 5 && s.disp.env[i].screen_y == 30,
+              "env %d lost SCREEN POSITION to the boot layout: (%d,%d)", i,
+              s.disp.env[i].screen_x, s.disp.env[i].screen_y);
+
+    q2_screen_free(&s);
+
+    /*
+     * The 240-line build takes its height from the framebuffer: SLUS-00757 has
+     * 240 at the two immediates PAL has 248 at.
+     */
+    CHECK(q2_screen_init(&s, Q2_VIDEO_NTSC) == Q2_OK, "NTSC init failed");
+    q2_screen_install_video(&s, 0, 0);
+    CHECK(s.disp.env[0].disp_h == 240, "NTSC disp.h %d, expected 240",
+          s.disp.env[0].disp_h);
+    q2_screen_install_video(&s, 0, -10);
+    CHECK(s.disp.env[0].disp_h == 230, "NTSC disp.h %d at y -10, expected 230",
+          s.disp.env[0].disp_h);
+    q2_screen_free(&s);
+}
+
+/*
+ * What PutDispEnv (0x80083BCC) makes of an env, for every position the page can
+ * reach. The property the setting rests on: framebuffer row k is on raster line
+ * `19 + y + k`, whichever side of zero y is. The library clamps the first line
+ * at 19, and Config_InstallVideo's y < 0 branch exists to keep that line
+ * straight through the clamp — it does, and the rows it gives up are exactly
+ * the ones that would have been above line 19.
+ */
+static void test_put_dispenv(void)
+{
+    q2_screen s;
+    q2_screen_range r;
+    int x, y, w = 0, h = 0;
+
+    printf("put dispenv\n");
+    CHECK(q2_screen_init(&s, Q2_VIDEO_PAL) == Q2_OK, "init failed");
+    q2_screen_set_layout(&s, Q2_SCREEN_LAYOUT_ONE, 1);
+
+    /* The reset routine's position, 0 and 24. */
+    q2_screen_install_video(&s, 0, 24);
+    q2_screen_shown_range(&s, &r);
+    CHECK(r.x1 == 635 && r.x2 == 3195 && r.dot == 5,
+          "clocks %d..%d dot %d, expected 635..3195 at 5", r.x1, r.x2, r.dot);
+    CHECK(r.y1 == 43 && r.y2 == 283, "lines %d..%d, expected 43..283", r.y1, r.y2);
+    CHECK(r.gp1_05 == (0x05000000u | 512u), "GP1(05h) %08X", (unsigned)r.gp1_05);
+    CHECK(r.gp1_06 == (0x06000000u | (3195u << 12) | 635u),
+          "GP1(06h) %08X", (unsigned)r.gp1_06);
+    CHECK(r.gp1_07 == (0x07000000u | (283u << 10) | 43u),
+          "GP1(07h) %08X", (unsigned)r.gp1_07);
+
+    q2_screen_picture_size(&s, &w, &h);
+    CHECK(w == 512 && h == 240, "the picture is %dx%d, expected 512x240", w, h);
+
+    for (y = -32; y <= 64; y++) {            /* the page's whole range */
+        int first, end;
+
+        q2_screen_install_video(&s, 0, y);
+        q2_screen_shown_range(&s, &r);
+        first = r.vram_y;
+        end   = r.vram_y + (r.y2 - r.y1);
+
+        CHECK(first == (y < 0 ? -y : 0), "y %d: scan-out starts at row %d", y, first);
+        CHECK(r.y1 - first == 19 + y,
+              "y %d: row k lands on line %d + k, expected %d + k",
+              y, r.y1 - first, 19 + y);
+        /* The window never reaches past the drawn picture's row 239, so nothing
+         * under the framebuffer is ever on screen; past y = 46 the bottom of
+         * the field (line 305) takes rows off instead. */
+        CHECK(end == (y <= 46 ? 240 : 286 - y),
+              "y %d: rows %d..%d, expected to end at %d",
+              y, first, end, y <= 46 ? 240 : 286 - y);
+    }
+
+    for (x = -20; x <= 20; x++) {             /* likewise, Q2_MENU_SCREEN_X_* */
+        int cols, want_cols;
+
+        q2_screen_install_video(&s, x, 24);
+        q2_screen_shown_range(&s, &r);
+        cols = (r.x2 - r.x1) / r.dot;
+
+        /* -20 is one step past the left clamp at 540: the picture stops where
+         * -19 put it and its end, taken from the unclamped start, costs it a
+         * column. Past 13 the right edge meets 3260. */
+        want_cols = x < -19 ? 511 : (x > 13 ? 512 - (x - 13) : 512);
+        CHECK(r.x1 == (x < -19 ? 540 : 635 + 5 * x),
+              "x %d: first clock %d", x, r.x1);
+        CHECK(cols == want_cols, "x %d: %d columns, expected %d", x, cols, want_cols);
+    }
+
+    q2_screen_free(&s);
+
+    /* NTSC's arm of the same function — the numbers SLUS-00757 runs on, where
+     * the reset position is 0 and 240 lines fill the field from line 16. Its
+     * buffer is 240 too, so the window crops nothing. */
+    CHECK(q2_screen_init(&s, Q2_VIDEO_NTSC) == Q2_OK, "NTSC init failed");
+    q2_screen_set_layout(&s, Q2_SCREEN_LAYOUT_ONE, 1);
+    q2_screen_install_video(&s, 0, 0);
+    q2_screen_shown_range(&s, &r);
+    CHECK(r.y1 == 16 && r.y2 == 256 && r.x1 == 615 && r.x2 == 3175,
+          "NTSC: lines %d..%d clocks %d..%d, expected 16..256 and 615..3175",
+          r.y1, r.y2, r.x1, r.x2);
+    q2_screen_picture_size(&s, &w, &h);
+    CHECK(w == 512 && h == 240 && h == (int)s.disp.height,
+          "NTSC picture %dx%d is the whole %d-line buffer", w, h, s.disp.height);
+    q2_screen_free(&s);
+}
+
+static bool near_f(double a, double b)
+{
+    return a - b < 1e-3 && b - a < 1e-3;
+}
+
+/*
+ * The window as a television. At the reset position the picture IS the fit
+ * rectangle; each step moves it a buffer pixel or a line at the picture's
+ * scale; and the pointer mapping is the exact inverse, so a menu hit test sees
+ * the same picture the eye does.
+ */
+static void test_place(void)
+{
+    q2_screen s;
+    q2_screen_range n, r;
+    q2_screen_placement p;
+    double bx = 0.0, by = 0.0;
+
+    printf("place\n");
+    CHECK(q2_screen_init(&s, Q2_VIDEO_PAL) == Q2_OK, "init failed");
+    q2_screen_set_layout(&s, Q2_SCREEN_LAYOUT_ONE, 1);
+    q2_screen_range_at(&s, 0, 24, &n);
+
+    /* 1536 x 1152 is a 4:3 window at 3x: 3 window pixels across per buffer
+     * pixel, 4.8 down per line. */
+    q2_screen_install_video(&s, 0, 24);
+    q2_screen_shown_range(&s, &r);
+    q2_screen_place(&s, Q2_SCREEN_FIT_FULL_4_3, 1536, 1152, &n, &r, &p);
+    CHECK(p.src_x == 0 && p.src_y == 0 && p.src_w == 512 && p.src_h == 240,
+          "neutral: src (%d,%d %dx%d), expected the top 240 rows",
+          p.src_x, p.src_y, p.src_w, p.src_h);
+    CHECK(near_f(p.dst_x, 0) && near_f(p.dst_y, 0) &&
+          near_f(p.dst_w, 1536) && near_f(p.dst_h, 1152),
+          "neutral: dst (%.2f,%.2f %.2fx%.2f), expected the whole window",
+          p.dst_x, p.dst_y, p.dst_w, p.dst_h);
+
+    q2_screen_install_video(&s, 4, 30);
+    q2_screen_shown_range(&s, &r);
+    q2_screen_place(&s, Q2_SCREEN_FIT_FULL_4_3, 1536, 1152, &n, &r, &p);
+    CHECK(near_f(p.dst_x, 12.0) && near_f(p.dst_y, 6.0 * 4.8) &&
+          p.src_h == 240,
+          "(4,30): dst at (%.2f,%.2f) with %d rows, expected (12,28.8) and 240",
+          p.dst_x, p.dst_y, p.src_h);
+
+    /* Up past zero. Row 10 is the first scanned and it sits 34 lines above the
+     * neutral top, so the window's top edge shows row 34. */
+    q2_screen_install_video(&s, 0, -10);
+    q2_screen_shown_range(&s, &r);
+    q2_screen_place(&s, Q2_SCREEN_FIT_FULL_4_3, 1536, 1152, &n, &r, &p);
+    CHECK(p.src_y == 10 && p.src_h == 230, "(0,-10): rows %d + %d, expected 10 + 230",
+          p.src_y, p.src_h);
+    CHECK(q2_screen_window_to_buffer(&p, 0.0, 0.0, &bx, &by) && near_f(by, 34.0),
+          "(0,-10): the window's top shows row %.2f, expected 34", by);
+
+    /* The inverse lands on the corner it came from. */
+    CHECK(q2_screen_window_to_buffer(&p, p.dst_x + p.dst_w, p.dst_y + p.dst_h,
+                                     &bx, &by) &&
+          near_f(bx, 512.0) && near_f(by, 240.0),
+          "the far corner maps to (%.2f,%.2f), expected (512,240)", bx, by);
 
     q2_screen_free(&s);
 }
@@ -1354,22 +1574,23 @@ static void test_pixel_aspect(void)
     CHECK(n == 2 && d == 3, "PAL 512-wide pixel is %d:%d, expected 2:3", n, d);
 
     /* The picture, at one buffer pixel across per unit of scale. 512 columns
-     * against 512*3/2 = 768... no: the HEIGHT grows, 248 -> 372. */
+     * against 512*3/2 = 768... no: the HEIGHT grows, 240 -> 360. It is 240
+     * because that is what PutDispEnv shows of the 248-line buffer. */
     q2_screen_window_size(&s, Q2_SCREEN_FIT_TELEVISION, 1, &w, &h);
-    CHECK(w == 512 && h == 372, "picture %dx%d, expected 512x372", w, h);
+    CHECK(w == 512 && h == 360, "picture %dx%d, expected 512x360", w, h);
 
     q2_screen_window_size(&s, Q2_SCREEN_FIT_TELEVISION, 3, &w, &h);
-    CHECK(w == 1536 && h == 1116, "3x picture %dx%d, expected 1536x1116", w, h);
+    CHECK(w == 1536 && h == 1080, "3x picture %dx%d, expected 1536x1080", w, h);
 
-    /* SQUARE is the raw buffer, which is what the port used to present and is
-     * a 1.5x horizontal stretch of the above. */
+    /* SQUARE is the displayed lines raw, which is what the port used to present
+     * (all 248 of them) and is a 1.5x horizontal stretch of the above. */
     q2_screen_window_size(&s, Q2_SCREEN_FIT_SQUARE, 1, &w, &h);
-    CHECK(w == 512 && h == 248, "square %dx%d, expected 512x248", w, h);
+    CHECK(w == 512 && h == 240, "square %dx%d, expected 512x240", w, h);
 
     /*
      * FULL_4_3 is the DEFAULT — a zero-initialised caller gets it — and it is
      * the shape the running game is captured at: 512 across, 384 down, exactly
-     * 4:3, three percent shorter than the strict pixel reading above.
+     * 4:3, six percent shorter than the strict pixel reading above.
      */
     CHECK(Q2_SCREEN_FIT_FULL_4_3 == 0, "4:3 must be what a memset gives");
     q2_screen_window_size(&s, Q2_SCREEN_FIT_FULL_4_3, 1, &w, &h);
@@ -1391,7 +1612,7 @@ static void test_fit_rect(void)
         { 2560, 1080 },   /* 21:9                           */
         { 1024,  768 },   /* 4:3    — very nearly exact     */
         {  600, 1200 },   /* portrait — letterboxed         */
-        { 1536, 1116 },   /* the default window — exact fit */
+        { 1536, 1080 },   /* the 3x window — exact fit     */
         {    1,    1 },   /* degenerate                     */
         {    0,    0 }    /* and a caller that passed junk  */
     };
@@ -1419,7 +1640,7 @@ static void test_fit_rect(void)
 
         /* The aspect, to within the pixel the integer fit has to give up. */
         if (w > 8 && h > 8) {
-            double want = 512.0 * 2.0 / (248.0 * 3.0);
+            double want = 512.0 * 2.0 / (240.0 * 3.0);
             double got  = (double)w / (double)h;
             CHECK(got > want * 0.99 && got < want * 1.01,
                   "%dx%d: picture %dx%d is %.4f:1, wanted %.4f:1",
@@ -1430,10 +1651,10 @@ static void test_fit_rect(void)
     /* The exact-fit window loses nothing at all. */
     {
         int x = -1, y = -1, w = -1, h = -1;
-        q2_screen_fit_rect(&s, Q2_SCREEN_FIT_TELEVISION, 1536, 1116,
+        q2_screen_fit_rect(&s, Q2_SCREEN_FIT_TELEVISION, 1536, 1080,
                            &x, &y, &w, &h);
-        CHECK(x == 0 && y == 0 && w == 1536 && h == 1116,
-              "the default window should fit exactly, got (%d,%d %dx%d)",
+        CHECK(x == 0 && y == 0 && w == 1536 && h == 1080,
+              "the 3x window should fit exactly, got (%d,%d %dx%d)",
               x, y, w, h);
     }
 
@@ -1550,6 +1771,9 @@ int main(void)
     test_build();
     test_context();
     test_display_envs();
+    test_install_video();
+    test_put_dispenv();
+    test_place();
     test_meter();
     test_blend_table();
     test_water_ramp();

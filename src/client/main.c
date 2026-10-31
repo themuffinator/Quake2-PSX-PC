@@ -1900,6 +1900,24 @@ typedef struct client {
     long             frames_total;       /* 0 = run until the window closes */
     long             shot_every;         /* 0 = only the last frame         */
     const char      *shot_path;          /* NULL = do not capture           */
+
+    /*
+     * `--shot-display`: the same frames as `--shot`, but placed — what the
+     * television is shown rather than what the console drew. The only way to
+     * see the presentation path, since `--shot` writes the buffer before it.
+     */
+    const char      *shot_display_path;
+
+    /* `--screen-pos X Y`, an override for the SCREEN POSITION setting, the way
+     * `--crosshair` overrides its own. Lets a capture show the page's effect
+     * without driving the menu. */
+    bool             screen_pos_set;
+    int              screen_pos_x, screen_pos_y;
+
+    /* `--scale`: the window's width in buffer pixels. Kept here so a headless
+     * `--shot-display`, which has no window to measure, writes the same size a
+     * windowed run would show. */
+    int              win_scale;
     long             shots_written;
 } client;
 
@@ -11926,9 +11944,31 @@ static void client_menu_origin(const client *c, int *ox, int *oy)
 }
 
 /*
+ * Where the finished frame goes in a window of `out_w` x `out_h`: the part of
+ * the framebuffer the television shows, and where. SCREEN POSITION is already
+ * in the display envs (client_frame installs it), so this only has to say what
+ * "unmoved" is — the reset routine's position for this build, which the fit
+ * rectangle stands for. One function because the frame and the pointer must
+ * agree to the pixel.
+ */
+static void client_place(const client *c, int out_w, int out_h,
+                         q2_screen_placement *pl)
+{
+    q2_menu_settings reset;
+    q2_screen_range neutral, shown;
+
+    /* 0x8001FA18: (0, 24) on PAL, and (0, 0) on the 240-line build. */
+    q2_menu_reset_video_for(&reset, c->screen.disp.height);
+    q2_screen_range_at(&c->screen, reset.v[Q2_SET_SCREEN_X],
+                       reset.v[Q2_SET_SCREEN_Y], &neutral);
+    q2_screen_shown_range(&c->screen, &shown);
+    q2_screen_place(&c->screen, c->fit, out_w, out_h, &neutral, &shown, pl);
+}
+
+/*
  * The pointer in menu space, undoing the two transforms the frame applied on
- * the way out: the window fit (q2_screen_fit_rect plus SCREEN POSITION, exactly
- * as client_frame composes them) and then the menu block's origin.
+ * the way out: the placement (client_place, exactly as client_frame blits it)
+ * and then the menu block's origin.
  *
  * False when there is no pointer to speak of — headless, or grabbed for
  * mouselook, in which case its motion is look input and its position is
@@ -11937,28 +11977,18 @@ static void client_menu_origin(const client *c, int *ox, int *oy)
 static bool client_menu_pointer_pos(const client *c, int *mx, int *my)
 {
     int out_w = 0, out_h = 0;
-    int px = 0, py = 0, pw = 0, ph = 0;
     int ox = 0, oy = 0;
-    double sx, sy, fx, fy;
+    double fx = 0.0, fy = 0.0;
+    q2_screen_placement pl;
 
     if (c->headless || !c->renderer || !c->pointer_valid || c->mouse_grabbed)
         return false;
 
     SDL_GetCurrentRenderOutputSize(c->renderer, &out_w, &out_h);
-    q2_screen_fit_rect(&c->screen, c->fit, out_w, out_h, &px, &py, &pw, &ph);
-    if (pw <= 0 || ph <= 0)
+    client_place(c, out_w, out_h, &pl);
+    if (!q2_screen_window_to_buffer(&pl, (double)c->pointer_x,
+                                    (double)c->pointer_y, &fx, &fy))
         return false;
-
-    sx = (double)c->settings.v[Q2_SET_SCREEN_X];
-    sy = (double)(c->settings.v[Q2_SET_SCREEN_Y] -
-                  q2_menu_screen_y_default(c->screen.disp.height));
-
-    fx = ((double)c->pointer_x -
-          ((double)px + sx * (double)pw / (double)Q2_SCREEN_PAL_WIDTH)) *
-         (double)c->width / (double)pw;
-    fy = ((double)c->pointer_y -
-          ((double)py + sy * (double)ph / (double)c->screen.disp.height)) *
-         (double)c->height / (double)ph;
 
     client_menu_origin(c, &ox, &oy);
 
@@ -14372,6 +14402,105 @@ static void client_screenshot(client *c)
     Q2_INFO("screenshot: %s", path);
 }
 
+/* `--shot`'s numbering, shared with `--shot-display`. */
+static void shot_path_for(const char *base, long frame, bool numbered,
+                          char *out, size_t out_sz)
+{
+    if (numbered) {
+        const char *dot = strrchr(base, '.');
+        size_t stem = dot ? (size_t)(dot - base) : strlen(base);
+
+        if (stem > out_sz - 32)
+            stem = out_sz - 32;
+        memcpy(out, base, stem);
+        snprintf(out + stem, out_sz - stem, "_%04ld%s",
+                 frame, dot ? dot : ".ppm");
+    } else {
+        snprintf(out, out_sz, "%s", base);
+    }
+}
+
+/*
+ * `--shot-display`: the finished frame as the television is shown it.
+ *
+ * `--shot` writes what the console DREW, which is the right thing for every
+ * pixel comparison in this project — but it is taken before presentation, so
+ * nothing in it can show what the display envs do. This runs the real
+ * placement, q2_screen_place over the live and neutral ranges exactly as
+ * client_present blits them, and samples the front buffer through it: the
+ * cropped rows are absent, SCREEN POSITION has moved the picture, and the
+ * border is the black the window is cleared to.
+ *
+ * Nearest-neighbour on purpose. The point is to see WHERE the picture is and
+ * how much of it there is, and an interpolated edge would blur the one thing
+ * the capture is for.
+ */
+static void client_write_shot_display(client *c, bool numbered)
+{
+    char path[512];
+    psx_framebuffer out;
+    q2_screen_placement pl;
+    int win_w = 0, win_h = 0, x, y;
+    q2_result rc;
+
+    if (!c->shot_display_path)
+        return;
+
+    /* Headless has no renderer to ask, so the window is the one `--scale`
+     * would have opened. */
+    q2_screen_window_size(&c->screen, c->fit, c->win_scale > 0 ? c->win_scale : 3,
+                          &win_w, &win_h);
+    if (win_w < 1 || win_h < 1)
+        return;
+
+    client_place(c, win_w, win_h, &pl);
+
+    memset(&out, 0, sizeof(out));
+    out.width  = win_w;
+    out.height = win_h;
+    out.px     = calloc((size_t)win_w * (size_t)win_h, sizeof(u16));
+    if (!out.px) {
+        Q2_ERROR("cannot allocate a %dx%d display capture", win_w, win_h);
+        return;
+    }
+
+    if (pl.src_w > 0 && pl.src_h > 0 && pl.dst_w > 0.0f && pl.dst_h > 0.0f) {
+        const psx_framebuffer *front = q2_screen_front(&c->screen);
+
+        for (y = 0; y < win_h; y++) {
+            for (x = 0; x < win_w; x++) {
+                double bx, by;
+                int sx, sy;
+
+                if (!q2_screen_window_to_buffer(&pl, (double)x + 0.5,
+                                                (double)y + 0.5, &bx, &by))
+                    continue;
+                sx = (int)bx;
+                sy = (int)by;
+                if (bx < 0.0 || by < 0.0 ||
+                    sx < pl.src_x || sx >= pl.src_x + pl.src_w ||
+                    sy < pl.src_y || sy >= pl.src_y + pl.src_h ||
+                    sx >= front->width || sy >= front->height)
+                    continue;       /* border: leave it the cleared colour */
+                out.px[(size_t)y * (size_t)win_w + (size_t)x] =
+                    front->px[(size_t)sy * (size_t)front->width + (size_t)sx];
+            }
+        }
+    }
+
+    shot_path_for(c->shot_display_path, c->frame_index, numbered,
+                  path, sizeof(path));
+    rc = psx_fb_write_ppm(&out, path);
+    free(out.px);
+
+    if (rc != Q2_OK) {
+        Q2_ERROR("cannot write %s: %s", path, q2_result_str(rc));
+        return;
+    }
+    Q2_INFO("display %ld -> %s  (%dx%d window, %d x %d rows from %d)",
+            c->frame_index, path, win_w, win_h, pl.src_w, pl.src_h, pl.src_y);
+}
+
 /*
  * The capture a scripted run writes.
  *
@@ -14379,34 +14508,33 @@ static void client_screenshot(client *c)
  * it becomes a stem — `out.ppm` -> `out_0000.ppm`, `out_0030.ppm` — so a run
  * produces a strip that can be flipped through. The framebuffer is written, not
  * the window: these are the console's own 512x248 pixels, which is what every
- * comparison in this project is made in.
+ * comparison in this project is made in. `--shot-display` writes the window
+ * alongside it.
  */
 static void client_write_shot(client *c, bool numbered)
 {
     char path[512];
     q2_result rc;
 
-    if (!c->shot_path)
+    /* Either capture can be asked for on its own; `shots_written` counts
+     * frames captured, so a display-only run still tells the final-frame
+     * check that this frame is done. */
+    client_write_shot_display(c, numbered);
+
+    if (!c->shot_path) {
+        if (c->shot_display_path)
+            c->shots_written++;
         return;
-
-    if (numbered) {
-        const char *dot = strrchr(c->shot_path, '.');
-        size_t stem = dot ? (size_t)(dot - c->shot_path) : strlen(c->shot_path);
-
-        if (stem > sizeof(path) - 32)
-            stem = sizeof(path) - 32;
-        memcpy(path, c->shot_path, stem);
-        snprintf(path + stem, sizeof(path) - stem, "_%04ld%s",
-                 c->frame_index, dot ? dot : ".ppm");
-    } else {
-        snprintf(path, sizeof(path), "%s", c->shot_path);
     }
+
+    shot_path_for(c->shot_path, c->frame_index, numbered, path, sizeof(path));
 
     rc = psx_fb_write_ppm(q2_screen_front(&c->screen), path);
     if (rc != Q2_OK) {
         Q2_ERROR("cannot write %s: %s", path, q2_result_str(rc));
         return;
     }
+
 
     c->shots_written++;
     Q2_INFO("frame %ld -> %s", c->frame_index, path);
@@ -17129,6 +17257,17 @@ static void client_present(client *c)
     int pitch;
     const psx_framebuffer *front;
 
+    /*
+     * SCREEN POSITION into the display envs, as Config_InstallVideo
+     * (0x8001C29C) puts it there — openquestions #40. The console calls it from
+     * the SCREEN POSITION page every frame it is up, after the video reset and
+     * a settings load, and from both functions that set the envs up; the
+     * settings cannot change anywhere else, so doing it once a frame here,
+     * before the env is put, shows exactly what those calls would. It sits in
+     * client_present so the loading screen is placed the same way.
+     */
+    q2_screen_install_video(&c->screen, c->settings.v[Q2_SET_SCREEN_X],
+                            c->settings.v[Q2_SET_SCREEN_Y]);
     q2_screen_present(&c->screen);
     front = q2_screen_front(&c->screen);
 
@@ -17138,7 +17277,7 @@ static void client_present(client *c)
      * frames, and neither depends on a driver's idea of what a 15-bit texture
      * looks like.
      */
-    if (c->shot_path && c->shot_every > 0 &&
+    if ((c->shot_path || c->shot_display_path) && c->shot_every > 0 &&
         (c->frame_index % c->shot_every) == 0)
         client_write_shot(c, true);
 
@@ -17158,26 +17297,6 @@ static void client_present(client *c)
     SDL_RenderClear(c->renderer);
     {
         /*
-         * SCREEN POSITION, honoured — openquestions #40.
-         *
-         * The page writes `0x800B3368` / `0x800B336A` (defaults 0 and 24) and
-         * an exhaustive sweep finds **no reader anywhere in the executable**:
-         * the obvious consumer would be the display env's screen rectangle,
-         * which `SetDefDispEnv` explicitly zeroes. So on this build the page is
-         * inert, and the port must not pretend otherwise about the CONSOLE.
-         *
-         * It can still do the honest thing for the player: a control that
-         * exists and does nothing is a bug from the outside. The offset is
-         * applied here, at presentation, where it shifts the finished image the
-         * way a television's own position control would — and nowhere near the
-         * ordering table, so it cannot perturb clipping or the viewport
-         * rectangles that the reconstruction does depend on.
-         *
-         * The default y of 24 is treated as the neutral point, because that is
-         * what the reset routine writes and a fresh install must not be
-         * off-centre.
-         */
-        /*
          * THE PICTURE'S SHAPE, which is not the buffer's.
          *
          * The GPU's five horizontal modes all span the same active line, so a
@@ -17186,34 +17305,29 @@ static void client_present(client *c)
          * framebuffer pixel exactly 2:3, and blitting the buffer to fill the
          * window — which is what this did — a 1.5x horizontal stretch.
          *
-         * q2_screen_fit_rect does the whole of it: the largest rectangle of the
-         * right shape that fits, centred, with the rest of the window left as
-         * border. It takes any window aspect, so a 16:9 monitor pillarboxes and
-         * a tall window letterboxes without this having to know which.
+         * AND THE PICTURE'S EXTENT, which is not the buffer's either. What
+         * reaches the television is what PutDispEnv programs from the display
+         * env: 240 lines — all of a 240-line buffer, 240 of PAL's 248 — starting
+         * where SCREEN POSITION, installed by client_frame as
+         * Config_InstallVideo installs it, says. So this blits the part of the
+         * buffer the ranges scan, where they put it, measured from the picture
+         * at the reset routine's position; the fit rectangle is that picture.
+         * See q2_screen_place.
          */
-        SDL_FRect dst;
+        SDL_FRect src, dst;
         int out_w = 0, out_h = 0;
-        int px = 0, py = 0, pw = 0, ph = 0;
-        float sx = (float)c->settings.v[Q2_SET_SCREEN_X];
-        float sy = (float)(c->settings.v[Q2_SET_SCREEN_Y] -
-                           q2_menu_screen_y_default(c->screen.disp.height));
+        q2_screen_placement pl;
 
         SDL_GetCurrentRenderOutputSize(c->renderer, &out_w, &out_h);
-        q2_screen_fit_rect(&c->screen, c->fit, out_w, out_h,
-                           &px, &py, &pw, &ph);
+        client_place(c, out_w, out_h, &pl);
 
-        /*
-         * SCREEN POSITION moves the picture, so its units are buffer pixels
-         * scaled by the PICTURE's size and not by the window's — otherwise the
-         * same setting would shift by a different amount depending on how much
-         * of the window is border.
-         */
-        dst.x = (float)px + sx * (float)pw / (float)Q2_SCREEN_PAL_WIDTH;
-        dst.y = (float)py + sy * (float)ph / (float)c->screen.disp.height;
-        dst.w = (float)pw;
-        dst.h = (float)ph;
-
-        SDL_RenderTexture(c->renderer, c->texture, NULL, &dst);
+        if (pl.src_w > 0 && pl.src_h > 0) {
+            src.x = (float)pl.src_x;  src.y = (float)pl.src_y;
+            src.w = (float)pl.src_w;  src.h = (float)pl.src_h;
+            dst.x = pl.dst_x;         dst.y = pl.dst_y;
+            dst.w = pl.dst_w;         dst.h = pl.dst_h;
+            SDL_RenderTexture(c->renderer, c->texture, &src, &dst);
+        }
     }
     SDL_RenderPresent(c->renderer);
 }
@@ -17823,6 +17937,10 @@ static void usage(void)
     printf("  --frames N    stop after N frames\n");
     printf("  --shot P.ppm  write the console's own framebuffer to P.ppm\n");
     printf("  --shot-every N  ...and one every N frames, numbered\n");
+    printf("  --shot-display P.ppm  ...and the WINDOW alongside it: the frame\n"
+           "                placed as the television is shown it, 240 lines\n"
+           "                of the buffer where SCREEN POSITION puts them\n");
+    printf("  --screen-pos X Y  override SCREEN POSITION (-20..20, -32..64)\n");
     printf("  --powerup KIND hold quad|invuln|enviro|breather for HUD capture\n");
     printf("  --fire-event NAME [F]  queue ONE named Events entry point at\n"
            "                frame F, instead of every trigger volume on the\n"
@@ -18415,7 +18533,7 @@ int main(int argc, char **argv)
     bool zone_probe = false;
     int zone_index = 0;
     bool zone_given = false;
-    int scale = 3;
+    int scale = 3;                   /* mirrored into c.win_scale */
     int i;
     u64 last;
     /*
@@ -18476,7 +18594,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--disc") && i + 1 < argc)       disc_path = argv[++i];
         else if (!strcmp(argv[i], "--map") && i + 1 < argc) { map = argv[++i]; map_given = true; }
         else if (!strcmp(argv[i], "--zone") && i + 1 < argc)  { zone_index = atoi(argv[++i]); zone_given = true; }
-        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) scale = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) scale = c.win_scale = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--headless"))              c.headless = true;
         else if (!strcmp(argv[i], "--demo"))                  c.demo = true;
         else if (!strcmp(argv[i], "--crosshair"))             force_crosshair = 1;
@@ -18637,6 +18755,13 @@ int main(int argc, char **argv)
             c.shot_path = argv[++i];
         else if (!strcmp(argv[i], "--shot-every") && i + 1 < argc)
             c.shot_every = strtol(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--shot-display") && i + 1 < argc)
+            c.shot_display_path = argv[++i];
+        else if (!strcmp(argv[i], "--screen-pos") && i + 2 < argc) {
+            c.screen_pos_set = true;
+            c.screen_pos_x = (int)strtol(argv[++i], NULL, 10);
+            c.screen_pos_y = (int)strtol(argv[++i], NULL, 10);
+        }
         else if (!strcmp(argv[i], "--saves") && i + 1 < argc) q2_save_set_dir(argv[++i]);
         else if (!strcmp(argv[i], "--dm")) {
             c.mp_enabled = true;
@@ -18788,7 +18913,7 @@ int main(int argc, char **argv)
 
     /*
      * The window opens at `scale` buffer pixels across and however tall the
-     * console's pixel shape makes that — 1536 x 1116 at the default scale of 3,
+     * console's pixel shape makes that — 1536 x 1080 at the default scale of 3,
      * not the 1536 x 744 the buffer's own dimensions suggest. Stretching
      * vertically rather than squeezing horizontally keeps every one of the 512
      * columns the 512-wide mode was chosen for.
@@ -19163,6 +19288,18 @@ no_window:
      * console (0x8001BDA8 resets it to 0); this is the shortcut. */
     if (force_vibration >= 0)
         c.settings.v[Q2_SET_VIBRATION] = force_vibration;
+    /* SCREEN POSITION, clamped to the page's own range so the override cannot
+     * reach a value the console could not (Q2_MENU_SCREEN_*). */
+    if (c.screen_pos_set) {
+        int px = c.screen_pos_x, py = c.screen_pos_y;
+
+        if (px < Q2_MENU_SCREEN_X_MIN) px = Q2_MENU_SCREEN_X_MIN;
+        if (px > Q2_MENU_SCREEN_X_MAX) px = Q2_MENU_SCREEN_X_MAX;
+        if (py < Q2_MENU_SCREEN_Y_MIN) py = Q2_MENU_SCREEN_Y_MIN;
+        if (py > Q2_MENU_SCREEN_Y_MAX) py = Q2_MENU_SCREEN_Y_MAX;
+        c.settings.v[Q2_SET_SCREEN_X] = (s16)px;
+        c.settings.v[Q2_SET_SCREEN_Y] = (s16)py;
+    }
 
     /* The library's SetShockData callers reach the pads through here. */
     q2_shock_attach(client_shock_sink, &c);
@@ -20469,7 +20606,8 @@ no_window:
      * The last frame, always — a run with no `--shot-every` asks for one
      * picture and gets exactly that, at the name it gave, with no number in it.
      */
-    if (c.shot_path && (c.shot_every <= 0 || c.shots_written == 0)) {
+    if ((c.shot_path || c.shot_display_path) &&
+        (c.shot_every <= 0 || c.shots_written == 0)) {
         c.frame_index--;
         client_write_shot(&c, false);
     }
