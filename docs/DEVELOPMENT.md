@@ -143,9 +143,9 @@ client can run with no window at all, on a fixed 1/30 s step, driving the pad fr
 script and writing the console's own framebuffer out:
 
 ```bash
-build-client/bin/q2psx --disc "Quake II (Europe).cue" --headless --demo \
+build/bin/q2psx --disc "Quake II (Europe).cue" --headless --demo \
                        --frames 120 --shot run.ppm --shot-every 10
-build-client/bin/q2psx --disc "Quake II (Europe).cue" --movie OUTRO1P.STX
+build/bin/q2psx --disc "Quake II (Europe).cue" --movie OUTRO1P.STX
 ```
 
 Split-screen captures use `--dm --dm-players 2` with `--dm-split horizontal` or
@@ -153,7 +153,7 @@ Split-screen captures use `--dm --dm-players 2` with `--dm-split horizontal` or
 HUD and view-weapon check, including all eleven weapons:
 
 ```bash
-python tests/check_split_screen.py --client build-client/bin/q2psx \
+python tests/check_split_screen.py --client build/bin/q2psx \
     --disc "Quake II (Europe).cue" --output .agents/tmp/split-screen/PAL --weapon-sweep
 ```
 
@@ -306,10 +306,10 @@ since `Intro FMV` and `Extro FMV` are both the directory `QFMV` and the name is 
 chooses the film. `--movie` plays one on its own.
 
 ```bash
-build-client/bin/q2psx --disc "Quake II (Europe).cue" --boot --headless --frames 560
-build-client/bin/q2psx --disc "Quake II (Europe).cue" --new-game
-build-client/bin/q2psx --disc "Quake II (Europe).cue" --map "Extro FMV"
-build-client/bin/q2psx --disc "Quake II (Europe).cue" --movie ROGUEINP.STX
+build/bin/q2psx --disc "Quake II (Europe).cue" --boot --headless --frames 560
+build/bin/q2psx --disc "Quake II (Europe).cue" --new-game
+build/bin/q2psx --disc "Quake II (Europe).cue" --map "Extro FMV"
+build/bin/q2psx --disc "Quake II (Europe).cue" --movie ROGUEINP.STX
 ```
 
 `--watch` adds a camera that stands in front of the nearest live creature and looks

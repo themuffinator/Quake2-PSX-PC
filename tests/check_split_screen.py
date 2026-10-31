@@ -1,7 +1,7 @@
 """Exercise the real client's split HUD and view weapons using a local disc.
 
 Run from the repository, for example:
-  python tests/check_split_screen.py --client build-client/bin/q2psx \
+  python tests/check_split_screen.py --client build/bin/q2psx \
       --disc /path/to/game.cue --output .agents/tmp/split-screen/PAL
 
 All captures use the engine framebuffer and a fixed headless timestep. No

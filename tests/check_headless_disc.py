@@ -693,7 +693,6 @@ def main():
     if not client:
         for candidate in (ROOT / ".install/q2psx.exe",
                           ROOT / "build-msvc/bin/Release/q2psx.exe",
-                          ROOT / "build-client/bin/q2psx",
                           ROOT / "build/bin/q2psx"):
             if candidate.is_file():
                 client = str(candidate)
